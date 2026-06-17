@@ -12,6 +12,10 @@ exclude.workspace = true
 name = "reth-partial-stateless"
 path = "src/main.rs"
 
+[[bin]]
+name = "partial-stateless-sidecar-consumer"
+path = "src/bin/sidecar_consumer.rs"
+
 [dependencies]
 alloy-primitives.workspace = true
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
@@ -24,5 +28,12 @@ partial-stateless = { path = "../partial-stateless" }
 
 eyre.workspace = true
 futures.workspace = true
+prost = "0.13"
 serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic = "0.13"
 tracing.workspace = true
+
+[build-dependencies]
+tonic-build = "0.13"

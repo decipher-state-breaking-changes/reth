@@ -195,6 +195,14 @@ pub struct PartialExecutionWitness {
 }
 
 impl PartialExecutionWitness {
+    /// Total raw payload bytes represented by this witness, when bytes are present.
+    pub const fn payload_total_bytes(&self) -> Option<usize> {
+        match &self.payload {
+            WitnessPayload::NoneSkeletonOnly => None,
+            WitnessPayload::StateMultiproofV1(payload) => Some(payload.stats.total_bytes()),
+        }
+    }
+
     /// Convert partial execution witness to the current JSON artifact representation.
     pub fn to_json_value(&self) -> serde_json::Value {
         json!({

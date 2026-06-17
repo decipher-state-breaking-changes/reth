@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package partialstateless;
+
+service PartialExecutionWitnessSidecars {
+  rpc Subscribe(SubscribeSidecarsRequest) returns (stream SidecarFrame) {}
+}
+
+message SubscribeSidecarsRequest {}
+
+message SidecarFrame {
+  string event = 1;
+  uint64 block_number = 2;
+  string block_hash = 3;
+  string parent_hash = 4;
+  string target_source = 5;
+  string payload_kind = 6;
+  uint64 target_count = 7;
+  uint64 payload_bytes = 8;
+  bytes sidecar_json = 9;
+}

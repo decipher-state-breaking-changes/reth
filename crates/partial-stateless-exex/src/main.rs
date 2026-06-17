@@ -2,10 +2,11 @@
 //!
 //! The binary installs one ExEx, observes canonical chain notifications, filters
 //! target sets through a deterministic cache view, and writes minimal sidecar
-//! artifacts. It does not implement validator consumption or wire transport.
+//! artifacts. It also exposes a minimal gRPC stream for sidecar consumers.
 
 mod bundle_summary;
 mod cache_mode;
+mod grpc;
 mod manifest;
 mod proof_payload;
 mod sidecar_writer;
@@ -14,6 +15,7 @@ mod target_source;
 use crate::{
     bundle_summary::BundleSummary,
     cache_mode::CacheMode,
+    grpc::{grpc_addr_from_env, serve_sidecars, SidecarPublisher},
     manifest::{BlockManifestEntry, ManifestWriter, SidecarManifestEntry},
     proof_payload::build_state_multiproof_payload,
     sidecar_writer::SidecarWriter,
@@ -35,6 +37,7 @@ use tracing::{info, warn};
 
 async fn partial_stateless_exex<Node: FullNodeComponents>(
     mut ctx: ExExContext<Node>,
+    sidecar_publisher: SidecarPublisher,
 ) -> eyre::Result<()> {
     let manifest_writer = ManifestWriter::from_env();
     let sidecar_writer = SidecarWriter::from_env();
@@ -75,6 +78,7 @@ async fn partial_stateless_exex<Node: FullNodeComponents>(
                         bundle_summary,
                         cache_mode,
                         &targets,
+                        &sidecar_publisher,
                     )?;
                 }
             }
@@ -104,6 +108,7 @@ async fn partial_stateless_exex<Node: FullNodeComponents>(
                         old_bundle_summary,
                         cache_mode,
                         &old_targets,
+                        &sidecar_publisher,
                     )?;
                 }
 
@@ -126,6 +131,7 @@ async fn partial_stateless_exex<Node: FullNodeComponents>(
                         new_bundle_summary,
                         cache_mode,
                         &new_targets,
+                        &sidecar_publisher,
                     )?;
                 }
             }
@@ -153,6 +159,7 @@ async fn partial_stateless_exex<Node: FullNodeComponents>(
                         bundle_summary,
                         cache_mode,
                         &targets,
+                        &sidecar_publisher,
                     )?;
                 }
             }
@@ -181,6 +188,7 @@ fn write_block_artifacts<Node: FullNodeComponents>(
     bundle_summary: BundleSummary,
     cache_mode: CacheMode,
     targets: &WitnessTargets,
+    sidecar_publisher: &SidecarPublisher,
 ) -> eyre::Result<()> {
     if bundle_summary.block_count != 1 {
         warn!(
@@ -220,7 +228,7 @@ fn write_block_artifacts<Node: FullNodeComponents>(
         build_state_multiproof_payload(state_provider.as_ref(), &filtered_targets.missing_targets)?
     };
 
-    let sidecar_result = sidecar_writer.write(&PartialExecutionWitnessSidecar {
+    let sidecar = PartialExecutionWitnessSidecar {
         envelope: SidecarBlockContext {
             event,
             block_number,
@@ -236,7 +244,10 @@ fn write_block_artifacts<Node: FullNodeComponents>(
             stats: filtered_targets.stats,
             payload,
         },
-    })?;
+    };
+
+    let sidecar_result = sidecar_writer.write(&sidecar)?;
+    sidecar_publisher.publish(&sidecar)?;
 
     manifest_writer.append_block_entry(BlockManifestEntry {
         event,
@@ -259,11 +270,26 @@ fn write_block_artifacts<Node: FullNodeComponents>(
 
 fn main() -> eyre::Result<()> {
     reth_ethereum::cli::Cli::parse_args().run(async move |builder, _| {
+        let grpc_addr = grpc_addr_from_env()?;
+        let sidecar_publisher = SidecarPublisher::new();
+        let exex_sidecar_publisher = sidecar_publisher.clone();
+
         let handle: NodeHandleFor<EthereumNode> = builder
             .node(EthereumNode::default())
-            .install_exex("partial-stateless", async move |ctx| Ok(partial_stateless_exex(ctx)))
+            .install_exex("partial-stateless", async move |ctx| {
+                Ok(partial_stateless_exex(ctx, exex_sidecar_publisher))
+            })
             .launch()
             .await?;
+
+        handle.node.task_executor.spawn_critical_task(
+            "partial-stateless sidecar gRPC stream",
+            async move {
+                serve_sidecars(grpc_addr, sidecar_publisher.sender())
+                    .await
+                    .expect("partial-stateless sidecar gRPC stream crashed");
+            },
+        );
 
         handle.wait_for_node_exit().await
     })
