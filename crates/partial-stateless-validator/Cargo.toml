@@ -1,0 +1,56 @@
+[package]
+name = "partial-stateless-validator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Partial-stateless validator: reconstruct state from {cache ∪ witness}, re-execute a block, and verify its state root"
+
+[lib]
+name = "partial_stateless_validator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ps-validator"
+path = "src/main.rs"
+
+[[bin]]
+name = "cache-experiment"
+path = "src/experiment.rs"
+
+[[bin]]
+name = "validate"
+path = "src/validate.rs"
+
+[dependencies]
+# trie + primitives (witness state reconstruction)
+alloy-primitives = { workspace = true, features = ["serde", "map"] }
+alloy-trie.workspace = true
+alloy-rlp.workspace = true
+alloy-consensus.workspace = true
+reth-trie-common.workspace = true
+
+# EVM state provider (serve reads to revm) — Phase 5
+reth-revm = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std"] }
+reth-storage-errors = { workspace = true, features = ["std"] }
+
+# block execution + chain spec — Phase 5
+reth-evm = { workspace = true, features = ["std"] }
+reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-chainspec = { workspace = true, features = ["std"] }
+reth-ethereum-primitives = { workspace = true, features = ["std"] }
+
+# stateless post-state root recompute (Phase 5 gold check)
+reth-trie-sparse = { workspace = true, features = ["std"] }
+
+# raw block fetch over JSON-RPC (debug_getRawBlock)
+reqwest = { workspace = true, features = ["blocking", "json"] }
+
+# (de)serialization of ps-replay witness/block dumps
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# utilities
+eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

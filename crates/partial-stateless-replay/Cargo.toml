@@ -1,0 +1,23 @@
+[package]
+name = "partial-stateless-replay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Fetches blocks + execution witnesses from a running reth node via JSON-RPC and dumps them to disk for offline partial-stateless experiments"
+
+[[bin]]
+name = "ps-replay"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime + HTTP JSON-RPC client
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true, features = ["json"] }
+
+# (de)serialization
+serde_json.workspace = true
+
+# utilities
+eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

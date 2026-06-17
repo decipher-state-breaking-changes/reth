@@ -153,6 +153,8 @@ members = [
     "crates/tracing-otlp",
     "crates/partial-stateless",
     "crates/partial-stateless-exex",
+    "crates/partial-stateless-replay",
+    "crates/partial-stateless-validator",
 ]
 default-members = ["bin/reth"]
 exclude = ["docs/cli"]

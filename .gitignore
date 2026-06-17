@@ -27,6 +27,11 @@ crates/stages/stages/testdata
 # Prometheus data dir
 data/
 
+# Partial-stateless experiment data: blocks + witnesses dumped by ps-replay
+replay_data/
+replay_data_canonical/
+replay_data*/
+
 # Proptest data
 proptest-regressions/
 
