@@ -1,0 +1,28 @@
+[package]
+name = "partial-stateless-exex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[[bin]]
+name = "reth-partial-stateless"
+path = "src/main.rs"
+
+[dependencies]
+alloy-primitives.workspace = true
+reth-ethereum = { workspace = true, features = ["full", "cli"] }
+reth-execution-types.workspace = true
+reth-provider.workspace = true
+reth-storage-api.workspace = true
+reth-trie.workspace = true
+
+partial-stateless = { path = "../partial-stateless" }
+
+eyre.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
