@@ -78,6 +78,7 @@ members = [
     "crates/payload/primitives/",
     "crates/payload/validator/",
     "crates/payload/util/",
+    "crates/partial-stateless/",
     "crates/prune/db",
     "crates/prune/prune",
     "crates/prune/types",

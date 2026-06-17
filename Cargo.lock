@@ -6458,6 +6458,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "partial-stateless"
+version = "2.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
