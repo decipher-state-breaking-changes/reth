@@ -217,7 +217,14 @@ struct RpcClient {
 
 impl RpcClient {
     fn new(url: String) -> Self {
-        Self { url, http: reqwest::Client::new(), next_id: AtomicU64::new(1) }
+        // A per-request timeout so one stuck block (e.g. a witness outside the
+        // node's pruned state window, which can hang indefinitely) is skipped
+        // rather than stalling the whole run.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("reqwest client");
+        Self { url, http, next_id: AtomicU64::new(1) }
     }
 
     /// Convenience wrapper for `eth_blockNumber`, returning the height as `u64`.

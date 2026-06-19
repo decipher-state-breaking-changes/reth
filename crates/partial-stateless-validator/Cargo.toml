@@ -18,6 +18,14 @@ name = "cache-experiment"
 path = "src/experiment.rs"
 
 [[bin]]
+name = "cache-experiment-v2"
+path = "src/experiment_v2.rs"
+
+[[bin]]
+name = "flatcache-experiment"
+path = "src/flatcache.rs"
+
+[[bin]]
 name = "validate"
 path = "src/validate.rs"
 

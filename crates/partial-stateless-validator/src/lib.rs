@@ -4,7 +4,9 @@
 //! (no state database), so a block can be validated statelessly. Shared by the
 //! `ps-validator` and `cache-experiment` binaries.
 
+pub mod byte_cache;
 pub mod cache;
 pub mod db;
+pub mod depth;
 pub mod trie;
 pub mod witness;
