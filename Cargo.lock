@@ -6504,10 +6504,12 @@ name = "partial-stateless-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-evm",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
  "eyre",
+ "partial-stateless",
  "reqwest 0.13.2",
  "reth-chainspec",
  "reth-ethereum-primitives",

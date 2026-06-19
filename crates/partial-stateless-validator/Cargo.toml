@@ -21,7 +21,16 @@ path = "src/experiment.rs"
 name = "validate"
 path = "src/validate.rs"
 
+# offline measurement of the real (network_cache-model) witness a validator
+# receives: state-key cache + missed-key multiproof bytes + missed code bytes
+[[bin]]
+name = "witness-sim"
+path = "src/witness_sim.rs"
+
 [dependencies]
+# the network-level state cache (account/storage/code) + miss/witness model
+partial-stateless = { path = "../partial-stateless" }
+
 # trie + primitives (witness state reconstruction)
 alloy-primitives = { workspace = true, features = ["serde", "map"] }
 alloy-trie.workspace = true
@@ -37,6 +46,8 @@ reth-storage-errors = { workspace = true, features = ["std"] }
 # block execution + chain spec — Phase 5
 reth-evm = { workspace = true, features = ["std"] }
 reth-evm-ethereum = { workspace = true, features = ["std"] }
+# BlockExecutor trait — drive execution manually (skip pre-exec system calls)
+alloy-evm.workspace = true
 reth-chainspec = { workspace = true, features = ["std"] }
 reth-ethereum-primitives = { workspace = true, features = ["std"] }
 
