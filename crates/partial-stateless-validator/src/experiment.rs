@@ -18,7 +18,7 @@ use partial_stateless_validator::{
     cache::{self, AVAILABLE_POLICIES},
     witness::IndexedWitness,
 };
-use std::{collections::HashSet, path::PathBuf};
+use std::path::PathBuf;
 
 fn main() -> eyre::Result<()> {
     let args = Args::parse()?;
@@ -35,8 +35,28 @@ fn main() -> eyre::Result<()> {
     let access_sets: Vec<Vec<B256>> =
         blocks.iter().map(|(_, w)| w.nodes.keys().copied().collect()).collect();
     let accesses: u64 = access_sets.iter().map(|s| s.len() as u64).sum();
-    let distinct = access_sets.iter().flatten().copied().collect::<HashSet<_>>().len() as u64;
+
+    // Distinct nodes and their byte sizes. Witness *cost* is bytes shipped, not
+    // node count: an un-cached node must travel in the block's witness. A node's
+    // bytes are identical wherever it appears (same hash => same preimage).
+    let mut node_size: std::collections::HashMap<B256, u64> = std::collections::HashMap::new();
+    for (_, w) in &blocks {
+        for (hash, bytes) in &w.nodes {
+            node_size.entry(*hash).or_insert(bytes.len() as u64);
+        }
+    }
+    let distinct = node_size.len() as u64;
     let max_hit_rate = if accesses > 0 { (accesses - distinct) as f64 / accesses as f64 } else { 0.0 };
+
+    // Bytes shipped with no cache (every access shipped) and the byte floor
+    // (each distinct node shipped exactly once, on first appearance).
+    let total_bytes: u64 = access_sets
+        .iter()
+        .flatten()
+        .map(|h| node_size.get(h).copied().unwrap_or(0))
+        .sum();
+    let floor_bytes: u64 = node_size.values().sum();
+    let n_blocks = blocks.len() as u64;
 
     println!(
         "# blocks={} ({}..{}) accesses={accesses} distinct_nodes={distinct} (compulsory floor) max_hit_rate={max_hit_rate:.4}",
@@ -44,24 +64,36 @@ fn main() -> eyre::Result<()> {
         blocks.first().unwrap().0,
         blocks.last().unwrap().0,
     );
-    println!("{:<8} {:>10} {:>9} {:>9} {:>12} {:>12} {:>9}", "policy", "capacity", "hit_rate", "miss_rate", "hits", "misses", "%_of_max");
+    println!(
+        "# witness bytes: no_cache={} ({}/block) floor={} ({}/block)",
+        mib(total_bytes),
+        mib(total_bytes / n_blocks),
+        mib(floor_bytes),
+        mib(floor_bytes / n_blocks),
+    );
+    println!(
+        "{:<8} {:>10} {:>9} {:>9} {:>14} {:>14} {:>9}",
+        "policy", "capacity", "hit_rate", "miss_rate", "ship_total", "ship/block", "%_of_max"
+    );
 
     for &capacity in &args.caps {
         for policy in &args.policies {
             let mut cache = cache::build(policy, capacity)?;
-            let (mut hits, mut misses) = (0u64, 0u64);
+            let mut hits = 0u64;
+            // Bytes the builder must ship: every miss travels in the witness.
+            let mut ship_bytes = 0u64;
 
             for (block_idx, ids) in access_sets.iter().enumerate() {
+                let node_map = &blocks[block_idx].1.nodes;
                 // Count residency against the cache as of the start of this block.
                 for id in ids {
                     if cache.contains(id) {
                         hits += 1;
                     } else {
-                        misses += 1;
+                        ship_bytes += node_map.get(id).map(|b| b.len() as u64).unwrap_or(0);
                     }
                 }
                 // Warm the cache with this block's nodes (admit + policy eviction).
-                let node_map = &blocks[block_idx].1.nodes;
                 for id in ids {
                     if let Some(bytes) = node_map.get(id) {
                         cache.insert(*id, bytes.clone());
@@ -72,8 +104,14 @@ fn main() -> eyre::Result<()> {
             let hit_rate = if accesses > 0 { hits as f64 / accesses as f64 } else { 0.0 };
             let pct_of_max = if max_hit_rate > 0.0 { hit_rate / max_hit_rate * 100.0 } else { 0.0 };
             println!(
-                "{:<8} {:>10} {:>9.4} {:>9.4} {:>12} {:>12} {:>8.1}%",
-                policy, capacity, hit_rate, 1.0 - hit_rate, hits, misses, pct_of_max
+                "{:<8} {:>10} {:>9.4} {:>9.4} {:>14} {:>14} {:>8.1}%",
+                policy,
+                capacity,
+                hit_rate,
+                1.0 - hit_rate,
+                mib(ship_bytes),
+                mib(ship_bytes / n_blocks),
+                pct_of_max
             );
         }
     }
@@ -109,6 +147,11 @@ impl Args {
 
 fn next(it: &mut impl Iterator<Item = String>, flag: &str) -> eyre::Result<String> {
     it.next().ok_or_else(|| eyre::eyre!("{flag} requires a value"))
+}
+
+/// Format a byte count as a human-readable MiB string (e.g. `12.34MiB`).
+fn mib(bytes: u64) -> String {
+    format!("{:.2}MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 fn parse_policies(spec: &str) -> eyre::Result<Vec<String>> {

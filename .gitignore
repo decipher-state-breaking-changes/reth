@@ -31,6 +31,8 @@ data/
 replay_data/
 replay_data_canonical/
 replay_data*/
+replay_*/
+crates/partial-stateless-validator/results/
 
 # Proptest data
 proptest-regressions/
