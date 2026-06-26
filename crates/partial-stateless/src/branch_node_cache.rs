@@ -1,78 +1,61 @@
-//! Benchmark-only cache for trie nodes observed in prior proofs.
+//! Benchmark-only content-addressed cache for structural trie nodes.
 //!
 //! This does not change the protocol-level value cache. It models how much
-//! witness data could be omitted if validators also retained structural proof
-//! nodes (branch and extension nodes) they have already seen.
+//! witness data could be omitted if validators also retained the structural
+//! proof nodes (branch and extension nodes) they have already seen.
 //!
-//! Three cache models are measured side by side from the same proof stream:
-//! - the positional model keyed by `(domain, path, content hash)` (the default),
-//! - an account-only positional model (storage structural nodes excluded), kept for its memory
-//!   footprint, and
-//! - a content-addressed (hash-only) model keyed solely by content hash, which estimates the extra
-//!   redundancy a protocol-accurate hash-keyed node cache would capture (same bytes reachable at a
-//!   different path or trie).
+//! The cache is keyed solely by node content hash — the identity an MPT actually
+//! uses, since a parent references each child by `keccak(child_rlp)`. A node is
+//! avoidable when the same bytes were seen in a prior block, regardless of the
+//! path or trie it now appears in. Branch and extension contributions are
+//! reported separately, but there is a single cache.
+//!
+//! Eviction uses the same per-domain windows as the value cache: a node survives
+//! while it was last seen within `account_window` in the account trie OR within
+//! `storage_window` in a storage trie.
 
-use crate::witness::{flatten_multiproof_nodes, ProofNodeDomain, ProofNodeKind, ProofNodeRecord};
+use crate::witness::{flatten_multiproof_nodes, ProofNodeKind, ProofNodeRecord};
 use alloy_primitives::{map::HashMap, Bytes, B256};
 use reth_trie_common::MultiProof;
 
-const DOMAIN_ACCOUNT_BYTES: usize = 1;
-const DOMAIN_STORAGE_BYTES: usize = 1 + 32;
 const CONTENT_HASH_BYTES: usize = 32;
 const NODE_KIND_BYTES: usize = 1;
 const CACHE_METADATA_BYTES: usize = 24;
 const HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 32;
 
-/// Compact identity for an exactly cached proof node.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProofNodeCacheKey {
-    domain: ProofNodeDomain,
-    path: Vec<u8>,
-    rlp_hash: B256,
-}
-
-impl ProofNodeCacheKey {
-    fn from_node(node: &ProofNodeRecord) -> Self {
-        Self { domain: node.domain.clone(), path: node.path.clone(), rlp_hash: node.rlp_hash }
-    }
-
-    fn is_storage(&self) -> bool {
-        matches!(self.domain, ProofNodeDomain::Storage(_))
-    }
-
-    fn domain_memory_bytes(&self) -> usize {
-        if self.is_storage() {
-            DOMAIN_STORAGE_BYTES
-        } else {
-            DOMAIN_ACCOUNT_BYTES
-        }
-    }
-}
-
-/// Trie structural-node payload retained from prior sidecars/proofs.
+/// Content-addressed cache entry: one entry per node content hash, regardless of
+/// where the node appears in the trie.
+///
+/// The same content can be reached in both the account and a storage trie, so
+/// the last sighting is tracked per domain. This lets eviction use the same
+/// per-domain windows as the value cache: the entry survives while it was last
+/// seen within `account_window` (account trie) or `storage_window` (storage trie).
 #[derive(Debug, Clone)]
-pub struct CachedProofNode {
-    pub rlp: Bytes,
-    pub kind: ProofNodeKind,
-    pub first_seen_block: u64,
-    pub last_seen_block: u64,
-    pub seen_count: u32,
+struct CachedNode {
+    rlp: Bytes,
+    kind: ProofNodeKind,
+    last_seen_account: Option<u64>,
+    last_seen_storage: Option<u64>,
 }
 
-impl CachedProofNode {
+impl CachedNode {
     fn new(node: &ProofNodeRecord, block: u64) -> Self {
-        Self {
+        let mut entry = Self {
             rlp: node.rlp.clone(),
             kind: node.kind,
-            first_seen_block: block,
-            last_seen_block: block,
-            seen_count: 1,
-        }
+            last_seen_account: None,
+            last_seen_storage: None,
+        };
+        entry.touch(block, node.is_storage());
+        entry
     }
 
-    fn touch(&mut self, block: u64) {
-        self.last_seen_block = block;
-        self.seen_count = self.seen_count.saturating_add(1);
+    fn touch(&mut self, block: u64, is_storage: bool) {
+        if is_storage {
+            self.last_seen_storage = Some(block);
+        } else {
+            self.last_seen_account = Some(block);
+        }
     }
 }
 
@@ -80,8 +63,6 @@ impl CachedProofNode {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BranchNodeCacheFootprint {
     pub total_nodes: usize,
-    pub account_nodes: usize,
-    pub storage_nodes: usize,
     pub branch_nodes: usize,
     pub extension_nodes: usize,
     /// Modeled cache bytes, not allocator RSS.
@@ -89,6 +70,12 @@ pub struct BranchNodeCacheFootprint {
 }
 
 /// Avoidable bytes for a proof against the current structural-node cache.
+///
+/// "Avoidable" means the exact node bytes are already in the cache (seen in a
+/// prior block), so a node that also retained structural nodes could omit them
+/// from the witness. Branch and extension are reported separately; the
+/// account/storage split attributes each avoidable node to the trie it appeared
+/// in for this block.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BranchNodeAvoidanceStats {
     pub partial_mpt_bytes_before: usize,
@@ -103,10 +90,6 @@ pub struct BranchNodeAvoidanceStats {
     pub avoidable_account_branch_nodes: usize,
     pub avoidable_storage_branch_bytes: usize,
     pub avoidable_storage_branch_nodes: usize,
-    pub avoidable_account_extension_bytes: usize,
-    pub avoidable_account_extension_nodes: usize,
-    pub avoidable_storage_extension_bytes: usize,
-    pub avoidable_storage_extension_nodes: usize,
     pub adjusted_partial_mpt_bytes: usize,
     pub branch_redundancy_ratio: Option<f64>,
     pub extension_redundancy_ratio: Option<f64>,
@@ -118,53 +101,26 @@ pub struct BranchNodeAvoidanceStats {
 /// Result of measuring a proof against the cache and then observing it.
 #[derive(Debug, Clone, Default)]
 pub struct BranchNodeCacheUpdate {
-    pub cache_before: BranchNodeCacheFootprint,
     pub cache_after: BranchNodeCacheFootprint,
     pub avoidance: BranchNodeAvoidanceStats,
-    /// Account-only positional model: kept for its memory footprint. Its avoidable
-    /// bytes equal the account-domain subset already reported in `avoidance`.
-    pub account_only_cache_after: BranchNodeCacheFootprint,
-    pub account_only_avoidable_structural_bytes: usize,
-    pub account_only_avoidable_structural_nodes: usize,
-    /// Content-addressed (hash-only) model: estimates redundancy a hash-keyed node
-    /// cache would capture beyond the positional model.
-    pub hash_only_cache_after: BranchNodeCacheFootprint,
-    pub hash_only_avoidable_structural_bytes: usize,
-    pub hash_only_avoidable_structural_nodes: usize,
 }
 
-/// Benchmark-only observed proof-node cache.
+/// Benchmark-only content-addressed structural-node cache.
 #[derive(Debug, Default)]
 pub struct ObservedBranchNodeCache {
-    nodes: HashMap<ProofNodeCacheKey, CachedProofNode>,
-    account_only_nodes: HashMap<ProofNodeCacheKey, CachedProofNode>,
-    hash_only_nodes: HashMap<B256, CachedProofNode>,
+    nodes: HashMap<B256, CachedNode>,
     account_window: u64,
     storage_window: u64,
 }
 
 impl ObservedBranchNodeCache {
     pub fn new(account_window: u64, storage_window: u64) -> Self {
-        Self {
-            nodes: HashMap::default(),
-            account_only_nodes: HashMap::default(),
-            hash_only_nodes: HashMap::default(),
-            account_window,
-            storage_window,
-        }
+        Self { nodes: HashMap::default(), account_window, storage_window }
     }
 
     pub fn footprint(&self) -> BranchNodeCacheFootprint {
-        Self::footprint_for(&self.nodes)
-    }
-
-    pub fn account_only_footprint(&self) -> BranchNodeCacheFootprint {
-        Self::footprint_for(&self.account_only_nodes)
-    }
-
-    pub fn hash_only_footprint(&self) -> BranchNodeCacheFootprint {
         let mut footprint = BranchNodeCacheFootprint::default();
-        for cached in self.hash_only_nodes.values() {
+        for cached in self.nodes.values() {
             footprint.total_nodes += 1;
             match cached.kind {
                 ProofNodeKind::Branch => footprint.branch_nodes += 1,
@@ -188,110 +144,36 @@ impl ObservedBranchNodeCache {
         proof: &MultiProof,
     ) -> BranchNodeCacheUpdate {
         let proof_nodes = flatten_multiproof_nodes(proof);
-        let cache_before = self.footprint();
         let mut avoidance = Self::avoidable_stats_for(&self.nodes, &proof_nodes);
-        let (hash_only_avoidable_structural_bytes, hash_only_avoidable_structural_nodes) =
-            Self::hash_only_avoidable_stats_for(&self.hash_only_nodes, &proof_nodes);
 
         for node in &proof_nodes {
             if !node.is_structural() {
                 continue;
             }
             Self::observe_node(&mut self.nodes, block_number, node);
-            if !node.is_storage() {
-                Self::observe_node(&mut self.account_only_nodes, block_number, node);
-            }
-            Self::observe_hash_only_node(&mut self.hash_only_nodes, block_number, node);
         }
 
         self.evict(block_number);
-        self.evict_account_only(block_number);
-        self.evict_hash_only(block_number);
-
         avoidance.finalize();
 
-        // The account-only positional cache retains the same account-domain
-        // structural nodes as the main cache, so its avoidable bytes are exactly
-        // the account-domain subset already computed above.
-        let account_only_avoidable_structural_bytes =
-            avoidance.avoidable_account_branch_bytes + avoidance.avoidable_account_extension_bytes;
-        let account_only_avoidable_structural_nodes =
-            avoidance.avoidable_account_branch_nodes + avoidance.avoidable_account_extension_nodes;
-
-        BranchNodeCacheUpdate {
-            cache_before,
-            cache_after: self.footprint(),
-            avoidance,
-            account_only_cache_after: self.account_only_footprint(),
-            account_only_avoidable_structural_bytes,
-            account_only_avoidable_structural_nodes,
-            hash_only_cache_after: self.hash_only_footprint(),
-            hash_only_avoidable_structural_bytes,
-            hash_only_avoidable_structural_nodes,
-        }
+        BranchNodeCacheUpdate { cache_after: self.footprint(), avoidance }
     }
 
     fn observe_node(
-        nodes: &mut HashMap<ProofNodeCacheKey, CachedProofNode>,
-        block_number: u64,
-        node: &ProofNodeRecord,
-    ) {
-        let key = ProofNodeCacheKey::from_node(node);
-        match nodes.get_mut(&key) {
-            Some(cached) => cached.touch(block_number),
-            None => {
-                nodes.insert(key, CachedProofNode::new(node, block_number));
-            }
-        }
-    }
-
-    fn observe_hash_only_node(
-        nodes: &mut HashMap<B256, CachedProofNode>,
+        nodes: &mut HashMap<B256, CachedNode>,
         block_number: u64,
         node: &ProofNodeRecord,
     ) {
         match nodes.get_mut(&node.rlp_hash) {
-            Some(cached) => cached.touch(block_number),
+            Some(cached) => cached.touch(block_number, node.is_storage()),
             None => {
-                nodes.insert(node.rlp_hash, CachedProofNode::new(node, block_number));
+                nodes.insert(node.rlp_hash, CachedNode::new(node, block_number));
             }
         }
-    }
-
-    fn footprint_for(
-        nodes: &HashMap<ProofNodeCacheKey, CachedProofNode>,
-    ) -> BranchNodeCacheFootprint {
-        let mut footprint = BranchNodeCacheFootprint::default();
-        for (key, cached) in nodes {
-            footprint.total_nodes += 1;
-            if key.is_storage() {
-                footprint.storage_nodes += 1;
-            } else {
-                footprint.account_nodes += 1;
-            }
-            match cached.kind {
-                ProofNodeKind::Branch => footprint.branch_nodes += 1,
-                ProofNodeKind::Extension => footprint.extension_nodes += 1,
-                ProofNodeKind::Other => {}
-            }
-            footprint.estimated_memory_bytes += Self::estimated_entry_memory_bytes(key, cached);
-        }
-        footprint
-    }
-
-    fn estimated_entry_memory_bytes(key: &ProofNodeCacheKey, cached: &CachedProofNode) -> usize {
-        // Modeled cache footprint: compact key + retained node bytes + lightweight metadata.
-        key.domain_memory_bytes() +
-            key.path.len() +
-            CONTENT_HASH_BYTES +
-            cached.rlp.len() +
-            NODE_KIND_BYTES +
-            CACHE_METADATA_BYTES +
-            HASHMAP_ENTRY_OVERHEAD_BYTES
     }
 
     fn avoidable_stats_for(
-        nodes: &HashMap<ProofNodeCacheKey, CachedProofNode>,
+        nodes: &HashMap<B256, CachedNode>,
         proof_nodes: &[ProofNodeRecord],
     ) -> BranchNodeAvoidanceStats {
         let partial_mpt_bytes_before: usize = proof_nodes.iter().map(|node| node.rlp.len()).sum();
@@ -305,8 +187,7 @@ impl ObservedBranchNodeCache {
             if !node.is_structural() {
                 continue;
             }
-            let key = ProofNodeCacheKey::from_node(node);
-            let Some(cached) = nodes.get(&key) else { continue };
+            let Some(cached) = nodes.get(&node.rlp_hash) else { continue };
             if cached.rlp != node.rlp {
                 continue;
             }
@@ -329,13 +210,6 @@ impl ObservedBranchNodeCache {
                 ProofNodeKind::Extension => {
                     stats.avoidable_extension_bytes += bytes;
                     stats.avoidable_extension_nodes += 1;
-                    if is_storage {
-                        stats.avoidable_storage_extension_bytes += bytes;
-                        stats.avoidable_storage_extension_nodes += 1;
-                    } else {
-                        stats.avoidable_account_extension_bytes += bytes;
-                        stats.avoidable_account_extension_nodes += 1;
-                    }
                 }
                 ProofNodeKind::Other => {}
             }
@@ -344,48 +218,17 @@ impl ObservedBranchNodeCache {
         stats
     }
 
-    /// Content-addressed avoidance: a structural node is avoidable if a node with
-    /// the same content hash was seen in a prior block, regardless of path or trie.
-    fn hash_only_avoidable_stats_for(
-        nodes: &HashMap<B256, CachedProofNode>,
-        proof_nodes: &[ProofNodeRecord],
-    ) -> (usize, usize) {
-        let mut bytes = 0usize;
-        let mut count = 0usize;
-        for node in proof_nodes {
-            if !node.is_structural() {
-                continue;
-            }
-            let Some(cached) = nodes.get(&node.rlp_hash) else { continue };
-            if cached.rlp != node.rlp {
-                continue;
-            }
-            bytes += node.rlp.len();
-            count += 1;
-        }
-        (bytes, count)
-    }
-
     fn evict(&mut self, current_block: u64) {
+        // A content-addressed entry survives while any of its sightings is still
+        // within that domain's window — matching the positional/value-cache
+        // retention so the only modeled difference is the content-hash key.
         let account_cutoff = current_block.saturating_sub(self.account_window);
         let storage_cutoff = current_block.saturating_sub(self.storage_window);
-        self.nodes.retain(|node, cached| {
-            let cutoff = if node.is_storage() { storage_cutoff } else { account_cutoff };
-            cached.last_seen_block >= cutoff
+        self.nodes.retain(|_, cached| {
+            let account_ok = cached.last_seen_account.is_some_and(|block| block >= account_cutoff);
+            let storage_ok = cached.last_seen_storage.is_some_and(|block| block >= storage_cutoff);
+            account_ok || storage_ok
         });
-    }
-
-    fn evict_account_only(&mut self, current_block: u64) {
-        let account_cutoff = current_block.saturating_sub(self.account_window);
-        self.account_only_nodes.retain(|_, cached| cached.last_seen_block >= account_cutoff);
-    }
-
-    fn evict_hash_only(&mut self, current_block: u64) {
-        // Content-addressed entries are domain-agnostic, so retain them for the
-        // wider of the two windows.
-        let window = self.account_window.max(self.storage_window);
-        let cutoff = current_block.saturating_sub(window);
-        self.hash_only_nodes.retain(|_, cached| cached.last_seen_block >= cutoff);
     }
 }
 
@@ -423,9 +266,13 @@ mod tests {
         bytes
     }
 
-    fn alternate_branch_rlp_vec() -> Vec<u8> {
-        let mut bytes = branch_rlp_vec();
-        *bytes.last_mut().unwrap() = 0x00;
+    /// A second, distinct, *valid* branch: one 32-byte child at slot 0, value slot empty.
+    fn other_branch_rlp_vec() -> Vec<u8> {
+        let mut payload = vec![0xa0];
+        payload.extend([0x22; 32]); // slot 0 = 32-byte child reference
+        payload.extend([0x80; 16]); // slots 1..=15 empty + value slot empty
+        let mut bytes = vec![0xc0 + payload.len() as u8];
+        bytes.extend(payload);
         bytes
     }
 
@@ -465,56 +312,53 @@ mod tests {
     }
 
     #[test]
-    fn compact_key_exact_match_counts_as_avoidable() {
+    fn exact_content_match_counts_as_avoidable() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
         let rlp = branch_rlp_vec();
-        let first = proof(vec![(&[1], rlp.clone())], vec![]);
-        let second = proof(vec![(&[1], rlp.clone())], vec![]);
-
-        let first_update = cache.measure_and_update(1, &first);
+        let first_update = cache.measure_and_update(1, &proof(vec![(&[1], rlp.clone())], vec![]));
         assert_eq!(first_update.avoidance.avoidable_branch_bytes, 0);
 
-        let second_update = cache.measure_and_update(2, &second);
+        let second_update = cache.measure_and_update(2, &proof(vec![(&[1], rlp.clone())], vec![]));
         assert_eq!(second_update.avoidance.avoidable_branch_bytes, rlp.len());
-        assert_eq!(second_update.avoidance.avoidable_account_branch_bytes, rlp.len());
-        assert_eq!(second_update.avoidance.avoidable_storage_branch_bytes, 0);
+        assert_eq!(second_update.avoidance.avoidable_structural_bytes, rlp.len());
     }
 
     #[test]
-    fn compact_key_requires_same_rlp_bytes() {
+    fn requires_same_rlp_bytes() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
-        let cached_rlp = branch_rlp_vec();
-        let changed_rlp = alternate_branch_rlp_vec();
-        cache.measure_and_update(1, &proof(vec![(&[1], cached_rlp)], vec![]));
+        cache.measure_and_update(1, &proof(vec![(&[1], branch_rlp_vec())], vec![]));
 
-        let update = cache.measure_and_update(2, &proof(vec![(&[1], changed_rlp)], vec![]));
+        let update =
+            cache.measure_and_update(2, &proof(vec![(&[1], other_branch_rlp_vec())], vec![]));
         assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
         assert_eq!(update.avoidance.avoidable_branch_nodes, 0);
     }
 
     #[test]
-    fn compact_key_separates_account_and_storage_domains() {
+    fn same_bytes_at_different_path_are_avoidable() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
         let rlp = branch_rlp_vec();
-        let storage_account = B256::repeat_byte(0xaa);
-        cache.measure_and_update(1, &proof(vec![], vec![(storage_account, &[1], rlp.clone())]));
+        cache.measure_and_update(1, &proof(vec![(&[1], rlp.clone())], vec![]));
 
-        let update = cache.measure_and_update(2, &proof(vec![(&[1], rlp)], vec![]));
-        assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
+        // Content addressing: same bytes, different path -> still a hit.
+        let update = cache.measure_and_update(2, &proof(vec![(&[2], rlp.clone())], vec![]));
+        assert_eq!(update.avoidance.avoidable_branch_bytes, rlp.len());
     }
 
     #[test]
-    fn compact_key_separates_storage_accounts() {
+    fn same_content_across_tries_is_avoidable() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
         let rlp = branch_rlp_vec();
-        cache.measure_and_update(
-            1,
+        // Seen in the account trie...
+        cache.measure_and_update(1, &proof(vec![(&[1], rlp.clone())], vec![]));
+        // ...then the identical node appears in a storage trie: content-addressed hit.
+        let update = cache.measure_and_update(
+            2,
             &proof(vec![], vec![(B256::repeat_byte(0xaa), &[1], rlp.clone())]),
         );
-
-        let update =
-            cache.measure_and_update(2, &proof(vec![], vec![(B256::repeat_byte(0xbb), &[1], rlp)]));
-        assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
+        assert_eq!(update.avoidance.avoidable_branch_bytes, rlp.len());
+        assert_eq!(update.avoidance.avoidable_storage_branch_bytes, rlp.len());
+        assert_eq!(update.avoidance.avoidable_account_branch_bytes, 0);
     }
 
     #[test]
@@ -536,117 +380,87 @@ mod tests {
     }
 
     #[test]
-    fn hash_only_model_matches_same_bytes_at_different_path() {
+    fn account_storage_split_attributes_by_trie() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
-        let rlp = branch_rlp_vec();
-        cache.measure_and_update(1, &proof(vec![(&[1], rlp.clone())], vec![]));
-
-        // Same node bytes, different path: positional model misses, hash-only hits.
-        let update = cache.measure_and_update(2, &proof(vec![(&[2], rlp.clone())], vec![]));
-        assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
-        assert_eq!(update.hash_only_avoidable_structural_bytes, rlp.len());
-        assert_eq!(update.hash_only_avoidable_structural_nodes, 1);
-    }
-
-    #[test]
-    fn footprint_counts_path_and_rlp_once() {
-        let mut cache = ObservedBranchNodeCache::new(10, 10);
-        let rlp = branch_rlp_vec();
-        let path = [1, 2, 3];
-        cache.measure_and_update(1, &proof(vec![(&path, rlp.clone())], vec![]));
-
-        let footprint = cache.footprint();
-        assert_eq!(footprint.total_nodes, 1);
-        assert_eq!(footprint.account_nodes, 1);
-        assert_eq!(footprint.storage_nodes, 0);
-        assert_eq!(footprint.branch_nodes, 1);
-        assert_eq!(footprint.extension_nodes, 0);
-        assert_eq!(
-            footprint.estimated_memory_bytes,
-            DOMAIN_ACCOUNT_BYTES +
-                path.len() +
-                CONTENT_HASH_BYTES +
-                rlp.len() +
-                NODE_KIND_BYTES +
-                CACHE_METADATA_BYTES +
-                HASHMAP_ENTRY_OVERHEAD_BYTES
+        let account_rlp = branch_rlp_vec();
+        let storage_rlp = other_branch_rlp_vec();
+        let observed = proof(
+            vec![(&[1], account_rlp.clone())],
+            vec![(B256::repeat_byte(0xaa), &[2], storage_rlp.clone())],
         );
+        cache.measure_and_update(1, &observed);
 
-        let representative_path_len = 32usize;
-        let representative_rlp_len = 256usize;
-        let compact_estimate = DOMAIN_ACCOUNT_BYTES +
-            representative_path_len +
-            CONTENT_HASH_BYTES +
-            representative_rlp_len +
-            NODE_KIND_BYTES +
-            CACHE_METADATA_BYTES +
-            HASHMAP_ENTRY_OVERHEAD_BYTES;
-        let duplicate_record_estimate = 2 *
-            (DOMAIN_ACCOUNT_BYTES + representative_path_len + representative_rlp_len) +
-            CACHE_METADATA_BYTES +
-            HASHMAP_ENTRY_OVERHEAD_BYTES;
-        assert!(compact_estimate < duplicate_record_estimate);
+        let update = cache.measure_and_update(2, &observed);
+        assert_eq!(update.avoidance.avoidable_account_branch_bytes, account_rlp.len());
+        assert_eq!(update.avoidance.avoidable_storage_branch_bytes, storage_rlp.len());
+        assert_eq!(update.avoidance.avoidable_branch_bytes, account_rlp.len() + storage_rlp.len());
     }
 
     #[test]
-    fn measure_and_update_uses_cache_state_before_current_block() {
+    fn evicts_storage_content_on_storage_window() {
+        let mut cache = ObservedBranchNodeCache::new(10, 3);
+        let rlp = branch_rlp_vec();
+        let storage_account = B256::repeat_byte(0xaa);
+        cache.measure_and_update(10, &proof(vec![], vec![(storage_account, &[2], rlp.clone())]));
+        // Advance past the storage window (10 + 3 < 14) to trigger eviction.
+        cache.measure_and_update(14, &proof(vec![], vec![]));
+
+        let update =
+            cache.measure_and_update(15, &proof(vec![], vec![(storage_account, &[2], rlp)]));
+        assert_eq!(update.avoidance.avoidable_structural_bytes, 0);
+    }
+
+    #[test]
+    fn keeps_account_content_for_account_window() {
+        let mut cache = ObservedBranchNodeCache::new(10, 3);
+        let rlp = branch_rlp_vec();
+        cache.measure_and_update(10, &proof(vec![(&[1], rlp.clone())], vec![]));
+        cache.measure_and_update(14, &proof(vec![], vec![]));
+
+        // Account window is 10, so content seen at block 10 is still cached at 15.
+        let update = cache.measure_and_update(15, &proof(vec![(&[1], rlp.clone())], vec![]));
+        assert_eq!(update.avoidance.avoidable_structural_bytes, rlp.len());
+    }
+
+    #[test]
+    fn measure_uses_cache_state_before_current_block() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
         let rlp = branch_rlp_vec();
         let update = cache
             .measure_and_update(1, &proof(vec![(&[1], rlp.clone()), (&[2], rlp.clone())], vec![]));
+        // Both share one content hash -> a single cache entry, nothing avoidable yet.
         assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
-        assert_eq!(update.cache_after.branch_nodes, 2);
+        assert_eq!(update.cache_after.total_nodes, 1);
 
         let update = cache.measure_and_update(2, &proof(vec![(&[1], rlp.clone())], vec![]));
         assert_eq!(update.avoidance.avoidable_branch_bytes, rlp.len());
     }
 
     #[test]
-    fn eviction_follows_account_and_storage_windows() {
-        let mut cache = ObservedBranchNodeCache::new(10, 3);
-        let rlp = branch_rlp_vec();
-        cache.measure_and_update(
-            10,
-            &proof(vec![(&[1], rlp.clone())], vec![(B256::repeat_byte(0xaa), &[2], rlp.clone())]),
-        );
-
-        let update = cache.measure_and_update(14, &proof(vec![], vec![]));
-        assert_eq!(update.cache_after.account_nodes, 1);
-        assert_eq!(update.cache_after.storage_nodes, 0);
-    }
-
-    #[test]
-    fn account_only_model_excludes_storage_nodes_and_bytes() {
+    fn footprint_memory_formula() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
-        let account_rlp = branch_rlp_vec();
-        let storage_rlp = branch_rlp_vec();
-        let storage_account = B256::repeat_byte(0xaa);
-        let observed = proof(
-            vec![(&[1], account_rlp.clone())],
-            vec![(storage_account, &[2], storage_rlp.clone())],
-        );
-        cache.measure_and_update(1, &observed);
+        let rlp = branch_rlp_vec();
+        cache.measure_and_update(1, &proof(vec![(&[1, 2, 3], rlp.clone())], vec![]));
 
-        let update = cache.measure_and_update(2, &observed);
-        assert_eq!(update.avoidance.avoidable_branch_bytes, account_rlp.len() + storage_rlp.len());
+        let footprint = cache.footprint();
+        assert_eq!(footprint.total_nodes, 1);
+        assert_eq!(footprint.branch_nodes, 1);
+        assert_eq!(footprint.extension_nodes, 0);
         assert_eq!(
-            update.avoidance.avoidable_branch_bytes,
-            update.avoidance.avoidable_account_branch_bytes +
-                update.avoidance.avoidable_storage_branch_bytes
+            footprint.estimated_memory_bytes,
+            CONTENT_HASH_BYTES +
+                rlp.len() +
+                NODE_KIND_BYTES +
+                CACHE_METADATA_BYTES +
+                HASHMAP_ENTRY_OVERHEAD_BYTES
         );
-        assert_eq!(update.account_only_avoidable_structural_bytes, account_rlp.len());
-        assert_eq!(update.account_only_cache_after.account_nodes, 1);
-        assert_eq!(update.account_only_cache_after.storage_nodes, 0);
     }
 
     #[test]
     fn empty_cache_has_no_avoidable_bytes() {
         let mut cache = ObservedBranchNodeCache::new(10, 10);
         let update = cache.measure_and_update(1, &proof(vec![(&[1], branch_rlp_vec())], vec![]));
-        assert_eq!(update.avoidance.avoidable_branch_bytes, 0);
-        assert_eq!(update.avoidance.avoidable_extension_bytes, 0);
         assert_eq!(update.avoidance.avoidable_structural_bytes, 0);
-        assert_eq!(update.hash_only_avoidable_structural_bytes, 0);
         assert_eq!(
             update.avoidance.adjusted_partial_mpt_bytes,
             update.avoidance.partial_mpt_bytes_before
