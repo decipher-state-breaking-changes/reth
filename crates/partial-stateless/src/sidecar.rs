@@ -1,8 +1,14 @@
-use crate::witness::WitnessResult;
-use alloy_primitives::map::{B256Map, HashMap};
-use alloy_primitives::{Address, B256, Bytes};
-use reth_trie_common::proof::ProofNodes;
-use reth_trie_common::{BranchNodeMasks, MultiProof, Nibbles, StorageMultiProof, TrieMask};
+use crate::{
+    branch_node_cache::{BranchNodeCacheFootprint, BranchNodeCacheUpdate},
+    witness::WitnessResult,
+};
+use alloy_primitives::{
+    map::{B256Map, HashMap},
+    Address, Bytes, B256,
+};
+use reth_trie_common::{
+    proof::ProofNodes, BranchNodeMasks, MultiProof, Nibbles, StorageMultiProof, TrieMask,
+};
 use serde::{Deserialize, Serialize};
 
 /// Hashed / Raw target keys that were missed in the network state cache for a block.
@@ -18,7 +24,8 @@ pub struct WitnessTargets {
 
 impl WitnessTargets {
     pub fn key_preimages(&self) -> Vec<Bytes> {
-        let mut addresses = Vec::with_capacity(self.missed_accounts.len() + self.missed_storage.len());
+        let mut addresses =
+            Vec::with_capacity(self.missed_accounts.len() + self.missed_storage.len());
         addresses.extend_from_slice(&self.missed_accounts);
         addresses.extend(self.missed_storage.iter().map(|(address, _)| *address));
         addresses.sort();
@@ -112,12 +119,12 @@ impl PartitionCheck {
             check(&accessed.storage, &cache_hit.storage, &sidecar_miss.storage);
         let (code_hashes_ok, code_hashes_disjoint) =
             check(&accessed.code_hashes, &cache_hit.code_hashes, &sidecar_miss.code_hashes);
-        let partition_ok = accounts_ok
-            && storage_ok
-            && code_hashes_ok
-            && accounts_disjoint
-            && storage_disjoint
-            && code_hashes_disjoint;
+        let partition_ok = accounts_ok &&
+            storage_ok &&
+            code_hashes_ok &&
+            accounts_disjoint &&
+            storage_disjoint &&
+            code_hashes_disjoint;
 
         Self {
             accounts_ok,
@@ -188,6 +195,166 @@ impl WitnessReductionStats {
     }
 }
 
+/// Benchmark-only estimate of how an observed structural-node cache would affect witness size.
+///
+/// "Structural" nodes are branch and extension nodes (the reusable intermediate
+/// nodes a cache can retain); leaves are excluded. Three cache models are reported:
+/// the positional model (keyed by domain/path/hash, the headline numbers), an
+/// account-only positional variant (kept for its memory footprint), and a
+/// content-addressed (hash-only) model that estimates the extra redundancy a
+/// protocol-accurate hash-keyed node cache would capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchNodeBenchmarkStats {
+    pub cache_before: BranchNodeCacheFootprint,
+    pub cache_after: BranchNodeCacheFootprint,
+    pub partial_mpt_bytes_before: usize,
+    pub avoidable_cached_structural_bytes: usize,
+    pub avoidable_cached_structural_nodes: usize,
+    pub avoidable_cached_branch_bytes: usize,
+    pub avoidable_cached_branch_nodes: usize,
+    pub avoidable_cached_extension_bytes: usize,
+    pub avoidable_cached_extension_nodes: usize,
+    #[serde(default)]
+    pub avoidable_cached_account_branch_bytes: usize,
+    #[serde(default)]
+    pub avoidable_cached_account_branch_nodes: usize,
+    #[serde(default)]
+    pub avoidable_cached_storage_branch_bytes: usize,
+    #[serde(default)]
+    pub avoidable_cached_storage_branch_nodes: usize,
+    #[serde(default)]
+    pub avoidable_cached_account_extension_bytes: usize,
+    #[serde(default)]
+    pub avoidable_cached_account_extension_nodes: usize,
+    #[serde(default)]
+    pub avoidable_cached_storage_extension_bytes: usize,
+    #[serde(default)]
+    pub avoidable_cached_storage_extension_nodes: usize,
+    pub adjusted_partial_mpt_bytes: usize,
+    pub adjusted_partial_total_bytes: usize,
+    pub branch_redundancy_ratio: Option<f64>,
+    pub extension_redundancy_ratio: Option<f64>,
+    pub structural_redundancy_ratio: Option<f64>,
+    #[serde(default)]
+    pub account_branch_redundancy_ratio: Option<f64>,
+    #[serde(default)]
+    pub storage_branch_redundancy_ratio: Option<f64>,
+    pub adjusted_mpt_reduction_ratio: Option<f64>,
+    pub adjusted_total_reduction_ratio: Option<f64>,
+    pub branch_cache_memory_overhead_ratio: Option<f64>,
+    #[serde(default)]
+    pub account_only_cache_after: BranchNodeCacheFootprint,
+    #[serde(default)]
+    pub account_only_avoidable_structural_bytes: usize,
+    #[serde(default)]
+    pub account_only_avoidable_structural_nodes: usize,
+    #[serde(default)]
+    pub account_only_branch_cache_memory_overhead_ratio: Option<f64>,
+    #[serde(default)]
+    pub hash_only_cache_after: BranchNodeCacheFootprint,
+    #[serde(default)]
+    pub hash_only_avoidable_structural_bytes: usize,
+    #[serde(default)]
+    pub hash_only_avoidable_structural_nodes: usize,
+    #[serde(default)]
+    pub hash_only_structural_redundancy_ratio: Option<f64>,
+    #[serde(default)]
+    pub hash_only_branch_cache_memory_overhead_ratio: Option<f64>,
+}
+
+impl BranchNodeBenchmarkStats {
+    pub fn new(
+        branch_cache_update: BranchNodeCacheUpdate,
+        partial: &WitnessResult,
+        full: &WitnessResult,
+        value_cache_bytes: usize,
+    ) -> Self {
+        fn reduction(partial: usize, full: usize) -> Option<f64> {
+            if full == 0 {
+                None
+            } else {
+                Some(1.0 - partial as f64 / full as f64)
+            }
+        }
+        fn ratio(num: usize, den: usize) -> Option<f64> {
+            if den == 0 {
+                None
+            } else {
+                Some(num as f64 / den as f64)
+            }
+        }
+
+        let BranchNodeCacheUpdate {
+            cache_before,
+            cache_after,
+            avoidance,
+            account_only_cache_after,
+            account_only_avoidable_structural_bytes,
+            account_only_avoidable_structural_nodes,
+            hash_only_cache_after,
+            hash_only_avoidable_structural_bytes,
+            hash_only_avoidable_structural_nodes,
+        } = branch_cache_update;
+        let adjusted_partial_total_bytes =
+            avoidance.adjusted_partial_mpt_bytes + partial.bytecode_bytes;
+        let full_mpt = full.account_proof_bytes + full.storage_proof_bytes;
+
+        Self {
+            cache_before,
+            cache_after: cache_after.clone(),
+            partial_mpt_bytes_before: avoidance.partial_mpt_bytes_before,
+            avoidable_cached_structural_bytes: avoidance.avoidable_structural_bytes,
+            avoidable_cached_structural_nodes: avoidance.avoidable_structural_nodes,
+            avoidable_cached_branch_bytes: avoidance.avoidable_branch_bytes,
+            avoidable_cached_branch_nodes: avoidance.avoidable_branch_nodes,
+            avoidable_cached_extension_bytes: avoidance.avoidable_extension_bytes,
+            avoidable_cached_extension_nodes: avoidance.avoidable_extension_nodes,
+            avoidable_cached_account_branch_bytes: avoidance.avoidable_account_branch_bytes,
+            avoidable_cached_account_branch_nodes: avoidance.avoidable_account_branch_nodes,
+            avoidable_cached_storage_branch_bytes: avoidance.avoidable_storage_branch_bytes,
+            avoidable_cached_storage_branch_nodes: avoidance.avoidable_storage_branch_nodes,
+            avoidable_cached_account_extension_bytes: avoidance.avoidable_account_extension_bytes,
+            avoidable_cached_account_extension_nodes: avoidance.avoidable_account_extension_nodes,
+            avoidable_cached_storage_extension_bytes: avoidance.avoidable_storage_extension_bytes,
+            avoidable_cached_storage_extension_nodes: avoidance.avoidable_storage_extension_nodes,
+            adjusted_partial_mpt_bytes: avoidance.adjusted_partial_mpt_bytes,
+            adjusted_partial_total_bytes,
+            branch_redundancy_ratio: avoidance.branch_redundancy_ratio,
+            extension_redundancy_ratio: avoidance.extension_redundancy_ratio,
+            structural_redundancy_ratio: avoidance.structural_redundancy_ratio,
+            account_branch_redundancy_ratio: avoidance.account_branch_redundancy_ratio,
+            storage_branch_redundancy_ratio: avoidance.storage_branch_redundancy_ratio,
+            adjusted_mpt_reduction_ratio: reduction(avoidance.adjusted_partial_mpt_bytes, full_mpt),
+            adjusted_total_reduction_ratio: reduction(
+                adjusted_partial_total_bytes,
+                full.total_size_bytes,
+            ),
+            branch_cache_memory_overhead_ratio: ratio(
+                cache_after.estimated_memory_bytes,
+                value_cache_bytes,
+            ),
+            account_only_cache_after: account_only_cache_after.clone(),
+            account_only_avoidable_structural_bytes,
+            account_only_avoidable_structural_nodes,
+            account_only_branch_cache_memory_overhead_ratio: ratio(
+                account_only_cache_after.estimated_memory_bytes,
+                value_cache_bytes,
+            ),
+            hash_only_structural_redundancy_ratio: ratio(
+                hash_only_avoidable_structural_bytes,
+                avoidance.partial_mpt_bytes_before,
+            ),
+            hash_only_branch_cache_memory_overhead_ratio: ratio(
+                hash_only_cache_after.estimated_memory_bytes,
+                value_cache_bytes,
+            ),
+            hash_only_cache_after: hash_only_cache_after.clone(),
+            hash_only_avoidable_structural_bytes,
+            hash_only_avoidable_structural_nodes,
+        }
+    }
+}
+
 /// Benchmark-only metadata written next to the lean sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarBenchmarkManifest {
@@ -209,9 +376,12 @@ pub struct SidecarBenchmarkManifest {
     pub full_sidecar_baseline_stats: WitnessResult,
     pub partial_sidecar_stats: WitnessResult,
     pub reduction: WitnessReductionStats,
+    #[serde(default)]
+    pub branch_node_benchmark: Option<BranchNodeBenchmarkStats>,
 }
 
-/// A serialized representation of a `StorageMultiProof` that can be easily serialized/deserialized with `serde`.
+/// A serialized representation of a `StorageMultiProof` that can be easily serialized/deserialized
+/// with `serde`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializableStorageMultiProof {
     pub root: B256,
@@ -219,7 +389,8 @@ pub struct SerializableStorageMultiProof {
     pub branch_node_masks: Vec<(Vec<u8>, u16, u16)>,
 }
 
-/// A serialized representation of a `MultiProof` that can be easily serialized/deserialized with `serde`.
+/// A serialized representation of a `MultiProof` that can be easily serialized/deserialized with
+/// `serde`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializableMultiProof {
     pub account_subtree: Vec<(Vec<u8>, Vec<u8>)>,
@@ -237,7 +408,11 @@ impl SerializableMultiProof {
 
         let mut branch_node_masks = Vec::new();
         for (nibbles, masks) in &proof.branch_node_masks {
-            branch_node_masks.push((nibbles.to_vec(), masks.hash_mask.get(), masks.tree_mask.get()));
+            branch_node_masks.push((
+                nibbles.to_vec(),
+                masks.hash_mask.get(),
+                masks.tree_mask.get(),
+            ));
         }
 
         let mut storages = Vec::new();
@@ -249,7 +424,11 @@ impl SerializableMultiProof {
 
             let mut storage_masks = Vec::new();
             for (nibbles, masks) in &storage_proof.branch_node_masks {
-                storage_masks.push((nibbles.to_vec(), masks.hash_mask.get(), masks.tree_mask.get()));
+                storage_masks.push((
+                    nibbles.to_vec(),
+                    masks.hash_mask.get(),
+                    masks.tree_mask.get(),
+                ));
             }
 
             storages.push((
@@ -269,7 +448,10 @@ impl SerializableMultiProof {
     pub fn to_multiproof(&self) -> MultiProof {
         let mut account_subtree_map: HashMap<Nibbles, Bytes> = HashMap::default();
         for (nibbles_bytes, node_bytes) in &self.account_subtree {
-            account_subtree_map.insert(Nibbles::from_nibbles(nibbles_bytes.clone()), Bytes::from(node_bytes.clone()));
+            account_subtree_map.insert(
+                Nibbles::from_nibbles(nibbles_bytes.clone()),
+                Bytes::from(node_bytes.clone()),
+            );
         }
         let account_subtree = ProofNodes::from_iter(account_subtree_map);
 
@@ -288,7 +470,10 @@ impl SerializableMultiProof {
         for (hashed_address, storage_proof) in &self.storages {
             let mut subtree_map: HashMap<Nibbles, Bytes> = HashMap::default();
             for (nibbles_bytes, node_bytes) in &storage_proof.subtree {
-                subtree_map.insert(Nibbles::from_nibbles(nibbles_bytes.clone()), Bytes::from(node_bytes.clone()));
+                subtree_map.insert(
+                    Nibbles::from_nibbles(nibbles_bytes.clone()),
+                    Bytes::from(node_bytes.clone()),
+                );
             }
             let subtree = ProofNodes::from_iter(subtree_map);
 

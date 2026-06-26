@@ -4,9 +4,100 @@
 //! for measuring witness (Merkle proof) size.
 
 use crate::{network_cache::MissResult, BlockAccessedState, StateTargetSet, WitnessTargets};
-use alloy_primitives::{keccak256, Address, B256};
-use reth_trie_common::{MultiProof, MultiProofTargets};
+use alloy_primitives::{keccak256, Address, Bytes, B256};
+use alloy_rlp::Decodable;
+use reth_trie_common::{MultiProof, MultiProofTargets, TrieNode};
 use std::collections::HashSet;
+
+/// Trie domain for a flattened proof node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProofNodeDomain {
+    /// Node from the account/state trie.
+    Account,
+    /// Node from a storage trie, namespaced by hashed account address.
+    Storage(B256),
+}
+
+/// Structural classification of a flattened proof node.
+///
+/// Only `Branch` and `Extension` are reusable structural nodes that a node-level
+/// cache can retain across blocks. Leaves (and the empty root) are tied to a
+/// specific value and are classified as `Other`; they are never cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProofNodeKind {
+    /// MPT branch node (17 items).
+    Branch,
+    /// MPT extension node (2 items, non-leaf).
+    Extension,
+    /// Leaf node or empty root; not a structural node.
+    Other,
+}
+
+/// A flattened proof node with precomputed content hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofNodeRecord {
+    pub domain: ProofNodeDomain,
+    pub path: Vec<u8>,
+    pub rlp: Bytes,
+    pub rlp_hash: B256,
+    pub kind: ProofNodeKind,
+}
+
+impl ProofNodeRecord {
+    pub fn is_storage(&self) -> bool {
+        matches!(self.domain, ProofNodeDomain::Storage(_))
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(self.kind, ProofNodeKind::Branch)
+    }
+
+    pub fn is_extension(&self) -> bool {
+        matches!(self.kind, ProofNodeKind::Extension)
+    }
+
+    /// Branch and extension nodes are the structural nodes a cache can retain.
+    pub fn is_structural(&self) -> bool {
+        matches!(self.kind, ProofNodeKind::Branch | ProofNodeKind::Extension)
+    }
+}
+
+fn classify_node(node_bytes: &[u8]) -> ProofNodeKind {
+    match TrieNode::decode(&mut &node_bytes[..]) {
+        Ok(TrieNode::Branch(_)) => ProofNodeKind::Branch,
+        Ok(TrieNode::Extension(_)) => ProofNodeKind::Extension,
+        _ => ProofNodeKind::Other,
+    }
+}
+
+/// Flatten a reth [`MultiProof`] into exact proof-node records.
+pub fn flatten_multiproof_nodes(proof: &MultiProof) -> Vec<ProofNodeRecord> {
+    let mut nodes = Vec::new();
+
+    for (path, node_bytes) in proof.account_subtree.iter() {
+        nodes.push(ProofNodeRecord {
+            domain: ProofNodeDomain::Account,
+            path: path.to_vec(),
+            rlp: node_bytes.clone(),
+            rlp_hash: keccak256(node_bytes),
+            kind: classify_node(node_bytes),
+        });
+    }
+
+    for (hashed_address, storage_proof) in &proof.storages {
+        for (path, node_bytes) in storage_proof.subtree.iter() {
+            nodes.push(ProofNodeRecord {
+                domain: ProofNodeDomain::Storage(*hashed_address),
+                path: path.to_vec(),
+                rlp: node_bytes.clone(),
+                rlp_hash: keccak256(node_bytes),
+                kind: classify_node(node_bytes),
+            });
+        }
+    }
+
+    nodes
+}
 
 /// Result of witness computation for a single block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -201,8 +292,8 @@ pub struct WitnessTargetsSummary {
     pub max_slots_per_account: usize,
 }
 
-/// Builds raw `WitnessTargets` (for Sidecar data payload) and hashed `MultiProofTargets` (for Trie Provider)
-/// in a single pass from `MissResult`.
+/// Builds raw `WitnessTargets` (for Sidecar data payload) and hashed `MultiProofTargets` (for Trie
+/// Provider) in a single pass from `MissResult`.
 pub fn build_sidecar_targets(miss: &MissResult) -> (WitnessTargets, MultiProofTargets) {
     let mut multiproof_targets = MultiProofTargets::with_capacity(miss.missed_accounts.len());
 
@@ -224,11 +315,112 @@ pub fn build_sidecar_targets(miss: &MissResult) -> (WitnessTargets, MultiProofTa
     // 3. Convert missed codes to WitnessTargets
     let missed_code_hashes = miss.missed_codes.clone();
 
-    let raw_targets = WitnessTargets {
-        missed_accounts,
-        missed_storage,
-        missed_code_hashes,
-    };
+    let raw_targets = WitnessTargets { missed_accounts, missed_storage, missed_code_hashes };
 
     (raw_targets, multiproof_targets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::map::{B256Map, HashMap};
+    use alloy_rlp::Encodable;
+    use reth_trie_common::{
+        proof::ProofNodes, BranchNodeMasksMap, ExtensionNode, Nibbles, RlpNode, StorageMultiProof,
+    };
+
+    fn branch_rlp() -> Bytes {
+        let mut bytes = vec![0xd1];
+        bytes.extend([0x80; 17]);
+        Bytes::from(bytes)
+    }
+
+    fn extension_rlp() -> Bytes {
+        let child = RlpNode::word_rlp(&B256::repeat_byte(0x11));
+        let node =
+            TrieNode::Extension(ExtensionNode::new(Nibbles::from_nibbles([0x1, 0x2]), child));
+        let mut buf = Vec::new();
+        node.encode(&mut buf);
+        Bytes::from(buf)
+    }
+
+    fn proof_with_nodes() -> MultiProof {
+        let branch = branch_rlp();
+        let leaf_like = Bytes::from(vec![0xc0]);
+        let account_path = Nibbles::from_nibbles(vec![0x01]);
+        let storage_path = Nibbles::from_nibbles(vec![0x02]);
+        let hashed_account_a = B256::repeat_byte(0xaa);
+        let hashed_account_b = B256::repeat_byte(0xbb);
+
+        let mut account_subtree_map: HashMap<Nibbles, Bytes> = HashMap::default();
+        account_subtree_map.insert(account_path, branch.clone());
+        let account_subtree = ProofNodes::from_iter(account_subtree_map);
+
+        let mut storage_subtree_a: HashMap<Nibbles, Bytes> = HashMap::default();
+        storage_subtree_a.insert(storage_path, branch.clone());
+        let mut storage_subtree_b: HashMap<Nibbles, Bytes> = HashMap::default();
+        storage_subtree_b.insert(storage_path, leaf_like);
+
+        let mut storages = B256Map::default();
+        storages.insert(
+            hashed_account_a,
+            StorageMultiProof {
+                root: B256::ZERO,
+                subtree: ProofNodes::from_iter(storage_subtree_a),
+                branch_node_masks: BranchNodeMasksMap::default(),
+            },
+        );
+        storages.insert(
+            hashed_account_b,
+            StorageMultiProof {
+                root: B256::ZERO,
+                subtree: ProofNodes::from_iter(storage_subtree_b),
+                branch_node_masks: BranchNodeMasksMap::default(),
+            },
+        );
+
+        MultiProof { account_subtree, branch_node_masks: BranchNodeMasksMap::default(), storages }
+    }
+
+    #[test]
+    fn flatten_multiproof_nodes_keeps_domains_distinct() {
+        let nodes = flatten_multiproof_nodes(&proof_with_nodes());
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes.iter().any(|node| matches!(node.domain, ProofNodeDomain::Account)));
+        assert!(nodes.iter().any(|node| matches!(node.domain, ProofNodeDomain::Storage(addr) if addr == B256::repeat_byte(0xaa))));
+        assert!(nodes.iter().any(|node| matches!(node.domain, ProofNodeDomain::Storage(addr) if addr == B256::repeat_byte(0xbb))));
+    }
+
+    #[test]
+    fn flatten_multiproof_nodes_classifies_branch_nodes() {
+        let nodes = flatten_multiproof_nodes(&proof_with_nodes());
+        assert_eq!(nodes.iter().filter(|node| node.is_branch()).count(), 2);
+        assert_eq!(nodes.iter().filter(|node| !node.is_branch()).count(), 1);
+    }
+
+    #[test]
+    fn flatten_multiproof_nodes_classifies_extension_nodes() {
+        let mut account_map: HashMap<Nibbles, Bytes> = HashMap::default();
+        account_map.insert(Nibbles::from_nibbles(vec![0x03]), extension_rlp());
+        account_map.insert(Nibbles::from_nibbles(vec![0x04]), branch_rlp());
+        let proof = MultiProof {
+            account_subtree: ProofNodes::from_iter(account_map),
+            branch_node_masks: BranchNodeMasksMap::default(),
+            storages: B256Map::default(),
+        };
+
+        let nodes = flatten_multiproof_nodes(&proof);
+        assert_eq!(nodes.iter().filter(|node| node.is_extension()).count(), 1);
+        assert_eq!(nodes.iter().filter(|node| node.is_branch()).count(), 1);
+        assert!(nodes.iter().all(|node| node.is_structural()));
+    }
+
+    #[test]
+    fn proof_node_record_identity_includes_domain_path_and_bytes() {
+        let nodes = flatten_multiproof_nodes(&proof_with_nodes());
+        let account =
+            nodes.iter().find(|node| matches!(node.domain, ProofNodeDomain::Account)).unwrap();
+        let storage = nodes.iter().find(|node| matches!(node.domain, ProofNodeDomain::Storage(addr) if addr == B256::repeat_byte(0xaa))).unwrap();
+        assert_ne!(account, storage, "same RLP bytes in different domains must not collide");
+    }
 }

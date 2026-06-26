@@ -9,6 +9,7 @@
 //! block arrives.
 
 pub mod accessed_state;
+pub mod branch_node_cache;
 pub mod network_cache;
 pub mod persistence;
 pub mod policy;
@@ -17,11 +18,19 @@ pub mod witness;
 pub mod sidecar;
 
 pub use accessed_state::BlockAccessedState;
+pub use branch_node_cache::{
+    BranchNodeAvoidanceStats, BranchNodeCacheFootprint, BranchNodeCacheUpdate,
+    ObservedBranchNodeCache,
+};
 pub use network_cache::{CachedEntry, NetworkStateCache};
 pub use policy::{CachePolicy, LastNBlocksPolicy};
-pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use sidecar::{
-    CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
-    PartialStatelessSidecar, PartitionCheck, SerializableMultiProof, SerializableStorageMultiProof,
-    SidecarBenchmarkManifest, StateTargetSet, WitnessReductionStats, WitnessTargets,
+    BranchNodeBenchmarkStats, CacheFootprintStats, PartialExecutionWitness,
+    PartialExecutionWitnessState, PartialStatelessSidecar, PartitionCheck, SerializableMultiProof,
+    SerializableStorageMultiProof, SidecarBenchmarkManifest, StateTargetSet, WitnessReductionStats,
+    WitnessTargets,
+};
+pub use witness::{
+    flatten_multiproof_nodes, measure_multiproof_size, miss_to_proof_targets, ProofNodeDomain,
+    ProofNodeKind, ProofNodeRecord, WitnessResult,
 };

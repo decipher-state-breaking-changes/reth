@@ -7,6 +7,7 @@ description = "Network-level state cache for Partial Statelessness PoC"
 [dependencies]
 # reth types (reuse existing structures)
 alloy-primitives = { workspace = true, features = ["std", "map-foldhash", "serde"] }
+alloy-rlp = { workspace = true }
 revm-database = { workspace = true, features = ["std"] }
 revm-state = { workspace = true, features = ["std"] }
 revm-primitives = { workspace = true, features = ["std"] }

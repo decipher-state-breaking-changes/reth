@@ -2,20 +2,18 @@
 //!
 //! Two independent checks, neither of which trusts the producer or the transport:
 //!
-//! 1. CRYPTO INTEGRITY (default) — every missed account proof verifies against
-//!    `parent_state_root`, every missed storage proof verifies against its account
-//!    `storageRoot` (`AccountProof::verify` covers both), and every supplied
-//!    bytecode preimage hashes to a declared missed code hash. This proves the
-//!    witness material that IS present is cryptographically anchored to the parent
+//! 1. CRYPTO INTEGRITY (default) — every missed account proof verifies against `parent_state_root`,
+//!    every missed storage proof verifies against its account `storageRoot` (`AccountProof::verify`
+//!    covers both), and every supplied bytecode preimage hashes to a declared missed code hash.
+//!    This proves the witness material that IS present is cryptographically anchored to the parent
 //!    state root. It does NOT prove the witness is COMPLETE.
 //!
-//! 2. COVERAGE (`--coverage`) — compares the sidecar against a reference
-//!    `debug_executionWitness` (ground truth from a full node) for the same block,
-//!    reporting how much of the state actually needed to re-execute the block is
-//!    present in the sidecar. This is what catches the BundleState target-source
-//!    incompleteness: even with a zero/cold cache (nothing legitimately omitted),
-//!    a `bundle_changed_state` source misses most executed bytecode and ancestor
-//!    headers, so coverage is well below 100%.
+//! 2. COVERAGE (`--coverage`) — compares the sidecar against a reference `debug_executionWitness`
+//!    (ground truth from a full node) for the same block, reporting how much of the state actually
+//!    needed to re-execute the block is present in the sidecar. This is what catches the
+//!    BundleState target-source incompleteness: even with a zero/cold cache (nothing legitimately
+//!    omitted), a `bundle_changed_state` source misses most executed bytecode and ancestor headers,
+//!    so coverage is well below 100%.
 //!
 //! Neither mode re-executes the block; full re-execution (`ACCEPT_BLOCK`) is a
 //! follow-up. Coverage uses the full node's canonical witness as an oracle, so it
@@ -81,9 +79,9 @@ struct CoverageReport {
 
 impl CoverageReport {
     fn complete(&self) -> bool {
-        self.covered_codes == self.ref_codes
-            && self.covered_keys == self.ref_keys
-            && self.covered_headers == self.ref_headers
+        self.covered_codes == self.ref_codes &&
+            self.covered_keys == self.ref_keys &&
+            self.covered_headers == self.ref_headers
     }
 }
 
@@ -141,9 +139,9 @@ fn crypto_verify(sidecar: &PartialStatelessSidecar) -> Res<CryptoVerdict> {
             clean_inline_nodes(&mut sp.proof);
         }
 
-        account_proof
-            .verify(root)
-            .map_err(|e| format!("account {addr:?}: proof failed against parent_state_root: {e}"))?;
+        account_proof.verify(root).map_err(|e| {
+            format!("account {addr:?}: proof failed against parent_state_root: {e}")
+        })?;
         storage_checked += slots.len();
     }
 
@@ -162,11 +160,7 @@ fn crypto_verify(sidecar: &PartialStatelessSidecar) -> Res<CryptoVerdict> {
         codes_checked += 1;
     }
 
-    Ok(CryptoVerdict {
-        accounts_checked: slots_by_account.len(),
-        storage_checked,
-        codes_checked,
-    })
+    Ok(CryptoVerdict { accounts_checked: slots_by_account.len(), storage_checked, codes_checked })
 }
 
 /// Compare a sidecar's coverage against a reference execution witness.
@@ -178,12 +172,8 @@ fn coverage(sidecar: &PartialStatelessSidecar, witness: &ReferenceWitness) -> Co
         .filter_map(|c| hex::decode(c.trim_start_matches("0x")).ok())
         .map(|bytes| norm_hex(&keccak256(&bytes).to_string()))
         .collect();
-    let sidecar_code_hashes: HashSet<String> = sidecar
-        .miss_manifest
-        .missed_code_hashes
-        .iter()
-        .map(|h| norm_hex(&h.to_string()))
-        .collect();
+    let sidecar_code_hashes: HashSet<String> =
+        sidecar.miss_manifest.missed_code_hashes.iter().map(|h| norm_hex(&h.to_string())).collect();
     let covered_codes = ref_code_hashes.intersection(&sidecar_code_hashes).count();
 
     // Keys: proxy (flat preimage list; account/slot pairing lost upstream).
@@ -199,12 +189,8 @@ fn coverage(sidecar: &PartialStatelessSidecar, witness: &ReferenceWitness) -> Co
 
     // Headers: compare RLP encoded bytes by hex (exact match).
     let ref_headers_set: HashSet<String> = witness.headers.iter().map(|h| norm_hex(h)).collect();
-    let sidecar_headers_set: HashSet<String> = sidecar
-        .witness
-        .headers
-        .iter()
-        .map(|bytes| norm_hex(&hex::encode(bytes)))
-        .collect();
+    let sidecar_headers_set: HashSet<String> =
+        sidecar.witness.headers.iter().map(|bytes| norm_hex(&hex::encode(bytes))).collect();
     let covered_headers = ref_headers_set.intersection(&sidecar_headers_set).count();
 
     CoverageReport {

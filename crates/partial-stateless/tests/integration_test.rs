@@ -39,10 +39,9 @@ fn test_multi_block_simulation() {
 
         // One cold address per block
         let cold = cold_addrs[block as usize - 100];
-        accessed.accounts.insert(
-            cold,
-            AccountData { nonce: 0, balance: U256::from(100), code_hash: None },
-        );
+        accessed
+            .accounts
+            .insert(cold, AccountData { nonce: 0, balance: U256::from(100), code_hash: None });
 
         // Compute miss before updating cache
         let miss = cache.compute_miss(&accessed);
@@ -77,7 +76,11 @@ fn test_multi_block_simulation() {
     // Account window=10: hot addr + cold addrs within window
     // Window includes current block and 10 blocks back, so up to 12 accounts at steady state
     // (hot + 11 cold addrs that are within the 10-block window due to inclusive boundary)
-    assert!(snap.total_accounts <= 12, "should have at most 12 accounts, got {}", snap.total_accounts);
+    assert!(
+        snap.total_accounts <= 12,
+        "should have at most 12 accounts, got {}",
+        snap.total_accounts
+    );
 
     // Storage window=5: hot_slot was accessed every block, so it's always retained
     assert!(cache.contains_storage(&hot_addr, &hot_slot));
@@ -102,10 +105,9 @@ fn test_differentiated_policies() {
 
     // Block 10: access account + storage
     let mut accessed = BlockAccessedState::default();
-    accessed.accounts.insert(
-        addr,
-        AccountData { nonce: 1, balance: U256::from(500), code_hash: None },
-    );
+    accessed
+        .accounts
+        .insert(addr, AccountData { nonce: 1, balance: U256::from(500), code_hash: None });
     accessed.storage.insert((addr, slot), U256::from(99));
     cache.on_block_executed(10, &accessed);
 
@@ -120,17 +122,20 @@ fn test_differentiated_policies() {
 /// Test sidecar serialization and deserialization along with build_sidecar_targets logic.
 #[test]
 fn test_sidecar_serialization_and_targets() {
-    use alloy_primitives::Bytes;
-    use reth_trie_common::{MultiProof, StorageMultiProof, BranchNodeMasks, TrieMask};
-    use reth_trie_common::proof::ProofNodes;
-    use alloy_primitives::map::{B256Map, HashMap};
+    use alloy_primitives::{
+        map::{B256Map, HashMap},
+        Bytes,
+    };
     use partial_stateless::{
-        witness::{build_sidecar_targets, WitnessResult},
+        network_cache::MissResult,
         sidecar::{
             PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
             SerializableMultiProof, WitnessTargets,
         },
-        network_cache::MissResult,
+        witness::{build_sidecar_targets, WitnessResult},
+    };
+    use reth_trie_common::{
+        proof::ProofNodes, BranchNodeMasks, MultiProof, StorageMultiProof, TrieMask,
     };
 
     // 1. Create a dummy MultiProof
@@ -140,29 +145,26 @@ fn test_sidecar_serialization_and_targets() {
     let hashed_slot = alloy_primitives::keccak256(slot);
 
     let mut account_subtree: HashMap<reth_trie_common::Nibbles, Bytes> = HashMap::default();
-    account_subtree.insert(reth_trie_common::Nibbles::unpack(hashed_account), Bytes::from(vec![1, 2, 3]));
+    account_subtree
+        .insert(reth_trie_common::Nibbles::unpack(hashed_account), Bytes::from(vec![1, 2, 3]));
     let account_subtree = ProofNodes::from_iter(account_subtree);
 
-    let mut branch_node_masks: HashMap<reth_trie_common::Nibbles, BranchNodeMasks> = HashMap::default();
+    let mut branch_node_masks: HashMap<reth_trie_common::Nibbles, BranchNodeMasks> =
+        HashMap::default();
     branch_node_masks.insert(
         reth_trie_common::Nibbles::unpack(hashed_account),
-        BranchNodeMasks {
-            hash_mask: TrieMask::new(0b101),
-            tree_mask: TrieMask::new(0b010),
-        },
+        BranchNodeMasks { hash_mask: TrieMask::new(0b101), tree_mask: TrieMask::new(0b010) },
     );
 
     let mut storage_subtree: HashMap<reth_trie_common::Nibbles, Bytes> = HashMap::default();
-    storage_subtree.insert(reth_trie_common::Nibbles::unpack(hashed_slot), Bytes::from(vec![4, 5, 6]));
+    storage_subtree
+        .insert(reth_trie_common::Nibbles::unpack(hashed_slot), Bytes::from(vec![4, 5, 6]));
     let storage_subtree = ProofNodes::from_iter(storage_subtree);
 
     let mut storage_masks: HashMap<reth_trie_common::Nibbles, BranchNodeMasks> = HashMap::default();
     storage_masks.insert(
         reth_trie_common::Nibbles::unpack(hashed_slot),
-        BranchNodeMasks {
-            hash_mask: TrieMask::new(0b011),
-            tree_mask: TrieMask::new(0b100),
-        },
+        BranchNodeMasks { hash_mask: TrieMask::new(0b011), tree_mask: TrieMask::new(0b100) },
     );
 
     let mut storages = B256Map::default();
@@ -175,11 +177,7 @@ fn test_sidecar_serialization_and_targets() {
         },
     );
 
-    let original_proof = MultiProof {
-        account_subtree,
-        branch_node_masks,
-        storages,
-    };
+    let original_proof = MultiProof { account_subtree, branch_node_masks, storages };
 
     // 2. Test SerializableMultiProof conversion
     let serializable = SerializableMultiProof::from_multiproof(&original_proof);
@@ -226,10 +224,14 @@ fn test_sidecar_serialization_and_targets() {
     };
 
     let sidecar_bytes = bincode::serialize(&sidecar).expect("serialize sidecar");
-    let deserialized_sidecar: PartialStatelessSidecar = bincode::deserialize(&sidecar_bytes).expect("deserialize sidecar");
+    let deserialized_sidecar: PartialStatelessSidecar =
+        bincode::deserialize(&sidecar_bytes).expect("deserialize sidecar");
 
     assert_eq!(deserialized_sidecar.block_number, sidecar.block_number);
-    assert_eq!(deserialized_sidecar.miss_manifest.missed_accounts, sidecar.miss_manifest.missed_accounts);
+    assert_eq!(
+        deserialized_sidecar.miss_manifest.missed_accounts,
+        sidecar.miss_manifest.missed_accounts
+    );
     assert_eq!(deserialized_sidecar.witness.codes, sidecar.witness.codes);
     assert_eq!(deserialized_sidecar.stats.total_size_bytes, sidecar.stats.total_size_bytes);
 
@@ -252,7 +254,6 @@ fn test_sidecar_serialization_and_targets() {
 /// Test that the sidecar file can be successfully written to disk and read back.
 #[test]
 fn test_sidecar_disk_write() {
-    use std::fs;
     use partial_stateless::{
         sidecar::{
             PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
@@ -260,6 +261,7 @@ fn test_sidecar_disk_write() {
         },
         witness::WitnessResult,
     };
+    use std::fs;
 
     let sidecar_dir = std::env::temp_dir().join("reth_sidecar_test");
     // Ensure clean state for test
@@ -304,7 +306,8 @@ fn test_sidecar_disk_write() {
 
     // Create dir
     fs::create_dir_all(&sidecar_dir).expect("create sidecar dir");
-    let file_path = sidecar_dir.join("block_100_0x0300000000000000000000000000000000000000000000000000000000000000.bin");
+    let file_path = sidecar_dir
+        .join("block_100_0x0300000000000000000000000000000000000000000000000000000000000000.bin");
     let sidecar_bytes = bincode::serialize(&sidecar).expect("serialize sidecar");
     fs::write(&file_path, sidecar_bytes).expect("write sidecar file");
 
@@ -313,7 +316,8 @@ fn test_sidecar_disk_write() {
 
     // Read back and verify
     let read_bytes = fs::read(&file_path).expect("read sidecar file");
-    let deserialized: PartialStatelessSidecar = bincode::deserialize(&read_bytes).expect("deserialize sidecar");
+    let deserialized: PartialStatelessSidecar =
+        bincode::deserialize(&read_bytes).expect("deserialize sidecar");
     assert_eq!(deserialized.block_number, 100);
 
     // Clean up after test

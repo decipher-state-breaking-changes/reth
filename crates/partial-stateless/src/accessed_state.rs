@@ -57,11 +57,7 @@ impl BlockAccessedState {
                 // Account is empty/destroyed/not found but was accessed
                 accounts.insert(
                     *address,
-                    AccountData {
-                        nonce: 0,
-                        balance: U256::ZERO,
-                        code_hash: None,
-                    },
+                    AccountData { nonce: 0, balance: U256::ZERO, code_hash: None },
                 );
             }
         }
@@ -85,8 +81,6 @@ impl BlockAccessedState {
 
         Self { accounts, storage, codes }
     }
-
-
 
     /// Total number of unique state keys accessed.
     pub fn total_keys(&self) -> usize {

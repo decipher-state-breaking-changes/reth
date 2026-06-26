@@ -83,10 +83,7 @@ pub struct NetworkStateCache {
 
 impl NetworkStateCache {
     /// Create a new cache with separate policies for accounts and storage/codes.
-    pub fn new(
-        account_policy: Box<dyn CachePolicy>,
-        storage_policy: Box<dyn CachePolicy>,
-    ) -> Self {
+    pub fn new(account_policy: Box<dyn CachePolicy>, storage_policy: Box<dyn CachePolicy>) -> Self {
         Self {
             accounts: HashMap::new(),
             storage: HashMap::new(),
@@ -165,8 +162,7 @@ impl NetworkStateCache {
                     entry.touch(block_number);
                 }
                 None => {
-                    self.codes
-                        .insert(*code_hash, CachedEntry::new(bytecode.clone(), block_number));
+                    self.codes.insert(*code_hash, CachedEntry::new(bytecode.clone(), block_number));
                     stats.codes_added += 1;
                 }
             }
@@ -225,10 +221,7 @@ impl NetworkStateCache {
     /// Compute which state from `accessed` is NOT in the cache (= needs witness).
     ///
     /// This represents what a builder would need to include in the witness sidecar.
-    pub fn compute_miss(
-        &self,
-        accessed: &BlockAccessedState,
-    ) -> MissResult {
+    pub fn compute_miss(&self, accessed: &BlockAccessedState) -> MissResult {
         let mut missed_accounts: Vec<Address> = Vec::new();
         let mut missed_storage: Vec<(Address, B256)> = Vec::new();
         let mut missed_codes: Vec<B256> = Vec::new();
@@ -253,11 +246,8 @@ impl NetworkStateCache {
 
         let total_accessed = accessed.total_keys();
         let total_missed = missed_accounts.len() + missed_storage.len() + missed_codes.len();
-        let miss_ratio = if total_accessed > 0 {
-            total_missed as f64 / total_accessed as f64
-        } else {
-            0.0
-        };
+        let miss_ratio =
+            if total_accessed > 0 { total_missed as f64 / total_accessed as f64 } else { 0.0 };
 
         MissResult {
             missed_accounts,
@@ -292,8 +282,8 @@ impl NetworkStateCache {
     /// Estimated memory usage in bytes.
     pub fn estimated_memory_bytes(&self) -> usize {
         // Rough estimates:
-        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈ 112
-        // Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
+        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈
+        // 112 Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
         // Code entry: 32 (hash) + avg ~8KB (bytecode) + 20 (metadata)
         let accounts_size = self.accounts.len() * 112;
         let storage_size = self.storage.len() * 104;
@@ -355,10 +345,9 @@ mod tests {
         let slot = B256::repeat_byte(0x02);
 
         let mut accessed = BlockAccessedState::default();
-        accessed.accounts.insert(
-            addr,
-            AccountData { nonce: 1, balance: U256::from(1000), code_hash: None },
-        );
+        accessed
+            .accounts
+            .insert(addr, AccountData { nonce: 1, balance: U256::from(1000), code_hash: None });
         accessed.storage.insert((addr, slot), U256::from(42));
 
         cache.on_block_executed(100, &accessed);
@@ -376,10 +365,9 @@ mod tests {
 
         // Block 10: insert both
         let mut accessed = BlockAccessedState::default();
-        accessed.accounts.insert(
-            addr,
-            AccountData { nonce: 1, balance: U256::from(100), code_hash: None },
-        );
+        accessed
+            .accounts
+            .insert(addr, AccountData { nonce: 1, balance: U256::from(100), code_hash: None });
         accessed.storage.insert((addr, slot), U256::from(1));
         cache.on_block_executed(10, &accessed);
 
@@ -421,10 +409,9 @@ mod tests {
             addr_cached,
             AccountData { nonce: 1, balance: U256::from(100), code_hash: None },
         );
-        new_block.accounts.insert(
-            addr_missed,
-            AccountData { nonce: 0, balance: U256::ZERO, code_hash: None },
-        );
+        new_block
+            .accounts
+            .insert(addr_missed, AccountData { nonce: 0, balance: U256::ZERO, code_hash: None });
         new_block.storage.insert((addr_cached, slot_cached), U256::from(1));
         new_block.storage.insert((addr_cached, slot_missed), U256::from(2));
 
