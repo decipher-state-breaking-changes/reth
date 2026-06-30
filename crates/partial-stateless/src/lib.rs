@@ -26,4 +26,5 @@ pub use sidecar::{
     CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
     PartialStatelessSidecar, PartitionCheck, SerializableMultiProof, SerializableStorageMultiProof,
     SidecarBenchmarkManifest, StateTargetSet, WitnessReductionStats, WitnessTargets,
+    target_partition_commitment,
 };

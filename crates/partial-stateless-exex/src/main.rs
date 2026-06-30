@@ -23,7 +23,7 @@ use partial_stateless::{
     },
     CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
     PartialStatelessSidecar, PartitionCheck, SerializableMultiProof, SidecarBenchmarkManifest,
-    StateTargetSet, WitnessReductionStats,
+    StateTargetSet, WitnessReductionStats, target_partition_commitment,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -406,6 +406,10 @@ async fn partial_stateless_exex<
                                         Err(e) => break 'sidecar Err(eyre::eyre!("Failed to serialize multiproof: {:?}", e)),
                                     };
 
+                                    let sidecar_miss = StateTargetSet::from(&raw_targets);
+                                    let target_partition_commitment =
+                                        target_partition_commitment(&cache_hit_targets, &sidecar_miss);
+
                                     let sidecar = PartialStatelessSidecar {
                                         parent_hash,
                                         parent_state_root,
@@ -416,6 +420,7 @@ async fn partial_stateless_exex<
                                             "LastNBlocks(account: {}, storage/code: {})",
                                             config.account_window, config.storage_window
                                         ),
+                                        target_partition_commitment,
                                         miss_manifest: raw_targets.clone(),
                                         witness: PartialExecutionWitness {
                                             state: PartialExecutionWitnessState::MptMultiProof(
@@ -451,11 +456,10 @@ async fn partial_stateless_exex<
                                     let sidecar_bytes_len = fs::metadata(&sidecar_path)
                                         .map(|m| m.len() as usize)
                                         .unwrap_or(0);
-                                    let sidecar_miss = StateTargetSet::from(&raw_targets);
                                     let partition =
                                         PartitionCheck::new(&accessed_targets, &cache_hit_targets, &sidecar_miss);
                                     let manifest = SidecarBenchmarkManifest {
-                                        schema_version: 1,
+                                        schema_version: 2,
                                         block_number: *block_number,
                                         block_hash: block.hash(),
                                         parent_hash,
@@ -485,6 +489,7 @@ async fn partial_stateless_exex<
                                         accessed: accessed_targets.clone(),
                                         cache_hit: cache_hit_targets.clone(),
                                         sidecar_miss,
+                                        target_partition_commitment,
                                         partition,
                                         full_sidecar_baseline_stats: full_sidecar_baseline_stats.clone(),
                                         partial_sidecar_stats: result.clone(),

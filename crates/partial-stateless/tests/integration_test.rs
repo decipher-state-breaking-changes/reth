@@ -127,8 +127,8 @@ fn test_sidecar_serialization_and_targets() {
     use partial_stateless::{
         witness::{build_sidecar_targets, WitnessResult},
         sidecar::{
-            PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
-            SerializableMultiProof, WitnessTargets,
+            target_partition_commitment, PartialExecutionWitness, PartialExecutionWitnessState,
+            PartialStatelessSidecar, SerializableMultiProof, StateTargetSet, WitnessTargets,
         },
         network_cache::MissResult,
     };
@@ -215,6 +215,10 @@ fn test_sidecar_serialization_and_targets() {
         block_number: 100,
         cache_block: 99,
         cache_policy_metadata: "LastNBlocks(60, 30)".to_string(),
+        target_partition_commitment: target_partition_commitment(
+            &StateTargetSet::default(),
+            &StateTargetSet::from(&raw_targets),
+        ),
         miss_manifest: raw_targets.clone(),
         witness: PartialExecutionWitness {
             state: PartialExecutionWitnessState::MptMultiProof(serialized_multiproof),
@@ -255,8 +259,8 @@ fn test_sidecar_disk_write() {
     use std::fs;
     use partial_stateless::{
         sidecar::{
-            PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
-            WitnessTargets,
+            target_partition_commitment, PartialExecutionWitness, PartialExecutionWitnessState,
+            PartialStatelessSidecar, StateTargetSet, WitnessTargets,
         },
         witness::WitnessResult,
     };
@@ -292,6 +296,10 @@ fn test_sidecar_disk_write() {
         block_number: 100,
         cache_block: 99,
         cache_policy_metadata: "LastNBlocks(60, 30)".to_string(),
+        target_partition_commitment: target_partition_commitment(
+            &StateTargetSet::default(),
+            &StateTargetSet::from(&raw_targets),
+        ),
         miss_manifest: raw_targets.clone(),
         witness: PartialExecutionWitness {
             state: PartialExecutionWitnessState::MptMultiProof(vec![1, 2, 3, 4]),
