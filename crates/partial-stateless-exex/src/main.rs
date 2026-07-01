@@ -23,7 +23,8 @@ use partial_stateless::{
     },
     CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
     PartialStatelessSidecar, PartitionCheck, SerializableMultiProof, SidecarBenchmarkManifest,
-    StateTargetSet, WitnessReductionStats, target_partition_commitment,
+    StateTargetSet, WitnessReductionStats, last_n_blocks_cache_policy_id,
+    target_partition_commitment,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -407,19 +408,30 @@ async fn partial_stateless_exex<
                                     };
 
                                     let sidecar_miss = StateTargetSet::from(&raw_targets);
-                                    let target_partition_commitment =
-                                        target_partition_commitment(&cache_hit_targets, &sidecar_miss);
+                                    let block_hash = block.hash();
+                                    let cache_policy_id = last_n_blocks_cache_policy_id(
+                                        config.account_window,
+                                        config.storage_window,
+                                    );
+                                    let cache_policy_metadata = format!(
+                                        "LastNBlocks(account: {}, storage/code: {})",
+                                        config.account_window, config.storage_window
+                                    );
+                                    let target_partition_commitment = target_partition_commitment(
+                                        block_hash,
+                                        cache_policy_id,
+                                        &cache_hit_targets,
+                                        &sidecar_miss,
+                                    );
 
                                     let sidecar = PartialStatelessSidecar {
                                         parent_hash,
                                         parent_state_root,
-                                        block_hash: block.hash(),
+                                        block_hash,
                                         block_number: *block_number,
                                         cache_block: block_number - 1,
-                                        cache_policy_metadata: format!(
-                                            "LastNBlocks(account: {}, storage/code: {})",
-                                            config.account_window, config.storage_window
-                                        ),
+                                        cache_policy_id,
+                                        cache_policy_metadata: cache_policy_metadata.clone(),
                                         target_partition_commitment,
                                         miss_manifest: raw_targets.clone(),
                                         witness: PartialExecutionWitness {
@@ -461,14 +473,12 @@ async fn partial_stateless_exex<
                                     let manifest = SidecarBenchmarkManifest {
                                         schema_version: 2,
                                         block_number: *block_number,
-                                        block_hash: block.hash(),
+                                        block_hash,
                                         parent_hash,
                                         parent_state_root,
                                         cache_block: block_number - 1,
-                                        cache_policy_metadata: format!(
-                                            "LastNBlocks(account: {}, storage/code: {})",
-                                            config.account_window, config.storage_window
-                                        ),
+                                        cache_policy_id,
+                                        cache_policy_metadata,
                                         sidecar_file: sidecar_path
                                             .file_name()
                                             .map(|name| name.to_string_lossy().into_owned())
