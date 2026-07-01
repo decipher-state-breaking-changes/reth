@@ -23,7 +23,8 @@ use partial_stateless::{
     },
     CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
     PartialStatelessSidecar, PartitionCheck, SerializableMultiProof, SidecarBenchmarkManifest,
-    StateTargetSet, WitnessReductionStats,
+    StateTargetSet, WitnessReductionStats, last_n_blocks_cache_policy_id,
+    target_partition_commitment,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -406,16 +407,32 @@ async fn partial_stateless_exex<
                                         Err(e) => break 'sidecar Err(eyre::eyre!("Failed to serialize multiproof: {:?}", e)),
                                     };
 
+                                    let sidecar_miss = StateTargetSet::from(&raw_targets);
+                                    let block_hash = block.hash();
+                                    let cache_policy_id = last_n_blocks_cache_policy_id(
+                                        config.account_window,
+                                        config.storage_window,
+                                    );
+                                    let cache_policy_metadata = format!(
+                                        "LastNBlocks(account: {}, storage/code: {})",
+                                        config.account_window, config.storage_window
+                                    );
+                                    let target_partition_commitment = target_partition_commitment(
+                                        block_hash,
+                                        cache_policy_id,
+                                        &cache_hit_targets,
+                                        &sidecar_miss,
+                                    );
+
                                     let sidecar = PartialStatelessSidecar {
                                         parent_hash,
                                         parent_state_root,
-                                        block_hash: block.hash(),
+                                        block_hash,
                                         block_number: *block_number,
                                         cache_block: block_number - 1,
-                                        cache_policy_metadata: format!(
-                                            "LastNBlocks(account: {}, storage/code: {})",
-                                            config.account_window, config.storage_window
-                                        ),
+                                        cache_policy_id,
+                                        cache_policy_metadata: cache_policy_metadata.clone(),
+                                        target_partition_commitment,
                                         miss_manifest: raw_targets.clone(),
                                         witness: PartialExecutionWitness {
                                             state: PartialExecutionWitnessState::MptMultiProof(
@@ -451,20 +468,17 @@ async fn partial_stateless_exex<
                                     let sidecar_bytes_len = fs::metadata(&sidecar_path)
                                         .map(|m| m.len() as usize)
                                         .unwrap_or(0);
-                                    let sidecar_miss = StateTargetSet::from(&raw_targets);
                                     let partition =
                                         PartitionCheck::new(&accessed_targets, &cache_hit_targets, &sidecar_miss);
                                     let manifest = SidecarBenchmarkManifest {
-                                        schema_version: 1,
+                                        schema_version: 2,
                                         block_number: *block_number,
-                                        block_hash: block.hash(),
+                                        block_hash,
                                         parent_hash,
                                         parent_state_root,
                                         cache_block: block_number - 1,
-                                        cache_policy_metadata: format!(
-                                            "LastNBlocks(account: {}, storage/code: {})",
-                                            config.account_window, config.storage_window
-                                        ),
+                                        cache_policy_id,
+                                        cache_policy_metadata,
                                         sidecar_file: sidecar_path
                                             .file_name()
                                             .map(|name| name.to_string_lossy().into_owned())
@@ -485,6 +499,7 @@ async fn partial_stateless_exex<
                                         accessed: accessed_targets.clone(),
                                         cache_hit: cache_hit_targets.clone(),
                                         sidecar_miss,
+                                        target_partition_commitment,
                                         partition,
                                         full_sidecar_baseline_stats: full_sidecar_baseline_stats.clone(),
                                         partial_sidecar_stats: result.clone(),

@@ -127,8 +127,9 @@ fn test_sidecar_serialization_and_targets() {
     use partial_stateless::{
         witness::{build_sidecar_targets, WitnessResult},
         sidecar::{
-            PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
-            SerializableMultiProof, WitnessTargets,
+            last_n_blocks_cache_policy_id, target_partition_commitment, PartialExecutionWitness,
+            PartialExecutionWitnessState, PartialStatelessSidecar, SerializableMultiProof,
+            StateTargetSet, WitnessTargets,
         },
         network_cache::MissResult,
     };
@@ -208,13 +209,22 @@ fn test_sidecar_serialization_and_targets() {
         computation_time_ms: Some(15),
     };
 
+    let block_hash = B256::repeat_byte(0x03);
+    let cache_policy_id = last_n_blocks_cache_policy_id(60, 30);
     let sidecar = PartialStatelessSidecar {
         parent_hash: B256::repeat_byte(0x01),
         parent_state_root: B256::repeat_byte(0x02),
-        block_hash: B256::repeat_byte(0x03),
+        block_hash,
         block_number: 100,
         cache_block: 99,
+        cache_policy_id,
         cache_policy_metadata: "LastNBlocks(60, 30)".to_string(),
+        target_partition_commitment: target_partition_commitment(
+            block_hash,
+            cache_policy_id,
+            &StateTargetSet::default(),
+            &StateTargetSet::from(&raw_targets),
+        ),
         miss_manifest: raw_targets.clone(),
         witness: PartialExecutionWitness {
             state: PartialExecutionWitnessState::MptMultiProof(serialized_multiproof),
@@ -255,8 +265,8 @@ fn test_sidecar_disk_write() {
     use std::fs;
     use partial_stateless::{
         sidecar::{
-            PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
-            WitnessTargets,
+            last_n_blocks_cache_policy_id, target_partition_commitment, PartialExecutionWitness,
+            PartialExecutionWitnessState, PartialStatelessSidecar, StateTargetSet, WitnessTargets,
         },
         witness::WitnessResult,
     };
@@ -285,13 +295,22 @@ fn test_sidecar_disk_write() {
         computation_time_ms: Some(5),
     };
 
+    let block_hash = B256::repeat_byte(0x03);
+    let cache_policy_id = last_n_blocks_cache_policy_id(60, 30);
     let sidecar = PartialStatelessSidecar {
         parent_hash: B256::repeat_byte(0x01),
         parent_state_root: B256::repeat_byte(0x02),
-        block_hash: B256::repeat_byte(0x03),
+        block_hash,
         block_number: 100,
         cache_block: 99,
+        cache_policy_id,
         cache_policy_metadata: "LastNBlocks(60, 30)".to_string(),
+        target_partition_commitment: target_partition_commitment(
+            block_hash,
+            cache_policy_id,
+            &StateTargetSet::default(),
+            &StateTargetSet::from(&raw_targets),
+        ),
         miss_manifest: raw_targets.clone(),
         witness: PartialExecutionWitness {
             state: PartialExecutionWitnessState::MptMultiProof(vec![1, 2, 3, 4]),

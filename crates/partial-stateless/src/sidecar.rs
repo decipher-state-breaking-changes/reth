@@ -1,6 +1,6 @@
 use crate::witness::WitnessResult;
 use alloy_primitives::map::{B256Map, HashMap};
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{keccak256, Address, B256, Bytes};
 use reth_trie_common::proof::ProofNodes;
 use reth_trie_common::{BranchNodeMasks, MultiProof, Nibbles, StorageMultiProof, TrieMask};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,64 @@ impl From<&WitnessTargets> for StateTargetSet {
         set.sort_dedup();
         set
     }
+}
+
+/// Commit to the exact block-local partition assumed by a sidecar.
+///
+/// This does not commit to the full cache contents. It commits only to the
+/// block- and policy-scoped target split: what the producer claims is already
+/// cached and what it supplies through the sidecar.
+pub fn target_partition_commitment(
+    block_hash: B256,
+    cache_policy_id: B256,
+    cache_hit: &StateTargetSet,
+    sidecar_miss: &StateTargetSet,
+) -> B256 {
+    fn encode_targets(out: &mut Vec<u8>, label: &[u8], targets: &StateTargetSet) {
+        let mut targets = targets.clone();
+        targets.sort_dedup();
+
+        out.extend_from_slice(label);
+
+        out.extend_from_slice(b"accounts");
+        out.extend_from_slice(&(targets.accounts.len() as u64).to_be_bytes());
+        for address in targets.accounts {
+            out.extend_from_slice(address.as_slice());
+        }
+
+        out.extend_from_slice(b"storage");
+        out.extend_from_slice(&(targets.storage.len() as u64).to_be_bytes());
+        for (address, slot) in targets.storage {
+            out.extend_from_slice(address.as_slice());
+            out.extend_from_slice(slot.as_slice());
+        }
+
+        out.extend_from_slice(b"code_hashes");
+        out.extend_from_slice(&(targets.code_hashes.len() as u64).to_be_bytes());
+        for code_hash in targets.code_hashes {
+            out.extend_from_slice(code_hash.as_slice());
+        }
+    }
+
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"block_hash");
+    preimage.extend_from_slice(block_hash.as_slice());
+    preimage.extend_from_slice(b"cache_policy_id");
+    preimage.extend_from_slice(cache_policy_id.as_slice());
+    encode_targets(&mut preimage, b"cache_hit_targets", cache_hit);
+    encode_targets(&mut preimage, b"sidecar_miss_targets", sidecar_miss);
+    keccak256(preimage)
+}
+
+/// Deterministic identifier for the prototype's split LastNBlocks cache policy.
+pub fn last_n_blocks_cache_policy_id(account_window: u64, storage_window: u64) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"LastNBlocksPolicy/v1");
+    preimage.extend_from_slice(b"account_window");
+    preimage.extend_from_slice(&account_window.to_be_bytes());
+    preimage.extend_from_slice(b"storage_window");
+    preimage.extend_from_slice(&storage_window.to_be_bytes());
+    keccak256(preimage)
 }
 
 /// Exact partition check for `accessed == cache_hit disjoint_union sidecar_miss`.
@@ -197,6 +255,7 @@ pub struct SidecarBenchmarkManifest {
     pub parent_hash: B256,
     pub parent_state_root: B256,
     pub cache_block: u64,
+    pub cache_policy_id: B256,
     pub cache_policy_metadata: String,
     pub sidecar_file: String,
     pub sidecar_bytes: usize,
@@ -205,6 +264,7 @@ pub struct SidecarBenchmarkManifest {
     pub accessed: StateTargetSet,
     pub cache_hit: StateTargetSet,
     pub sidecar_miss: StateTargetSet,
+    pub target_partition_commitment: B256,
     pub partition: PartitionCheck,
     /// Full-witness baseline (all accessed state, ignoring the cache). `None` when
     /// the comparison is disabled (`PS_WITNESS_BASELINE` unset).
@@ -361,8 +421,12 @@ pub struct PartialStatelessSidecar {
     pub block_number: u64,
     /// Block number that the network cache is synchronized with (should be block_number - 1).
     pub cache_block: u64,
+    /// Deterministic identifier for the cache policy used to compute the target split.
+    pub cache_policy_id: B256,
     /// Metadata describing the cache eviction policy (e.g. "LastNBlocks(60, 30)").
     pub cache_policy_metadata: String,
+    /// Commitment to `H(block_hash, cache_policy_id, sorted(cache_hit_targets), sorted(sidecar_miss_targets))`.
+    pub target_partition_commitment: B256,
     /// Cache-missed targets covered by `witness`.
     pub miss_manifest: WitnessTargets,
     /// Execution material split like Reth `ExecutionWitness`: state, codes, keys, headers.
@@ -420,6 +484,99 @@ mod tests {
         assert!(!check.accounts_disjoint);
         assert!(!check.code_hashes_disjoint);
         assert!(!check.partition_ok);
+    }
+
+    #[test]
+    fn target_partition_commitment_is_order_insensitive() {
+        let account_a = Address::repeat_byte(0x01);
+        let account_b = Address::repeat_byte(0x02);
+        let slot_a = B256::repeat_byte(0x0a);
+        let slot_b = B256::repeat_byte(0x0b);
+
+        let cache_hit = StateTargetSet {
+            accounts: vec![account_b, account_a],
+            storage: vec![(account_b, slot_b), (account_a, slot_a)],
+            code_hashes: vec![B256::repeat_byte(0xcb), B256::repeat_byte(0xca)],
+        };
+        let mut reordered_hit = cache_hit.clone();
+        reordered_hit.sort_dedup();
+
+        let sidecar_miss = StateTargetSet {
+            accounts: vec![Address::repeat_byte(0x03)],
+            storage: vec![(Address::repeat_byte(0x03), B256::repeat_byte(0x0c))],
+            code_hashes: vec![B256::repeat_byte(0xcc)],
+        };
+        let block_hash = B256::repeat_byte(0xba);
+        let cache_policy_id = last_n_blocks_cache_policy_id(60, 30);
+
+        assert_eq!(
+            target_partition_commitment(block_hash, cache_policy_id, &cache_hit, &sidecar_miss),
+            target_partition_commitment(block_hash, cache_policy_id, &reordered_hit, &sidecar_miss)
+        );
+    }
+
+    #[test]
+    fn target_partition_commitment_changes_when_partition_changes() {
+        let account = Address::repeat_byte(0x01);
+        let code_hash = B256::repeat_byte(0xca);
+
+        let cache_hit = StateTargetSet {
+            accounts: vec![account],
+            storage: vec![],
+            code_hashes: vec![code_hash],
+        };
+        let sidecar_miss = StateTargetSet::default();
+        let block_hash = B256::repeat_byte(0xba);
+        let cache_policy_id = last_n_blocks_cache_policy_id(60, 30);
+
+        let moved_to_miss = StateTargetSet {
+            accounts: vec![account],
+            storage: vec![],
+            code_hashes: vec![code_hash],
+        };
+
+        assert_ne!(
+            target_partition_commitment(block_hash, cache_policy_id, &cache_hit, &sidecar_miss),
+            target_partition_commitment(
+                block_hash,
+                cache_policy_id,
+                &StateTargetSet::default(),
+                &moved_to_miss
+            )
+        );
+    }
+
+    #[test]
+    fn target_partition_commitment_changes_when_context_changes() {
+        let cache_hit = StateTargetSet {
+            accounts: vec![Address::repeat_byte(0x01)],
+            storage: vec![],
+            code_hashes: vec![],
+        };
+        let sidecar_miss = StateTargetSet::default();
+        let block_hash = B256::repeat_byte(0xba);
+        let cache_policy_id = last_n_blocks_cache_policy_id(60, 30);
+        let base =
+            target_partition_commitment(block_hash, cache_policy_id, &cache_hit, &sidecar_miss);
+
+        assert_ne!(
+            base,
+            target_partition_commitment(
+                B256::repeat_byte(0xbb),
+                cache_policy_id,
+                &cache_hit,
+                &sidecar_miss
+            )
+        );
+        assert_ne!(
+            base,
+            target_partition_commitment(
+                block_hash,
+                last_n_blocks_cache_policy_id(61, 30),
+                &cache_hit,
+                &sidecar_miss
+            )
+        );
     }
 
     #[test]
