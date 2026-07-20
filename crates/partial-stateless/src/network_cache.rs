@@ -145,21 +145,6 @@ impl NetworkStateCache {
         self.current_block = block_number;
         let mut stats = UpdateStats::default();
 
-        // SELFDESTRUCT followed by recreation starts from an empty storage trie. Drop every cached
-        // slot for the wiped account before inserting the post-state slots observed in this block.
-        if !accessed.storage_wipes.is_empty() {
-            let wiped_keys = self
-                .storage
-                .keys()
-                .filter(|(address, _)| accessed.storage_wipes.contains(address))
-                .copied()
-                .collect::<Vec<_>>();
-            for key in wiped_keys {
-                undo.storage_before.entry(key).or_insert_with(|| self.storage.get(&key).cloned());
-                self.storage.remove(&key);
-            }
-        }
-
         // --- Insert/refresh accounts ---
         for (address, account_data) in &accessed.accounts {
             undo.accounts_before
@@ -381,9 +366,8 @@ impl NetworkStateCache {
 
         fn hash_account(address: Address, entry: &CachedEntry<AccountData>) -> B256 {
             let mut preimage = Vec::new();
-            preimage.extend_from_slice(b"NetworkStateCacheLeaf/v2/account");
+            preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/account");
             preimage.extend_from_slice(address.as_slice());
-            preimage.push(u8::from(entry.value.exists));
             preimage.extend_from_slice(&entry.value.nonce.to_be_bytes());
             push_u256(&mut preimage, entry.value.balance);
             match entry.value.code_hash {
@@ -473,8 +457,8 @@ impl NetworkStateCache {
     /// Estimated memory usage in bytes.
     pub fn estimated_memory_bytes(&self) -> usize {
         // Rough estimates:
-        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈
-        // 112 Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
+        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈ 112
+        // Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
         // Code entry: 32 (hash) + avg ~8KB (bytecode) + 20 (metadata)
         let accounts_size = self.accounts.len() * 112;
         let storage_size = self.storage.len() * 104;
@@ -558,16 +542,6 @@ impl NetworkStateCache {
         self.codes.clear();
         self.undo_log.clear();
         self.current_block = 0;
-    }
-
-    /// Clear the cache and align the resulting empty state to a canonical block.
-    ///
-    /// This is used after a multi-block catch-up notification whose intermediate historical
-    /// state providers may not be queryable yet. An empty cache is valid at any state root: the
-    /// next contiguous block simply treats every access as cold and rebuilds from its witness.
-    pub fn reset_at_block(&mut self, block_number: u64) {
-        self.reset();
-        self.current_block = block_number;
     }
 }
 
@@ -673,10 +647,9 @@ mod tests {
         let slot = B256::repeat_byte(0x02);
 
         let mut accessed = BlockAccessedState::default();
-        accessed.accounts.insert(
-            addr,
-            AccountData { exists: true, nonce: 1, balance: U256::from(1000), code_hash: None },
-        );
+        accessed
+            .accounts
+            .insert(addr, AccountData { nonce: 1, balance: U256::from(1000), code_hash: None });
         accessed.storage.insert((addr, slot), U256::from(42));
 
         cache.on_block_executed(100, &accessed);
@@ -694,10 +667,9 @@ mod tests {
 
         // Block 10: insert both
         let mut accessed = BlockAccessedState::default();
-        accessed.accounts.insert(
-            addr,
-            AccountData { exists: true, nonce: 1, balance: U256::from(100), code_hash: None },
-        );
+        accessed
+            .accounts
+            .insert(addr, AccountData { nonce: 1, balance: U256::from(100), code_hash: None });
         accessed.storage.insert((addr, slot), U256::from(1));
         cache.on_block_executed(10, &accessed);
 
@@ -728,7 +700,7 @@ mod tests {
         let mut pre = BlockAccessedState::default();
         pre.accounts.insert(
             addr_cached,
-            AccountData { exists: true, nonce: 1, balance: U256::from(100), code_hash: None },
+            AccountData { nonce: 1, balance: U256::from(100), code_hash: None },
         );
         pre.storage.insert((addr_cached, slot_cached), U256::from(1));
         cache.on_block_executed(100, &pre);
@@ -737,12 +709,11 @@ mod tests {
         let mut new_block = BlockAccessedState::default();
         new_block.accounts.insert(
             addr_cached,
-            AccountData { exists: true, nonce: 1, balance: U256::from(100), code_hash: None },
+            AccountData { nonce: 1, balance: U256::from(100), code_hash: None },
         );
-        new_block.accounts.insert(
-            addr_missed,
-            AccountData { exists: false, nonce: 0, balance: U256::ZERO, code_hash: None },
-        );
+        new_block
+            .accounts
+            .insert(addr_missed, AccountData { nonce: 0, balance: U256::ZERO, code_hash: None });
         new_block.storage.insert((addr_cached, slot_cached), U256::from(1));
         new_block.storage.insert((addr_cached, slot_missed), U256::from(2));
 
@@ -771,12 +742,7 @@ mod tests {
         let mut accessed = BlockAccessedState::default();
         accessed.accounts.insert(
             addr,
-            AccountData {
-                exists: true,
-                nonce: 1,
-                balance: U256::from(100),
-                code_hash: Some(code_hash),
-            },
+            AccountData { nonce: 1, balance: U256::from(100), code_hash: Some(code_hash) },
         );
         accessed.storage.insert((addr, slot), U256::from(42));
         accessed.codes.insert(code_hash, Bytes::from(vec![1, 2, 3]));
@@ -868,8 +834,7 @@ mod tests {
     #[test]
     fn cache_root_excludes_local_access_metadata() {
         let addr = Address::repeat_byte(0x01);
-        let value =
-            AccountData { exists: true, nonce: 1, balance: U256::from(100), code_hash: None };
+        let value = AccountData { nonce: 1, balance: U256::from(100), code_hash: None };
 
         let mut accounts_a = HashMap::new();
         accounts_a.insert(
@@ -973,7 +938,7 @@ mod tests {
     }
 
     fn account(nonce: u64, balance: u64) -> AccountData {
-        AccountData { exists: true, nonce, balance: U256::from(balance), code_hash: None }
+        AccountData { nonce, balance: U256::from(balance), code_hash: None }
     }
 
     #[test]
@@ -1085,70 +1050,5 @@ mod tests {
         assert_eq!(cache.snapshot().total_accounts, 0);
         assert_eq!(cache.snapshot().total_storage_slots, 0);
         assert_eq!(cache.current_block(), 0);
-    }
-
-    #[test]
-    fn test_reset_at_block_aligns_an_empty_cache() {
-        let mut cache = make_cache(10, 10);
-        let addr = Address::repeat_byte(0x01);
-        let mut accessed = BlockAccessedState::default();
-        accessed.accounts.insert(addr, account(1, 1));
-        cache.on_block_executed(100, &accessed);
-
-        cache.reset_at_block(120);
-
-        assert!(cache.accounts().is_empty());
-        assert!(cache.storage().is_empty());
-        assert!(cache.codes().is_empty());
-        assert_eq!(cache.current_block(), 120);
-        assert_eq!(
-            cache.rollback_block(100),
-            Err(CacheError::RollbackMismatch { requested: 100, found: None })
-        );
-    }
-
-    #[test]
-    fn storage_wipe_invalidates_old_slots_and_rollback_restores_them() {
-        let mut cache = make_cache(10, 10);
-        let address = Address::repeat_byte(0x11);
-        let old_slot = B256::repeat_byte(0x22);
-        let new_slot = B256::repeat_byte(0x33);
-
-        let mut before = BlockAccessedState::default();
-        before.accounts.insert(address, account(1, 1));
-        before.storage.insert((address, old_slot), U256::from(7));
-        cache.on_block_executed(10, &before);
-
-        let mut recreated = BlockAccessedState::default();
-        recreated.storage_wipes.insert(address);
-        recreated.accounts.insert(address, account(1, 2));
-        recreated.storage.insert((address, new_slot), U256::from(9));
-        cache.on_block_executed(11, &recreated);
-
-        assert!(!cache.contains_storage(&address, &old_slot));
-        assert_eq!(cache.storage().get(&(address, new_slot)).unwrap().value, U256::from(9));
-
-        cache.rollback_block(11).unwrap();
-        assert_eq!(cache.storage().get(&(address, old_slot)).unwrap().value, U256::from(7));
-        assert!(!cache.contains_storage(&address, &new_slot));
-    }
-
-    #[test]
-    fn cache_root_distinguishes_absent_from_existing_empty_account() {
-        let address = Address::repeat_byte(0x44);
-        let mut absent = BlockAccessedState::default();
-        absent.accounts.insert(
-            address,
-            AccountData { exists: false, nonce: 0, balance: U256::ZERO, code_hash: None },
-        );
-        let mut existing = absent.clone();
-        existing.accounts.get_mut(&address).unwrap().exists = true;
-
-        let mut absent_cache = make_cache(10, 10);
-        absent_cache.on_block_executed(1, &absent);
-        let mut existing_cache = make_cache(10, 10);
-        existing_cache.on_block_executed(1, &existing);
-
-        assert_ne!(absent_cache.cache_root(), existing_cache.cache_root());
     }
 }

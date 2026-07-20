@@ -2,21 +2,23 @@
 //!
 //! Two independent checks, neither of which trusts the producer or the transport:
 //!
-//! 1. CRYPTO INTEGRITY (default) — the sidecar's declared miss targets match its witness manifest,
-//!    its witness commitment matches the carried payload, every missed account proof verifies
-//!    against `parent_state_root`, every missed storage proof verifies against its account
-//!    `storageRoot` (`AccountProof::verify` covers both), and every declared missed bytecode has a
-//!    matching preimage. If ancestor header witnesses are present, they must decode to the declared
-//!    parent/ancestor hash chain. This proves the witness material that IS present is
-//!    cryptographically anchored to the parent state root. It does NOT prove the witness is
-//!    COMPLETE.
+//! 1. CRYPTO INTEGRITY (default) — the sidecar's declared miss targets match its
+//!    witness manifest, its witness commitment matches the carried payload, every
+//!    missed account proof verifies against `parent_state_root`, every missed
+//!    storage proof verifies against its account `storageRoot`
+//!    (`AccountProof::verify` covers both), and every declared missed bytecode has
+//!    a matching preimage. If ancestor header witnesses are present, they must
+//!    decode to the declared parent/ancestor hash chain. This proves the witness
+//!    material that IS present is cryptographically anchored to the parent state
+//!    root. It does NOT prove the witness is COMPLETE.
 //!
-//! 2. COVERAGE (`--coverage`) — compares the sidecar against a reference `debug_executionWitness`
-//!    (ground truth from a full node) for the same block, reporting how much of the state actually
-//!    needed to re-execute the block is present in the sidecar. This is what catches the
-//!    BundleState target-source incompleteness: even with a zero/cold cache (nothing legitimately
-//!    omitted), a `bundle_changed_state` source misses most executed bytecode and ancestor headers,
-//!    so coverage is well below 100%.
+//! 2. COVERAGE (`--coverage`) — compares the sidecar against a reference
+//!    `debug_executionWitness` (ground truth from a full node) for the same block,
+//!    reporting how much of the state actually needed to re-execute the block is
+//!    present in the sidecar. This is what catches the BundleState target-source
+//!    incompleteness: even with a zero/cold cache (nothing legitimately omitted),
+//!    a `bundle_changed_state` source misses most executed bytecode and ancestor
+//!    headers, so coverage is well below 100%.
 //!
 //! Neither mode re-executes the block; full re-execution (`ACCEPT_BLOCK`) is a
 //! follow-up. Coverage uses the full node's canonical witness as an oracle, so it
@@ -85,9 +87,9 @@ struct CoverageReport {
 
 impl CoverageReport {
     fn complete(&self) -> bool {
-        self.covered_codes == self.ref_codes &&
-            self.covered_keys == self.ref_keys &&
-            self.covered_headers == self.ref_headers
+        self.covered_codes == self.ref_codes
+            && self.covered_keys == self.ref_keys
+            && self.covered_headers == self.ref_headers
     }
 }
 

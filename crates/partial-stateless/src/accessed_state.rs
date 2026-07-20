@@ -18,8 +18,6 @@ pub struct BlockAccessedState {
     pub storage: HashMap<(Address, B256), U256>,
     /// Bytecodes accessed: code_hash → bytecode bytes.
     pub codes: HashMap<B256, Bytes>,
-    /// Accounts whose previous storage trie was wiped during execution.
-    pub storage_wipes: HashSet<Address>,
 }
 
 impl BlockAccessedState {
@@ -44,7 +42,6 @@ impl BlockAccessedState {
                 accounts.insert(
                     *address,
                     AccountData {
-                        exists: true,
                         nonce: account.info.nonce,
                         balance: account.info.balance,
                         code_hash,
@@ -60,17 +57,14 @@ impl BlockAccessedState {
                 // Account is empty/destroyed/not found but was accessed
                 accounts.insert(
                     *address,
-                    AccountData { exists: false, nonce: 0, balance: U256::ZERO, code_hash: None },
+                    AccountData {
+                        nonce: 0,
+                        balance: U256::ZERO,
+                        code_hash: None,
+                    },
                 );
             }
         }
-
-        let storage_wipes = statedb
-            .cache
-            .accounts
-            .iter()
-            .filter_map(|(address, account)| account.status.was_destroyed().then_some(*address))
-            .collect();
 
         // 2. Traverse bytecodes (contracts)
         // Check cache.contracts
@@ -89,8 +83,10 @@ impl BlockAccessedState {
             }
         }
 
-        Self { accounts, storage, codes, storage_wipes }
+        Self { accounts, storage, codes }
     }
+
+
 
     /// Total number of unique state keys accessed.
     pub fn total_keys(&self) -> usize {

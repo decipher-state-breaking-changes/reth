@@ -220,8 +220,8 @@ pub struct WitnessTargetsSummary {
     pub max_slots_per_account: usize,
 }
 
-/// Builds raw `WitnessTargets` (for Sidecar data payload) and hashed `MultiProofTargets` (for Trie
-/// Provider) in a single pass from `MissResult`.
+/// Builds raw `WitnessTargets` (for Sidecar data payload) and hashed `MultiProofTargets` (for Trie Provider)
+/// in a single pass from `MissResult`.
 pub fn build_sidecar_targets(miss: &MissResult) -> (WitnessTargets, MultiProofTargets) {
     let mut multiproof_targets = MultiProofTargets::with_capacity(miss.missed_accounts.len());
 
@@ -243,7 +243,11 @@ pub fn build_sidecar_targets(miss: &MissResult) -> (WitnessTargets, MultiProofTa
     // 3. Convert missed codes to WitnessTargets
     let missed_code_hashes = miss.missed_codes.clone();
 
-    let raw_targets = WitnessTargets { missed_accounts, missed_storage, missed_code_hashes };
+    let raw_targets = WitnessTargets {
+        missed_accounts,
+        missed_storage,
+        missed_code_hashes,
+    };
 
     (raw_targets, multiproof_targets)
 }

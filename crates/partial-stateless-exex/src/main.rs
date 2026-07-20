@@ -8,7 +8,7 @@
 //! 1. Extracts `BlockAccessedState` via EVM simulation of each block
 //! 2. Updates the `NetworkStateCache` with the accessed state
 //! 3. Computes and logs cache miss ratio (= witness requirement)
-//! 4. Computes an all-access Merkle proof plus cache-miss-only values and bytecodes
+//! 4. Computes actual Merkle proof (witness) size for cache-missed state
 
 mod sidecar_create;
 mod sidecar_io;
@@ -22,6 +22,7 @@ use partial_stateless::{
     network_cache::NetworkStateCache,
     persistence::{load_from_file, save_to_file},
     policy::LastNBlocksPolicy,
+    PartialTrieNodeCache,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -38,7 +39,8 @@ use reth_provider::{BlockIdReader, HeaderProvider};
 use sidecar_create::{create_sidecar_for_block, BuilderBlockReport, BuilderOptions};
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Configuration for the partial statelessness cache.
@@ -207,15 +209,25 @@ async fn partial_stateless_exex<
         );
     }
 
-    // Optional benchmark-only comparisons against the previous cold-only proof and the FULL
-    // witness (every accessed key, ignoring the cache). These compute two extra multiproofs per
-    // block, so they are off by default and gated behind `PS_WITNESS_BASELINE`. Core sidecar
-    // generation never depends on them.
+    // Optional benchmark-only comparison against the FULL witness (every accessed
+    // key, ignoring the cache). It computes a second, larger multiproof per block,
+    // so it is off by default and gated behind `PS_WITNESS_BASELINE`. Core sidecar
+    // generation never depends on it.
     let compute_baseline = env_flag("PS_WITNESS_BASELINE");
     if compute_baseline {
         info!(
             target: "partial_stateless",
-            "Cold-only and full-witness baseline comparisons ENABLED (PS_WITNESS_BASELINE) — two extra multiproofs per block"
+            "Full-witness baseline comparison ENABLED (PS_WITNESS_BASELINE) — extra multiproof per block"
+        );
+    }
+
+    // Optional sparse-trie shape benchmark and full cache-invariant scan. This walks every
+    // retained path, so keep it off during normal operation and enable it for bounded runs.
+    let trie_cache_diagnostics = env_flag("PS_TRIE_CACHE_DIAGNOSTICS");
+    if trie_cache_diagnostics {
+        info!(
+            target: "partial_stateless",
+            "Trie-shape cache diagnostics ENABLED (PS_TRIE_CACHE_DIAGNOSTICS) — per-block timings, depth-0..5 prefix coverage, and full retained-path validation"
         );
     }
 
@@ -237,21 +249,22 @@ async fn partial_stateless_exex<
         if compute_baseline {
             warn!(
                 target: "partial_stateless",
-                "PS_WITNESS_BASELINE runs before the sidecar multiproof; resource/page-fault metrics may be lower because the baseline can warm the OS page cache"
+                "PS_WITNESS_BASELINE runs before the partial multiproof; resource/page-fault metrics for the partial proof may be lower because the full baseline can warm the OS page cache"
             );
         }
     }
 
-    // Optional trustless validator preflight. This re-executes each generated sidecar with a
-    // cache+witness-backed provider, recomputes the post-state root from its MPT proof, and checks
-    // the cache-state transition. It adds another block execution on the generation path.
-    let run_sidecar_preflight = sidecar_role != SidecarRole::Verifier &&
-        (env_flag("PS_SIDECAR_PREFLIGHT") || sidecar_role == SidecarRole::BuilderVerifier);
+    // Optional provider-assisted validator preflight. This re-executes each
+    // generated sidecar with a cache+witness-backed provider and checks the
+    // cache-state transition. It is useful for PoC acceptance checks, but it
+    // adds another block execution on the sidecar generation path.
+    let run_sidecar_preflight = sidecar_role != SidecarRole::Verifier
+        && (env_flag("PS_SIDECAR_PREFLIGHT") || sidecar_role == SidecarRole::BuilderVerifier);
     if run_sidecar_preflight {
         info!(
             target: "partial_stateless",
             sidecar_role = ?sidecar_role,
-            "Trustless sidecar preflight ENABLED — extra re-execution per sidecar"
+            "Provider-assisted sidecar preflight ENABLED — extra re-execution per sidecar"
         );
     }
     if sidecar_role == SidecarRole::Verifier {
@@ -264,44 +277,27 @@ async fn partial_stateless_exex<
     }
     let reexec_limits = SidecarReexecLimits::default();
 
+    // This persistent-in-memory sparse trie mirrors value-cache account and storage paths. It has
+    // no persisted snapshot or branch-aware undo log yet, so it must reset together with values.
+    let mut trie_cache = PartialTrieNodeCache::new();
+    if cache.current_block() != 0 {
+        warn!(
+            target: "partial_stateless",
+            cache_block = cache.current_block(),
+            "Persisted values have no matching sparse-trie snapshot; cold-resetting both caches"
+        );
+        cache.reset();
+    }
+
     while let Some(notification) = ctx.notifications.try_next().await? {
         match &notification {
             ExExNotification::ChainCommitted { new } => {
-                let tip_block = *new.range().end();
+                let range = new.range();
+                let tip_block = *range.end();
 
                 // Process blocks in chronological order
                 for (block_number, block) in new.blocks() {
                     let parent_block_number = block_number.saturating_sub(1);
-
-                    if sidecar_role == SidecarRole::Verifier {
-                        let parent_state_root = ctx
-                            .provider()
-                            .sealed_header_by_hash(block.parent_hash)
-                            .map_err(|err| eyre::eyre!("failed to fetch parent header: {err}"))?
-                            .map(|header| header.state_root)
-                            .ok_or_else(|| {
-                                eyre::eyre!(
-                                    "parent header not found for hash {:?}",
-                                    block.parent_hash
-                                )
-                            })?;
-                        if let Err(e) = verify_live_sidecar(
-                            ctx.evm_config(),
-                            block,
-                            parent_state_root,
-                            &mut cache,
-                            &config,
-                            &sidecar_dir,
-                            &reexec_limits,
-                            verifier_wait,
-                        ) {
-                            return Err(eyre::eyre!(
-                                "live sidecar verification failed at block {}: {e}",
-                                block_number
-                            ));
-                        }
-                        continue;
-                    }
 
                     // Get state provider for the parent block to run execution simulation
                     let state_provider =
@@ -317,6 +313,26 @@ async fn partial_stateless_exex<
                                 continue;
                             }
                         };
+
+                    if sidecar_role == SidecarRole::Verifier {
+                        if let Err(e) = verify_live_sidecar(
+                            ctx.evm_config(),
+                            state_provider.as_ref(),
+                            block,
+                            &mut cache,
+                            &mut trie_cache,
+                            &config,
+                            &sidecar_dir,
+                            &reexec_limits,
+                            verifier_wait,
+                        ) {
+                            return Err(eyre::eyre!(
+                                "live sidecar verification failed at block {}: {e}",
+                                block_number
+                            ));
+                        }
+                        continue;
+                    }
 
                     let parent_state_root_by_hash = |parent_hash: B256| {
                         ctx.provider()
@@ -342,7 +358,7 @@ async fn partial_stateless_exex<
                                 .into_iter()
                                 .map(|header| {
                                     let mut buf = Vec::new();
-                                    header.encode(&mut buf);
+                                    let _ = header.encode(&mut buf);
                                     buf.into()
                                 })
                                 .collect())
@@ -353,12 +369,14 @@ async fn partial_stateless_exex<
                         state_provider.as_ref(),
                         block,
                         &mut cache,
+                        &mut trie_cache,
                         &config,
                         BuilderOptions {
                             capture_dir: capture_dir.as_deref(),
                             sidecar_dir: &sidecar_dir,
                             compute_baseline,
                             resource_metrics,
+                            trie_cache_diagnostics,
                             run_sidecar_preflight,
                             reexec_limits: &reexec_limits,
                         },
@@ -395,62 +413,17 @@ async fn partial_stateless_exex<
                     target: "partial_stateless",
                     from_chain = ?old.range(),
                     to_chain = ?new.range(),
-                    "Chain reorg detected — rolling back old blocks, then applying new chain"
+                    "Chain reorg detected — cold-resetting value and sparse-trie caches, then applying new chain"
                 );
 
-                // 1. Roll back the reverted (old) blocks newest→oldest, returning the cache to the
-                //    fork point. On failure (history pruned/missing), cold-reset and let the
-                //    new-chain loop below rebuild from scratch.
-                let mut rollback_ok = true;
-                for block_number in old.blocks().keys().rev() {
-                    if let Err(e) = cache.rollback_block(*block_number) {
-                        warn!(
-                            target: "partial_stateless",
-                            block = *block_number,
-                            error = %e,
-                            "Cache rollback failed on reorg — cold-resetting before reapply"
-                        );
-                        rollback_ok = false;
-                        break;
-                    }
-                }
-                if !rollback_ok {
-                    cache.reset();
-                }
+                // Sparse-trie snapshots currently have no branch-aware undo log. Reset both
+                // caches together so value hits can never outlive their authenticated paths.
+                trie_cache = PartialTrieNodeCache::new();
+                cache.reset();
 
-                // 2. Apply the new canonical chain block-by-block (records undo).
+                // Apply the new canonical chain block-by-block (records value-cache undo).
                 for (block_number, block) in new.blocks() {
                     let parent_block_number = block_number.saturating_sub(1);
-
-                    if sidecar_role == SidecarRole::Verifier {
-                        let parent_state_root = ctx
-                            .provider()
-                            .sealed_header_by_hash(block.parent_hash)
-                            .map_err(|err| eyre::eyre!("failed to fetch parent header: {err}"))?
-                            .map(|header| header.state_root)
-                            .ok_or_else(|| {
-                                eyre::eyre!(
-                                    "parent header not found for hash {:?}",
-                                    block.parent_hash
-                                )
-                            })?;
-                        if let Err(e) = verify_live_sidecar(
-                            ctx.evm_config(),
-                            block,
-                            parent_state_root,
-                            &mut cache,
-                            &config,
-                            &sidecar_dir,
-                            &reexec_limits,
-                            verifier_wait,
-                        ) {
-                            return Err(eyre::eyre!(
-                                "live sidecar verification failed while applying reorg block {}: {e}",
-                                block_number
-                            ));
-                        }
-                        continue;
-                    }
 
                     let state_provider = match ctx
                         .provider()
@@ -467,6 +440,26 @@ async fn partial_stateless_exex<
                             continue;
                         }
                     };
+
+                    if sidecar_role == SidecarRole::Verifier {
+                        if let Err(e) = verify_live_sidecar(
+                            ctx.evm_config(),
+                            state_provider.as_ref(),
+                            block,
+                            &mut cache,
+                            &mut trie_cache,
+                            &config,
+                            &sidecar_dir,
+                            &reexec_limits,
+                            verifier_wait,
+                        ) {
+                            return Err(eyre::eyre!(
+                                "live sidecar verification failed while applying reorg block {}: {e}",
+                                block_number
+                            ));
+                        }
+                        continue;
+                    }
 
                     let parent_state_root_by_hash = |parent_hash: B256| {
                         ctx.provider()
@@ -492,7 +485,7 @@ async fn partial_stateless_exex<
                                 .into_iter()
                                 .map(|header| {
                                     let mut buf = Vec::new();
-                                    header.encode(&mut buf);
+                                    let _ = header.encode(&mut buf);
                                     buf.into()
                                 })
                                 .collect())
@@ -503,12 +496,14 @@ async fn partial_stateless_exex<
                         state_provider.as_ref(),
                         block,
                         &mut cache,
+                        &mut trie_cache,
                         &config,
                         BuilderOptions {
                             capture_dir: capture_dir.as_deref(),
                             sidecar_dir: &sidecar_dir,
                             compute_baseline,
                             resource_metrics,
+                            trie_cache_diagnostics,
                             run_sidecar_preflight,
                             reexec_limits: &reexec_limits,
                         },
@@ -544,27 +539,14 @@ async fn partial_stateless_exex<
                 warn!(
                     target: "partial_stateless",
                     reverted_chain = ?old.range(),
-                    "Chain reverted — rolling back cache to the pre-revert state"
+                    "Chain reverted — cold-resetting value and sparse-trie caches"
                 );
 
-                // Undo reverted blocks newest→oldest so each matches the top of the
-                // undo stack. If a block can't be rolled back (history pruned/missing),
-                // cold-reset: the cache rebuilds from subsequent canonical blocks.
-                for block_number in old.blocks().keys().rev() {
-                    if let Err(e) = cache.rollback_block(*block_number) {
-                        warn!(
-                            target: "partial_stateless",
-                            block = *block_number,
-                            error = %e,
-                            "Cache rollback failed — cold-resetting cache"
-                        );
-                        cache.reset();
-                        break;
-                    }
-                }
+                trie_cache = PartialTrieNodeCache::new();
+                cache.reset();
 
-                // Persist the rolled-back cache: a restart before the next commit
-                // must not reload the stale pre-revert cache from disk.
+                // Persist the cold value cache: a restart before the next commit must not reload
+                // stale pre-revert values without their sparse-trie paths.
                 if let Err(e) = save_to_file(&cache, &cache_path) {
                     warn!(
                         target: "partial_stateless",
@@ -632,10 +614,10 @@ fn thread_rusage() -> (u64, u64, u64) {
         if libc::getrusage(libc::RUSAGE_THREAD, &mut ru) != 0 {
             return (0, 0, 0);
         }
-        let cpu_us = (ru.ru_utime.tv_sec as u64) * 1_000_000 +
-            (ru.ru_utime.tv_usec as u64) +
-            (ru.ru_stime.tv_sec as u64) * 1_000_000 +
-            (ru.ru_stime.tv_usec as u64);
+        let cpu_us = (ru.ru_utime.tv_sec as u64) * 1_000_000
+            + (ru.ru_utime.tv_usec as u64)
+            + (ru.ru_stime.tv_sec as u64) * 1_000_000
+            + (ru.ru_stime.tv_usec as u64);
         (cpu_us, ru.ru_majflt as u64, ru.ru_minflt as u64)
     }
 }

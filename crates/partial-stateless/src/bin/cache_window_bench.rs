@@ -79,8 +79,13 @@ fn run() -> Res<()> {
 
     // Default warmup = the largest window in the grid, so the cache is fully warmed
     // for every config and all configs are scored over the SAME measured blocks.
-    let max_window =
-        args.account_windows.iter().chain(&args.storage_windows).copied().max().unwrap_or(0);
+    let max_window = args
+        .account_windows
+        .iter()
+        .chain(&args.storage_windows)
+        .copied()
+        .max()
+        .unwrap_or(0);
     let warmup = args.warmup.unwrap_or(max_window as usize).min(total.saturating_sub(1));
     let measured = total - warmup;
 
@@ -132,10 +137,7 @@ struct Row {
 
 impl Row {
     fn overall_hit_pct(&self) -> f64 {
-        pct(
-            self.acc_hit + self.sto_hit + self.code_hit,
-            self.acc_accessed + self.sto_accessed + self.code_accessed,
-        )
+        pct(self.acc_hit + self.sto_hit + self.code_hit, self.acc_accessed + self.sto_accessed + self.code_accessed)
     }
     fn account_hit_pct(&self) -> f64 {
         pct(self.acc_hit, self.acc_accessed)
@@ -151,12 +153,7 @@ impl Row {
 /// Replay all fixtures through a fresh cache; accumulate metrics only for blocks
 /// at index >= `warmup` (the cache is still updated during warmup so eviction
 /// windows are populated correctly).
-fn simulate(
-    fixtures: &[partial_stateless::AccessedStateFixture],
-    aw: u64,
-    sw: u64,
-    warmup: usize,
-) -> Row {
+fn simulate(fixtures: &[partial_stateless::AccessedStateFixture], aw: u64, sw: u64, warmup: usize) -> Row {
     let mut cache = NetworkStateCache::new(
         Box::new(LastNBlocksPolicy::new(aw)),
         Box::new(LastNBlocksPolicy::new(sw)),
@@ -250,11 +247,7 @@ fn print_table(rows: &[Row]) {
 /// Per-category miss breakdown at the baseline config — answers "which dimension
 /// is the hot-spot": the category responsible for the largest share of misses is
 /// where extra cache memory buys the most hit ratio.
-fn print_hotspot(
-    fixtures: &[partial_stateless::AccessedStateFixture],
-    baseline: (u64, u64),
-    warmup: usize,
-) {
+fn print_hotspot(fixtures: &[partial_stateless::AccessedStateFixture], baseline: (u64, u64), warmup: usize) {
     let (aw, sw) = baseline;
     let r = simulate(fixtures, aw, sw, warmup);
 
@@ -341,12 +334,8 @@ fn parse_args() -> Res<Args> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--fixtures" => fixtures = PathBuf::from(next(&mut it, "--fixtures")?),
-            "--account-windows" => {
-                account_windows = Some(parse_u64_list(&next(&mut it, "--account-windows")?)?)
-            }
-            "--storage-windows" => {
-                storage_windows = Some(parse_u64_list(&next(&mut it, "--storage-windows")?)?)
-            }
+            "--account-windows" => account_windows = Some(parse_u64_list(&next(&mut it, "--account-windows")?)?),
+            "--storage-windows" => storage_windows = Some(parse_u64_list(&next(&mut it, "--storage-windows")?)?),
             "--warmup" => warmup = Some(next(&mut it, "--warmup")?.parse()?),
             "--baseline" => {
                 let v = parse_u64_list(&next(&mut it, "--baseline")?)?;
@@ -365,8 +354,7 @@ fn parse_args() -> Res<Args> {
     }
 
     // Dedup + sort so the grid is stable regardless of input order.
-    let dedup =
-        |v: Vec<u64>| v.into_iter().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+    let dedup = |v: Vec<u64>| v.into_iter().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
     Ok(Args {
         fixtures,
         account_windows: dedup(account_windows.unwrap_or_else(|| DEFAULT_WINDOWS.to_vec())),
