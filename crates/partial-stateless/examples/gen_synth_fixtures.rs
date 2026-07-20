@@ -7,7 +7,10 @@
 //! "cold" ones, so larger cache windows produce visibly higher hit ratios.
 
 use alloy_primitives::{Address, B256, U256};
-use partial_stateless::{accessed_state::BlockAccessedState, fixture::save_fixture, policy::AccountData, AccessedStateFixture};
+use partial_stateless::{
+    accessed_state::BlockAccessedState, fixture::save_fixture, policy::AccountData,
+    AccessedStateFixture,
+};
 use std::path::PathBuf;
 
 fn addr(n: u64) -> Address {
@@ -29,19 +32,33 @@ fn main() {
         // 40 "hot" accounts that recur every block (cacheable across any window).
         for i in 0..40 {
             let a = addr(i);
-            accessed.accounts.insert(a, AccountData { nonce: block, balance: U256::from(block), code_hash: None });
+            accessed.accounts.insert(
+                a,
+                AccountData {
+                    exists: true,
+                    nonce: block,
+                    balance: U256::from(block),
+                    code_hash: None,
+                },
+            );
             accessed.storage.insert((a, slot(i)), U256::from(block));
         }
         // 20 "warm" accounts on a ~50-block cycle (hit only by larger windows).
         for i in 0..20 {
             let a = addr(1000 + (block % 50) * 20 + i);
-            accessed.accounts.insert(a, AccountData { nonce: 0, balance: U256::ZERO, code_hash: None });
+            accessed.accounts.insert(
+                a,
+                AccountData { exists: true, nonce: 0, balance: U256::ZERO, code_hash: None },
+            );
             accessed.storage.insert((a, slot(i)), U256::from(i));
         }
         // 30 "cold" accounts unique to this block (always a miss).
         for i in 0..30 {
             let a = addr(1_000_000 + block * 100 + i);
-            accessed.accounts.insert(a, AccountData { nonce: 0, balance: U256::ZERO, code_hash: None });
+            accessed.accounts.insert(
+                a,
+                AccountData { exists: false, nonce: 0, balance: U256::ZERO, code_hash: None },
+            );
         }
 
         let fixture = AccessedStateFixture {

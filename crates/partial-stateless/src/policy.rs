@@ -30,6 +30,9 @@ pub trait CachePolicy: Send + Sync {
 /// Account data stored in the cache.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountData {
+    /// Whether the account exists in the state trie. This must not be inferred from zero-valued
+    /// fields: an absent account and an existing empty account have different EVM semantics.
+    pub exists: bool,
     pub nonce: u64,
     pub balance: U256,
     pub code_hash: Option<B256>,
@@ -90,7 +93,12 @@ mod tests {
         accounts.insert(
             Address::ZERO,
             CachedEntry {
-                value: AccountData { nonce: 1, balance: U256::from(100), code_hash: None },
+                value: AccountData {
+                    exists: true,
+                    nonce: 1,
+                    balance: U256::from(100),
+                    code_hash: None,
+                },
                 first_accessed_block: 5,
                 last_accessed_block: 5,
                 access_count: 1,
@@ -121,7 +129,7 @@ mod tests {
         accounts.insert(
             addr,
             CachedEntry {
-                value: AccountData { nonce: 0, balance: U256::ZERO, code_hash: None },
+                value: AccountData { exists: true, nonce: 0, balance: U256::ZERO, code_hash: None },
                 first_accessed_block: 10,
                 last_accessed_block: 10,
                 access_count: 1,

@@ -33,15 +33,21 @@ fn test_multi_block_simulation() {
         // Hot address always accessed
         accessed.accounts.insert(
             hot_addr,
-            AccountData { nonce: block, balance: U256::from(block * 1000), code_hash: None },
+            AccountData {
+                exists: true,
+                nonce: block,
+                balance: U256::from(block * 1000),
+                code_hash: None,
+            },
         );
         accessed.storage.insert((hot_addr, hot_slot), U256::from(block));
 
         // One cold address per block
         let cold = cold_addrs[block as usize - 100];
-        accessed
-            .accounts
-            .insert(cold, AccountData { nonce: 0, balance: U256::from(100), code_hash: None });
+        accessed.accounts.insert(
+            cold,
+            AccountData { exists: true, nonce: 0, balance: U256::from(100), code_hash: None },
+        );
 
         // Compute miss before updating cache
         let miss = cache.compute_miss(&accessed);
@@ -105,9 +111,10 @@ fn test_differentiated_policies() {
 
     // Block 10: access account + storage
     let mut accessed = BlockAccessedState::default();
-    accessed
-        .accounts
-        .insert(addr, AccountData { nonce: 1, balance: U256::from(500), code_hash: None });
+    accessed.accounts.insert(
+        addr,
+        AccountData { exists: true, nonce: 1, balance: U256::from(500), code_hash: None },
+    );
     accessed.storage.insert((addr, slot), U256::from(99));
     cache.on_block_executed(10, &accessed);
 
@@ -144,19 +151,22 @@ fn test_cache_coherency_claim_over_cache_transition() {
     let missed_account = Address::repeat_byte(0x02);
 
     let mut prev_accessed = BlockAccessedState::default();
-    prev_accessed
-        .accounts
-        .insert(hit_account, AccountData { nonce: 1, balance: U256::from(100), code_hash: None });
+    prev_accessed.accounts.insert(
+        hit_account,
+        AccountData { exists: true, nonce: 1, balance: U256::from(100), code_hash: None },
+    );
     cache.on_block_executed(99, &prev_accessed);
     let prev_cache_anchor = cache.cache_anchor(99, parent_hash, cache_policy_id);
 
     let mut block_accessed = BlockAccessedState::default();
-    block_accessed
-        .accounts
-        .insert(hit_account, AccountData { nonce: 2, balance: U256::from(110), code_hash: None });
-    block_accessed
-        .accounts
-        .insert(missed_account, AccountData { nonce: 0, balance: U256::from(1), code_hash: None });
+    block_accessed.accounts.insert(
+        hit_account,
+        AccountData { exists: true, nonce: 2, balance: U256::from(110), code_hash: None },
+    );
+    block_accessed.accounts.insert(
+        missed_account,
+        AccountData { exists: true, nonce: 0, balance: U256::from(1), code_hash: None },
+    );
 
     let miss = cache.compute_miss(&block_accessed);
     let expected_miss = cache.expected_miss_targets(&block_accessed);
@@ -228,8 +238,10 @@ fn test_cache_coherency_claim_over_cache_transition() {
 /// Test sidecar serialization and deserialization along with build_sidecar_targets logic.
 #[test]
 fn test_sidecar_serialization_and_targets() {
-    use alloy_primitives::map::{B256Map, HashMap};
-    use alloy_primitives::Bytes;
+    use alloy_primitives::{
+        map::{B256Map, HashMap},
+        Bytes,
+    };
     use partial_stateless::{
         network_cache::MissResult,
         sidecar::{
@@ -239,8 +251,9 @@ fn test_sidecar_serialization_and_targets() {
         },
         witness::{build_sidecar_targets, WitnessResult},
     };
-    use reth_trie_common::proof::ProofNodes;
-    use reth_trie_common::{BranchNodeMasks, MultiProof, StorageMultiProof, TrieMask};
+    use reth_trie_common::{
+        proof::ProofNodes, BranchNodeMasks, MultiProof, StorageMultiProof, TrieMask,
+    };
 
     // 1. Create a dummy MultiProof
     let account = Address::repeat_byte(0x11);

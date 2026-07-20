@@ -1,8 +1,12 @@
 use crate::witness::WitnessResult;
-use alloy_primitives::map::{B256Map, HashMap};
-use alloy_primitives::{keccak256, Address, Bytes, B256};
-use reth_trie_common::proof::ProofNodes;
-use reth_trie_common::{BranchNodeMasks, MultiProof, Nibbles, StorageMultiProof, TrieMask};
+use alloy_primitives::{
+    keccak256,
+    map::{B256Map, HashMap},
+    Address, Bytes, B256,
+};
+use reth_trie_common::{
+    proof::ProofNodes, BranchNodeMasks, MultiProof, Nibbles, StorageMultiProof, TrieMask,
+};
 use serde::{Deserialize, Serialize};
 
 /// Hashed / Raw target keys that were missed in the network state cache for a block.
@@ -52,6 +56,14 @@ impl StateTargetSet {
         self.storage.dedup();
         self.code_hashes.sort();
         self.code_hashes.dedup();
+    }
+
+    /// Extend this set with another target set and restore its sorted, deduplicated form.
+    pub fn extend(&mut self, other: &Self) {
+        self.accounts.extend_from_slice(&other.accounts);
+        self.storage.extend_from_slice(&other.storage);
+        self.code_hashes.extend_from_slice(&other.code_hashes);
+        self.sort_dedup();
     }
 }
 
@@ -255,7 +267,8 @@ pub fn check_next_cache_anchor(
 /// Deterministic identifier for the prototype's split LastNBlocks cache policy.
 pub fn last_n_blocks_cache_policy_id(account_window: u64, storage_code_window: u64) -> B256 {
     let mut preimage = Vec::new();
-    preimage.extend_from_slice(b"LastNBlocksPolicy/v1");
+    // v2 commits to absent-account identity and storage-wipe invalidation semantics.
+    preimage.extend_from_slice(b"LastNBlocksPolicy/v2");
     preimage.extend_from_slice(b"account_window");
     preimage.extend_from_slice(&account_window.to_be_bytes());
     preimage.extend_from_slice(b"storage_code_window");
@@ -357,14 +370,17 @@ pub struct SidecarBenchmarkManifest {
     pub accessed: StateTargetStats,
     pub cache_hit: StateTargetStats,
     pub sidecar_miss: StateTargetStats,
-    /// Whether the ExEx ran the provider-assisted validator preflight for this sidecar.
-    pub provider_assisted_preflight: bool,
-    /// Whether a partial-state node could verify the post-state root without the
-    /// full provider. Currently false when written cache-hit paths are missing
-    /// from the sidecar/cache shape.
+    /// State paths changed by execution. These paths are added to the cold miss targets so the
+    /// verifier can recompute the post-state root without proving warm read-only paths.
+    #[serde(default)]
+    pub write_targets: StateTargetStats,
+    /// Union of the cache miss and write target sets used for the actual sidecar multiproof.
+    #[serde(default)]
+    pub proof_targets: StateTargetStats,
+    /// Whether the ExEx ran the trustless replay and state-root preflight for this sidecar.
+    pub trustless_preflight: bool,
+    /// Whether a partial-state node verified the post-state root without a full provider.
     pub partial_state_trustless_verification_ready: bool,
-    /// Diagnostic-only readiness for a future fully trustless state-root proof.
-    pub root_witness_completeness: RootWitnessCompletenessSummary,
     /// Full-witness baseline (all accessed state, ignoring the cache). `None` when
     /// the comparison is disabled (`PS_WITNESS_BASELINE` unset).
     pub full_sidecar_baseline_stats: Option<WitnessResult>,
@@ -374,39 +390,8 @@ pub struct SidecarBenchmarkManifest {
     pub reduction: Option<WitnessReductionStats>,
 }
 
-/// Diagnostic report for whether the current sidecar/cache shape contains enough
-/// trie paths to compute the post-state root without provider assistance.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RootWitnessCompletenessReport {
-    pub trustless_root_ready: bool,
-    pub missing_account_paths: Vec<Address>,
-    pub missing_storage_paths: Vec<(Address, B256)>,
-    pub covered_account_paths: usize,
-    pub covered_storage_paths: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RootWitnessCompletenessSummary {
-    pub trustless_root_ready: bool,
-    pub missing_account_paths: usize,
-    pub missing_storage_paths: usize,
-    pub covered_account_paths: usize,
-    pub covered_storage_paths: usize,
-}
-
-impl RootWitnessCompletenessSummary {
-    pub fn from_report(report: &RootWitnessCompletenessReport) -> Self {
-        Self {
-            trustless_root_ready: report.trustless_root_ready,
-            missing_account_paths: report.missing_account_paths.len(),
-            missing_storage_paths: report.missing_storage_paths.len(),
-            covered_account_paths: report.covered_account_paths,
-            covered_storage_paths: report.covered_storage_paths,
-        }
-    }
-}
-
-/// A serialized representation of a `StorageMultiProof` that can be easily serialized/deserialized with `serde`.
+/// A serialized representation of a `StorageMultiProof` that can be easily serialized/deserialized
+/// with `serde`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializableStorageMultiProof {
     pub root: B256,
@@ -414,7 +399,8 @@ pub struct SerializableStorageMultiProof {
     pub branch_node_masks: Vec<(Vec<u8>, u16, u16)>,
 }
 
-/// A serialized representation of a `MultiProof` that can be easily serialized/deserialized with `serde`.
+/// A serialized representation of a `MultiProof` that can be easily serialized/deserialized with
+/// `serde`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SerializableMultiProof {
     pub account_subtree: Vec<(Vec<u8>, Vec<u8>)>,

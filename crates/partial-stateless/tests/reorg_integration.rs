@@ -24,7 +24,7 @@ fn make_cache(account_window: u64, storage_window: u64) -> NetworkStateCache {
 }
 
 fn account(nonce: u64, balance: u64) -> AccountData {
-    AccountData { nonce, balance: U256::from(balance), code_hash: None }
+    AccountData { exists: true, nonce, balance: U256::from(balance), code_hash: None }
 }
 
 /// Build one block's accessed state from `(address, account)` and `(address, slot, value)` lists.
@@ -88,11 +88,8 @@ fn fingerprint(cache: &NetworkStateCache) -> Fingerprint {
         .iter()
         .map(|(k, e)| (*k, (e.value.nonce, e.value.balance, e.last_accessed_block)))
         .collect();
-    let storage = cache
-        .storage()
-        .iter()
-        .map(|(k, e)| (*k, (e.value, e.last_accessed_block)))
-        .collect();
+    let storage =
+        cache.storage().iter().map(|(k, e)| (*k, (e.value, e.last_accessed_block))).collect();
     (accounts, storage, cache.current_block())
 }
 
