@@ -14,6 +14,7 @@ mod sidecar_create;
 mod sidecar_io;
 mod sidecar_reexec;
 mod sidecar_verify;
+mod write_path_experiment;
 
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
@@ -267,6 +268,14 @@ async fn partial_stateless_exex<
             "Provider-assisted sidecar preflight ENABLED — extra re-execution per sidecar"
         );
     }
+    let run_write_path_experiment =
+        sidecar_role != SidecarRole::Verifier && env_flag("PS_WRITE_PATH_EXPERIMENT");
+    if run_write_path_experiment {
+        info!(
+            target: "partial_stateless",
+            "Write-path proof experiment ENABLED — #13 remains the primary sidecar path"
+        );
+    }
     if sidecar_role == SidecarRole::Verifier {
         info!(
             target: "partial_stateless",
@@ -378,6 +387,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            run_write_path_experiment,
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,
@@ -505,6 +515,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            run_write_path_experiment,
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,

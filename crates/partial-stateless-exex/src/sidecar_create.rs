@@ -3,6 +3,7 @@ use crate::{
     sidecar_io::sidecar_path,
     sidecar_reexec::{verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits},
     thread_rusage, CacheConfig,
+    write_path_experiment::{run_write_path_experiment, save_write_path_report},
 };
 use alloy_primitives::{Bytes, B256};
 use partial_stateless::{
@@ -43,6 +44,7 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) resource_metrics: bool,
     pub(crate) trie_cache_diagnostics: bool,
     pub(crate) run_sidecar_preflight: bool,
+    pub(crate) run_write_path_experiment: bool,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
 }
 
@@ -443,6 +445,48 @@ where
                         witness: witness_payload,
                         stats: result.clone(),
                     };
+
+                    if options.run_write_path_experiment {
+                        fs::create_dir_all(options.sidecar_dir).map_err(|err| {
+                            eyre::eyre!("failed to create sidecar directory: {err}")
+                        })?;
+                        let experiment_path = sidecar_path(
+                            options.sidecar_dir,
+                            block_number,
+                            block_hash,
+                        )
+                        .with_extension("write-path.bin");
+                        let experiment = run_write_path_experiment(
+                            evm_config,
+                            state_provider,
+                            block,
+                            prev_cache_for_reexec,
+                            config.account_window,
+                            config.storage_window,
+                            &sidecar,
+                            &execution_output.state,
+                            options.reexec_limits,
+                            &experiment_path,
+                        )
+                        .map_err(|err| {
+                            eyre::eyre!("write-path proof experiment failed: {err}")
+                        })?;
+                        save_write_path_report(&experiment_path, &experiment)?;
+                        info!(
+                            target: "partial_stateless",
+                            block = block_number,
+                            path = %experiment_path.display(),
+                            wire_sidecar_bytes = experiment.wire_sidecar_bytes,
+                            proof_bytes = experiment.proof_bytes,
+                            base_target_accounts = experiment.base_target_accounts,
+                            base_target_storage = experiment.base_target_storage,
+                            final_target_accounts = experiment.final_target_accounts,
+                            final_target_storage = experiment.final_target_storage,
+                            supplemental_rounds = experiment.supplemental_rounds,
+                            computed_state_root = ?experiment.computed_state_root,
+                            "Write-path proof experiment VERIFIED without the #13 trie cache"
+                        );
+                    }
 
                     let root_witness_completeness = if options.run_sidecar_preflight {
                         let mut trie_cache_for_reexec = trie_cache.clone();

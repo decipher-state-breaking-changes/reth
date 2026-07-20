@@ -77,6 +77,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around the partial multiproof (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
 | `PS_SIDECAR_PREFLIGHT=1` | run provider-assisted validator preflight for each sidecar (an extra re-execution per block) |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
+| `PS_WRITE_PATH_EXPERIMENT=1` | keep the #13 sidecar path unchanged and additionally test a self-contained `cold misses ∪ writes` proof from an empty trie cache |
 
 `PS_SIDECAR_ROLE=builder-verifier` is a single-process test mode: it keeps the
 normal builder output path, but forces the same provider-assisted client preflight
@@ -165,6 +166,18 @@ Combine diagnostics with `PS_SIDECAR_PREFLIGHT=1` for a bounded correctness run.
 Do not interpret prefix coverage as a literal MPT node count: Patricia extensions
 compress nibble levels.
 
+### Write-path proof experiment
+
+`PS_WRITE_PATH_EXPERIMENT=1` leaves the persistent trie-node cache and primary sidecar unchanged.
+For each coherent block it independently starts with `multiproof(cold misses ∪ writes)`, adds any
+structural proof targets requested by an empty sparse trie, serializes and deserializes the
+resulting sidecar, and re-executes it from the previous value cache plus cold witness values. The
+experiment succeeds only when that empty-trie replay reproduces the block state root.
+
+This currently transmits a standard multiproof for warm writes; warm-leaf elision is not part of
+the experiment. The `.write-path.json` report records the base/final target counts and the number
+of supplemental proof rounds so live runs can show whether structural completion was necessary.
+
 ### Capturing a benchmark dataset
 
 Set `PS_CAPTURE_DIR` to dump each block's `BlockAccessedState` as a fixture. This
@@ -188,4 +201,6 @@ snapshot is the portable, self-contained artifact.
 | `<datadir>/partial_stateless_cache.bin` | persisted flat cache; cold-reset on restart until trie snapshots are persisted |
 | `./sidecar/block_<N>_<hash>.bin` | witness sidecar (or `$PS_SIDECAR_DIR/block_<N>_<hash>.bin`) |
 | `./sidecar/block_<N>_<hash>.manifest.json` | per-block benchmark manifest |
+| `./sidecar/block_<N>_<hash>.write-path.bin` | opt-in write-path experiment sidecar |
+| `./sidecar/block_<N>_<hash>.write-path.json` | opt-in write-path proof target and size report |
 | `$PS_CAPTURE_DIR/accessed_<N>.bin` | captured fixture (when capture is enabled) |
