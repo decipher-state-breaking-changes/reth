@@ -86,6 +86,8 @@ pub struct SyncAccountValueEncoder<T, H> {
     hashed_cursor_factory: Rc<H>,
     /// Storage prefix sets keyed by hashed address.
     storage_prefix_sets: Rc<B256Map<PrefixSet>>,
+    /// Storage roots already computed while generating storage proofs.
+    precomputed_storage_roots: Rc<B256Map<B256>>,
 }
 
 impl<T, H> SyncAccountValueEncoder<T, H> {
@@ -95,6 +97,7 @@ impl<T, H> SyncAccountValueEncoder<T, H> {
             trie_cursor_factory: Rc::new(trie_cursor_factory),
             hashed_cursor_factory: Rc::new(hashed_cursor_factory),
             storage_prefix_sets: Rc::new(B256Map::default()),
+            precomputed_storage_roots: Rc::new(B256Map::default()),
         }
     }
 
@@ -103,6 +106,15 @@ impl<T, H> SyncAccountValueEncoder<T, H> {
     /// accounts.
     pub fn with_storage_prefix_sets(mut self, storage_prefix_sets: B256Map<PrefixSet>) -> Self {
         self.storage_prefix_sets = Rc::new(storage_prefix_sets);
+        self
+    }
+
+    /// Sets storage roots computed by preceding storage proof calculations.
+    pub fn with_precomputed_storage_roots(
+        mut self,
+        precomputed_storage_roots: B256Map<B256>,
+    ) -> Self {
+        self.precomputed_storage_roots = Rc::new(precomputed_storage_roots);
         self
     }
 }
@@ -115,6 +127,7 @@ pub struct SyncAccountDeferredValueEncoder<T, H> {
     storage_prefix_sets: Rc<B256Map<PrefixSet>>,
     hashed_address: B256,
     account: Account,
+    precomputed_storage_root: Option<B256>,
 }
 
 impl<T, H> DeferredValueEncoder for SyncAccountDeferredValueEncoder<T, H>
@@ -123,18 +136,21 @@ where
     H: HashedCursorFactory,
 {
     fn encode(self, buf: &mut Vec<u8>) -> Result<(), StateProofError> {
-        let trie_cursor = self.trie_cursor_factory.storage_trie_cursor(self.hashed_address)?;
-        let hashed_cursor =
-            self.hashed_cursor_factory.hashed_storage_cursor(self.hashed_address)?;
-
-        let mut storage_proof_calculator = ProofCalculator::new_storage(trie_cursor, hashed_cursor);
-        if let Some(prefix_set) = self.storage_prefix_sets.get(&self.hashed_address) {
-            storage_proof_calculator = storage_proof_calculator.with_prefix_set(prefix_set.clone());
-        }
-        let root_node = storage_proof_calculator.storage_root_node(self.hashed_address)?;
-        let storage_root = storage_proof_calculator
-            .compute_root_hash(&[root_node])?
-            .expect("storage_root_node returns a node at empty path");
+        let storage_root = if let Some(storage_root) = self.precomputed_storage_root {
+            storage_root
+        } else {
+            let trie_cursor = self.trie_cursor_factory.storage_trie_cursor(self.hashed_address)?;
+            let hashed_cursor =
+                self.hashed_cursor_factory.hashed_storage_cursor(self.hashed_address)?;
+            let mut calculator = ProofCalculator::new_storage(trie_cursor, hashed_cursor);
+            if let Some(prefix_set) = self.storage_prefix_sets.get(&self.hashed_address) {
+                calculator = calculator.with_prefix_set(prefix_set.clone());
+            }
+            let root_node = calculator.storage_root_node(self.hashed_address)?;
+            calculator
+                .compute_root_hash(&[root_node])?
+                .expect("storage_root_node returns a node at empty path")
+        };
 
         let trie_account = self.account.into_trie_account(storage_root);
         trie_account.encode(buf);
@@ -156,14 +172,59 @@ where
         hashed_address: B256,
         account: Self::Value,
     ) -> Self::DeferredEncoder {
-        // Return a deferred encoder that will synchronously compute the storage root when encode()
-        // is called.
         SyncAccountDeferredValueEncoder {
             trie_cursor_factory: Rc::clone(&self.trie_cursor_factory),
             hashed_cursor_factory: Rc::clone(&self.hashed_cursor_factory),
             storage_prefix_sets: Rc::clone(&self.storage_prefix_sets),
             hashed_address,
             account,
+            precomputed_storage_root: self.precomputed_storage_roots.get(&hashed_address).copied(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        hashed_cursor::noop::NoopHashedCursorFactory, trie_cursor::noop::NoopTrieCursorFactory,
+    };
+    use reth_trie_common::EMPTY_ROOT_HASH;
+
+    #[test]
+    fn account_encoder_reuses_precomputed_storage_root() {
+        let hashed_address = B256::repeat_byte(0x11);
+        let storage_root = B256::repeat_byte(0x22);
+        let account = Account { nonce: 7, ..Default::default() };
+        let mut encoder =
+            SyncAccountValueEncoder::new(NoopTrieCursorFactory, NoopHashedCursorFactory)
+                .with_precomputed_storage_roots(B256Map::from_iter([(
+                    hashed_address,
+                    storage_root,
+                )]));
+
+        let deferred = encoder.deferred_encoder(hashed_address, account);
+        let mut encoded = Vec::new();
+        deferred.encode(&mut encoded).unwrap();
+
+        let mut expected = Vec::new();
+        account.into_trie_account(storage_root).encode(&mut expected);
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn account_encoder_falls_back_when_precomputed_root_is_missing() {
+        let hashed_address = B256::repeat_byte(0x33);
+        let account = Account { nonce: 9, ..Default::default() };
+        let mut encoder =
+            SyncAccountValueEncoder::new(NoopTrieCursorFactory, NoopHashedCursorFactory);
+
+        let deferred = encoder.deferred_encoder(hashed_address, account);
+        let mut encoded = Vec::new();
+        deferred.encode(&mut encoded).unwrap();
+
+        let mut expected = Vec::new();
+        account.into_trie_account(EMPTY_ROOT_HASH).encode(&mut expected);
+        assert_eq!(encoded, expected);
     }
 }

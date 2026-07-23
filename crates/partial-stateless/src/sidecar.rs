@@ -531,12 +531,15 @@ impl SerializableMultiProof {
 pub enum PartialExecutionWitnessState {
     /// Reth MPT multiproof encoded in the local serializable representation.
     MptMultiProof(Vec<u8>),
+    /// Parent-state trie node preimages recorded while applying the complete transition.
+    MptTransitionNodes(Vec<Bytes>),
 }
 
 impl PartialExecutionWitnessState {
-    pub fn mpt_multiproof_bytes(&self) -> &[u8] {
+    pub fn encoded_len(&self) -> usize {
         match self {
-            Self::MptMultiProof(bytes) => bytes,
+            Self::MptMultiProof(bytes) => bytes.len(),
+            Self::MptTransitionNodes(nodes) => nodes.iter().map(|node| node.len()).sum(),
         }
     }
 }
@@ -567,8 +570,19 @@ pub fn partial_witness_commitment(
     preimage.extend_from_slice(parent_state_root.as_slice());
     encode_state_targets(&mut preimage, b"cache_miss_targets", cache_miss_targets);
 
-    preimage.extend_from_slice(b"state_mpt_multiproof");
-    encode_bytes(&mut preimage, witness.state.mpt_multiproof_bytes());
+    match &witness.state {
+        PartialExecutionWitnessState::MptMultiProof(bytes) => {
+            preimage.extend_from_slice(b"state_mpt_multiproof");
+            encode_bytes(&mut preimage, bytes);
+        }
+        PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
+            preimage.extend_from_slice(b"state_mpt_transition_nodes");
+            preimage.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
+            for node in nodes {
+                encode_bytes(&mut preimage, node);
+            }
+        }
+    }
 
     let mut codes: Vec<_> =
         witness.codes.iter().map(|code| (keccak256(code.as_ref()), code)).collect();
@@ -693,6 +707,17 @@ mod tests {
             witness,
             stats: empty_stats(),
         }
+    }
+
+    #[test]
+    fn flat_transition_wire_variant_remains_compatible() {
+        let state =
+            PartialExecutionWitnessState::MptTransitionNodes(vec![Bytes::from_static(&[0xaa])]);
+        let encoded = bincode::serialize(&state).unwrap();
+
+        // Keep the established flat-transition discriminant stable for existing sidecars.
+        assert_eq!(&encoded[..4], &[1, 0, 0, 0]);
+        assert_eq!(bincode::deserialize::<PartialExecutionWitnessState>(&encoded).unwrap(), state);
     }
 
     #[test]

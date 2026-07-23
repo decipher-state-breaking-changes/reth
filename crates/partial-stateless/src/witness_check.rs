@@ -1,20 +1,21 @@
 use crate::{
     sidecar::{
-        check_sidecar_self_consistency, PartialStatelessSidecar, RootWitnessCompletenessReport,
-        SerializableMultiProof, SidecarCheckError, StateTargetSet,
+        check_sidecar_self_consistency, PartialExecutionWitnessState, PartialStatelessSidecar,
+        RootWitnessCompletenessReport, SerializableMultiProof, SidecarCheckError, StateTargetSet,
     },
     trie_cache::PartialTrieNodeCache,
 };
-use alloy_consensus::Header;
+use alloy_consensus::{Header, EMPTY_ROOT_HASH};
 use alloy_primitives::{keccak256, map::B256Map, Address, Bytes, B256, U256};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, EMPTY_STRING_CODE};
 use reth_primitives_traits::Account;
 use reth_trie_common::{
     BranchNodeMasksMap, BranchNodeV2, DecodedMultiProof, DecodedMultiProofV2, HashedPostState,
-    KeccakKeyHasher, MultiProof, Nibbles, ProofTrieNodeV2, TrieNode, TrieNodeV2,
+    KeccakKeyHasher, MultiProof, Nibbles, ProofTrieNodeV2, TrieAccount, TrieNode, TrieNodeV2,
 };
-use reth_trie_sparse::{LeafUpdate, SparseTrie};
+use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie, SparseTrie};
 use revm_database::BundleState;
+use revm_primitives::KECCAK_EMPTY;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error,
@@ -75,10 +76,348 @@ impl fmt::Display for SidecarWitnessCheckError {
 
 impl Error for SidecarWitnessCheckError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TrieProofTarget {
     Account(B256),
     Storage { hashed_address: B256, hashed_slot: B256 },
+}
+
+/// Native V2 target requested by an in-progress sparse-trie transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrieProofTargetV2 {
+    Account { key: B256, min_len: u8 },
+    Storage { hashed_address: B256, key: B256, min_len: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheAwareTransitionPhase {
+    Prepare,
+    StorageUpserts,
+    StorageRemovals,
+    PrepareAccounts,
+    AccountUpserts,
+    AccountRemovals,
+    Complete(B256),
+}
+
+/// Progress made by [`CacheAwareTrieTransition::advance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheAwareTransitionProgress {
+    ProofRequired(Vec<TrieProofTargetV2>),
+    Complete(B256),
+}
+
+/// Stateful canonical transition over a transactional persistent sparse-trie cache.
+///
+/// Successfully applied leaf updates are removed from the phase-local maps. When a blind node is
+/// encountered, callers can fetch and reveal only the returned delta before resuming the same
+/// transition without replaying prior phases.
+pub struct CacheAwareTrieTransition<'a> {
+    trie_cache: &'a mut PartialTrieNodeCache,
+    hashed_post_state: HashedPostState,
+    read_only_storage_targets: Vec<B256>,
+    storage_upserts: B256Map<B256Map<LeafUpdate>>,
+    storage_removals: B256Map<B256Map<LeafUpdate>>,
+    account_upserts: B256Map<LeafUpdate>,
+    account_removals: B256Map<LeafUpdate>,
+    phase: CacheAwareTransitionPhase,
+}
+
+impl<'a> CacheAwareTrieTransition<'a> {
+    pub fn new(
+        trie_cache: &'a mut PartialTrieNodeCache,
+        hashed_post_state: HashedPostState,
+        storage_targets: impl IntoIterator<Item = B256>,
+    ) -> Self {
+        let mut read_only_storage_targets = storage_targets.into_iter().collect::<Vec<_>>();
+        read_only_storage_targets.sort_unstable();
+        read_only_storage_targets.dedup();
+
+        let mut storage_upserts = B256Map::default();
+        let mut storage_removals = B256Map::default();
+        for (&hashed_address, storage) in &hashed_post_state.storages {
+            for (&hashed_slot, value) in &storage.storage {
+                if value.is_zero() {
+                    if !storage.wiped {
+                        storage_removals
+                            .entry(hashed_address)
+                            .or_insert_with(B256Map::default)
+                            .insert(hashed_slot, LeafUpdate::Changed(Vec::new()));
+                    }
+                } else {
+                    storage_upserts
+                        .entry(hashed_address)
+                        .or_insert_with(B256Map::default)
+                        .insert(hashed_slot, LeafUpdate::Changed(alloy_rlp::encode(value)));
+                }
+            }
+        }
+
+        Self {
+            trie_cache,
+            hashed_post_state,
+            read_only_storage_targets,
+            storage_upserts,
+            storage_removals,
+            account_upserts: B256Map::default(),
+            account_removals: B256Map::default(),
+            phase: CacheAwareTransitionPhase::Prepare,
+        }
+    }
+
+    /// Reveals a newly fetched parent-state proof delta into the in-progress trie.
+    pub fn reveal(
+        &mut self,
+        proof: DecodedMultiProofV2,
+    ) -> std::result::Result<(), TrieTransitionError> {
+        self.trie_cache.sparse_mut().reveal_decoded_multiproof_v2(proof).map_err(|err| {
+            TrieTransitionError::Failed(format!("failed to reveal parent multiproof: {err}"))
+        })
+    }
+
+    fn prepare(&mut self) -> std::result::Result<(), TrieTransitionError> {
+        let mut required_storage_tries = self.read_only_storage_targets.clone();
+        required_storage_tries.extend(
+            self.hashed_post_state
+                .storages
+                .iter()
+                .filter_map(|(address, storage)| (!storage.wiped).then_some(*address)),
+        );
+        required_storage_tries.sort_unstable();
+        required_storage_tries.dedup();
+
+        let sparse = self.trie_cache.sparse_mut();
+        for hashed_address in required_storage_tries {
+            if sparse.storage_trie_ref(&hashed_address).is_some() {
+                continue
+            }
+            if !sparse.is_account_revealed(hashed_address) {
+                return Err(TrieTransitionError::Failed(format!(
+                    "account path was not revealed for storage address={hashed_address}"
+                )))
+            }
+            let storage_root = sparse
+                .get_account_value(&hashed_address)
+                .map(|value| TrieAccount::decode(&mut &value[..]))
+                .transpose()
+                .map_err(|err| {
+                    TrieTransitionError::Failed(format!(
+                        "failed to decode parent account for storage address={hashed_address}: {err}"
+                    ))
+                })?
+                .map_or(EMPTY_ROOT_HASH, |account| account.storage_root);
+            if storage_root != EMPTY_ROOT_HASH {
+                return Err(TrieTransitionError::Failed(format!(
+                    "storage proof is missing for address={hashed_address}, root={storage_root}"
+                )))
+            }
+            sparse.insert_storage_trie(hashed_address, RevealableSparseTrie::revealed_empty());
+        }
+
+        // A wipe authenticates the post-wipe empty root without needing any parent storage path.
+        // Cache-miss proofs for pre-state reads were already recorded before this replacement.
+        for (&hashed_address, storage) in &self.hashed_post_state.storages {
+            if storage.wiped {
+                sparse.insert_storage_trie(hashed_address, RevealableSparseTrie::revealed_empty());
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_storage_updates(
+        &mut self,
+        removals: bool,
+    ) -> std::result::Result<Vec<TrieProofTargetV2>, TrieTransitionError> {
+        let updates_by_address =
+            if removals { &mut self.storage_removals } else { &mut self.storage_upserts };
+        let mut addresses = updates_by_address.keys().copied().collect::<Vec<_>>();
+        addresses.sort_unstable();
+        let sparse = self.trie_cache.sparse_mut();
+        let mut targets = Vec::new();
+        for hashed_address in addresses {
+            let Some(updates) = updates_by_address.get_mut(&hashed_address) else { continue };
+            if updates.is_empty() {
+                continue
+            }
+            let storage_trie = sparse.storage_trie_mut(&hashed_address).ok_or_else(|| {
+                TrieTransitionError::Failed(format!(
+                    "storage trie was not revealed for address={hashed_address}"
+                ))
+            })?;
+            storage_trie
+                .update_leaves(updates, |key, min_len| {
+                    targets.push(TrieProofTargetV2::Storage { hashed_address, key, min_len });
+                })
+                .map_err(|err| {
+                    TrieTransitionError::Failed(format!(
+                        "failed to apply storage updates for address={hashed_address}: {err}"
+                    ))
+                })?;
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        Ok(targets)
+    }
+
+    fn prepare_accounts(&mut self) -> std::result::Result<(), TrieTransitionError> {
+        let mut addresses = self
+            .hashed_post_state
+            .accounts
+            .keys()
+            .chain(self.hashed_post_state.storages.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+
+        let sparse = self.trie_cache.sparse_mut();
+        for hashed_address in addresses {
+            let storage_root = if let Some(root) = sparse.storage_root(&hashed_address) {
+                root
+            } else if sparse.is_account_revealed(hashed_address) {
+                sparse
+                    .get_account_value(&hashed_address)
+                    .map(|value| TrieAccount::decode(&mut &value[..]))
+                    .transpose()
+                    .map_err(|err| {
+                        TrieTransitionError::Failed(format!(
+                            "failed to decode account {hashed_address}: {err}"
+                        ))
+                    })?
+                    .map_or(EMPTY_ROOT_HASH, |account| account.storage_root)
+            } else {
+                return Err(TrieTransitionError::Failed(format!(
+                    "account path was not revealed for address={hashed_address}"
+                )))
+            };
+
+            match self.hashed_post_state.accounts.get(&hashed_address) {
+                Some(Some(account)) => {
+                    if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
+                        self.account_removals
+                            .insert(hashed_address, LeafUpdate::Changed(Vec::new()));
+                    } else {
+                        self.account_upserts.insert(
+                            hashed_address,
+                            LeafUpdate::Changed(alloy_rlp::encode(
+                                account.into_trie_account(storage_root),
+                            )),
+                        );
+                    }
+                }
+                Some(None) => {
+                    self.account_removals.insert(hashed_address, LeafUpdate::Changed(Vec::new()));
+                }
+                None => {
+                    let Some(mut account) = sparse
+                        .get_account_value(&hashed_address)
+                        .map(|value| TrieAccount::decode(&mut &value[..]))
+                        .transpose()
+                        .map_err(|err| {
+                            TrieTransitionError::Failed(format!(
+                                "failed to decode storage-only account {hashed_address}: {err}"
+                            ))
+                        })?
+                    else {
+                        continue
+                    };
+                    account.storage_root = storage_root;
+                    if account == TrieAccount::default() {
+                        self.account_removals
+                            .insert(hashed_address, LeafUpdate::Changed(Vec::new()));
+                    } else {
+                        self.account_upserts.insert(
+                            hashed_address,
+                            LeafUpdate::Changed(alloy_rlp::encode(account)),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_account_updates(
+        &mut self,
+        removals: bool,
+    ) -> std::result::Result<Vec<TrieProofTargetV2>, TrieTransitionError> {
+        let updates = if removals { &mut self.account_removals } else { &mut self.account_upserts };
+        if updates.is_empty() {
+            return Ok(Vec::new())
+        }
+        let account_trie = self
+            .trie_cache
+            .sparse_mut()
+            .trie_mut()
+            .as_revealed_mut()
+            .ok_or_else(|| TrieTransitionError::Failed("account trie is blind".to_string()))?;
+        let mut targets = Vec::new();
+        account_trie
+            .update_leaves(updates, |key, min_len| {
+                targets.push(TrieProofTargetV2::Account { key, min_len });
+            })
+            .map_err(|err| {
+                TrieTransitionError::Failed(format!("failed to apply account updates: {err}"))
+            })?;
+        targets.sort_unstable();
+        targets.dedup();
+        Ok(targets)
+    }
+
+    /// Advances until either a proof delta is required or the transition is complete.
+    pub fn advance(
+        &mut self,
+    ) -> std::result::Result<CacheAwareTransitionProgress, TrieTransitionError> {
+        loop {
+            match self.phase {
+                CacheAwareTransitionPhase::Prepare => {
+                    self.prepare()?;
+                    self.phase = CacheAwareTransitionPhase::StorageUpserts;
+                }
+                CacheAwareTransitionPhase::StorageUpserts => {
+                    let targets = self.advance_storage_updates(false)?;
+                    if !targets.is_empty() {
+                        return Ok(CacheAwareTransitionProgress::ProofRequired(targets))
+                    }
+                    self.phase = CacheAwareTransitionPhase::StorageRemovals;
+                }
+                CacheAwareTransitionPhase::StorageRemovals => {
+                    let targets = self.advance_storage_updates(true)?;
+                    if !targets.is_empty() {
+                        return Ok(CacheAwareTransitionProgress::ProofRequired(targets))
+                    }
+                    self.phase = CacheAwareTransitionPhase::PrepareAccounts;
+                }
+                CacheAwareTransitionPhase::PrepareAccounts => {
+                    self.prepare_accounts()?;
+                    self.phase = CacheAwareTransitionPhase::AccountUpserts;
+                }
+                CacheAwareTransitionPhase::AccountUpserts => {
+                    let targets = self.advance_account_updates(false)?;
+                    if !targets.is_empty() {
+                        return Ok(CacheAwareTransitionProgress::ProofRequired(targets))
+                    }
+                    self.phase = CacheAwareTransitionPhase::AccountRemovals;
+                }
+                CacheAwareTransitionPhase::AccountRemovals => {
+                    let targets = self.advance_account_updates(true)?;
+                    if !targets.is_empty() {
+                        return Ok(CacheAwareTransitionProgress::ProofRequired(targets))
+                    }
+                    let sparse = self.trie_cache.sparse_mut();
+                    let state_root = sparse.root().map_err(|err| {
+                        TrieTransitionError::Failed(format!("failed to compute state root: {err}"))
+                    })?;
+                    drop(sparse.take_deferred_drops());
+                    self.trie_cache.set_state_root(state_root);
+                    self.phase = CacheAwareTransitionPhase::Complete(state_root);
+                }
+                CacheAwareTransitionPhase::Complete(root) => {
+                    return Ok(CacheAwareTransitionProgress::Complete(root))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +441,16 @@ impl Error for TrieTransitionError {}
 
 type Result<T> = std::result::Result<T, SidecarWitnessCheckError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum MaterializedStateProof {
+    Legacy(MultiProof),
+    Transition(DecodedMultiProofV2),
+}
+
+#[derive(Debug, Clone)]
 pub struct MaterializedSidecarWitness {
-    /// Self-contained parent-state miss proof, also revealed into the persistent sparse trie for
-    /// trustless state-root computation (see [`compute_trustless_state_root`]).
-    pub multiproof: MultiProof,
+    /// Self-contained parent-state proof revealed into the persistent sparse trie.
+    pub state_proof: MaterializedStateProof,
     pub accounts: HashMap<Address, Option<Account>>,
     pub storage: HashMap<(Address, B256), U256>,
     pub codes: HashMap<B256, Bytes>,
@@ -126,7 +470,7 @@ pub fn check_sidecar_witness_prefilter(
     ensure_cap("header witnesses", sidecar.witness.headers.len(), limits.max_headers)?;
     ensure_cap(
         "state proof bytes",
-        sidecar.witness.state.mpt_multiproof_bytes().len(),
+        sidecar.witness.state.encoded_len(),
         limits.max_state_proof_bytes,
     )?;
     ensure_cap(
@@ -161,8 +505,6 @@ pub fn materialize_sidecar_witness_with_limits(
 ) -> Result<MaterializedSidecarWitness> {
     check_sidecar_witness_prefilter(sidecar, limits)?;
 
-    let multiproof = decode_multiproof(sidecar.witness.state.mpt_multiproof_bytes())?;
-
     let mut grouped_targets: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
     for address in &sidecar.cache_miss_targets.accounts {
         grouped_targets.entry(*address).or_default();
@@ -171,6 +513,35 @@ pub fn materialize_sidecar_witness_with_limits(
         grouped_targets.entry(*address).or_default().insert(*slot);
     }
 
+    let (state_proof, accounts, storage) = match &sidecar.witness.state {
+        PartialExecutionWitnessState::MptMultiProof(bytes) => {
+            let multiproof = decode_multiproof(bytes)?;
+            let (accounts, storage) = materialize_legacy_targets(
+                &multiproof,
+                grouped_targets,
+                sidecar.parent_state_root,
+            )?;
+            (MaterializedStateProof::Legacy(multiproof), accounts, storage)
+        }
+        PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
+            let proof = decode_transition_nodes(sidecar.parent_state_root, nodes)?;
+            let (accounts, storage) =
+                materialize_v2_targets(&proof, grouped_targets, sidecar.parent_state_root)?;
+            (MaterializedStateProof::Transition(proof), accounts, storage)
+        }
+    };
+
+    let codes = materialize_codes(sidecar)?;
+    let headers = materialize_headers(sidecar)?;
+
+    Ok(MaterializedSidecarWitness { state_proof, accounts, storage, codes, headers })
+}
+
+fn materialize_legacy_targets(
+    multiproof: &MultiProof,
+    grouped_targets: BTreeMap<Address, BTreeSet<B256>>,
+    parent_state_root: B256,
+) -> Result<(HashMap<Address, Option<Account>>, HashMap<(Address, B256), U256>)> {
     let mut accounts = HashMap::new();
     let mut storage = HashMap::new();
     for (address, slots) in grouped_targets {
@@ -180,25 +551,112 @@ pub fn materialize_sidecar_witness_with_limits(
                 "failed to materialize account proof for {address:?}: {err}"
             ))
         })?;
-        let account_proof =
-            verify_and_trim_redundant_suffixes(account_proof, sidecar.parent_state_root).map_err(
-                |err| {
-                    SidecarWitnessCheckError::Proof(format!(
-                        "invalid account/storage proof for {address:?}: {err}"
-                    ))
-                },
-            )?;
+        let account_proof = verify_and_trim_redundant_suffixes(account_proof, parent_state_root)
+            .map_err(|err| {
+                SidecarWitnessCheckError::Proof(format!(
+                    "invalid account/storage proof for {address:?}: {err}"
+                ))
+            })?;
 
         accounts.insert(address, account_proof.info);
         for proof in account_proof.storage_proofs {
             storage.insert((address, proof.key), proof.value);
         }
     }
+    Ok((accounts, storage))
+}
 
-    let codes = materialize_codes(sidecar)?;
-    let headers = materialize_headers(sidecar)?;
+fn decode_transition_nodes(
+    parent_state_root: B256,
+    nodes: &[Bytes],
+) -> Result<DecodedMultiProofV2> {
+    let mut witness = B256Map::with_capacity_and_hasher(nodes.len(), Default::default());
+    for node in nodes {
+        let node_hash = keccak256(node);
+        if witness.insert(node_hash, node.clone()).is_some() {
+            return Err(SidecarWitnessCheckError::Proof(format!(
+                "transition witness contains duplicate node {node_hash:?}"
+            )))
+        }
+    }
+    if parent_state_root == EMPTY_ROOT_HASH {
+        witness.entry(parent_state_root).or_insert_with(|| Bytes::from([EMPTY_STRING_CODE]));
+    }
+    DecodedMultiProofV2::from_witness(parent_state_root, &witness).map_err(|err| {
+        SidecarWitnessCheckError::Decode(format!("failed to decode transition witness: {err}"))
+    })
+}
 
-    Ok(MaterializedSidecarWitness { multiproof, accounts, storage, codes, headers })
+fn materialize_v2_targets(
+    proof: &DecodedMultiProofV2,
+    grouped_targets: BTreeMap<Address, BTreeSet<B256>>,
+    parent_state_root: B256,
+) -> Result<(HashMap<Address, Option<Account>>, HashMap<(Address, B256), U256>)> {
+    let mut sparse = SparseStateTrie::new();
+    sparse.reveal_decoded_multiproof_v2(proof.clone()).map_err(|err| {
+        SidecarWitnessCheckError::Proof(format!("failed to reveal transition witness: {err}"))
+    })?;
+    let computed_root = sparse.root().map_err(|err| {
+        SidecarWitnessCheckError::Proof(format!("failed to root transition witness: {err}"))
+    })?;
+    if computed_root != parent_state_root {
+        return Err(SidecarWitnessCheckError::Proof(format!(
+            "transition witness root mismatch: expected={parent_state_root:?}, got={computed_root:?}"
+        )))
+    }
+
+    let mut accounts = HashMap::new();
+    let mut storage = HashMap::new();
+    for (address, slots) in grouped_targets {
+        let hashed_address = keccak256(address);
+        if !sparse.is_account_revealed(hashed_address) {
+            return Err(SidecarWitnessCheckError::Proof(format!(
+                "transition witness does not prove account {address:?}"
+            )))
+        }
+        let trie_account = sparse
+            .get_account_value(&hashed_address)
+            .map(|value| TrieAccount::decode(&mut &value[..]))
+            .transpose()
+            .map_err(|err| {
+                SidecarWitnessCheckError::Decode(format!(
+                    "failed to decode account {address:?}: {err}"
+                ))
+            })?;
+        let storage_root =
+            trie_account.as_ref().map_or(EMPTY_ROOT_HASH, |account| account.storage_root);
+        let info = trie_account.map(|account| Account {
+            balance: account.balance,
+            nonce: account.nonce,
+            bytecode_hash: (account.code_hash != KECCAK_EMPTY).then_some(account.code_hash),
+        });
+        accounts.insert(address, info);
+
+        for slot in slots {
+            let value = if storage_root == EMPTY_ROOT_HASH {
+                U256::ZERO
+            } else {
+                let hashed_slot = keccak256(slot);
+                if !sparse.check_valid_storage_witness(hashed_address, hashed_slot) {
+                    return Err(SidecarWitnessCheckError::Proof(format!(
+                        "transition witness does not prove storage address={address:?}, slot={slot:?}"
+                    )))
+                }
+                sparse
+                    .get_storage_slot_value(&hashed_address, &hashed_slot)
+                    .map(|value| U256::decode(&mut &value[..]))
+                    .transpose()
+                    .map_err(|err| {
+                        SidecarWitnessCheckError::Decode(format!(
+                            "failed to decode storage address={address:?}, slot={slot:?}: {err}"
+                        ))
+                    })?
+                    .unwrap_or_default()
+            };
+            storage.insert((address, slot), value);
+        }
+    }
+    Ok((accounts, storage))
 }
 
 /// Removes proof nodes that occur after an inline trie node has already completed a lookup.
@@ -235,12 +693,13 @@ fn decode_multiproof(bytes: &[u8]) -> Result<MultiProof> {
     Ok(serializable.to_multiproof())
 }
 
-/// Converts a legacy decoded proof to V2, requesting a deeper proof target when an exclusion
-/// proof stops at a hashed extension child that the upstream sparse trie cannot reveal directly.
-fn decoded_proof_nodes_to_v2_or_request(
+/// Converts legacy decoded proof nodes to V2 and collects deeper targets for every exclusion
+/// proof that stops at a hashed extension child.
+fn decoded_proof_nodes_to_v2_and_collect(
     nodes: impl IntoIterator<Item = (Nibbles, TrieNode)>,
     masks: &BranchNodeMasksMap,
     storage_address: Option<B256>,
+    missing_targets: &mut Vec<TrieProofTarget>,
 ) -> std::result::Result<Vec<ProofTrieNodeV2>, TrieTransitionError> {
     let mut sorted = nodes.into_iter().collect::<Vec<_>>();
     sorted.sort_unstable_by(|a, b| reth_trie_common::depth_first_cmp(&a.0, &b.0));
@@ -294,7 +753,7 @@ fn decoded_proof_nodes_to_v2_or_request(
                             }
                             None => TrieProofTarget::Account(target),
                         };
-                        return Err(TrieTransitionError::ProofRequired(vec![proof_target]))
+                        missing_targets.push(proof_target);
                     } else {
                         let child_rlp = ext.child.clone();
                         let TrieNodeV2::Branch(mut branch) =
@@ -329,25 +788,29 @@ fn multiproof_to_v2_or_request(
     let decoded = DecodedMultiProof::try_from(multiproof).map_err(|err| {
         TrieTransitionError::Failed(format!("failed to decode parent multiproof: {err}"))
     })?;
-    let account_proofs = decoded_proof_nodes_to_v2_or_request(
+    let mut missing_targets = Vec::new();
+    let account_proofs = decoded_proof_nodes_to_v2_and_collect(
         decoded.account_subtree.into_inner(),
         &decoded.branch_node_masks,
         None,
+        &mut missing_targets,
     )?;
-    let storage_proofs = decoded
-        .storages
-        .into_iter()
-        .map(|(address, storage)| {
-            Ok((
-                address,
-                decoded_proof_nodes_to_v2_or_request(
-                    storage.subtree.into_inner(),
-                    &storage.branch_node_masks,
-                    Some(address),
-                )?,
-            ))
-        })
-        .collect::<std::result::Result<_, TrieTransitionError>>()?;
+    let mut storage_proofs =
+        B256Map::with_capacity_and_hasher(decoded.storages.len(), Default::default());
+    for (address, storage) in decoded.storages {
+        let proof = decoded_proof_nodes_to_v2_and_collect(
+            storage.subtree.into_inner(),
+            &storage.branch_node_masks,
+            Some(address),
+            &mut missing_targets,
+        )?;
+        storage_proofs.insert(address, proof);
+    }
+    missing_targets.sort_unstable();
+    missing_targets.dedup();
+    if !missing_targets.is_empty() {
+        return Err(TrieTransitionError::ProofRequired(missing_targets))
+    }
     Ok(DecodedMultiProofV2 { account_proofs, storage_proofs })
 }
 
@@ -390,6 +853,34 @@ pub fn try_compute_trustless_state_root(
     bundle_state: &BundleState,
 ) -> std::result::Result<B256, TrieTransitionError> {
     let decoded_multiproof = multiproof_to_v2_or_request(witness_multiproof)?;
+    try_compute_trustless_state_root_v2(decoded_multiproof, trie_cache, bundle_state)
+}
+
+/// Applies a native V2 parent-state proof to the persistent sparse-trie cache.
+pub fn try_compute_trustless_state_root_v2(
+    decoded_multiproof: DecodedMultiProofV2,
+    trie_cache: &mut PartialTrieNodeCache,
+    bundle_state: &BundleState,
+) -> std::result::Result<B256, TrieTransitionError> {
+    try_compute_trustless_state_root_v2_with_storage_targets(
+        decoded_multiproof,
+        trie_cache,
+        bundle_state,
+        std::iter::empty(),
+    )
+}
+
+/// Applies a native V2 parent-state proof while also retaining read-only storage targets.
+///
+/// Canonical flat witnesses omit empty storage-trie nodes. `storage_targets` supplies the hashed
+/// account addresses for cache-missed storage reads so an authenticated empty storage root can be
+/// represented locally even when the block does not modify that storage trie.
+pub fn try_compute_trustless_state_root_v2_with_storage_targets(
+    decoded_multiproof: DecodedMultiProofV2,
+    trie_cache: &mut PartialTrieNodeCache,
+    bundle_state: &BundleState,
+    storage_targets: impl IntoIterator<Item = B256>,
+) -> std::result::Result<B256, TrieTransitionError> {
     let sparse = trie_cache.sparse_mut();
     sparse.reveal_decoded_multiproof_v2(decoded_multiproof).map_err(|err| {
         TrieTransitionError::Failed(format!("failed to reveal parent multiproof: {err}"))
@@ -398,9 +889,42 @@ pub fn try_compute_trustless_state_root(
     let hashed_post_state =
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
 
-    // Storage is updated first. The account leaf is rewritten afterwards so its storage root
-    // commits the new storage trie even when the account info itself did not change.
-    let mut required_proofs = Vec::new();
+    // Canonical flat witnesses omit empty trie nodes. Reconstruct omitted storage tries for both
+    // execution writes and read-only cache misses, but only when the authenticated parent account
+    // proves that its storage root is empty.
+    let mut required_storage_tries = hashed_post_state.storages.keys().copied().collect::<Vec<_>>();
+    required_storage_tries.extend(storage_targets);
+    required_storage_tries.sort_unstable();
+    required_storage_tries.dedup();
+    for hashed_address in &required_storage_tries {
+        if sparse.storage_trie_ref(hashed_address).is_some() {
+            continue
+        }
+        if !sparse.is_account_revealed(*hashed_address) {
+            return Err(TrieTransitionError::Failed(format!(
+                "account path was not revealed for storage address={hashed_address}"
+            )))
+        }
+        let storage_root = sparse
+            .get_account_value(hashed_address)
+            .map(|value| TrieAccount::decode(&mut &value[..]))
+            .transpose()
+            .map_err(|err| {
+                TrieTransitionError::Failed(format!(
+                    "failed to decode parent account for storage address={hashed_address}: {err}"
+                ))
+            })?
+            .map_or(EMPTY_ROOT_HASH, |account| account.storage_root);
+        if storage_root != EMPTY_ROOT_HASH {
+            return Err(TrieTransitionError::Failed(format!(
+                "storage proof is missing for address={hashed_address}, root={storage_root}"
+            )))
+        }
+        sparse.insert_storage_trie(*hashed_address, RevealableSparseTrie::revealed_empty());
+    }
+
+    // Match canonical witness generation: wipe first, then apply upserts before removals.
+    // Account leaves are rewritten afterwards so they commit the updated storage roots.
     for (hashed_address, hashed_storage) in &hashed_post_state.storages {
         if hashed_storage.wiped {
             sparse.wipe_storage(*hashed_address).map_err(|err| {
@@ -409,67 +933,50 @@ pub fn try_compute_trustless_state_root(
                 ))
             })?;
         }
-        for (slot_hash, value) in &hashed_storage.storage {
-            if *value == U256::ZERO {
-                if hashed_storage.wiped {
-                    continue
-                }
-                let storage_trie = sparse.storage_trie_mut(hashed_address).ok_or_else(|| {
-                    TrieTransitionError::Failed(format!(
-                        "storage trie was not revealed for address={hashed_address}"
-                    ))
-                })?;
-                for hashed_slot in remove_leaf_and_collect_proofs(storage_trie, *slot_hash)
-                    .map_err(|err| TrieTransitionError::Failed(format!(
-                        "failed to remove storage path: address={hashed_address}, slot={slot_hash}: {err}"
-                    )))?
-                {
-                    required_proofs.push(TrieProofTarget::Storage {
-                        hashed_address: *hashed_address,
-                        hashed_slot,
-                    });
-                }
-            } else {
-                sparse
-                    .update_storage_leaf(
-                        *hashed_address,
-                        Nibbles::unpack(*slot_hash),
-                        alloy_rlp::encode(value),
-                    )
-                    .map_err(|err| TrieTransitionError::Failed(format!(
-                        "failed to update storage path: address={hashed_address}, slot={slot_hash}, value={value}, wiped={}: {err}",
-                        hashed_storage.wiped
-                    )))?;
-            }
-        }
     }
-    dedup_proof_targets(&mut required_proofs);
-    if !required_proofs.is_empty() {
-        return Err(TrieTransitionError::ProofRequired(required_proofs))
+
+    for (hashed_address, hashed_storage) in &hashed_post_state.storages {
+        for (slot_hash, value) in &hashed_storage.storage {
+            if value.is_zero() {
+                continue
+            }
+            sparse
+                .update_storage_leaf(
+                    *hashed_address,
+                    Nibbles::unpack(*slot_hash),
+                    alloy_rlp::encode(value),
+                )
+                .map_err(|err| TrieTransitionError::Failed(format!(
+                    "failed to update storage path: address={hashed_address}, slot={slot_hash}, value={value}, wiped={}: {err}",
+                    hashed_storage.wiped
+                )))?;
+        }
     }
 
     let mut required_proofs = Vec::new();
-    for (hashed_address, account) in &hashed_post_state.accounts {
-        if account.is_none() {
-            let account_trie = sparse
-                .trie_mut()
-                .as_revealed_mut()
-                .ok_or_else(|| TrieTransitionError::Failed("account trie is blind".to_string()))?;
-            for target in
-                remove_leaf_and_collect_proofs(account_trie, *hashed_address).map_err(|err| {
-                    TrieTransitionError::Failed(format!(
-                        "failed to remove account path {hashed_address}: {err}"
-                    ))
-                })?
-            {
-                required_proofs.push(TrieProofTarget::Account(target));
+    for (hashed_address, hashed_storage) in &hashed_post_state.storages {
+        if hashed_storage.wiped {
+            continue
+        }
+        for (slot_hash, value) in &hashed_storage.storage {
+            if !value.is_zero() {
+                continue
             }
-        } else {
-            sparse.update_account_stateless(*hashed_address, *account).map_err(|err| {
+            let storage_trie = sparse.storage_trie_mut(hashed_address).ok_or_else(|| {
                 TrieTransitionError::Failed(format!(
-                    "failed to update account path {hashed_address}, account={account:?}: {err}"
+                    "storage trie was not revealed for address={hashed_address}"
                 ))
             })?;
+            for hashed_slot in remove_leaf_and_collect_proofs(storage_trie, *slot_hash)
+                .map_err(|err| TrieTransitionError::Failed(format!(
+                    "failed to remove storage path: address={hashed_address}, slot={slot_hash}: {err}"
+                )))?
+            {
+                required_proofs.push(TrieProofTarget::Storage {
+                    hashed_address: *hashed_address,
+                    hashed_slot,
+                });
+            }
         }
     }
     dedup_proof_targets(&mut required_proofs);
@@ -477,7 +984,26 @@ pub fn try_compute_trustless_state_root(
         return Err(TrieTransitionError::ProofRequired(required_proofs))
     }
 
-    let mut required_proofs = Vec::new();
+    let mut accounts_to_remove = Vec::new();
+    for (hashed_address, account) in &hashed_post_state.accounts {
+        match account {
+            Some(account) => {
+                let keep_account =
+                    sparse.update_account(*hashed_address, *account).map_err(|err| {
+                        TrieTransitionError::Failed(format!(
+                        "failed to update account path {hashed_address}, account={account:?}: {err}"
+                    ))
+                    })?;
+                if !keep_account {
+                    accounts_to_remove.push(*hashed_address);
+                }
+            }
+            None => accounts_to_remove.push(*hashed_address),
+        }
+    }
+
+    // HashedPostState normally has an account entry for every storage entry. Keep this fallback
+    // for callers that construct storage-only post states directly.
     for hashed_address in hashed_post_state.storages.keys() {
         if hashed_post_state.accounts.contains_key(hashed_address) {
             continue
@@ -488,19 +1014,26 @@ pub fn try_compute_trustless_state_root(
             ))
         })?;
         if !keep_account {
-            let account_trie = sparse
-                .trie_mut()
-                .as_revealed_mut()
-                .ok_or_else(|| TrieTransitionError::Failed("account trie is blind".to_string()))?;
-            for target in
-                remove_leaf_and_collect_proofs(account_trie, *hashed_address).map_err(|err| {
-                    TrieTransitionError::Failed(format!(
-                        "failed to remove empty account {hashed_address}: {err}"
-                    ))
-                })?
-            {
-                required_proofs.push(TrieProofTarget::Account(target));
-            }
+            accounts_to_remove.push(*hashed_address);
+        }
+    }
+
+    accounts_to_remove.sort_unstable();
+    accounts_to_remove.dedup();
+    let mut required_proofs = Vec::new();
+    for hashed_address in accounts_to_remove {
+        let account_trie = sparse
+            .trie_mut()
+            .as_revealed_mut()
+            .ok_or_else(|| TrieTransitionError::Failed("account trie is blind".to_string()))?;
+        for target in
+            remove_leaf_and_collect_proofs(account_trie, hashed_address).map_err(|err| {
+                TrieTransitionError::Failed(format!(
+                    "failed to remove account path {hashed_address}: {err}"
+                ))
+            })?
+        {
+            required_proofs.push(TrieProofTarget::Account(target));
         }
     }
     dedup_proof_targets(&mut required_proofs);
@@ -793,6 +1326,26 @@ mod tests {
     }
 
     #[test]
+    fn transition_witness_materializes_empty_trie_exclusion() {
+        let address = Address::repeat_byte(0x42);
+        let mut sidecar = sidecar_with_headers(11, B256::repeat_byte(0xaa), vec![]);
+        sidecar.parent_state_root = EMPTY_ROOT_HASH;
+        sidecar.cache_miss_targets.accounts.push(address);
+        sidecar.miss_manifest.missed_accounts.push(address);
+        sidecar.witness.state = PartialExecutionWitnessState::MptTransitionNodes(vec![]);
+        sidecar.witness.keys.push(address.to_vec().into());
+        sidecar.witness_commitment = crate::partial_witness_commitment(
+            sidecar.parent_state_root,
+            &sidecar.cache_miss_targets,
+            &sidecar.witness,
+        );
+
+        let materialized = materialize_sidecar_witness(&sidecar).unwrap();
+        assert!(matches!(materialized.state_proof, MaterializedStateProof::Transition(_)));
+        assert_eq!(materialized.accounts.get(&address), Some(&None));
+    }
+
+    #[test]
     fn root_readiness_reports_cache_hit_account_write_as_missing() {
         let address = Address::repeat_byte(0x11);
         let report =
@@ -1082,6 +1635,110 @@ mod tests {
         trie_cache.validate_against_value_cache(&values).unwrap();
         assert!(trie_cache.contains_account_path(&missing_address));
         assert_eq!(trie_cache.state_root(), Some(parent_root));
+    }
+
+    #[test]
+    fn conversion_batches_extension_gaps_across_account_and_storage_proofs() {
+        fn path(first: u8, second: u8, last: u8) -> Nibbles {
+            let mut nibbles = [0u8; 64];
+            nibbles[0] = first;
+            nibbles[1] = second;
+            nibbles[63] = last;
+            Nibbles::from_nibbles(nibbles)
+        }
+
+        let target_path = path(1, 4, 0);
+        let mut builder =
+            HashBuilder::default().with_proof_retainer(ProofRetainer::from_iter([target_path]));
+        for (leaf_path, value) in [
+            (path(1, 2, 1), U256::MAX),
+            (path(1, 2, 2), U256::MAX - U256::from(1)),
+            (path(3, 0, 3), U256::MAX - U256::from(2)),
+        ] {
+            builder.add_leaf(leaf_path, &alloy_rlp::encode(value));
+        }
+        let root = builder.root();
+        let subtree = builder.take_proof_nodes();
+        assert!(subtree.iter().any(|(_, bytes)| matches!(
+            TrieNode::decode(&mut bytes.as_ref()).unwrap(),
+            TrieNode::Extension(ext) if ext.child.is_hash()
+        )));
+
+        let storage_a = B256::repeat_byte(0x11);
+        let storage_b = B256::repeat_byte(0x22);
+        let mut storages = B256Map::default();
+        for address in [storage_b, storage_a] {
+            storages.insert(
+                address,
+                StorageMultiProof {
+                    root,
+                    subtree: subtree.clone(),
+                    branch_node_masks: Default::default(),
+                },
+            );
+        }
+        let proof = MultiProof {
+            account_subtree: subtree,
+            branch_node_masks: Default::default(),
+            storages,
+        };
+
+        let mut packed_target = [0u8; 32];
+        path(1, 2, 0).pack_to(&mut packed_target);
+        let packed_target = B256::from(packed_target);
+        let targets = match multiproof_to_v2_or_request(proof.clone()) {
+            Err(TrieTransitionError::ProofRequired(targets)) => targets,
+            other => panic!("expected batched extension-child requests, got {other:?}"),
+        };
+
+        assert_eq!(
+            targets,
+            vec![
+                TrieProofTarget::Account(packed_target),
+                TrieProofTarget::Storage { hashed_address: storage_a, hashed_slot: packed_target },
+                TrieProofTarget::Storage { hashed_address: storage_b, hashed_slot: packed_target },
+            ]
+        );
+
+        let requested_path = path(1, 2, 0);
+        let mut delta_builder =
+            HashBuilder::default().with_proof_retainer(ProofRetainer::from_iter([requested_path]));
+        for (leaf_path, value) in [
+            (path(1, 2, 1), U256::MAX),
+            (path(1, 2, 2), U256::MAX - U256::from(1)),
+            (path(3, 0, 3), U256::MAX - U256::from(2)),
+        ] {
+            delta_builder.add_leaf(leaf_path, &alloy_rlp::encode(value));
+        }
+        assert_eq!(delta_builder.root(), root);
+        let delta_subtree = delta_builder.take_proof_nodes();
+        let mut delta_storages = B256Map::default();
+        for address in [storage_a, storage_b] {
+            delta_storages.insert(
+                address,
+                StorageMultiProof {
+                    root,
+                    subtree: delta_subtree.clone(),
+                    branch_node_masks: Default::default(),
+                },
+            );
+        }
+        let delta_proof = MultiProof {
+            account_subtree: delta_subtree,
+            branch_node_masks: Default::default(),
+            storages: delta_storages,
+        };
+
+        let mut accumulated_proof = proof;
+        accumulated_proof.extend(delta_proof);
+        let mut trie_cache = PartialTrieNodeCache::new();
+        let merged_root = try_compute_trustless_state_root(
+            accumulated_proof,
+            &mut trie_cache,
+            &BundleState::default(),
+        )
+        .unwrap();
+        assert_eq!(merged_root, root);
     }
 
     #[test]
@@ -1506,6 +2163,85 @@ mod tests {
             TrieProofTarget::Storage { hashed_address: target_address, .. }
                 if *target_address == hashed_address
         )));
+    }
+
+    #[test]
+    fn canonical_v2_reconstructs_omitted_empty_storage_trie() {
+        let address = Address::repeat_byte(0x40);
+        let slot = B256::ZERO;
+        let account = Account {
+            nonce: 1,
+            balance: U256::from(10),
+            bytecode_hash: Some(B256::repeat_byte(0x92)),
+        };
+        let (parent_proof, _) = single_account_proof(address, account, None);
+        let decoded = multiproof_to_v2_or_request(parent_proof).unwrap();
+        assert!(!decoded.storage_proofs.contains_key(&keccak256(address)));
+
+        let new_value = U256::from(9);
+        let mut storage = StorageWithOriginalValues::default();
+        storage.insert(
+            U256::ZERO,
+            StorageSlot { previous_or_original_value: U256::ZERO, present_value: new_value },
+        );
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            address,
+            BundleAccount {
+                info: Some(account_info(account)),
+                original_info: Some(account_info(account)),
+                storage,
+                status: AccountStatus::Changed,
+            },
+        );
+
+        let mut trie_cache = PartialTrieNodeCache::new();
+        let root = try_compute_trustless_state_root_v2(decoded, &mut trie_cache, &bundle).unwrap();
+        let (_, expected_root) = single_account_proof(address, account, Some((slot, new_value)));
+        assert_eq!(root, expected_root);
+    }
+
+    #[test]
+    fn canonical_v2_retains_read_only_empty_storage_target() {
+        let address = Address::repeat_byte(0x43);
+        let slot = B256::ZERO;
+        let account = Account {
+            nonce: 1,
+            balance: U256::from(10),
+            bytecode_hash: Some(B256::repeat_byte(0x94)),
+        };
+        let (parent_proof, parent_root) = single_account_proof(address, account, None);
+        let decoded = multiproof_to_v2_or_request(parent_proof).unwrap();
+        assert!(!decoded.storage_proofs.contains_key(&keccak256(address)));
+
+        let mut trie_cache = PartialTrieNodeCache::new();
+        let root = try_compute_trustless_state_root_v2_with_storage_targets(
+            decoded,
+            &mut trie_cache,
+            &BundleState::default(),
+            [keccak256(address)],
+        )
+        .unwrap();
+        assert_eq!(root, parent_root);
+
+        let mut values = NetworkStateCache::new(
+            Box::new(LastNBlocksPolicy::new(60)),
+            Box::new(LastNBlocksPolicy::new(30)),
+        );
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            address,
+            AccountData {
+                nonce: account.nonce,
+                balance: account.balance,
+                code_hash: account.bytecode_hash,
+            },
+        );
+        accessed.storage.insert((address, slot), U256::ZERO);
+        values.on_block_executed(1, &accessed);
+        trie_cache.retain_from_value_cache(&values);
+        trie_cache.validate_against_value_cache(&values).unwrap();
+        assert!(trie_cache.contains_storage_path(&address, &slot));
     }
 
     #[test]

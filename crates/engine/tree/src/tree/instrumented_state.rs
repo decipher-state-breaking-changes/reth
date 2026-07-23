@@ -9,8 +9,8 @@ use reth_provider::{
     StateProvider, StateRootProvider, StorageRootProvider,
 };
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    updates::TrieUpdates, AccountProof, DecodedMultiProofV2, HashedPostState, HashedStorage,
+    MultiProof, MultiProofTargets, MultiProofTargetsV2, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
     sync::{
@@ -231,6 +231,14 @@ impl<S: StateProofProvider> StateProofProvider for InstrumentedStateProvider<S> 
         targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
         self.state_provider.multiproof(input, targets)
+    }
+
+    fn multiproof_v2(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargetsV2,
+    ) -> ProviderResult<DecodedMultiProofV2> {
+        self.state_provider.multiproof_v2(input, targets)
     }
 
     fn witness(

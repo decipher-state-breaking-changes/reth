@@ -28,12 +28,11 @@ A block's execution touches a set of accounts, storage slots, and bytecodes
 (`BlockAccessedState`). The `NetworkStateCache` holds whatever was accessed within
 the last *N* blocks. Its misses are exactly the values and bytecodes the sidecar
 must supply; cache hits remain authoritative even if the sparse trie happens to
-contain additional decoded nodes. The parent-state multiproof can also contain
-structural targets needed for execution-diff paths or canonical branch/extension
-transitions, so proof-target count is not always identical to value-cache miss
-count. The sidecar carries no post-state proof: execution updates storage and
-account paths locally, and the result is checked against the consensus block
-root.
+contain additional decoded nodes. The state payload is a flat canonical transition
+witness: it contains parent-state node preimages for cache misses, execution-diff
+paths, and any branch/extension structure discovered while applying the complete
+transition. The sidecar carries no post-state proof: execution updates storage and
+account paths locally, and the result is checked against the consensus block root.
 
 ## Modules
 
@@ -62,13 +61,20 @@ caches can be restored together or a protocol bootstrap mechanism is added.
 
 ## Per-block trie synchronization
 
-For each block, the value-cache miss is computed against the parent cache and the value-cache
-transition applies its normal account and storage windows. The parent multiproof is then revealed
-into a transactional sparse-trie clone, where the execution diff updates account values, storage
-values, and account storage roots locally. The computed root must equal the block's consensus
-state root. The already-computed value-cache membership then drives sparse-trie retention. A
-failure rolls back the value-cache transition and discards the trie clone; the two caches advance
-together only after the block checks succeed.
+For each block, execution records touched parent-state values while the value-cache miss is
+computed against the parent cache. Cache misses remain parent-value proof targets; they are not
+inserted into the post-state diff. The builder starts one transactional sparse-trie session with
+the real execution diff, reveals an initial native V2 proof for misses and initially
+uncovered mutation paths, and then resumes the same session whenever a blinded structural child is
+encountered. Paths already authenticated by the persistent trie cache are omitted from provider
+targets. Each structural request fetches only the newly visible `(key, min_len)` delta, with no
+transition replay and no accumulated-proof regeneration.
+
+Storage wipe, upsert, removal, account upsert, and account removal ordering is preserved. The
+session's final root is the builder root check; the normal builder path does not perform a second
+DB-free transition replay. The root must equal the consensus block root before value-cache
+membership drives sparse-trie retention. A failure rolls back the value-cache transition and
+discards the trie clone; the two caches advance together only after the block checks succeed.
 
 Retention keeps a complete lookup witness for every cached value. Existing accounts and nonzero
 storage slots retain their inclusion paths. Nonexistent accounts and zero storage slots retain the
@@ -81,24 +87,27 @@ Only `NetworkStateCache` determines hits, misses, eviction, and cache anchors. A
 trie nodes never change the sidecar miss manifest or its anchors, and the sidecar carries no
 post-state proof.
 
-## Structural proof retries
+## Cache-aware structural witness generation
 
-Leaf deletion can collapse a branch or extension. A blinded sibling hash is sufficient to commit
-to the parent state, but it does not reveal the sibling's node kind needed to construct the new
-canonical shape. The sparse trie can therefore request additional parent-state structural nodes
-while applying the execution diff.
+Leaf deletion can collapse a branch or extension. A blinded sibling hash commits to the parent
+state but does not reveal the sibling's node kind, which is needed to construct the new canonical
+shape. These structural dependencies cannot always be predicted from the transaction read set
+alone.
 
-The current ExEx provider exposes legacy leaf-key multiproofs rather than V2 structural targets.
-`partial-stateless` converts those proofs to V2 locally. If a hashed extension child is missing,
-the converter currently reports the first missing target; the ExEx adds it to the cumulative
-legacy target set, regenerates the full proof, and retries from the parent trie snapshot. Deletion
-targets discovered by one update phase are batched, but account conversion, storage conversion,
-and the later update phases can still require separate rounds.
+The builder does not issue legacy leaf multiproofs or retry the transition from scratch. The
+`StateProofProvider::multiproof_v2` API preserves native account/storage targets and `min_len`
+through latest, historical, in-memory overlay, and delegating providers. A 128-round cap and
+no-progress check remain as safety guards for chained structural gaps.
 
-The intended follow-up is to collect all conversion gaps in one pass, request and merge only proof
-deltas, and ultimately preserve the sparse-trie callback's `(key, min_len)` through a V2-capable
-provider API. These retries fetch trie structure only: they do not turn a value-cache hit into a
-miss or change either cache anchor.
+The production sidecar uses the flat transition-node format. Structural targets are normalized to
+root-to-target paths (`min_len=0`) and their RLP preimages are hash-deduplicated. Native V2 proof
+generation computes storage proofs first and reuses their storage roots while encoding account
+leaves, avoiding a second traversal of targeted storage tries.
+
+The builder session advances its persistent trie cache and checks the consensus root directly. A
+separate serialized-sidecar re-execution is optional and runs only when `PS_SIDECAR_PREFLIGHT` is
+set or the role is `builder-verifier`. Legacy multiproof and flat transition-node sidecars remain
+decodable.
 
 ## Binaries & examples
 

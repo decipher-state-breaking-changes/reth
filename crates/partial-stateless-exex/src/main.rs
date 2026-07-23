@@ -8,7 +8,7 @@
 //! 1. Extracts `BlockAccessedState` via EVM simulation of each block
 //! 2. Updates the `NetworkStateCache` with the accessed state
 //! 3. Computes and logs cache miss ratio (= witness requirement)
-//! 4. Computes actual Merkle proof (witness) size for cache-missed state
+//! 4. Builds and measures the canonical parent-state transition witness
 
 mod sidecar_create;
 mod sidecar_io;
@@ -232,8 +232,8 @@ async fn partial_stateless_exex<
     }
 
     // Optional per-thread resource metrics (CPU time + page faults) captured
-    // around the cold multiproof, to attribute its cost between compute and
-    // disk I/O. Off by default and gated behind `PS_RESOURCE_METRICS`; when
+    // around the canonical transition witness, to attribute its cost between
+    // compute and disk I/O. Off by default and gated behind `PS_RESOURCE_METRICS`; when
     // disabled the getrusage syscalls are skipped and the metric fields stay None.
     let resource_metrics = env_flag("PS_RESOURCE_METRICS");
     if resource_metrics {
@@ -249,7 +249,7 @@ async fn partial_stateless_exex<
         if compute_baseline {
             warn!(
                 target: "partial_stateless",
-                "PS_WITNESS_BASELINE runs before the partial multiproof; resource/page-fault metrics for the partial proof may be lower because the full baseline can warm the OS page cache"
+                "PS_WITNESS_BASELINE runs before the transition witness; resource/page-fault metrics may be lower because the full baseline can warm the OS page cache"
             );
         }
     }

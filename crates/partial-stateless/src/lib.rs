@@ -43,5 +43,8 @@ pub use trie_cache::{
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use witness_check::{
     compute_trustless_state_root, root_witness_targets_from_bundle,
-    try_compute_trustless_state_root, TrieProofTarget, TrieTransitionError,
+    try_compute_trustless_state_root, try_compute_trustless_state_root_v2,
+    try_compute_trustless_state_root_v2_with_storage_targets, CacheAwareTransitionProgress,
+    CacheAwareTrieTransition, MaterializedStateProof, TrieProofTarget, TrieProofTargetV2,
+    TrieTransitionError,
 };

@@ -16,11 +16,11 @@ installed.
    validator joining at this block would have to be sent.
 3. Applies the tentative `NetworkStateCache` transition (including `LastNBlocksPolicy` eviction),
    retaining a rollback record until the sparse-trie transition and sidecar checks succeed.
-4. Computes the parent-state Merkle multiproof for cache misses plus uncovered execution-diff
-   paths. If a canonical deletion or legacy-to-V2 extension conversion needs a blinded
-   sibling/child, it adds a structural target and regenerates the cumulative legacy multiproof.
-   Structural targets do not change the cache-miss manifest. It writes a **witness sidecar** + a
-   JSON benchmark **manifest** to `./sidecar/`.
+4. Generates a native V2 parent-state proof for cache misses plus execution-diff paths not already
+   authenticated by the trie cache. It reveals that proof into one transactional sparse-trie
+   session, fetches only newly discovered structural proof deltas, and resumes the same transition.
+   The resulting flat, hash-deduplicated node witness is written with a JSON benchmark
+   **manifest** to `./sidecar/`. Structural targets do not change the cache-miss manifest.
 5. *(optional)* Runs the **provider-assisted sidecar preflight** — re-executes
    the block through a cache+witness-backed provider and checks the miss set plus
    cache-anchor transition.
@@ -28,7 +28,7 @@ installed.
    *all* accessed state, ignoring the cache — to report the reduction ratio.
 7. Logs accessed/missed counts, miss ratio, witness size, and cache footprint.
 
-The parent-state multiproof is revealed into a cloned local sparse trie. Storage and account
+The parent-state proof is revealed into a cloned local sparse trie. Storage and account
 changes are applied locally and the computed post-state root is checked against the block header.
 The tentative flat-cache membership produced in step 3 is then mirrored into the sparse trie:
 inclusion paths are retained for existing values, while zero and nonexistent values retain the
@@ -74,7 +74,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
-| `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around the partial multiproof (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
+| `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around transition-witness construction (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
 | `PS_SIDECAR_PREFLIGHT=1` | run provider-assisted validator preflight for each sidecar (an extra re-execution per block) |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
 
@@ -121,30 +121,34 @@ When `PS_RESOURCE_METRICS` is unset, the partial stats' `cpu_time_ms`,
 syscalls are made. The metrics are Linux-only (`RUSAGE_THREAD`); on other
 platforms they log zeros. If comparing against the baseline, note that
 `PS_WITNESS_BASELINE` runs first and can warm the OS page cache, deflating the
-partial proof's page-fault counts.
+partial witness page-fault counts.
 
-### Structural proof retries
+### Transition-witness construction
 
-Some post-state deletions require the decoded type of a blinded sibling or extension child before
-the sparse trie can form the canonical collapsed branch. This is a structural parent-state proof
-requirement, not a value-cache miss. The current provider interface accepts legacy leaf-key
-targets, while the sparse-trie update API describes structural requests as `(key, min_len)` V2
-targets. The adapter currently zero-pads the requested prefix, drops `min_len`, and converts the
-legacy proof to V2 locally.
+The initial builder target set is the union of value-cache misses and mutation paths not already
+authenticated by the persistent trie cache. It requests that set once through
+`StateProofProvider::multiproof_v2`. Native V2 proof generation builds targeted storage proofs
+first and reuses their roots when encoding account leaves, avoiding a second traversal of those
+storage tries when a full storage proof is available.
 
-The current retry loop adds newly discovered targets to the cumulative target set and regenerates
-the entire legacy multiproof. Legacy-to-V2 conversion also stops at the first missing hashed
-extension child, although deletion targets within one update phase are batched. Thus a block can
-show several one-target retries followed by a larger deletion batch. Planned improvements are to:
+The proof is revealed into one transactional sparse-trie clone. A deletion can expose a blinded
+sibling or extension child whose node kind is needed for canonical branch compression. In that
+case the transition reports all currently visible `(key, min_len)` targets, the builder subtracts
+targets already requested, fetches only the delta, and resumes the unfinished session. There is no
+full proof regeneration or transition replay. An empty delta is rejected as no progress, and a
+128-round cap guards malformed or unexpectedly deep chains of structural dependencies.
 
-1. collect every account/storage conversion gap before retrying;
-2. request only new proof targets and merge each delta into the accumulated proof; and
-3. expose V2 proof generation through the provider so `min_len` is preserved.
+Production sidecars use only `MptTransitionNodes`: deterministic, hash-deduplicated parent-state
+RLP node preimages. Because this flat format carries no account/storage path context, storage
+targets also include the account path needed to reconnect their storage root to the state root.
+Legacy `MptMultiProof` sidecars remain decodable for compatibility.
 
-Until those changes land, `partial_sidecar_stats.computation_time_ms` covers cumulative wall time
-from the first legacy proof request through the final successful proof request, including time
-spent in failed local trie attempts between requests. The final sidecar still contains one
-self-contained, parent-root-verified proof.
+For benchmark logs, `initial_provider_us` is the initial native V2 provider call,
+`structural_provider_us` is the sum of later context/structural provider calls, and
+`provider_calls` counts both. `partial_sidecar_stats.computation_time_ms` covers the initial proof,
+transactional trie clone, proof deltas, transition, root check, and flat-witness decoding. It
+excludes cache retention, optional trie-cache validation, and optional sidecar preflight, which
+have separate timings or logs.
 
 ### Trie-shape diagnostics
 
@@ -156,9 +160,9 @@ post-state root. Successful blocks log clone, update, retention, and validation
 timings; memory; decoded account/storage node counts; and hashed-key prefix
 coverage at depths zero through five.
 
-The clone and local-root timing fields describe the final successful retry only; discarded clones
-and failed local transitions are included in the cumulative proof computation time instead.
-Retention is normal per-block cache work. Full validation is diagnostic-only and is skipped when
+The clone timing covers the single transactional trie-cache clone. The local-root timing covers the
+resumable transition, including waits for any structural proof deltas. Retention is normal
+per-block cache work. Full validation is diagnostic-only and is skipped when
 `PS_TRIE_CACHE_DIAGNOSTICS` is unset.
 
 Combine diagnostics with `PS_SIDECAR_PREFLIGHT=1` for a bounded correctness run.

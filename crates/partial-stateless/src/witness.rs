@@ -27,21 +27,21 @@ pub struct WitnessResult {
     pub target_accounts: usize,
     /// Number of unique storage slots in the proof targets.
     pub target_storage_slots: usize,
-    /// Time taken to compute the multiproof (if measured).
+    /// Wall-clock time taken to construct the witness (if measured).
     pub computation_time_ms: Option<u64>,
-    /// CPU time (user+sys) consumed by the calling thread while computing the
-    /// multiproof, in milliseconds. Compared against `computation_time_ms`
+    /// CPU time (user+sys) consumed by the calling thread during witness construction, in
+    /// milliseconds. Compared against `computation_time_ms`
     /// (wall clock) this separates compute-bound blocks (cpu ≈ wall) from
     /// I/O/wait-bound blocks (cpu ≪ wall). `None` when not instrumented.
     #[serde(default)]
     pub cpu_time_ms: Option<u64>,
-    /// Major page faults taken by the calling thread during multiproof
-    /// computation (faults served from disk/swap, not the page cache). A
+    /// Major page faults taken by the calling thread during witness
+    /// construction (faults served from disk/swap, not the page cache). A
     /// nonzero value means the cold trie read actually hit disk — the
     /// signature of the environmental I/O tail. `None` when not instrumented.
     #[serde(default)]
     pub major_page_faults: Option<u64>,
-    /// Minor page faults during multiproof (served without disk I/O).
+    /// Minor page faults during witness construction (served without disk I/O).
     /// `None` when not instrumented.
     #[serde(default)]
     pub minor_page_faults: Option<u64>,

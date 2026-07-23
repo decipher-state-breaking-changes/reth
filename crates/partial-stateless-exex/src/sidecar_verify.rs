@@ -1,6 +1,8 @@
 use crate::{
     sidecar_io::{read_sidecar, sidecar_path},
-    sidecar_reexec::{verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits},
+    sidecar_reexec::{
+        verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits, TrieCacheDisposition,
+    },
     CacheConfig,
 };
 use partial_stateless::{
@@ -59,6 +61,7 @@ where
         &sidecar,
         limits,
         trie_cache,
+        TrieCacheDisposition::Commit,
     )?;
 
     if !report.root_witness_completeness.trustless_root_ready {

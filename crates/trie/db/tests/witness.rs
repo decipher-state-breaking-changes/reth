@@ -13,8 +13,9 @@ use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{test_utils::create_test_provider_factory, HashingWriter};
 use reth_storage_api::StorageSettingsCache;
 use reth_trie::{
-    proof::Proof, witness::TrieWitness, ExecutionWitnessMode, HashedPostState, HashedStorage,
-    LeafNode, MultiProofTargets, Nibbles, StateRoot, StorageRoot, TrieNodeV2,
+    proof::Proof, witness::TrieWitness, DecodedMultiProof, DecodedMultiProofV2,
+    ExecutionWitnessMode, HashedPostState, HashedStorage, LeafNode, MultiProofTargets,
+    MultiProofTargetsV2, Nibbles, ProofV2Target, StateRoot, StorageRoot, TrieInput, TrieNodeV2,
 };
 use reth_trie_db::{
     DatabaseHashedCursorFactory, DatabaseProof, DatabaseStateRoot, DatabaseStorageRoot,
@@ -27,6 +28,110 @@ type DbStorageRoot<'a, TX, A> =
     StorageRoot<DatabaseTrieCursorFactory<&'a TX, A>, DatabaseHashedCursorFactory<&'a TX>>;
 type DbProof<'a, TX, A> =
     Proof<DatabaseTrieCursorFactory<&'a TX, A>, DatabaseHashedCursorFactory<&'a TX>>;
+
+#[test]
+fn native_v2_proof_preserves_overlay_root_context_and_min_len() {
+    let factory = create_test_provider_factory();
+    let provider = factory.provider_rw().unwrap();
+    let address = Address::repeat_byte(0x11);
+    let other_address = Address::repeat_byte(0x22);
+    let overlay_address = Address::repeat_byte(0x33);
+    let slot = B256::repeat_byte(0x44);
+    let hashed_address = keccak256(address);
+    let hashed_slot = keccak256(slot);
+    let hashed_overlay_address = keccak256(overlay_address);
+
+    provider
+        .insert_account_for_hashing([
+            (address, Some(Account::default())),
+            (other_address, Some(Account { nonce: 1, ..Default::default() })),
+        ])
+        .unwrap();
+    provider
+        .insert_storage_for_hashing([(address, [StorageEntry { key: slot, value: U256::from(7) }])])
+        .unwrap();
+
+    reth_trie_db::with_adapter!(provider, |A| {
+        let expected_root = DbStateRoot::<_, A>::from_tx(provider.tx_ref()).root().unwrap();
+        let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(provider.tx_ref());
+        let full = proof
+            .overlay_multiproof_v2(
+                TrieInput::default(),
+                MultiProofTargetsV2 {
+                    account_targets: vec![ProofV2Target::new(hashed_address)],
+                    storage_targets: HashMap::from_iter([(
+                        hashed_address,
+                        vec![ProofV2Target::new(hashed_slot)],
+                    )]),
+                },
+            )
+            .unwrap();
+        let root = full.account_proofs.iter().find(|node| node.path.is_empty()).unwrap();
+        assert_eq!(keccak256(alloy_rlp::encode(&root.node)), expected_root);
+        assert!(full.storage_proofs.contains_key(&hashed_address));
+
+        let legacy = proof
+            .overlay_multiproof(
+                TrieInput::default(),
+                MultiProofTargets::account_with_slots(hashed_address, [hashed_slot]),
+            )
+            .unwrap();
+        let legacy: DecodedMultiProofV2 = DecodedMultiProof::try_from(legacy).unwrap().into();
+        let legacy_root = legacy.account_proofs.iter().find(|node| node.path.is_empty()).unwrap();
+        assert_eq!(keccak256(alloy_rlp::encode(&legacy_root.node)), expected_root);
+        let native_storage_root =
+            full.storage_proofs[&hashed_address].iter().find(|node| node.path.is_empty()).unwrap();
+        let legacy_storage_root = legacy.storage_proofs[&hashed_address]
+            .iter()
+            .find(|node| node.path.is_empty())
+            .unwrap();
+        assert_eq!(
+            keccak256(alloy_rlp::encode(&native_storage_root.node)),
+            keccak256(alloy_rlp::encode(&legacy_storage_root.node))
+        );
+
+        let suffix_only = proof
+            .overlay_multiproof_v2(
+                TrieInput::default(),
+                MultiProofTargetsV2 {
+                    account_targets: vec![ProofV2Target::new(hashed_address).with_min_len(1)],
+                    storage_targets: HashMap::from_iter([(
+                        hashed_address,
+                        vec![ProofV2Target::new(hashed_slot).with_min_len(1)],
+                    )]),
+                },
+            )
+            .unwrap();
+        assert!(suffix_only.account_proofs.iter().all(|node| node.path.len() >= 1));
+        assert!(suffix_only.storage_proofs[&hashed_address]
+            .iter()
+            .all(|node| node.path.len() >= 1));
+
+        let overlay = HashedPostState {
+            accounts: HashMap::from_iter([(
+                hashed_overlay_address,
+                Some(Account { nonce: 2, ..Default::default() }),
+            )]),
+            storages: HashMap::default(),
+        };
+        let overlay_root =
+            DbStateRoot::<_, A>::overlay_root(provider.tx_ref(), &overlay.clone().into_sorted())
+                .unwrap();
+        let overlay_proof = proof
+            .overlay_multiproof_v2(
+                TrieInput::from_state(overlay),
+                MultiProofTargetsV2 {
+                    account_targets: vec![ProofV2Target::new(hashed_overlay_address)],
+                    storage_targets: HashMap::default(),
+                },
+            )
+            .unwrap();
+        let overlay_root_node =
+            overlay_proof.account_proofs.iter().find(|node| node.path.is_empty()).unwrap();
+        assert_eq!(keccak256(alloy_rlp::encode(&overlay_root_node.node)), overlay_root);
+    });
+}
+
 #[test]
 fn includes_empty_node_preimage() {
     let factory = create_test_provider_factory();

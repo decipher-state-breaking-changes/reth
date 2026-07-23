@@ -15,8 +15,8 @@ use reth_provider::{
 };
 use reth_revm::db::BundleState;
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    updates::TrieUpdates, AccountProof, DecodedMultiProofV2, HashedPostState, HashedStorage,
+    MultiProof, MultiProofTargets, MultiProofTargetsV2, StorageMultiProof, StorageProof, TrieInput,
 };
 use std::{
     fmt,
@@ -585,6 +585,14 @@ impl<S: StateProofProvider, const PREWARM: bool> StateProofProvider
         targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
         self.state_provider.multiproof(input, targets)
+    }
+
+    fn multiproof_v2(
+        &self,
+        input: TrieInput,
+        targets: MultiProofTargetsV2,
+    ) -> ProviderResult<DecodedMultiProofV2> {
+        self.state_provider.multiproof_v2(input, targets)
     }
 
     fn witness(

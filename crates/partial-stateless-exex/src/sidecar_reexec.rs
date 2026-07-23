@@ -4,13 +4,13 @@ use partial_stateless::{
     accessed_state::BlockAccessedState,
     check_sidecar_context, check_sidecar_miss_targets,
     network_cache::{NetworkStateCache, UpdateStats},
-    try_compute_trustless_state_root,
+    try_compute_trustless_state_root, try_compute_trustless_state_root_v2_with_storage_targets,
     witness_check::{
         materialize_sidecar_witness_with_limits, root_witness_completeness_from_bundle_with_cache,
         SidecarWitnessCheckLimits,
     },
-    CacheAnchor, PartialStatelessSidecar, PartialTrieNodeCache, RootWitnessCompletenessReport,
-    StateTargetSet,
+    CacheAnchor, MaterializedStateProof, PartialStatelessSidecar, PartialTrieNodeCache,
+    RootWitnessCompletenessReport, StateTargetSet,
 };
 use reth_ethereum::EthPrimitives;
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -21,6 +21,16 @@ use revm::database::State;
 use std::collections::HashMap;
 
 pub(crate) type SidecarReexecLimits = SidecarWitnessCheckLimits;
+
+/// Controls whether a successfully verified transition replaces the caller's trie cache.
+///
+/// Builder-side preflights only need the verification result. Discarding their transactional
+/// result avoids cloning the parent trie cache once in the caller and then again here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrieCacheDisposition {
+    Commit,
+    Discard,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SidecarReexecReport {
@@ -42,6 +52,7 @@ pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm>(
     sidecar: &PartialStatelessSidecar,
     limits: &SidecarReexecLimits,
     trie_cache: &mut PartialTrieNodeCache,
+    trie_cache_disposition: TrieCacheDisposition,
 ) -> Result<SidecarReexecReport>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -51,7 +62,7 @@ where
     let materialized = materialize_sidecar_witness_with_limits(sidecar, limits)
         .map_err(|err| eyre!("sidecar witness check failed: {err}"))?;
     // Retained for trustless root computation before the other fields are moved into the provider.
-    let witness_multiproof = materialized.multiproof;
+    let state_proof = materialized.state_proof;
     let witness_provider = WitnessBackedStateProvider {
         cache: prev_cache,
         witness_accounts: materialized.accounts,
@@ -76,11 +87,26 @@ where
     // Apply the block to a transactional sparse-trie snapshot. The original cache is left
     // untouched until the consensus root and next cache anchor have both been checked.
     let mut next_trie_cache = trie_cache.clone();
-    let trustless_state_root = try_compute_trustless_state_root(
-        witness_multiproof,
-        &mut next_trie_cache,
-        &execution_output.state,
-    )
+    let hashed_post_state = full_provider.hashed_post_state(&execution_output.state);
+    let transition_storage_targets = sidecar
+        .cache_miss_targets
+        .storage
+        .iter()
+        .map(|(address, _)| alloy_primitives::keccak256(address))
+        .collect::<Vec<_>>();
+    let trustless_state_root = match state_proof {
+        MaterializedStateProof::Legacy(proof) => {
+            try_compute_trustless_state_root(proof, &mut next_trie_cache, &execution_output.state)
+        }
+        MaterializedStateProof::Transition(proof) => {
+            try_compute_trustless_state_root_v2_with_storage_targets(
+                proof,
+                &mut next_trie_cache,
+                &execution_output.state,
+                transition_storage_targets.iter().copied(),
+            )
+        }
+    }
     .map_err(|err| eyre!("local sparse-trie transition failed: {err}"))?;
     if trustless_state_root != block.state_root() {
         bail!(
@@ -90,7 +116,6 @@ where
         );
     }
 
-    let hashed_post_state = full_provider.hashed_post_state(&execution_output.state);
     let (computed_state_root, _) = full_provider
         .state_root_with_updates(hashed_post_state)
         .map_err(|err| eyre!("provider-assisted state root failed: {err}"))?;
@@ -121,6 +146,7 @@ where
         sidecar.next_cache_anchor,
         trie_cache,
         next_trie_cache,
+        trie_cache_disposition,
     )?;
 
     Ok(SidecarReexecReport {
@@ -143,6 +169,7 @@ fn apply_cache_transition_and_check(
     expected_next_anchor: CacheAnchor,
     trie_cache: &mut PartialTrieNodeCache,
     mut next_trie_cache: PartialTrieNodeCache,
+    trie_cache_disposition: TrieCacheDisposition,
 ) -> Result<(UpdateStats, CacheAnchor)> {
     let cache_update = cache.on_block_executed(block_number, accessed);
     next_trie_cache.retain_from_value_cache(cache);
@@ -155,7 +182,9 @@ fn apply_cache_transition_and_check(
             "next cache anchor mismatch: expected {expected_next_anchor:?}, got {next_cache_anchor:?}"
         );
     }
-    *trie_cache = next_trie_cache;
+    if trie_cache_disposition == TrieCacheDisposition::Commit {
+        *trie_cache = next_trie_cache;
+    }
     Ok((cache_update, next_cache_anchor))
 }
 
@@ -288,6 +317,7 @@ mod tests {
             },
             &mut trie_cache,
             PartialTrieNodeCache::new(),
+            TrieCacheDisposition::Commit,
         )
         .expect_err("wrong next cache root must fail");
 
@@ -295,5 +325,47 @@ mod tests {
         assert_eq!(cache.cache_root(), root_before);
         assert_eq!(trie_cache.cache_root(), trie_root_before);
         assert!(!cache.contains_account(&address));
+    }
+
+    #[test]
+    fn successful_preflight_can_discard_transactional_trie_cache() {
+        fn cache_at_block_99() -> NetworkStateCache {
+            let mut cache = NetworkStateCache::new(
+                Box::new(LastNBlocksPolicy::new(60)),
+                Box::new(LastNBlocksPolicy::new(30)),
+            );
+            cache.on_block_executed(99, &BlockAccessedState::default());
+            cache
+        }
+
+        let block_hash = B256::repeat_byte(0x22);
+        let policy_id = B256::repeat_byte(0x33);
+        let address = Address::repeat_byte(0x11);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 1, balance: U256::from(10), code_hash: None });
+
+        let mut expected_cache = cache_at_block_99();
+        expected_cache.on_block_executed(100, &accessed);
+        let expected_anchor = expected_cache.cache_anchor(100, block_hash, policy_id);
+
+        let mut cache = cache_at_block_99();
+        let mut trie_cache = PartialTrieNodeCache::new();
+        apply_cache_transition_and_check(
+            &mut cache,
+            &accessed,
+            100,
+            block_hash,
+            policy_id,
+            expected_anchor,
+            &mut trie_cache,
+            PartialTrieNodeCache::new(),
+            TrieCacheDisposition::Discard,
+        )
+        .expect("valid preflight transition should succeed");
+
+        assert_eq!(cache.current_block(), 100);
+        assert!(!trie_cache.tracks_account(&address));
     }
 }

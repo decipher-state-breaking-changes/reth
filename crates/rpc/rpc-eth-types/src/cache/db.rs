@@ -97,6 +97,14 @@ impl reth_storage_api::StateProofProvider for StateProviderTraitObjWrapper {
         self.0.multiproof(input, targets)
     }
 
+    fn multiproof_v2(
+        &self,
+        input: reth_trie::TrieInput,
+        targets: reth_trie::MultiProofTargetsV2,
+    ) -> ProviderResult<reth_trie::DecodedMultiProofV2> {
+        self.0.multiproof_v2(input, targets)
+    }
+
     fn witness(
         &self,
         input: reth_trie::TrieInput,

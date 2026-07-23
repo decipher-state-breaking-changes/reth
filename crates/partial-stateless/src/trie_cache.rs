@@ -139,12 +139,22 @@ impl PartialTrieNodeCache {
 
     /// Whether the current sparse shape can prove this account value or absence.
     pub fn contains_account_path(&self, address: &Address) -> bool {
-        self.sparse.is_account_revealed(keccak256(address))
+        self.contains_hashed_account_path(keccak256(address))
+    }
+
+    /// Whether the current sparse shape can prove this hashed account path.
+    pub fn contains_hashed_account_path(&self, hashed_address: B256) -> bool {
+        self.sparse.is_account_revealed(hashed_address)
     }
 
     /// Whether the current sparse shape can prove this storage value or absence.
     pub fn contains_storage_path(&self, address: &Address, slot: &B256) -> bool {
-        self.sparse.check_valid_storage_witness(keccak256(address), keccak256(slot))
+        self.contains_hashed_storage_path(keccak256(address), keccak256(slot))
+    }
+
+    /// Whether the current sparse shape can prove this hashed storage path.
+    pub fn contains_hashed_storage_path(&self, hashed_address: B256, hashed_slot: B256) -> bool {
+        self.sparse.check_valid_storage_witness(hashed_address, hashed_slot)
     }
 
     #[cfg(test)]

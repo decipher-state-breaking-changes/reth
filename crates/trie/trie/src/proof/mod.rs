@@ -153,22 +153,11 @@ where
             .map(|(addr, ps)| (addr, ps.freeze()))
             .collect();
 
-        // Compute account proofs using the V2 proof calculator with sync account encoding.
-        let account_trie_cursor = self.trie_cursor_factory.account_trie_cursor()?;
-        let hashed_account_cursor = self.hashed_cursor_factory.hashed_account_cursor()?;
-        let mut account_value_encoder = SyncAccountValueEncoder::new(
-            self.trie_cursor_factory.clone(),
-            self.hashed_cursor_factory.clone(),
-        )
-        .with_storage_prefix_sets(storage_prefix_sets.clone());
-        let mut account_calculator =
-            proof_v2::ProofCalculator::new(account_trie_cursor, hashed_account_cursor)
-                .with_prefix_set(self.prefix_sets.account_prefix_set.freeze());
-        let account_proofs =
-            account_calculator.proof(&mut account_value_encoder, &mut account_targets)?;
-
-        // Compute storage proofs for each targeted account.
+        // Compute storage proofs first. A full proof contains its root node, so the account proof
+        // can reuse that root instead of traversing the same storage trie a second time.
         let mut storage_proofs =
+            B256Map::with_capacity_and_hasher(storage_targets.len(), Default::default());
+        let mut precomputed_storage_roots =
             B256Map::with_capacity_and_hasher(storage_targets.len(), Default::default());
         for (hashed_address, mut targets) in storage_targets {
             let storage_trie_cursor =
@@ -183,8 +172,25 @@ where
                 storage_calculator = storage_calculator.with_prefix_set(prefix_set.clone());
             }
             let proofs = storage_calculator.storage_proof(hashed_address, &mut targets)?;
+            if let Some(storage_root) = storage_calculator.compute_root_hash(&proofs)? {
+                precomputed_storage_roots.insert(hashed_address, storage_root);
+            }
             storage_proofs.insert(hashed_address, proofs);
         }
+        // Compute account proofs after storage proofs so account leaf encoding can reuse roots.
+        let account_trie_cursor = self.trie_cursor_factory.account_trie_cursor()?;
+        let hashed_account_cursor = self.hashed_cursor_factory.hashed_account_cursor()?;
+        let mut account_value_encoder = SyncAccountValueEncoder::new(
+            self.trie_cursor_factory.clone(),
+            self.hashed_cursor_factory.clone(),
+        )
+        .with_storage_prefix_sets(storage_prefix_sets)
+        .with_precomputed_storage_roots(precomputed_storage_roots);
+        let mut account_calculator =
+            proof_v2::ProofCalculator::new(account_trie_cursor, hashed_account_cursor)
+                .with_prefix_set(self.prefix_sets.account_prefix_set.freeze());
+        let account_proofs =
+            account_calculator.proof(&mut account_value_encoder, &mut account_targets)?;
 
         Ok(DecodedMultiProofV2 { account_proofs, storage_proofs })
     }

@@ -1,6 +1,9 @@
 //! Merkle trie proofs.
 
-use crate::{BranchNodeMasks, BranchNodeMasksMap, Nibbles, ProofTrieNodeV2, TrieAccount};
+use crate::{
+    BranchNodeMasks, BranchNodeMasksMap, MultiProofTargetsV2, Nibbles, ProofTrieNodeV2,
+    ProofV2Target, TrieAccount, TrieNodeV2,
+};
 use alloc::{borrow::Cow, collections::VecDeque, vec::Vec};
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{
@@ -8,9 +11,9 @@ use alloy_primitives::{
     map::{hash_map, B256Map, B256Set},
     Address, Bytes, B256, U256,
 };
-use alloy_rlp::{encode_fixed_size, Decodable, EMPTY_STRING_CODE};
+use alloy_rlp::{encode_fixed_size, Decodable, Encodable, EMPTY_STRING_CODE};
 use alloy_trie::{
-    nodes::TrieNode,
+    nodes::{BranchNodeRef, TrieNode},
     proof::{verify_proof, DecodedProofNodes, ProofNodes, ProofVerificationError},
     EMPTY_ROOT_HASH,
 };
@@ -480,31 +483,45 @@ impl DecodedMultiProofV2 {
         let mut storage_nodes: B256Map<Vec<(Nibbles, TrieNode, Option<BranchNodeMasks>)>> =
             B256Map::default();
 
-        let mut queue: VecDeque<(B256, Nibbles, Option<B256>)> =
-            VecDeque::from([(state_root, Nibbles::default(), None)]);
+        enum WitnessNode {
+            Hashed(B256),
+            Inline(Vec<u8>),
+        }
 
-        while let Some((hash, path, maybe_account)) = queue.pop_front() {
-            let Some(rlp_bytes) = witness.get(&hash) else { continue };
-            let trie_node = TrieNode::decode(&mut rlp_bytes.as_ref())?;
+        let mut queue: VecDeque<(WitnessNode, Nibbles, Option<B256>)> =
+            VecDeque::from([(WitnessNode::Hashed(state_root), Nibbles::default(), None)]);
+
+        while let Some((node, path, maybe_account)) = queue.pop_front() {
+            let trie_node = match node {
+                WitnessNode::Hashed(hash) => {
+                    let Some(rlp_bytes) = witness.get(&hash) else { continue };
+                    TrieNode::decode(&mut rlp_bytes.as_ref())?
+                }
+                WitnessNode::Inline(rlp_bytes) => TrieNode::decode(&mut rlp_bytes.as_slice())?,
+            };
 
             match &trie_node {
                 TrieNode::Branch(branch) => {
                     for (idx, maybe_child) in branch.as_ref().children() {
-                        if let Some(child_hash) =
-                            maybe_child.and_then(alloy_trie::nodes::RlpNode::as_hash)
-                        {
+                        if let Some(child) = maybe_child {
                             let mut child_path = path;
                             child_path.push_unchecked(idx);
-                            queue.push_back((child_hash, child_path, maybe_account));
+                            let child = child.as_hash().map_or_else(
+                                || WitnessNode::Inline(child.as_slice().to_vec()),
+                                WitnessNode::Hashed,
+                            );
+                            queue.push_back((child, child_path, maybe_account));
                         }
                     }
                 }
                 TrieNode::Extension(ext) => {
-                    if let Some(child_hash) = ext.child.as_hash() {
-                        let mut child_path = path;
-                        child_path.extend(&ext.key);
-                        queue.push_back((child_hash, child_path, maybe_account));
-                    }
+                    let mut child_path = path;
+                    child_path.extend(&ext.key);
+                    let child = ext.child.as_hash().map_or_else(
+                        || WitnessNode::Inline(ext.child.as_slice().to_vec()),
+                        WitnessNode::Hashed,
+                    );
+                    queue.push_back((child, child_path, maybe_account));
                 }
                 TrieNode::Leaf(leaf) => {
                     if maybe_account.is_none() {
@@ -514,7 +531,7 @@ impl DecodedMultiProofV2 {
                         let account = TrieAccount::decode(&mut &leaf.value[..])?;
                         if account.storage_root != EMPTY_ROOT_HASH {
                             queue.push_back((
-                                account.storage_root,
+                                WitnessNode::Hashed(account.storage_root),
                                 Nibbles::default(),
                                 Some(hashed_address),
                             ));
@@ -541,6 +558,61 @@ impl DecodedMultiProofV2 {
         }
 
         Ok(Self { account_proofs, storage_proofs })
+    }
+
+    /// Inserts every encoded proof node into a flat content-addressed witness map.
+    ///
+    /// A V2 branch with a non-empty key represents an extension followed by its child branch.
+    /// Both encodings are recorded so a flat witness traversal can follow the extension hash.
+    pub fn extend_flat_witness(&self, witness: &mut B256Map<Bytes>) {
+        fn record(node: &TrieNodeV2, witness: &mut B256Map<Bytes>, encoded: &mut Vec<u8>) {
+            encoded.clear();
+            node.encode(encoded);
+            let bytes = Bytes::from(encoded.clone());
+            witness.entry(keccak256(&bytes)).or_insert(bytes);
+
+            if let TrieNodeV2::Branch(branch) = node &&
+                !branch.key.is_empty()
+            {
+                encoded.clear();
+                BranchNodeRef::new(&branch.stack, branch.state_mask).encode(encoded);
+                let bytes = Bytes::from(encoded.clone());
+                witness.entry(keccak256(&bytes)).or_insert(bytes);
+            }
+        }
+
+        let mut encoded = Vec::new();
+        for proof_node in &self.account_proofs {
+            record(&proof_node.node, witness, &mut encoded);
+        }
+        for proof_nodes in self.storage_proofs.values() {
+            for proof_node in proof_nodes {
+                record(&proof_node.node, witness, &mut encoded);
+            }
+        }
+    }
+
+    /// Retains only nodes selected by the supplied V2 targets.
+    ///
+    /// This is useful when a root-to-target proof is also being stored as a self-contained flat
+    /// witness, but only the suffix below an already revealed sparse-trie path should be revealed
+    /// into an in-progress transition.
+    pub fn retain_targets(&mut self, targets: &MultiProofTargetsV2) {
+        fn matches(node: &ProofTrieNodeV2, targets: &[ProofV2Target]) -> bool {
+            targets.iter().any(|target| {
+                target.key_nibbles.starts_with(&node.path) &&
+                    node.path.len() >= target.min_len as usize
+            })
+        }
+
+        self.account_proofs.retain(|node| matches(node, &targets.account_targets));
+        self.storage_proofs.retain(|hashed_address, nodes| {
+            let Some(storage_targets) = targets.storage_targets.get(hashed_address) else {
+                return false
+            };
+            nodes.retain(|node| matches(node, storage_targets));
+            !nodes.is_empty()
+        });
     }
 
     /// Appends the given multiproof's data to this one.
@@ -1008,6 +1080,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decoded_multiproof_v2_from_witness_expands_inline_children() {
+        use alloy_trie::{
+            nodes::{BranchNode, ExtensionNode, LeafNode, RlpNode},
+            TrieMask,
+        };
+
+        let hashed_address = B256::repeat_byte(0x11);
+        let storage_prefix = Nibbles::from_nibbles(vec![0x01; 60]);
+        let storage_branch_index = 0x02;
+        let storage_leaf_key = Nibbles::from_nibbles([0x03, 0x04, 0x05]);
+
+        let storage_leaf_rlp = alloy_rlp::encode(TrieNode::Leaf(LeafNode::new(
+            storage_leaf_key,
+            alloy_rlp::encode(U256::from(1)),
+        )));
+        assert!(storage_leaf_rlp.len() < 32);
+
+        let mut branch_mask = TrieMask::default();
+        branch_mask.set_bit(storage_branch_index);
+        let storage_branch_rlp = alloy_rlp::encode(TrieNode::Branch(BranchNode::new(
+            vec![RlpNode::from_rlp(&storage_leaf_rlp)],
+            branch_mask,
+        )));
+        assert!(storage_branch_rlp.len() < 32);
+
+        let storage_root_rlp = alloy_rlp::encode(TrieNode::Extension(ExtensionNode::new(
+            storage_prefix.clone(),
+            RlpNode::from_rlp(&storage_branch_rlp),
+        )));
+        assert!(storage_root_rlp.len() >= 32);
+        let storage_root = keccak256(&storage_root_rlp);
+
+        let account_rlp = alloy_rlp::encode(TrieAccount { storage_root, ..Default::default() });
+        let state_root_rlp = alloy_rlp::encode(TrieNode::Leaf(LeafNode::new(
+            Nibbles::unpack(hashed_address),
+            account_rlp,
+        )));
+        let state_root = keccak256(&state_root_rlp);
+
+        // Canonical flat witnesses contain only hashed nodes. The storage branch and leaf are
+        // embedded in the storage-root RLP and therefore have no separate witness entries.
+        let witness = B256Map::from_iter([
+            (state_root, Bytes::from(state_root_rlp)),
+            (storage_root, Bytes::from(storage_root_rlp)),
+        ]);
+        let proof = DecodedMultiProofV2::from_witness(state_root, &witness).unwrap();
+        let storage_proof = proof.storage_proofs.get(&hashed_address).unwrap();
+
+        let mut storage_leaf_path = storage_prefix;
+        storage_leaf_path.push_unchecked(storage_branch_index);
+        assert!(storage_proof.iter().any(|node| {
+            node.path == storage_leaf_path && matches!(node.node, crate::TrieNodeV2::Leaf(_))
+        }));
+        assert!(storage_proof.iter().any(|node| {
+            node.path.is_empty() && matches!(node.node, crate::TrieNodeV2::Branch(_))
+        }));
+    }
+
+    #[test]
     fn test_multiproof_extend_account_proofs() {
         let mut proof1 = MultiProof::default();
         let mut proof2 = MultiProof::default();
@@ -1236,5 +1367,38 @@ mod tests {
                 chunking_length, size
             );
         }
+    }
+
+    #[test]
+    fn decoded_v2_retain_targets_preserves_min_len_and_storage_context() {
+        let key = B256::repeat_byte(0xab);
+        let storage_address = B256::repeat_byte(0x55);
+        let node = |path: &[u8]| ProofTrieNodeV2 {
+            path: Nibbles::from_nibbles(path),
+            node: TrieNodeV2::EmptyRoot,
+            masks: None,
+        };
+        let mut proof = DecodedMultiProofV2 {
+            account_proofs: vec![node(&[]), node(&[0x0a]), node(&[0x0a, 0x0b])],
+            storage_proofs: B256Map::from_iter([(
+                storage_address,
+                vec![node(&[]), node(&[0x0a]), node(&[0x0a, 0x0b])],
+            )]),
+        };
+        let targets = MultiProofTargetsV2 {
+            account_targets: vec![ProofV2Target::new(key).with_min_len(2)],
+            storage_targets: B256Map::from_iter([(
+                storage_address,
+                vec![ProofV2Target::new(key).with_min_len(1)],
+            )]),
+        };
+
+        proof.retain_targets(&targets);
+
+        assert_eq!(proof.account_proofs.iter().map(|node| node.path.len()).collect_vec(), vec![2]);
+        assert_eq!(
+            proof.storage_proofs[&storage_address].iter().map(|node| node.path.len()).collect_vec(),
+            vec![1, 2]
+        );
     }
 }
