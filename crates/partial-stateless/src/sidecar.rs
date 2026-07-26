@@ -308,6 +308,52 @@ pub struct WitnessReductionStats {
     pub bytecode_reduction_ratio: Option<f64>,
 }
 
+/// Raw item count and byte length for one witness component.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WitnessComponentStats {
+    pub items: usize,
+    pub bytes: usize,
+}
+
+impl WitnessComponentStats {
+    pub fn from_values(values: &[Bytes]) -> Self {
+        Self { items: values.len(), bytes: values.iter().map(|value| value.len()).sum() }
+    }
+}
+
+/// Benchmark-only, same-block comparison between the Partial Witness and Execution Witness.
+///
+/// Both paths start after the shared block re-execution. Optional diagnostics, verifier preflight,
+/// file I/O, HTTP, and JSON encoding are excluded from the matched totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MatchedWitnessBenchmarkStats {
+    pub generation_order: String,
+    pub shared_block_reexecution_us: u64,
+    pub partial_preparation_us: u64,
+    pub partial_core_generation_us: u64,
+    pub partial_value_cache_update_us: u64,
+    pub partial_trie_cache_update_us: u64,
+    pub partial_assembly_us: u64,
+    pub partial_serialization_us: u64,
+    pub partial_total_us: u64,
+    pub partial_serialized_witness_bytes: usize,
+    pub partial_serialized_sidecar_bytes: usize,
+    pub partial_state: WitnessComponentStats,
+    pub partial_codes: WitnessComponentStats,
+    pub partial_keys: WitnessComponentStats,
+    pub partial_headers: WitnessComponentStats,
+    pub execution_core_generation_us: u64,
+    pub execution_header_fetch_us: u64,
+    pub execution_assembly_us: u64,
+    pub execution_serialization_us: u64,
+    pub execution_total_us: u64,
+    pub execution_serialized_bytes: usize,
+    pub execution_state: WitnessComponentStats,
+    pub execution_codes: WitnessComponentStats,
+    pub execution_keys: WitnessComponentStats,
+    pub execution_headers: WitnessComponentStats,
+}
+
 impl WitnessReductionStats {
     pub fn new(partial: &WitnessResult, full: &WitnessResult) -> Self {
         fn reduction(partial: usize, full: usize) -> Option<f64> {
@@ -372,6 +418,10 @@ pub struct SidecarBenchmarkManifest {
     /// Reduction of the partial sidecar vs the full baseline. `None` when the
     /// baseline comparison is disabled.
     pub reduction: Option<WitnessReductionStats>,
+    /// Same-block, same-provider benchmark. `None` unless
+    /// `PS_EXECUTION_WITNESS_BASELINE` is enabled.
+    #[serde(default)]
+    pub matched_witness_benchmark: Option<MatchedWitnessBenchmarkStats>,
 }
 
 /// Diagnostic report for whether the current sidecar/cache shape contains enough

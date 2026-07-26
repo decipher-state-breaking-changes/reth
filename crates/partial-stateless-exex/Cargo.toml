@@ -15,7 +15,7 @@ reth-ethereum = { workspace = true, features = ["full", "cli"] }
 reth-trie-common = { workspace = true }
 reth-provider = { workspace = true }
 reth-evm = { workspace = true }
-reth-revm = { workspace = true }
+reth-revm = { workspace = true, features = ["witness"] }
 reth-primitives-traits = { workspace = true }
 revm = { workspace = true }
 
@@ -25,6 +25,7 @@ partial-stateless = { path = "../partial-stateless" }
 # alloy
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
 
 # async
 futures.workspace = true

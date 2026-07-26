@@ -8,6 +8,7 @@ use crate::{
 };
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use alloy_rlp::{Decodable, Encodable, EMPTY_STRING_CODE};
+use alloy_rpc_types_debug::ExecutionWitness;
 use partial_stateless::{
     accessed_state::BlockAccessedState,
     fixture::{save_fixture, AccessedStateFixture},
@@ -20,18 +21,19 @@ use partial_stateless::{
         measure_multiproof_size, state_targets_to_proof_targets, WitnessResult,
     },
     CacheAwareTransitionProgress, CacheAwareTrieTransition, CacheFootprintStats,
-    PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
-    PartialTrieNodeCache, RootWitnessCompletenessSummary, SidecarBenchmarkManifest, StateTargetSet,
-    StateTargetStats, TrieProofTargetV2, WitnessReductionStats,
+    MatchedWitnessBenchmarkStats, PartialExecutionWitness, PartialExecutionWitnessState,
+    PartialStatelessSidecar, PartialTrieNodeCache, RootWitnessCompletenessSummary,
+    SidecarBenchmarkManifest, StateTargetSet, StateTargetStats, TrieProofTargetV2,
+    WitnessComponentStats, WitnessReductionStats,
 };
 use reth_ethereum::EthPrimitives;
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::StateProvider;
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_trie_common::{
-    DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofV2Target, TrieInput,
-    TrieNodeV2, EMPTY_ROOT_HASH,
+    DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, MultiProofTargetsV2, ProofV2Target,
+    TrieInput, TrieNodeV2, EMPTY_ROOT_HASH,
 };
 use revm::database::State;
 use std::{
@@ -49,6 +51,7 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) resource_metrics: bool,
     pub(crate) trie_cache_diagnostics: bool,
     pub(crate) run_sidecar_preflight: bool,
+    pub(crate) execution_witness_baseline: bool,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
 }
 
@@ -195,6 +198,73 @@ struct CacheAwareBaseProof {
     proof: DecodedMultiProofV2,
     cache_covered_mutation_targets: usize,
     provider_us: u64,
+}
+
+#[derive(Debug)]
+struct GeneratedExecutionWitnessBenchmark {
+    witness: ExecutionWitness,
+    core_generation_us: u64,
+    header_fetch_us: u64,
+    assembly_us: u64,
+    serialization_us: u64,
+    serialized_bytes: usize,
+}
+
+impl GeneratedExecutionWitnessBenchmark {
+    const fn total_us(&self) -> u64 {
+        self.core_generation_us + self.header_fetch_us + self.assembly_us + self.serialization_us
+    }
+}
+
+fn generate_execution_witness_benchmark<AncestorHeadersFn>(
+    state_provider: &dyn StateProvider,
+    record: &ExecutionWitnessRecord,
+    block_number: u64,
+    ancestor_headers_for_range: &AncestorHeadersFn,
+) -> eyre::Result<GeneratedExecutionWitnessBenchmark>
+where
+    AncestorHeadersFn: Fn(Option<u64>, u64) -> eyre::Result<Vec<Bytes>>,
+{
+    let core_start = Instant::now();
+    let state = state_provider
+        .witness(TrieInput::default(), record.hashed_state.clone(), ExecutionWitnessMode::Canonical)
+        .map_err(|err| eyre::eyre!("failed to generate Execution Witness state: {err}"))?;
+    let core_generation_us = core_start.elapsed().as_micros() as u64;
+
+    let header_start = Instant::now();
+    let smallest = record.lowest_block_number.unwrap_or_else(|| block_number.saturating_sub(1));
+    let headers = ancestor_headers_for_range(Some(smallest), block_number)?;
+    let header_fetch_us = header_start.elapsed().as_micros() as u64;
+
+    let assembly_start = Instant::now();
+    let witness =
+        ExecutionWitness { state, codes: record.codes.clone(), keys: record.keys.clone(), headers };
+    let assembly_us = assembly_start.elapsed().as_micros() as u64;
+
+    let serialization_start = Instant::now();
+    let serialized = bincode::serialize(&witness)
+        .map_err(|err| eyre::eyre!("failed to serialize Execution Witness: {err}"))?;
+    let serialization_us = serialization_start.elapsed().as_micros() as u64;
+
+    Ok(GeneratedExecutionWitnessBenchmark {
+        witness,
+        core_generation_us,
+        header_fetch_us,
+        assembly_us,
+        serialization_us,
+        serialized_bytes: serialized.len(),
+    })
+}
+
+fn partial_state_component_stats(state: &PartialExecutionWitnessState) -> WitnessComponentStats {
+    match state {
+        PartialExecutionWitnessState::MptMultiProof(bytes) => {
+            WitnessComponentStats { items: usize::from(!bytes.is_empty()), bytes: bytes.len() }
+        }
+        PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
+            WitnessComponentStats::from_values(nodes)
+        }
+    }
 }
 
 fn initial_cache_aware_targets(
@@ -557,25 +627,49 @@ pub(crate) fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
     ParentStateRootFn: FnOnce(B256) -> eyre::Result<B256>,
-    AncestorHeadersFn: FnOnce(Option<u64>, u64) -> eyre::Result<Vec<Bytes>>,
+    AncestorHeadersFn: Fn(Option<u64>, u64) -> eyre::Result<Vec<Bytes>>,
 {
     let block_number = block.number();
     let parent_block_number = block_number.saturating_sub(1);
 
+    let shared_execution_start = Instant::now();
     let state_provider_db = StateProviderDatabase::new(state_provider);
     let mut db = State::builder().with_bundle_update().with_database(state_provider_db).build();
     let block_executor = evm_config.executor(&mut db);
 
     let mut accessed = BlockAccessedState::default();
     let mut lowest_block_number = None;
+    let mut execution_witness_record = ExecutionWitnessRecord::default();
     let execution_output = block_executor
         .execute_with_state_closure(block, |statedb: &State<_>| {
             accessed = BlockAccessedState::from_simulated_state(statedb);
             lowest_block_number = statedb.block_hashes.lowest().map(|(num, _)| num);
+            if options.execution_witness_baseline {
+                execution_witness_record
+                    .record_executed_state(statedb, ExecutionWitnessMode::Canonical);
+            }
         })
         .map_err(|err| eyre::eyre!("simulation failed for block: {err}"))?;
+    let shared_block_reexecution_us = shared_execution_start.elapsed().as_micros() as u64;
 
+    // Alternate which witness starts immediately after the shared block re-execution so neither
+    // path consistently benefits from the other path warming the database page cache.
+    let execution_witness_first = block_number % 2 == 0;
+    let mut execution_witness_benchmark =
+        if options.execution_witness_baseline && execution_witness_first {
+            Some(generate_execution_witness_benchmark(
+                state_provider,
+                &execution_witness_record,
+                block_number,
+                &ancestor_headers_for_range,
+            )?)
+        } else {
+            None
+        };
+
+    let partial_preparation_start = Instant::now();
     let hashed_post_state = state_provider.hashed_post_state(&execution_output.state);
+    let mut partial_preparation_us = partial_preparation_start.elapsed().as_micros() as u64;
 
     let block_hash = block.hash();
     let parent_hash = block.parent_hash;
@@ -607,6 +701,7 @@ where
         }
     }
 
+    let partial_cache_preparation_start = Instant::now();
     let cache_policy_id =
         last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
     let cache_policy_metadata = format!(
@@ -641,8 +736,11 @@ where
     let miss = cache.compute_miss(&accessed);
     let accessed_targets = accessed_to_state_targets(&accessed);
     let cache_hit_targets = cache_hit_targets(&accessed, &miss);
+    partial_preparation_us += partial_cache_preparation_start.elapsed().as_micros() as u64;
 
+    let value_cache_update_start = Instant::now();
     let stats = cache.on_block_executed(block_number, &accessed);
+    let value_cache_update_us = value_cache_update_start.elapsed().as_micros() as u64;
     let snapshot = cache.snapshot();
     let cache_memory_after = cache.estimated_memory_bytes();
 
@@ -671,6 +769,7 @@ where
         "Witness requirement (cache miss)"
     );
 
+    let partial_target_preparation_start = Instant::now();
     let (raw_targets, _) = build_sidecar_targets(&miss);
 
     let missed_bytecode_bytes: usize = miss
@@ -684,6 +783,7 @@ where
         .iter()
         .filter_map(|code_hash| accessed.codes.get(code_hash).cloned())
         .collect();
+    partial_preparation_us += partial_target_preparation_start.elapsed().as_micros() as u64;
 
     let full_sidecar_baseline_stats: Option<WitnessResult> = if options.compute_baseline {
         let full_targets = state_targets_to_proof_targets(&accessed_targets);
@@ -714,6 +814,7 @@ where
         None
     };
 
+    let parent_state_root_start = Instant::now();
     let parent_state_root = parent_state_root_result.map_err(|err| {
         rollback_sidecar_transition(
             cache,
@@ -721,9 +822,10 @@ where
             eyre::eyre!("failed to resolve parent state root: {err}"),
         )
     })?;
+    partial_preparation_us += parent_state_root_start.elapsed().as_micros() as u64;
 
     let rusage_before = options.resource_metrics.then(thread_rusage);
-    let start = Instant::now();
+    let partial_core_start = Instant::now();
     let saved_sidecar_path;
     let witness = {
         let base =
@@ -757,7 +859,19 @@ where
         )
         .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
         let initial_provider_us = base.provider_us;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let partial_core_us = partial_core_start.elapsed().as_micros() as u64;
+        let elapsed_ms = partial_core_us / 1_000;
+        if options.execution_witness_baseline && !execution_witness_first {
+            execution_witness_benchmark = Some(
+                generate_execution_witness_benchmark(
+                    state_provider,
+                    &execution_witness_record,
+                    block_number,
+                    &ancestor_headers_for_range,
+                )
+                .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?,
+            );
+        }
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
         let (account_node_kinds, storage_node_kinds) =
             measure_transition_node_kinds(&nodes, &proof);
@@ -839,6 +953,7 @@ where
                 break 'sidecar Ok(None);
             }
 
+            let partial_assembly_start = Instant::now();
             let ancestor_headers = ancestor_headers_for_range(lowest_block_number, block_number)?;
             // The flat canonical witness contains every parent-state node required for
             // both cache misses and the post-state trie transition.
@@ -867,6 +982,10 @@ where
                 witness: witness_payload,
                 stats: result.clone(),
             };
+            let partial_assembly_us = partial_assembly_start.elapsed().as_micros() as u64;
+            let partial_serialized_witness_bytes = bincode::serialize(&sidecar.witness)
+                .map_err(|err| eyre::eyre!("failed to serialize Partial Witness: {err}"))?
+                .len();
 
             let root_witness_completeness = if options.run_sidecar_preflight {
                 let reexec_report = verify_and_apply_provider_assisted_sidecar(
@@ -945,13 +1064,54 @@ where
             fs::create_dir_all(options.sidecar_dir)
                 .map_err(|err| eyre::eyre!("failed to create sidecar directory: {err}"))?;
             let sidecar_path = sidecar_path(options.sidecar_dir, block_number, block_hash);
+            let partial_serialization_start = Instant::now();
             let sidecar_bytes = bincode::serialize(&sidecar)
                 .map_err(|err| eyre::eyre!("failed to serialize sidecar: {err}"))?;
+            let partial_serialization_us = partial_serialization_start.elapsed().as_micros() as u64;
+            let sidecar_bytes_len = sidecar_bytes.len();
+            let matched_witness_benchmark = execution_witness_benchmark.as_ref().map(|execution| {
+                MatchedWitnessBenchmarkStats {
+                    generation_order: if execution_witness_first {
+                        "Execution Witness first".to_string()
+                    } else {
+                        "Partial Witness first".to_string()
+                    },
+                    shared_block_reexecution_us,
+                    partial_preparation_us,
+                    partial_core_generation_us: partial_core_us,
+                    partial_value_cache_update_us: value_cache_update_us,
+                    partial_trie_cache_update_us: trie_retention_us,
+                    partial_assembly_us,
+                    partial_serialization_us,
+                    partial_total_us: partial_preparation_us +
+                        partial_core_us +
+                        value_cache_update_us +
+                        trie_retention_us +
+                        partial_assembly_us +
+                        partial_serialization_us,
+                    partial_serialized_witness_bytes,
+                    partial_serialized_sidecar_bytes: sidecar_bytes_len,
+                    partial_state: partial_state_component_stats(&sidecar.witness.state),
+                    partial_codes: WitnessComponentStats::from_values(&sidecar.witness.codes),
+                    partial_keys: WitnessComponentStats::from_values(&sidecar.witness.keys),
+                    partial_headers: WitnessComponentStats::from_values(&sidecar.witness.headers),
+                    execution_core_generation_us: execution.core_generation_us,
+                    execution_header_fetch_us: execution.header_fetch_us,
+                    execution_assembly_us: execution.assembly_us,
+                    execution_serialization_us: execution.serialization_us,
+                    execution_total_us: execution.total_us(),
+                    execution_serialized_bytes: execution.serialized_bytes,
+                    execution_state: WitnessComponentStats::from_values(&execution.witness.state),
+                    execution_codes: WitnessComponentStats::from_values(&execution.witness.codes),
+                    execution_keys: WitnessComponentStats::from_values(&execution.witness.keys),
+                    execution_headers: WitnessComponentStats::from_values(
+                        &execution.witness.headers,
+                    ),
+                }
+            });
             fs::write(&sidecar_path, sidecar_bytes).map_err(|err| {
                 eyre::eyre!("failed to write sidecar file {:?}: {err}", sidecar_path)
             })?;
-            let sidecar_bytes_len =
-                fs::metadata(&sidecar_path).map(|m| m.len() as usize).unwrap_or(0);
             let partial_state_trustless_verification_ready =
                 root_witness_completeness.trustless_root_ready;
             let manifest = SidecarBenchmarkManifest {
@@ -993,6 +1153,7 @@ where
                 reduction: full_sidecar_baseline_stats
                     .as_ref()
                     .map(|full| WitnessReductionStats::new(&result, full)),
+                matched_witness_benchmark,
             };
             let manifest_path = sidecar_path.with_extension("manifest.json");
             let manifest_saved = match serde_json::to_vec_pretty(&manifest) {

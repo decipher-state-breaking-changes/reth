@@ -32,10 +32,11 @@ pub use sender_proof::{
 pub use sidecar::{
     check_next_cache_anchor, check_sidecar_context, check_sidecar_miss_targets,
     check_sidecar_self_consistency, last_n_blocks_cache_policy_id, partial_witness_commitment,
-    CacheAnchor, CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
-    PartialStatelessSidecar, RootWitnessCompletenessReport, RootWitnessCompletenessSummary,
-    SerializableMultiProof, SerializableStorageMultiProof, SidecarBenchmarkManifest,
-    SidecarCheckError, StateTargetSet, StateTargetStats, WitnessReductionStats, WitnessTargets,
+    CacheAnchor, CacheFootprintStats, MatchedWitnessBenchmarkStats, PartialExecutionWitness,
+    PartialExecutionWitnessState, PartialStatelessSidecar, RootWitnessCompletenessReport,
+    RootWitnessCompletenessSummary, SerializableMultiProof, SerializableStorageMultiProof,
+    SidecarBenchmarkManifest, SidecarCheckError, StateTargetSet, StateTargetStats,
+    WitnessComponentStats, WitnessReductionStats, WitnessTargets,
 };
 pub use trie_cache::{
     PartialTrieNodeCache, TrieCacheValidationError, TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,

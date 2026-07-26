@@ -221,6 +221,16 @@ async fn partial_stateless_exex<
         );
     }
 
+    // Optional same-block benchmark against Reth's standard Execution Witness.
+    // The block is re-executed once, then both witness paths use the same state provider.
+    let execution_witness_baseline = env_flag("PS_EXECUTION_WITNESS_BASELINE");
+    if execution_witness_baseline {
+        info!(
+            target: "partial_stateless",
+            "Matched Execution Witness comparison ENABLED (PS_EXECUTION_WITNESS_BASELINE)"
+        );
+    }
+
     // Optional sparse-trie shape benchmark and full cache-invariant scan. This walks every
     // retained path, so keep it off during normal operation and enable it for bounded runs.
     let trie_cache_diagnostics = env_flag("PS_TRIE_CACHE_DIAGNOSTICS");
@@ -378,6 +388,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            execution_witness_baseline,
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,
@@ -505,6 +516,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            execution_witness_baseline,
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,
