@@ -7,7 +7,7 @@ use crate::{
     thread_rusage, CacheConfig,
 };
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
-use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
+use alloy_rlp::{Decodable, Encodable, EMPTY_STRING_CODE};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
     fixture::{save_fixture, AccessedStateFixture},
@@ -31,7 +31,7 @@ use reth_provider::StateProvider;
 use reth_revm::database::StateProviderDatabase;
 use reth_trie_common::{
     DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofV2Target, TrieInput,
-    EMPTY_ROOT_HASH,
+    TrieNodeV2, EMPTY_ROOT_HASH,
 };
 use revm::database::State;
 use std::{
@@ -485,6 +485,64 @@ fn measure_transition_witness_size(
     }
 }
 
+#[derive(Debug, Default)]
+struct TransitionNodeKindMetrics {
+    physical_nodes: usize,
+    physical_bytes: usize,
+    empty_roots: usize,
+    leaves: usize,
+    extensions: usize,
+    branches: usize,
+    fused_extension_branches: usize,
+    undecodable_nodes: usize,
+}
+
+impl TransitionNodeKindMetrics {
+    fn record(&mut self, encoded: &[u8]) {
+        self.physical_nodes += 1;
+        self.physical_bytes += encoded.len();
+        let mut input = encoded;
+        match TrieNodeV2::decode(&mut input) {
+            Ok(TrieNodeV2::EmptyRoot) => self.empty_roots += 1,
+            Ok(TrieNodeV2::Leaf(_)) => self.leaves += 1,
+            Ok(TrieNodeV2::Extension(_)) => self.extensions += 1,
+            Ok(TrieNodeV2::Branch(branch)) => {
+                self.branches += 1;
+                if !branch.key.is_empty() {
+                    self.extensions += 1;
+                    self.fused_extension_branches += 1;
+                }
+            }
+            Err(_) => self.undecodable_nodes += 1,
+        }
+    }
+}
+
+fn measure_transition_node_kinds(
+    nodes: &[Bytes],
+    proof: &DecodedMultiProofV2,
+) -> (TransitionNodeKindMetrics, TransitionNodeKindMetrics) {
+    let mut storage_hashes = std::collections::HashSet::new();
+    for storage_proof in proof.storage_proofs.values() {
+        for proof_node in storage_proof {
+            let mut encoded = Vec::new();
+            proof_node.node.encode(&mut encoded);
+            storage_hashes.insert(keccak256(&encoded));
+        }
+    }
+
+    let mut account = TransitionNodeKindMetrics::default();
+    let mut storage = TransitionNodeKindMetrics::default();
+    for node in nodes {
+        if storage_hashes.contains(&keccak256(node)) {
+            storage.record(node);
+        } else {
+            account.record(node);
+        }
+    }
+    (account, storage)
+}
+
 pub(crate) fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn>(
     evm_config: &Evm,
     state_provider: &dyn StateProvider,
@@ -701,6 +759,8 @@ where
         let initial_provider_us = base.provider_us;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
+        let (account_node_kinds, storage_node_kinds) =
+            measure_transition_node_kinds(&nodes, &proof);
         let witness_state = PartialExecutionWitnessState::MptTransitionNodes(nodes);
         result.computation_time_ms = Some(elapsed_ms);
         if let Some((cpu_us_before, majflt_before, minflt_before)) = rusage_before {
@@ -724,6 +784,17 @@ where
             initial_proof_nodes,
             initial_proof_bytes,
             cache_covered_mutation_targets,
+            account_branch_nodes = account_node_kinds.branches,
+            account_extension_nodes = account_node_kinds.extensions,
+            account_leaf_nodes = account_node_kinds.leaves,
+            account_fused_extension_branches = account_node_kinds.fused_extension_branches,
+            account_node_bytes = account_node_kinds.physical_bytes,
+            storage_branch_nodes = storage_node_kinds.branches,
+            storage_extension_nodes = storage_node_kinds.extensions,
+            storage_leaf_nodes = storage_node_kinds.leaves,
+            storage_fused_extension_branches = storage_node_kinds.fused_extension_branches,
+            storage_node_bytes = storage_node_kinds.physical_bytes,
+            undecodable_transition_nodes = account_node_kinds.undecodable_nodes + storage_node_kinds.undecodable_nodes,
             computed_state_root = ?local_state_root,
             "Generated cache-aware canonical transition witness"
         );
@@ -983,6 +1054,14 @@ where
                 retained_storage_paths = metrics.retained_storage_paths,
                 account_revealed_nodes = metrics.account_revealed_nodes,
                 storage_revealed_nodes = metrics.storage_revealed_nodes,
+                account_cached_branch_nodes = metrics.account_node_kinds.branches,
+                account_cached_extension_nodes = metrics.account_node_kinds.extensions,
+                account_cached_leaf_nodes = metrics.account_node_kinds.leaves,
+                account_cached_blinded_children = metrics.account_node_kinds.blinded_children,
+                storage_cached_branch_nodes = metrics.storage_node_kinds.branches,
+                storage_cached_extension_nodes = metrics.storage_node_kinds.extensions,
+                storage_cached_leaf_nodes = metrics.storage_node_kinds.leaves,
+                storage_cached_blinded_children = metrics.storage_node_kinds.blinded_children,
                 trie_cache_bytes = metrics.estimated_memory_bytes,
                 account_key_prefixes_d0 = metrics.account_key_prefixes[0],
                 account_key_prefixes_d1 = metrics.account_key_prefixes[1],

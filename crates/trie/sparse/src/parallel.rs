@@ -2,7 +2,7 @@
 use crate::debug_recorder::{LeafUpdateRecord, ProofTrieNodeRecord, RecordedOp, TrieDebugRecorder};
 use crate::{
     lower::LowerSparseSubtrie, LeafLookup, LeafLookupError, RlpNodeStackItem, SparseNode,
-    SparseNodeState, SparseNodeType, SparseTrie, SparseTrieUpdates,
+    SparseNodeState, SparseNodeType, SparseTrie, SparseTrieNodeKindCounts, SparseTrieUpdates,
 };
 use alloc::{borrow::Cow, boxed::Box, vec, vec::Vec};
 use alloy_primitives::{
@@ -713,6 +713,28 @@ impl SparseTrie for ParallelSparseTrie {
             .map(|s| s.nodes.len())
             .sum();
         upper_count + lower_count
+    }
+
+    fn node_kind_counts(&self) -> SparseTrieNodeKindCounts {
+        let mut counts = SparseTrieNodeKindCounts::default();
+        let nodes = self.upper_subtrie.nodes.values().chain(
+            self.lower_subtries
+                .iter()
+                .filter_map(LowerSparseSubtrie::as_revealed_ref)
+                .flat_map(|subtrie| subtrie.nodes.values()),
+        );
+        for node in nodes {
+            match node {
+                SparseNode::Empty => counts.empty_roots += 1,
+                SparseNode::Leaf { .. } => counts.leaves += 1,
+                SparseNode::Extension { .. } => counts.extensions += 1,
+                SparseNode::Branch { blinded_mask, .. } => {
+                    counts.branches += 1;
+                    counts.blinded_children += blinded_mask.count_bits() as usize;
+                }
+            }
+        }
+        counts
     }
 
     fn memory_size(&self) -> usize {

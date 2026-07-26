@@ -16,7 +16,9 @@ use alloy_primitives::{
     Address, B256,
 };
 use reth_trie_common::Nibbles;
-use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie, SparseTrie};
+use reth_trie_sparse::{
+    RevealableSparseTrie, SparseStateTrie, SparseTrie, SparseTrieNodeKindCounts,
+};
 use std::fmt;
 
 /// Sparse trie plus the value-cache membership whose paths it is required to retain.
@@ -210,13 +212,21 @@ impl PartialTrieNodeCache {
 
         let mut storage_addresses = HashSet::<B256>::default();
         let mut storage_revealed_nodes = 0;
+        let mut storage_node_kinds = SparseTrieNodeKindCounts::default();
         for (address, _) in &self.warm_storage {
             let hashed_address = keccak256(address);
             if storage_addresses.insert(hashed_address) {
-                storage_revealed_nodes +=
-                    self.sparse.storage_trie_ref(&hashed_address).map_or(0, SparseTrie::size_hint);
+                if let Some(trie) = self.sparse.storage_trie_ref(&hashed_address) {
+                    storage_revealed_nodes += trie.size_hint();
+                    storage_node_kinds += trie.node_kind_counts();
+                }
             }
         }
+
+        let account_node_kinds = self
+            .sparse
+            .state_trie_ref()
+            .map_or_else(SparseTrieNodeKindCounts::default, SparseTrie::node_kind_counts);
 
         let account_key_prefixes = std::array::from_fn(|depth| prefixes[depth].len());
         let account_prefix_coverage = std::array::from_fn(|depth| {
@@ -230,6 +240,8 @@ impl PartialTrieNodeCache {
             retained_storage_paths: self.warm_storage.len(),
             account_revealed_nodes: self.sparse.state_trie_ref().map_or(0, SparseTrie::size_hint),
             storage_revealed_nodes,
+            account_node_kinds,
+            storage_node_kinds,
             estimated_memory_bytes: self.estimated_memory_bytes(),
             account_key_prefixes,
             account_prefix_coverage,
@@ -341,6 +353,8 @@ pub struct TrieShapeMetrics {
     pub retained_storage_paths: usize,
     pub account_revealed_nodes: usize,
     pub storage_revealed_nodes: usize,
+    pub account_node_kinds: SparseTrieNodeKindCounts,
+    pub storage_node_kinds: SparseTrieNodeKindCounts,
     pub estimated_memory_bytes: usize,
     pub account_key_prefixes: [usize; TRIE_SHAPE_PREFIX_LEVELS],
     pub account_prefix_coverage: [f64; TRIE_SHAPE_PREFIX_LEVELS],

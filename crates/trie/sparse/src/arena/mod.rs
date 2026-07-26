@@ -8,7 +8,10 @@ use nodes::{
     ArenaSparseNode, ArenaSparseNodeBranch, ArenaSparseNodeBranchChild, ArenaSparseNodeState,
 };
 
-use crate::{LeafLookup, LeafLookupError, LeafUpdate, SparseTrie, SparseTrieUpdates};
+use crate::{
+    LeafLookup, LeafLookupError, LeafUpdate, SparseTrie, SparseTrieNodeKindCounts,
+    SparseTrieUpdates,
+};
 use alloc::{borrow::Cow, boxed::Box, collections::VecDeque, vec::Vec};
 use alloy_primitives::{
     keccak256,
@@ -2783,6 +2786,29 @@ impl SparseTrie for ArenaParallelSparseTrie {
                 _ => 0,
             })
             .sum()
+    }
+
+    fn node_kind_counts(&self) -> SparseTrieNodeKindCounts {
+        fn accumulate(arena: &NodeArena, counts: &mut SparseTrieNodeKindCounts) {
+            for (_, node) in arena {
+                match node {
+                    ArenaSparseNode::EmptyRoot => counts.empty_roots += 1,
+                    ArenaSparseNode::Leaf { .. } => counts.leaves += 1,
+                    ArenaSparseNode::Branch(branch) => {
+                        counts.branches += 1;
+                        counts.extensions += usize::from(!branch.short_key.is_empty());
+                        counts.blinded_children +=
+                            branch.children.iter().filter(|child| child.is_blinded()).count();
+                    }
+                    ArenaSparseNode::Subtrie(subtrie) => accumulate(&subtrie.arena, counts),
+                    ArenaSparseNode::TakenSubtrie => {}
+                }
+            }
+        }
+
+        let mut counts = SparseTrieNodeKindCounts::default();
+        accumulate(&self.upper_arena, &mut counts);
+        counts
     }
 
     fn memory_size(&self) -> usize {

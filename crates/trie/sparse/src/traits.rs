@@ -25,6 +25,35 @@ pub enum LeafUpdate {
     Touched,
 }
 
+/// Logical MPT node kinds retained by a sparse trie.
+///
+/// Some implementations fuse an extension prefix into its child branch. In that case the fused
+/// node contributes to both `branches` and `extensions`, matching the canonical MPT shape it
+/// represents. `blinded_children` counts child references retained only as hashes or inline RLP.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparseTrieNodeKindCounts {
+    /// Empty trie roots.
+    pub empty_roots: usize,
+    /// Decoded leaf nodes.
+    pub leaves: usize,
+    /// Logical extension nodes, including prefixes fused into branch representations.
+    pub extensions: usize,
+    /// Decoded branch nodes.
+    pub branches: usize,
+    /// Child references retained without decoding the referenced child node.
+    pub blinded_children: usize,
+}
+
+impl core::ops::AddAssign for SparseTrieNodeKindCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.empty_roots += rhs.empty_roots;
+        self.leaves += rhs.leaves;
+        self.extensions += rhs.extensions;
+        self.branches += rhs.branches;
+        self.blinded_children += rhs.blinded_children;
+    }
+}
+
 impl LeafUpdate {
     /// Returns true if the leaf update is a change.
     pub const fn is_changed(&self) -> bool {
@@ -246,6 +275,9 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// This is used as a heuristic for prioritizing which storage tries to keep
     /// during pruning. Larger values indicate larger tries that are more valuable to preserve.
     fn size_hint(&self) -> usize;
+
+    /// Returns the logical MPT node kinds currently retained by the sparse trie.
+    fn node_kind_counts(&self) -> SparseTrieNodeKindCounts;
 
     /// Returns a heuristic for the in-memory size of this trie in bytes.
     ///
@@ -477,6 +509,10 @@ mod configurable_sparse_trie {
 
         fn size_hint(&self) -> usize {
             delegate!(self, size_hint)
+        }
+
+        fn node_kind_counts(&self) -> SparseTrieNodeKindCounts {
+            delegate!(self, node_kind_counts)
         }
 
         fn memory_size(&self) -> usize {
