@@ -105,8 +105,8 @@ generation computes storage proofs first and reuses their storage roots while en
 leaves, avoiding a second traversal of targeted storage tries.
 
 The builder session advances its persistent trie cache and checks the consensus root directly. A
-separate serialized-sidecar re-execution is optional and runs only when `PS_SIDECAR_PREFLIGHT` is
-set or the role is `builder-verifier`. Legacy multiproof and flat transition-node sidecars remain
+separate serialized-sidecar re-execution is performed only by the `builder-verifier` role. Legacy
+multiproof and flat transition-node sidecars remain
 decodable.
 
 ## Binaries & examples

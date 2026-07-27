@@ -10,6 +10,7 @@
 //! 3. Computes and logs cache miss ratio (= witness requirement)
 //! 4. Builds and measures the canonical parent-state transition witness
 
+mod benchmark;
 mod sidecar_create;
 mod sidecar_io;
 mod sidecar_reexec;
@@ -39,11 +40,11 @@ use reth_provider::{BlockIdReader, HeaderProvider};
 use sidecar_create::{create_sidecar_for_block, BuilderBlockReport, BuilderOptions};
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tracing::{info, warn};
 
 /// Configuration for the partial statelessness cache.
+#[derive(Debug, Clone, Copy)]
 struct CacheConfig {
     /// Window size for account eviction policy (in blocks).
     account_window: u64,
@@ -74,6 +75,10 @@ enum SidecarRole {
 }
 
 impl SidecarRole {
+    const fn runs_preflight(self) -> bool {
+        matches!(self, Self::BuilderVerifier)
+    }
+
     fn from_env() -> Self {
         let Some(value) = std::env::var("PS_SIDECAR_ROLE").ok() else {
             return Self::Builder;
@@ -184,6 +189,15 @@ async fn partial_stateless_exex<
     let sidecar_role = SidecarRole::from_env();
     let sidecar_dir = configured_sidecar_dir();
     let verifier_wait = env_millis("PS_SIDECAR_VERIFIER_WAIT_MS", 2_000);
+    let validation_bench = env_flag("PS_VALIDATION_BENCH");
+    if validation_bench && sidecar_role != SidecarRole::BuilderVerifier {
+        return Err(eyre::eyre!("PS_VALIDATION_BENCH requires PS_SIDECAR_ROLE=builder-verifier"));
+    }
+    let bench_output = validation_bench.then(|| {
+        std::env::var_os("PS_BENCH_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| sidecar_dir.join("validation_bench.jsonl"))
+    });
 
     info!(
         target: "partial_stateless",
@@ -200,7 +214,11 @@ async fn partial_stateless_exex<
     // per-block `BlockAccessedState` (the only cache input) so the cache-window
     // benchmark can replay a fixed range offline, with no node or EVM. This reuses
     // the exact execution path the live system uses, so the dataset is faithful.
-    let capture_dir = std::env::var("PS_CAPTURE_DIR").ok().map(std::path::PathBuf::from);
+    let capture_dir = if validation_bench {
+        None
+    } else {
+        std::env::var("PS_CAPTURE_DIR").ok().map(std::path::PathBuf::from)
+    };
     if let Some(dir) = &capture_dir {
         info!(
             target: "partial_stateless",
@@ -213,7 +231,7 @@ async fn partial_stateless_exex<
     // key, ignoring the cache). It computes a second, larger multiproof per block,
     // so it is off by default and gated behind `PS_WITNESS_BASELINE`. Core sidecar
     // generation never depends on it.
-    let compute_baseline = env_flag("PS_WITNESS_BASELINE");
+    let compute_baseline = !validation_bench && env_flag("PS_WITNESS_BASELINE");
     if compute_baseline {
         info!(
             target: "partial_stateless",
@@ -223,7 +241,7 @@ async fn partial_stateless_exex<
 
     // Optional sparse-trie shape benchmark and full cache-invariant scan. This walks every
     // retained path, so keep it off during normal operation and enable it for bounded runs.
-    let trie_cache_diagnostics = env_flag("PS_TRIE_CACHE_DIAGNOSTICS");
+    let trie_cache_diagnostics = !validation_bench && env_flag("PS_TRIE_CACHE_DIAGNOSTICS");
     if trie_cache_diagnostics {
         info!(
             target: "partial_stateless",
@@ -235,7 +253,7 @@ async fn partial_stateless_exex<
     // around the canonical transition witness, to attribute its cost between
     // compute and disk I/O. Off by default and gated behind `PS_RESOURCE_METRICS`; when
     // disabled the getrusage syscalls are skipped and the metric fields stay None.
-    let resource_metrics = env_flag("PS_RESOURCE_METRICS");
+    let resource_metrics = !validation_bench && env_flag("PS_RESOURCE_METRICS");
     if resource_metrics {
         info!(
             target: "partial_stateless",
@@ -258,13 +276,19 @@ async fn partial_stateless_exex<
     // generated sidecar with a cache+witness-backed provider and checks the
     // cache-state transition. It is useful for PoC acceptance checks, but it
     // adds another block execution on the sidecar generation path.
-    let run_sidecar_preflight = sidecar_role != SidecarRole::Verifier
-        && (env_flag("PS_SIDECAR_PREFLIGHT") || sidecar_role == SidecarRole::BuilderVerifier);
+    let run_sidecar_preflight = sidecar_role.runs_preflight();
     if run_sidecar_preflight {
         info!(
             target: "partial_stateless",
             sidecar_role = ?sidecar_role,
             "Provider-assisted sidecar preflight ENABLED — extra re-execution per sidecar"
+        );
+    }
+    if let Some(path) = &bench_output {
+        info!(
+            target: "partial_stateless",
+            path = %path.display(),
+            "Paired Partial/Weak/Vanilla validation benchmark ENABLED (PS_VALIDATION_BENCH)"
         );
     }
     if sidecar_role == SidecarRole::Verifier {
@@ -378,6 +402,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            validation_bench_output: bench_output.as_deref(),
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,
@@ -397,14 +422,17 @@ async fn partial_stateless_exex<
                     }
                 }
 
-                // Save updated cache state to file
-                if let Err(e) = save_to_file(&cache, &cache_path) {
-                    warn!(
-                        target: "partial_stateless",
-                        block = tip_block,
-                        error = %e,
-                        "Failed to save cache state to disk"
-                    );
+                // Cache persistence is unrelated to validation and can perturb later
+                // Engine samples, so the bounded paired benchmark keeps it in memory only.
+                if !validation_bench {
+                    if let Err(e) = save_to_file(&cache, &cache_path) {
+                        warn!(
+                            target: "partial_stateless",
+                            block = tip_block,
+                            error = %e,
+                            "Failed to save cache state to disk"
+                        );
+                    }
                 }
             }
             ExExNotification::ChainReorged { old, new } => {
@@ -505,6 +533,7 @@ async fn partial_stateless_exex<
                             resource_metrics,
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
+                            validation_bench_output: bench_output.as_deref(),
                             reexec_limits: &reexec_limits,
                         },
                         parent_state_root_by_hash,
@@ -524,15 +553,17 @@ async fn partial_stateless_exex<
                     }
                 }
 
-                // Persist the rebuilt cache: a restart before the next commit must
-                // not reload the stale pre-reorg (old-branch) cache from disk.
-                if let Err(e) = save_to_file(&cache, &cache_path) {
-                    warn!(
-                        target: "partial_stateless",
-                        block = tip_block,
-                        error = %e,
-                        "Failed to persist cache after reorg"
-                    );
+                // Production persists the rebuilt cache so a restart cannot reload the old
+                // branch. Benchmark mode deliberately keeps all cache state in memory.
+                if !validation_bench {
+                    if let Err(e) = save_to_file(&cache, &cache_path) {
+                        warn!(
+                            target: "partial_stateless",
+                            block = tip_block,
+                            error = %e,
+                            "Failed to persist cache after reorg"
+                        );
+                    }
                 }
             }
             ExExNotification::ChainReverted { old } => {
@@ -545,14 +576,16 @@ async fn partial_stateless_exex<
                 trie_cache = PartialTrieNodeCache::new();
                 cache.reset();
 
-                // Persist the cold value cache: a restart before the next commit must not reload
-                // stale pre-revert values without their sparse-trie paths.
-                if let Err(e) = save_to_file(&cache, &cache_path) {
-                    warn!(
-                        target: "partial_stateless",
-                        error = %e,
-                        "Failed to persist cache after revert"
-                    );
+                // Production persists the cold value cache; benchmark mode has no
+                // restart contract and avoids this unrelated disk write.
+                if !validation_bench {
+                    if let Err(e) = save_to_file(&cache, &cache_path) {
+                        warn!(
+                            target: "partial_stateless",
+                            error = %e,
+                            "Failed to persist cache after revert"
+                        );
+                    }
                 }
             }
         }
@@ -625,6 +658,18 @@ fn thread_rusage() -> (u64, u64, u64) {
 #[cfg(not(target_os = "linux"))]
 fn thread_rusage() -> (u64, u64, u64) {
     (0, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SidecarRole;
+
+    #[test]
+    fn only_builder_verifier_runs_builder_side_preflight() {
+        assert!(!SidecarRole::Builder.runs_preflight());
+        assert!(SidecarRole::BuilderVerifier.runs_preflight());
+        assert!(!SidecarRole::Verifier.runs_preflight());
+    }
 }
 
 fn main() -> eyre::Result<()> {

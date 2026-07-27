@@ -97,7 +97,7 @@ use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::RecvTimeoutError,
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -115,6 +115,109 @@ type InsertPayloadResult<N> = Result<
     (ExecutedBlock<N>, Option<Box<ExecutionTimingStats>>),
     InsertPayloadError<<N as NodePrimitives>::Block>,
 >;
+
+static ENGINE_BENCH_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static ENGINE_BENCH_COLLISION_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+struct EngineBenchmarkGuard {
+    start: Instant,
+    collision_epoch: usize,
+    overlapped_at_start: bool,
+    active: bool,
+}
+
+impl EngineBenchmarkGuard {
+    fn start() -> Self {
+        let overlapped_at_start = ENGINE_BENCH_ACTIVE.fetch_add(1, Ordering::AcqRel) > 0;
+        let collision_epoch = if overlapped_at_start {
+            ENGINE_BENCH_COLLISION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            ENGINE_BENCH_COLLISION_EPOCH.load(Ordering::Acquire)
+        };
+        Self { start: Instant::now(), collision_epoch, overlapped_at_start, active: true }
+    }
+
+    fn finish(mut self) -> (Duration, bool) {
+        let elapsed = self.start.elapsed();
+        let contaminated = self.overlapped_at_start ||
+            ENGINE_BENCH_COLLISION_EPOCH.load(Ordering::Acquire) != self.collision_epoch;
+        ENGINE_BENCH_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        self.active = false;
+        (elapsed, contaminated)
+    }
+}
+
+impl Drop for EngineBenchmarkGuard {
+    fn drop(&mut self) {
+        if self.active {
+            ENGINE_BENCH_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn partial_stateless_validation_bench_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ["PS_ENGINE_BENCH", "PS_VALIDATION_BENCH"].into_iter().any(|name| {
+            std::env::var(name)
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false)
+        })
+    })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn append_engine_benchmark_record(
+    block_number: u64,
+    block_hash: B256,
+    gas_used: u64,
+    tx_count: usize,
+    execution_us: u64,
+    state_access_execution_us: u64,
+    state_root_wait_us: u64,
+    validation_us: u64,
+    contaminated: bool,
+    strategy: &str,
+) {
+    let path = std::env::var_os("PS_ENGINE_BENCH_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("engine_bench.jsonl"));
+    static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let Ok(_guard) = WRITE_LOCK.get_or_init(|| Mutex::new(())).lock() else {
+        warn!(target: "partial_stateless_bench", "engine benchmark output lock poisoned");
+        return;
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(target: "partial_stateless_bench", %error, path = %path.display(), "failed to create engine benchmark directory");
+            return;
+        }
+    }
+    let record = serde_json::json!({
+        "schema_version": 2,
+        "benchmark": "vanilla_engine_v2",
+        "block_number": block_number,
+        "block_hash": block_hash,
+        "gas_used": gas_used,
+        "tx_count": tx_count,
+        "execution_us": execution_us,
+        "state_access_execution_us": state_access_execution_us,
+        "state_root_wait_us": state_root_wait_us,
+        "validation_us": validation_us,
+        "contaminated": contaminated,
+        "state_root_strategy": strategy,
+    });
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        serde_json::to_writer(&mut file, &record).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    })();
+    if let Err(error) = result {
+        warn!(target: "partial_stateless_bench", %error, path = %path.display(), "failed to append engine benchmark record");
+    }
+}
 
 /// Context providing access to tree state during validation.
 ///
@@ -395,6 +498,16 @@ where
         V: PayloadValidator<T, Block = N::Block> + Clone,
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
+        let validation_bench =
+            partial_stateless_validation_bench_enabled().then(EngineBenchmarkGuard::start);
+        if validation_bench.is_some() {
+            info!(
+                target: "partial_stateless_bench",
+                benchmark = "vanilla_engine_v2_start",
+                block_hash = ?input.hash(),
+                "Vanilla Reth Engine V2 benchmark start"
+            );
+        }
         // Spawn payload conversion on a background thread so it runs concurrently with the
         // rest of the function (setup + execution). For payloads this overlaps the cost of
         // RLP decoding + header hashing.
@@ -459,6 +572,10 @@ where
         }
 
         let parent_hash = input.parent_hash();
+
+        // The primary Vanilla benchmark starts before provider construction so it includes
+        // production cache/prewarming setup and any Full-DB reads on the execution path.
+        let state_access_execution_start = validation_bench.as_ref().map(|_| Instant::now());
 
         trace!(target: "engine::tree::payload_validator", "Fetching block state provider");
         let _enter =
@@ -574,6 +691,9 @@ where
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
             };
         let execution_duration = execute_block_start.elapsed();
+        let state_access_execution_us = state_access_execution_start
+            .map(|start| start.elapsed().as_micros() as u64)
+            .unwrap_or_default();
 
         // After executing the block we can stop prewarming transactions
         handle.stop_prewarming_execution();
@@ -812,6 +932,42 @@ where
                 .into(),
             )
             .into())
+        }
+
+        if let Some(validation_bench) = validation_bench {
+            let execution_us = execution_duration.as_micros() as u64;
+            let state_root_wait_us = root_elapsed.as_micros() as u64;
+            let (validation_duration, contaminated) = validation_bench.finish();
+            let validation_us = validation_duration.as_micros() as u64;
+            let strategy_name = format!("{strategy:?}");
+            info!(
+                target: "partial_stateless_bench",
+                benchmark = "vanilla_engine_v2",
+                block = block.number(),
+                block_hash = ?block.hash(),
+                gas_used = output.result.gas_used,
+                tx_count = block.transaction_count(),
+                execution_us,
+                state_access_execution_us,
+                state_root_wait_us,
+                validation_us,
+                contaminated,
+                strategy = %strategy_name,
+                "Vanilla Reth Engine V2 validation benchmark"
+            );
+            // File I/O happens after every measured phase has ended.
+            append_engine_benchmark_record(
+                block.number(),
+                block.hash(),
+                output.result.gas_used,
+                block.transaction_count(),
+                execution_us,
+                state_access_execution_us,
+                state_root_wait_us,
+                validation_us,
+                contaminated,
+                &strategy_name,
+            );
         }
 
         let timing_stats = state_provider_stats.map(|stats| {

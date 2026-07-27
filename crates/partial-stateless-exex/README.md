@@ -75,7 +75,10 @@ variables, so the core sidecar generation path stays lean:
 | `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
 | `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around transition-witness construction (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
-| `PS_SIDECAR_PREFLIGHT=1` | run provider-assisted validator preflight for each sidecar (an extra re-execution per block) |
+| `PS_ENGINE_BENCH=1` | enable the lightweight Vanilla Engine V2 timing collector; usable by a standard Reth node without the ExEx |
+| `PS_ENGINE_BENCH_OUTPUT=<file>` | JSONL destination for Vanilla Engine V2 timing records (default: `./engine_bench.jsonl`) |
+| `PS_VALIDATION_BENCH=1` | enable in-memory DB-free Partial/Weak validation paired with same-block Vanilla Engine timing; requires `builder-verifier` |
+| `PS_BENCH_OUTPUT=<file>` | JSONL destination for paired Partial/Weak benchmark records |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
 
 `PS_SIDECAR_ROLE=builder-verifier` is a single-process test mode: it keeps the
@@ -93,8 +96,6 @@ cache synchronized to the parent block; the sidecar file alone is not enough to
 reconstruct that previous cache. Because sparse-trie snapshots are not persisted,
 the current binary cold-resets a persisted flat cache at startup; ordinary
 mid-chain verifier restart/cold-start is therefore not implemented yet.
-
-`PS_SIDECAR_PREFLIGHT` gates the validator-like self-check. When enabled, sidecar generation fails fast if the cache+witness-backed re-execution, expected miss set, or next cache anchor check fails. When unset, the sidecar still carries `prev_cache_anchor`, `next_cache_anchor`, and `witness_commitment`, but this ExEx does not spend the extra execution work to preflight them. The manifest records this as `provider_assisted_preflight: false`.
 
 Preflight re-executes from cache hits plus sidecar misses, applies the execution
 diff to a cloned local sparse trie, checks that root against the consensus block
@@ -122,6 +123,56 @@ syscalls are made. The metrics are Linux-only (`RUSAGE_THREAD`); on other
 platforms they log zeros. If comparing against the baseline, note that
 `PS_WITNESS_BASELINE` runs first and can warm the OS page cache, deflating the
 partial witness page-fault counts.
+
+### Single-process paired execution benchmark
+
+`scripts/run_live_paired_bench.py` supervises one `reth-partial-stateless` process. For each
+canonical block, Engine V2 first records production Full-DB state access plus EVM execution. The
+ExEx then builds the two witnesses and re-executes the same block through the DB-free Partial and
+Weak providers. Partial-first and Weak-first order alternates by block.
+
+The primary `state_access_execution_us` boundary is:
+
+- Vanilla: parent provider construction, production prewarming/cache setup, DB-backed reads, and
+  EVM execution.
+- Partial/Weak: sidecar deserialize, context and witness commitment/self-consistency checks,
+  materialization, witness-backed provider setup/lookups, and EVM execution.
+
+Post-execution access capture, hashing/root work, cache maintenance, builder proof generation, file
+I/O, and network transfer are outside the primary metric and are reported separately where
+applicable. The secondary executor-call metric still includes state-provider reads made by the EVM:
+Full DB/cache reads for Vanilla and in-memory witness/cache lookups for Partial and Weak. It excludes
+Partial/Weak deserialize, cache-context validation, commitment checks, and materialization.
+
+If builder-side preflight fails, the process remains fail-closed, but writes a reproducible diagnostic
+bundle below `$PS_SIDECAR_DIR/preflight-failures/`. The bundle contains the exact sidecar, parent
+value cache, a self-contained proof for all retained parent cache paths, and JSON metadata.
+
+Benchmark mode keeps generated sidecars in memory, does not persist the cache, skips
+warn-only root-completeness scans, and ignores capture, full-witness-baseline, resource, and trie
+diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` is unset.
+
+The default run excludes 60 successful warm-up blocks and collects 600 same-hash accepted samples.
+It discards invalid pairs and any pair whose Partial/Weak interval overlaps the start of the next
+Engine validation. A reorg/revert cold-resets the caches and restarts the warm-up; only samples after
+the last reset are retained. The supervisor sends `SIGINT` after the target and writes `results.md`.
+The output directory must be absent or empty.
+
+```bash
+python3 crates/partial-stateless-exex/scripts/run_live_paired_bench.py \
+  --reth-bin ./target/release/reth-partial-stateless \
+  --datadir /path/to/reth-data \
+  --jwtsecret /path/to/jwt.hex \
+  --output /path/to/benchmark-output \
+  --warmup 60 \
+  --samples 600 \
+  -- \
+  --minimal
+```
+
+The script only starts the node when the user invokes it; building or testing this crate does not
+start a node. Raw records and logs are saved next to the report as `paired.jsonl`, `engine.jsonl`,
+and `reth-partial-stateless.log`.
 
 ### Transition-witness construction
 
@@ -165,7 +216,7 @@ resumable transition, including waits for any structural proof deltas. Retention
 per-block cache work. Full validation is diagnostic-only and is skipped when
 `PS_TRIE_CACHE_DIAGNOSTICS` is unset.
 
-Combine diagnostics with `PS_SIDECAR_PREFLIGHT=1` for a bounded correctness run.
+Use `PS_SIDECAR_ROLE=builder-verifier` for a bounded correctness run.
 Do not interpret prefix coverage as a literal MPT node count: Patricia extensions
 compress nibble levels.
 

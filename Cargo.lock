@@ -6495,6 +6495,7 @@ dependencies = [
  "reth-revm",
  "reth-trie-common",
  "revm",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

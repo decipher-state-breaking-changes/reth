@@ -504,7 +504,16 @@ pub fn materialize_sidecar_witness_with_limits(
     limits: &SidecarWitnessCheckLimits,
 ) -> Result<MaterializedSidecarWitness> {
     check_sidecar_witness_prefilter(sidecar, limits)?;
+    materialize_sidecar_witness_after_prefilter(sidecar)
+}
 
+/// Materializes a sidecar after [`check_sidecar_witness_prefilter`] has succeeded.
+///
+/// This supports benchmark instrumentation that measures commitment/self-consistency separately
+/// from proof decoding. Production callers should use `materialize_sidecar_witness_with_limits`.
+pub fn materialize_sidecar_witness_after_prefilter(
+    sidecar: &PartialStatelessSidecar,
+) -> Result<MaterializedSidecarWitness> {
     let mut grouped_targets: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
     for address in &sidecar.cache_miss_targets.accounts {
         grouped_targets.entry(*address).or_default();
@@ -814,25 +823,6 @@ fn multiproof_to_v2_or_request(
     Ok(DecodedMultiProofV2 { account_proofs, storage_proofs })
 }
 
-fn remove_leaf_and_collect_proofs(
-    trie: &mut impl SparseTrie,
-    key: B256,
-) -> std::result::Result<Vec<B256>, String> {
-    let mut updates = B256Map::default();
-    updates.insert(key, LeafUpdate::Changed(Vec::new()));
-    let mut proof_targets = Vec::new();
-    trie.update_leaves(&mut updates, |target, _min_len| {
-        proof_targets.push(target);
-    })
-    .map_err(|err| err.to_string())?;
-    Ok(proof_targets)
-}
-
-fn dedup_proof_targets(targets: &mut Vec<TrieProofTarget>) {
-    let mut seen = HashSet::with_capacity(targets.len());
-    targets.retain(|target| seen.insert(*target));
-}
-
 /// Compute and persist the block post-state in the local sparse trie without a database walk.
 ///
 /// The witness reveals parent-state paths for value-cache misses. Paths for cache hits are
@@ -881,172 +871,25 @@ pub fn try_compute_trustless_state_root_v2_with_storage_targets(
     bundle_state: &BundleState,
     storage_targets: impl IntoIterator<Item = B256>,
 ) -> std::result::Result<B256, TrieTransitionError> {
-    let sparse = trie_cache.sparse_mut();
-    sparse.reveal_decoded_multiproof_v2(decoded_multiproof).map_err(|err| {
-        TrieTransitionError::Failed(format!("failed to reveal parent multiproof: {err}"))
-    })?;
-
     let hashed_post_state =
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
-
-    // Canonical flat witnesses omit empty trie nodes. Reconstruct omitted storage tries for both
-    // execution writes and read-only cache misses, but only when the authenticated parent account
-    // proves that its storage root is empty.
-    let mut required_storage_tries = hashed_post_state.storages.keys().copied().collect::<Vec<_>>();
-    required_storage_tries.extend(storage_targets);
-    required_storage_tries.sort_unstable();
-    required_storage_tries.dedup();
-    for hashed_address in &required_storage_tries {
-        if sparse.storage_trie_ref(hashed_address).is_some() {
-            continue
-        }
-        if !sparse.is_account_revealed(*hashed_address) {
-            return Err(TrieTransitionError::Failed(format!(
-                "account path was not revealed for storage address={hashed_address}"
-            )))
-        }
-        let storage_root = sparse
-            .get_account_value(hashed_address)
-            .map(|value| TrieAccount::decode(&mut &value[..]))
-            .transpose()
-            .map_err(|err| {
-                TrieTransitionError::Failed(format!(
-                    "failed to decode parent account for storage address={hashed_address}: {err}"
-                ))
-            })?
-            .map_or(EMPTY_ROOT_HASH, |account| account.storage_root);
-        if storage_root != EMPTY_ROOT_HASH {
-            return Err(TrieTransitionError::Failed(format!(
-                "storage proof is missing for address={hashed_address}, root={storage_root}"
-            )))
-        }
-        sparse.insert_storage_trie(*hashed_address, RevealableSparseTrie::revealed_empty());
-    }
-
-    // Match canonical witness generation: wipe first, then apply upserts before removals.
-    // Account leaves are rewritten afterwards so they commit the updated storage roots.
-    for (hashed_address, hashed_storage) in &hashed_post_state.storages {
-        if hashed_storage.wiped {
-            sparse.wipe_storage(*hashed_address).map_err(|err| {
-                TrieTransitionError::Failed(format!(
-                    "failed to wipe storage {hashed_address}: {err}"
-                ))
-            })?;
+    let mut session = CacheAwareTrieTransition::new(trie_cache, hashed_post_state, storage_targets);
+    session.reveal(decoded_multiproof)?;
+    match session.advance()? {
+        CacheAwareTransitionProgress::Complete(root) => Ok(root),
+        CacheAwareTransitionProgress::ProofRequired(targets) => {
+            let targets = targets
+                .into_iter()
+                .map(|target| match target {
+                    TrieProofTargetV2::Account { key, .. } => TrieProofTarget::Account(key),
+                    TrieProofTargetV2::Storage { hashed_address, key, .. } => {
+                        TrieProofTarget::Storage { hashed_address, hashed_slot: key }
+                    }
+                })
+                .collect();
+            Err(TrieTransitionError::ProofRequired(targets))
         }
     }
-
-    for (hashed_address, hashed_storage) in &hashed_post_state.storages {
-        for (slot_hash, value) in &hashed_storage.storage {
-            if value.is_zero() {
-                continue
-            }
-            sparse
-                .update_storage_leaf(
-                    *hashed_address,
-                    Nibbles::unpack(*slot_hash),
-                    alloy_rlp::encode(value),
-                )
-                .map_err(|err| TrieTransitionError::Failed(format!(
-                    "failed to update storage path: address={hashed_address}, slot={slot_hash}, value={value}, wiped={}: {err}",
-                    hashed_storage.wiped
-                )))?;
-        }
-    }
-
-    let mut required_proofs = Vec::new();
-    for (hashed_address, hashed_storage) in &hashed_post_state.storages {
-        if hashed_storage.wiped {
-            continue
-        }
-        for (slot_hash, value) in &hashed_storage.storage {
-            if !value.is_zero() {
-                continue
-            }
-            let storage_trie = sparse.storage_trie_mut(hashed_address).ok_or_else(|| {
-                TrieTransitionError::Failed(format!(
-                    "storage trie was not revealed for address={hashed_address}"
-                ))
-            })?;
-            for hashed_slot in remove_leaf_and_collect_proofs(storage_trie, *slot_hash)
-                .map_err(|err| TrieTransitionError::Failed(format!(
-                    "failed to remove storage path: address={hashed_address}, slot={slot_hash}: {err}"
-                )))?
-            {
-                required_proofs.push(TrieProofTarget::Storage {
-                    hashed_address: *hashed_address,
-                    hashed_slot,
-                });
-            }
-        }
-    }
-    dedup_proof_targets(&mut required_proofs);
-    if !required_proofs.is_empty() {
-        return Err(TrieTransitionError::ProofRequired(required_proofs))
-    }
-
-    let mut accounts_to_remove = Vec::new();
-    for (hashed_address, account) in &hashed_post_state.accounts {
-        match account {
-            Some(account) => {
-                let keep_account =
-                    sparse.update_account(*hashed_address, *account).map_err(|err| {
-                        TrieTransitionError::Failed(format!(
-                        "failed to update account path {hashed_address}, account={account:?}: {err}"
-                    ))
-                    })?;
-                if !keep_account {
-                    accounts_to_remove.push(*hashed_address);
-                }
-            }
-            None => accounts_to_remove.push(*hashed_address),
-        }
-    }
-
-    // HashedPostState normally has an account entry for every storage entry. Keep this fallback
-    // for callers that construct storage-only post states directly.
-    for hashed_address in hashed_post_state.storages.keys() {
-        if hashed_post_state.accounts.contains_key(hashed_address) {
-            continue
-        }
-        let keep_account = sparse.update_account_storage_root(*hashed_address).map_err(|err| {
-            TrieTransitionError::Failed(format!(
-                "failed to propagate storage root for {hashed_address}: {err}"
-            ))
-        })?;
-        if !keep_account {
-            accounts_to_remove.push(*hashed_address);
-        }
-    }
-
-    accounts_to_remove.sort_unstable();
-    accounts_to_remove.dedup();
-    let mut required_proofs = Vec::new();
-    for hashed_address in accounts_to_remove {
-        let account_trie = sparse
-            .trie_mut()
-            .as_revealed_mut()
-            .ok_or_else(|| TrieTransitionError::Failed("account trie is blind".to_string()))?;
-        for target in
-            remove_leaf_and_collect_proofs(account_trie, hashed_address).map_err(|err| {
-                TrieTransitionError::Failed(format!(
-                    "failed to remove account path {hashed_address}: {err}"
-                ))
-            })?
-        {
-            required_proofs.push(TrieProofTarget::Account(target));
-        }
-    }
-    dedup_proof_targets(&mut required_proofs);
-    if !required_proofs.is_empty() {
-        return Err(TrieTransitionError::ProofRequired(required_proofs))
-    }
-
-    let state_root = sparse.root().map_err(|err| {
-        TrieTransitionError::Failed(format!("failed to compute state root: {err}"))
-    })?;
-    drop(sparse.take_deferred_drops());
-    trie_cache.set_state_root(state_root);
-    Ok(state_root)
 }
 
 fn ensure_cap(label: &'static str, actual: usize, cap: usize) -> Result<()> {

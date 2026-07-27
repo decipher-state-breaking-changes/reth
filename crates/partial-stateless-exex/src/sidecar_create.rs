@@ -1,8 +1,14 @@
 use crate::{
+    benchmark::{
+        append_record, deserialize_sidecar_for_benchmark, serialize_sidecar_for_benchmark,
+        ValidationBenchmarkRecord, WitnessSizeBreakdown,
+    },
     format_bytes,
     sidecar_io::sidecar_path,
     sidecar_reexec::{
-        verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits, TrieCacheDisposition,
+        verify_and_apply_provider_assisted_sidecar,
+        verify_and_apply_trustless_sidecar_for_benchmark, SidecarReexecLimits,
+        TrieCacheDisposition,
     },
     thread_rusage, CacheConfig,
 };
@@ -24,7 +30,7 @@ use partial_stateless::{
     PartialTrieNodeCache, RootWitnessCompletenessSummary, SidecarBenchmarkManifest, StateTargetSet,
     StateTargetStats, TrieProofTargetV2, WitnessReductionStats,
 };
-use reth_ethereum::EthPrimitives;
+use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::StateProvider;
@@ -49,6 +55,7 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) resource_metrics: bool,
     pub(crate) trie_cache_diagnostics: bool,
     pub(crate) run_sidecar_preflight: bool,
+    pub(crate) validation_bench_output: Option<&'a Path>,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
 }
 
@@ -129,14 +136,14 @@ impl V2TargetSet {
         let mut delta = Self::default();
         for (&key, &min_len) in &self.accounts {
             if requested.accounts.get(&key).is_some_and(|current| *current <= min_len) {
-                continue
+                continue;
             }
             requested.accounts.insert(key, min_len);
             delta.accounts.insert(key, min_len);
         }
         for (&key, &min_len) in &self.storage {
             if requested.storage.get(&key).is_some_and(|current| *current <= min_len) {
-                continue
+                continue;
             }
             requested.storage.insert(key, min_len);
             delta.storage.insert(key, min_len);
@@ -233,7 +240,7 @@ fn initial_cache_aware_targets(
     }
     for (&hashed_address, storage) in &post_state.storages {
         if storage.wiped {
-            continue
+            continue;
         }
         for &hashed_slot in storage.storage.keys() {
             mutation_target_count += 1;
@@ -348,7 +355,7 @@ fn build_cache_aware_flat_transition(
                     if structural_rounds >= 128 {
                         return Err(eyre::eyre!(
                             "cache-aware transition exceeded 128 structural proof rounds"
-                        ))
+                        ));
                     }
                     structural_rounds += 1;
                     let mut exact = V2TargetSet::default();
@@ -378,7 +385,7 @@ fn build_cache_aware_flat_transition(
                         return Err(eyre::eyre!(
                             "cache-aware transition made no progress: all {} structural targets were already requested",
                             exact.len()
-                        ))
+                        ));
                     }
                     let mut reveal_proof = accumulated_parent_proof.clone();
                     reveal_proof.retain_targets(&reveal_delta.to_provider_targets());
@@ -386,7 +393,7 @@ fn build_cache_aware_flat_transition(
                         return Err(eyre::eyre!(
                             "cache-aware transition structural proof delta was empty for {} targets",
                             reveal_delta.len()
-                        ))
+                        ));
                     }
                     session.reveal(reveal_proof).map_err(|err| {
                         eyre::eyre!("failed to reveal structural V2 proof delta: {err}")
@@ -400,7 +407,7 @@ fn build_cache_aware_flat_transition(
     if state_root != expected_state_root {
         return Err(eyre::eyre!(
             "cache-aware sparse-trie root mismatch: expected {expected_state_root:?}, got {state_root:?}"
-        ))
+        ));
     }
 
     let mut nodes = flat_nodes.into_values().collect::<Vec<_>>();
@@ -441,6 +448,98 @@ fn decode_transition_witness(
     }
     DecodedMultiProofV2::from_witness(parent_state_root, &witness)
         .map_err(|err| eyre::eyre!("failed to decode canonical transition witness: {err}"))
+}
+
+fn persist_preflight_failure_artifacts(
+    sidecar_dir: &Path,
+    state_provider: &dyn StateProvider,
+    sidecar: &PartialStatelessSidecar,
+    expected_state_root: B256,
+    parent_cache: &NetworkStateCache,
+    parent_trie_cache: &PartialTrieNodeCache,
+    error: &eyre::Report,
+) -> eyre::Result<PathBuf> {
+    let failure_dir = sidecar_dir
+        .join("preflight-failures")
+        .join(format!("{}_{:?}", sidecar.block_number, sidecar.block_hash));
+    fs::create_dir_all(&failure_dir)?;
+
+    let sidecar_bytes = bincode::serialize(sidecar)?;
+    fs::write(failure_dir.join("sidecar.bin"), &sidecar_bytes)?;
+    let value_cache_bytes = bincode::serialize(&(
+        1u64,
+        parent_cache.current_block(),
+        parent_cache.accounts(),
+        parent_cache.storage(),
+        parent_cache.codes(),
+    ))?;
+    fs::write(failure_dir.join("parent-value-cache.bin"), &value_cache_bytes)?;
+
+    let mut parent_targets = V2TargetSet::default();
+    for address in parent_cache.accounts().keys() {
+        parent_targets.insert(TrieProofTargetV2::Account { key: keccak256(address), min_len: 0 });
+    }
+    for (address, slot) in parent_cache.storage().keys() {
+        let hashed_address = keccak256(address);
+        parent_targets.insert(TrieProofTargetV2::Account { key: hashed_address, min_len: 0 });
+        parent_targets.insert(TrieProofTargetV2::Storage {
+            hashed_address,
+            key: keccak256(slot),
+            min_len: 0,
+        });
+    }
+    if parent_targets.is_empty() {
+        parent_targets.insert(TrieProofTargetV2::Account { key: B256::ZERO, min_len: 0 });
+    }
+
+    let mut parent_witness_nodes = 0usize;
+    let mut parent_witness_bytes = 0usize;
+    let mut parent_witness_error = None;
+    match state_provider.multiproof_v2(TrieInput::default(), parent_targets.to_provider_targets()) {
+        Ok(proof) => {
+            let mut flat_nodes = B256Map::<Bytes>::default();
+            proof.extend_flat_witness(&mut flat_nodes);
+            let mut nodes = flat_nodes.into_values().collect::<Vec<_>>();
+            nodes.sort_unstable();
+            nodes.dedup();
+            parent_witness_nodes = nodes.len();
+            parent_witness_bytes = nodes.iter().map(|node| node.len()).sum();
+            fs::write(failure_dir.join("parent-trie-witness.bin"), bincode::serialize(&nodes)?)?;
+        }
+        Err(proof_error) => parent_witness_error = Some(proof_error.to_string()),
+    }
+
+    let shape = parent_trie_cache.shape_metrics();
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "block_number": sidecar.block_number,
+        "block_hash": format!("{:?}", sidecar.block_hash),
+        "parent_hash": format!("{:?}", sidecar.parent_hash),
+        "parent_state_root": format!("{:?}", sidecar.parent_state_root),
+        "expected_state_root": format!("{:?}", expected_state_root),
+        "preflight_error": format!("{error:#}"),
+        "sidecar_bytes": sidecar_bytes.len(),
+        "parent_value_cache_bytes": value_cache_bytes.len(),
+        "parent_cache_accounts": parent_cache.accounts().len(),
+        "parent_cache_storage": parent_cache.storage().len(),
+        "parent_cache_codes": parent_cache.codes().len(),
+        "parent_trie_state_root": parent_trie_cache.state_root().map(|root| format!("{root:?}")),
+        "parent_trie_warm_accounts": shape.retained_account_paths,
+        "parent_trie_warm_storage": shape.retained_storage_paths,
+        "parent_trie_account_nodes": shape.account_revealed_nodes,
+        "parent_trie_storage_nodes": shape.storage_revealed_nodes,
+        "parent_trie_witness_targets": parent_targets.len(),
+        "parent_trie_witness_nodes": parent_witness_nodes,
+        "parent_trie_witness_bytes": parent_witness_bytes,
+        "parent_trie_witness_error": parent_witness_error,
+        "files": {
+            "sidecar": "sidecar.bin",
+            "parent_value_cache": "parent-value-cache.bin",
+            "parent_trie_witness": (parent_witness_nodes > 0).then_some("parent-trie-witness.bin"),
+        },
+    });
+    fs::write(failure_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
+    Ok(failure_dir)
 }
 
 fn measure_transition_witness_size(
@@ -485,7 +584,307 @@ fn measure_transition_witness_size(
     }
 }
 
-pub(crate) fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn>(
+#[derive(Debug)]
+pub struct WeakStatelessBuild {
+    pub sidecar: PartialStatelessSidecar,
+    pub build_us: u64,
+}
+
+#[expect(clippy::too_many_arguments)]
+pub fn build_weak_stateless_sidecar(
+    state_provider: &dyn StateProvider,
+    parent_state_root: B256,
+    expected_state_root: B256,
+    parent_hash: B256,
+    block_hash: B256,
+    block_number: u64,
+    hashed_post_state: &HashedPostState,
+    accessed: &BlockAccessedState,
+    ancestor_headers: &[Bytes],
+    config: &CacheConfig,
+) -> eyre::Result<WeakStatelessBuild> {
+    let build_start = Instant::now();
+    let cold_cache = config.new_cache();
+    let full_miss = cold_cache.compute_miss(accessed);
+    let cold_trie = PartialTrieNodeCache::new();
+    let base =
+        generate_cache_aware_base_proof(state_provider, hashed_post_state, &full_miss, &cold_trie)?;
+    let build = build_cache_aware_flat_transition(
+        state_provider,
+        parent_state_root,
+        expected_state_root,
+        hashed_post_state.clone(),
+        &full_miss,
+        &cold_trie,
+        &base,
+    )?;
+
+    let (raw_targets, _) = build_sidecar_targets(&full_miss);
+    let full_targets = StateTargetSet::from(&raw_targets);
+    let mut codes = accessed.codes.iter().collect::<Vec<_>>();
+    codes.sort_unstable_by_key(|(code_hash, _)| **code_hash);
+    let codes = codes.into_iter().map(|(_, code)| code.clone()).collect::<Vec<_>>();
+    let bytecode_bytes = codes.iter().map(|code| code.len()).sum();
+    let mut stats =
+        measure_transition_witness_size(&build.nodes, &build.decoded_proof, bytecode_bytes);
+    stats.target_accounts = base.targets.accounts.len() + build.structural_account_targets;
+    stats.target_storage_slots = base.targets.storage.len() + build.structural_storage_targets;
+    stats.computation_time_ms = Some(build_start.elapsed().as_millis() as u64);
+
+    let witness = PartialExecutionWitness {
+        state: PartialExecutionWitnessState::MptTransitionNodes(build.nodes),
+        codes,
+        keys: raw_targets.key_preimages(),
+        headers: ancestor_headers.to_vec(),
+    };
+    let cache_policy_id =
+        last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
+    let parent_block_number = block_number.saturating_sub(1);
+    let prev_cache_anchor =
+        cold_cache.cache_anchor(parent_block_number, parent_hash, cache_policy_id);
+    let mut next_cache = config.new_cache();
+    next_cache.on_block_executed(block_number, accessed);
+    let next_cache_anchor = next_cache.cache_anchor(block_number, block_hash, cache_policy_id);
+    let witness_commitment = partial_witness_commitment(parent_state_root, &full_targets, &witness);
+
+    Ok(WeakStatelessBuild {
+        sidecar: PartialStatelessSidecar {
+            parent_hash,
+            parent_state_root,
+            block_hash,
+            block_number,
+            cache_block: parent_block_number,
+            cache_policy_id,
+            prev_cache_anchor,
+            next_cache_anchor,
+            cache_policy_metadata: "WeakStateless(no persistent cache)".to_string(),
+            cache_miss_targets: full_targets,
+            witness_commitment,
+            miss_manifest: raw_targets,
+            witness,
+            stats,
+        },
+        build_us: build_start.elapsed().as_micros() as u64,
+    })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn benchmark_one_sidecar_validation<Evm>(
+    evm_config: &Evm,
+    block: &RecoveredBlock<BlockTy<EthPrimitives>>,
+    cache: &mut NetworkStateCache,
+    trie_cache: &mut PartialTrieNodeCache,
+    sidecar_bytes: &[u8],
+    limits: &SidecarReexecLimits,
+) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
+where
+    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+{
+    let (sidecar, deserialize_us) = deserialize_sidecar_for_benchmark(sidecar_bytes)?;
+    let mut report = verify_and_apply_trustless_sidecar_for_benchmark(
+        evm_config,
+        block,
+        cache,
+        &sidecar,
+        limits,
+        trie_cache,
+        TrieCacheDisposition::Discard,
+    )?;
+    report.timings.set_deserialize_us(deserialize_us);
+    Ok(report)
+}
+
+const fn partial_runs_first(block_number: u64) -> bool {
+    block_number % 2 == 0
+}
+
+#[expect(clippy::too_many_arguments)]
+fn benchmark_sidecar_validation<Evm>(
+    evm_config: &Evm,
+    state_provider: &dyn StateProvider,
+    block: &RecoveredBlock<BlockTy<EthPrimitives>>,
+    prev_cache: &mut NetworkStateCache,
+    trie_cache: &mut PartialTrieNodeCache,
+    partial_sidecar: &PartialStatelessSidecar,
+    hashed_post_state: &HashedPostState,
+    accessed: &BlockAccessedState,
+    ancestor_headers: &[Bytes],
+    config: &CacheConfig,
+    limits: &SidecarReexecLimits,
+    output_path: &Path,
+    historical_full_db_evm_us: u64,
+    partial_witness_build_us: u64,
+    historical_gas_used: u64,
+    historical_receipts_root: B256,
+    historical_requests_hash: B256,
+    historical_requests_empty: bool,
+    value_cache_bytes: usize,
+) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
+where
+    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+{
+    let WeakStatelessBuild { sidecar: weak_sidecar, build_us: weak_build_us } =
+        build_weak_stateless_sidecar(
+            state_provider,
+            partial_sidecar.parent_state_root,
+            block.state_root(),
+            block.parent_hash,
+            block.hash(),
+            block.number(),
+            hashed_post_state,
+            accessed,
+            ancestor_headers,
+            config,
+        )?;
+
+    // Serialization is builder-side preparation and is outside both execution timers. Each
+    // sidecar is deserialized immediately before its execution so decode order follows EVM order.
+    let partial_serialize_start = Instant::now();
+    let partial_bytes = serialize_sidecar_for_benchmark(partial_sidecar)?;
+    let partial_serialize_us = partial_serialize_start.elapsed().as_micros() as u64;
+    let weak_serialize_start = Instant::now();
+    let weak_bytes = serialize_sidecar_for_benchmark(&weak_sidecar)?;
+    let weak_serialize_us = weak_serialize_start.elapsed().as_micros() as u64;
+    let partial_witness = WitnessSizeBreakdown::from_witness(&partial_sidecar.witness)?;
+    let weak_witness = WitnessSizeBreakdown::from_witness(&weak_sidecar.witness)?;
+
+    let mut weak_cache = config.new_cache();
+    let mut weak_trie = PartialTrieNodeCache::new();
+    let partial_first = partial_runs_first(block.number());
+    let (partial_report, weak_report) = if partial_first {
+        let partial_report = benchmark_one_sidecar_validation(
+            evm_config,
+            block,
+            prev_cache,
+            trie_cache,
+            &partial_bytes,
+            limits,
+        )?;
+        let weak_report = benchmark_one_sidecar_validation(
+            evm_config,
+            block,
+            &mut weak_cache,
+            &mut weak_trie,
+            &weak_bytes,
+            limits,
+        )?;
+        (partial_report, weak_report)
+    } else {
+        let weak_report = benchmark_one_sidecar_validation(
+            evm_config,
+            block,
+            &mut weak_cache,
+            &mut weak_trie,
+            &weak_bytes,
+            limits,
+        )?;
+        let partial_report = benchmark_one_sidecar_validation(
+            evm_config,
+            block,
+            prev_cache,
+            trie_cache,
+            &partial_bytes,
+            limits,
+        )?;
+        (partial_report, weak_report)
+    };
+    info!(
+        target: "partial_stateless_bench",
+        block = block.number(),
+        block_hash = ?block.hash(),
+        verifier_order = if partial_first { "partial-then-weak" } else { "weak-then-partial" },
+        "Paired Partial/Weak timed validation complete"
+    );
+    let expected_root = block.state_root();
+    let partial_root = partial_report.trustless_state_root.unwrap_or_default();
+    let weak_root = weak_report.trustless_state_root.unwrap_or_default();
+    let expected_gas_used = block.header().gas_used();
+    let expected_receipts_root = block.header().receipts_root();
+    let expected_requests_hash = block.header().requests_hash();
+    let requests_valid = expected_requests_hash.map_or_else(
+        || {
+            historical_requests_empty &&
+                partial_report.execution_requests_empty &&
+                weak_report.execution_requests_empty
+        },
+        |expected| {
+            historical_requests_hash == expected &&
+                partial_report.execution_requests_hash == expected &&
+                weak_report.execution_requests_hash == expected
+        },
+    );
+    let valid = partial_root == expected_root &&
+        weak_root == expected_root &&
+        historical_gas_used == expected_gas_used &&
+        partial_report.execution_gas_used == expected_gas_used &&
+        weak_report.execution_gas_used == expected_gas_used &&
+        historical_receipts_root == expected_receipts_root &&
+        partial_report.execution_receipts_root == expected_receipts_root &&
+        weak_report.execution_receipts_root == expected_receipts_root &&
+        requests_valid;
+    let record = ValidationBenchmarkRecord {
+        schema_version: 2,
+        block_number: block.number(),
+        block_hash: block.hash(),
+        gas_used: expected_gas_used,
+        historical_gas_used,
+        tx_count: block.transaction_count(),
+        verifier_order: if partial_first { "partial-then-weak" } else { "weak-then-partial" },
+        historical_full_db_evm_us,
+        partial_witness_build_us,
+        weak_witness_build_us: weak_build_us,
+        partial_serialize_us,
+        weak_serialize_us,
+        partial: partial_report.timings.clone(),
+        weak: weak_report.timings.clone(),
+        partial_witness,
+        weak_witness,
+        partial_sidecar_bytes: partial_bytes.len(),
+        weak_sidecar_bytes: weak_bytes.len(),
+        value_cache_bytes,
+        trie_cache_bytes: trie_cache.estimated_memory_bytes(),
+        expected_state_root: expected_root,
+        partial_state_root: partial_root,
+        weak_state_root: weak_root,
+        expected_receipts_root,
+        historical_receipts_root,
+        partial_receipts_root: partial_report.execution_receipts_root,
+        weak_receipts_root: weak_report.execution_receipts_root,
+        expected_requests_hash,
+        historical_requests_hash,
+        partial_requests_hash: partial_report.execution_requests_hash,
+        weak_requests_hash: weak_report.execution_requests_hash,
+        valid,
+    };
+    append_record(output_path, &record)?;
+    info!(
+        target: "partial_stateless_bench",
+        benchmark = "paired_validation",
+        block = block.number(),
+        block_hash = ?block.hash(),
+        verifier_order = record.verifier_order,
+        historical_full_db_evm_us,
+        partial_state_access_execution_us = partial_report.timings.state_access_execution_us,
+        weak_state_access_execution_us = weak_report.timings.state_access_execution_us,
+        partial_evm_us = partial_report.timings.evm_us,
+        weak_evm_us = weak_report.timings.evm_us,
+        partial_witness_bytes = record.partial_witness.serialized_witness_bytes,
+        weak_witness_bytes = record.weak_witness.serialized_witness_bytes,
+        weak_witness_build_us = weak_build_us,
+        valid,
+        "Recorded paired Partial/Weak validation benchmark"
+    );
+    if !valid {
+        return Err(eyre::eyre!(
+            "paired validation mismatch: expected_root={expected_root:?}, partial_root={partial_root:?}, weak_root={weak_root:?}, expected_gas={expected_gas_used}, partial_gas={}, weak_gas={}",
+            partial_report.execution_gas_used,
+            weak_report.execution_gas_used,
+        ));
+    }
+
+    Ok(partial_report)
+}
+pub fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn>(
     evm_config: &Evm,
     state_provider: &dyn StateProvider,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
@@ -502,8 +901,10 @@ where
     AncestorHeadersFn: FnOnce(Option<u64>, u64) -> eyre::Result<Vec<Bytes>>,
 {
     let block_number = block.number();
+    let builder_total_start = Instant::now();
     let parent_block_number = block_number.saturating_sub(1);
 
+    let historical_execution_start = Instant::now();
     let state_provider_db = StateProviderDatabase::new(state_provider);
     let mut db = State::builder().with_bundle_update().with_database(state_provider_db).build();
     let block_executor = evm_config.executor(&mut db);
@@ -516,6 +917,12 @@ where
             lowest_block_number = statedb.block_hashes.lowest().map(|(num, _)| num);
         })
         .map_err(|err| eyre::eyre!("simulation failed for block: {err}"))?;
+    let historical_full_db_evm_us = historical_execution_start.elapsed().as_micros() as u64;
+    let historical_gas_used = execution_output.result.gas_used;
+    let historical_receipts_root =
+        calculate_receipt_root_no_memo(&execution_output.result.receipts);
+    let historical_requests_hash = execution_output.result.requests.requests_hash();
+    let historical_requests_empty = execution_output.result.requests.is_empty();
 
     let hashed_post_state = state_provider.hashed_post_state(&execution_output.state);
 
@@ -699,7 +1106,8 @@ where
         )
         .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
         let initial_provider_us = base.provider_us;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let transition_witness_build_us = start.elapsed().as_micros() as u64;
+        let elapsed_ms = transition_witness_build_us / 1_000;
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
         let witness_state = PartialExecutionWitnessState::MptTransitionNodes(nodes);
         result.computation_time_ms = Some(elapsed_ms);
@@ -798,19 +1206,74 @@ where
             };
 
             let root_witness_completeness = if options.run_sidecar_preflight {
-                let reexec_report = verify_and_apply_provider_assisted_sidecar(
-                    evm_config,
-                    state_provider,
-                    block,
-                    prev_cache_for_reexec,
-                    &sidecar,
-                    options.reexec_limits,
-                    trie_cache,
-                    TrieCacheDisposition::Discard,
-                )
-                .map_err(|err| eyre::eyre!("provider-assisted sidecar preflight failed: {err}"))?;
+                let reexec_report = if let Some(output_path) = options.validation_bench_output {
+                    benchmark_sidecar_validation(
+                        evm_config,
+                        state_provider,
+                        block,
+                        prev_cache_for_reexec,
+                        trie_cache,
+                        &sidecar,
+                        &hashed_post_state,
+                        &accessed,
+                        &ancestor_headers,
+                        config,
+                        options.reexec_limits,
+                        output_path,
+                        historical_full_db_evm_us,
+                        transition_witness_build_us,
+                        historical_gas_used,
+                        historical_receipts_root,
+                        historical_requests_hash,
+                        historical_requests_empty,
+                        cache_memory_before,
+                    )
+                } else {
+                    verify_and_apply_provider_assisted_sidecar(
+                        evm_config,
+                        state_provider,
+                        block,
+                        prev_cache_for_reexec,
+                        &sidecar,
+                        options.reexec_limits,
+                        trie_cache,
+                        TrieCacheDisposition::Discard,
+                    )
+                };
+                let reexec_report = match reexec_report {
+                    Ok(report) => report,
+                    Err(err) => {
+                        match persist_preflight_failure_artifacts(
+                            options.sidecar_dir,
+                            state_provider,
+                            &sidecar,
+                            block.state_root(),
+                            prev_cache_for_reexec,
+                            trie_cache,
+                            &err,
+                        ) {
+                            Ok(path) => warn!(
+                                target: "partial_stateless",
+                                block = block_number,
+                                path = %path.display(),
+                                error = %err,
+                                "Saved sidecar preflight failure artifacts"
+                            ),
+                            Err(artifact_error) => warn!(
+                                target: "partial_stateless",
+                                block = block_number,
+                                error = %err,
+                                artifact_error = %artifact_error,
+                                "Failed to save sidecar preflight failure artifacts"
+                            ),
+                        }
+                        break 'sidecar Err(eyre::eyre!("sidecar preflight failed: {err}"))
+                    }
+                };
 
-                if !reexec_report.root_witness_completeness.trustless_root_ready {
+                if options.validation_bench_output.is_none() &&
+                    !reexec_report.root_witness_completeness.trustless_root_ready
+                {
                     warn!(
                         target: "partial_stateless",
                         block = block_number,
@@ -840,7 +1303,7 @@ where
                     expected_miss_storage = reexec_report.expected_miss.storage.len(),
                     expected_miss_codes = reexec_report.expected_miss.code_hashes.len(),
                     next_cache_root = ?reexec_report.next_cache_anchor.cache_root,
-                    "Provider-assisted sidecar preflight succeeded"
+                    "Sidecar preflight succeeded"
                 );
                 match reexec_report.trustless_state_root {
                     Some(root) if root == block.state_root() => info!(
@@ -871,14 +1334,27 @@ where
                 RootWitnessCompletenessSummary::default()
             };
 
+            if options.validation_bench_output.is_some() {
+                info!(
+                    target: "partial_stateless_bench",
+                    block = block_number,
+                    "Paired benchmark retained sidecars in memory; file and manifest writes skipped"
+                );
+                break 'sidecar Ok(None);
+            }
+
             fs::create_dir_all(options.sidecar_dir)
                 .map_err(|err| eyre::eyre!("failed to create sidecar directory: {err}"))?;
             let sidecar_path = sidecar_path(options.sidecar_dir, block_number, block_hash);
+            let serialize_start = Instant::now();
             let sidecar_bytes = bincode::serialize(&sidecar)
                 .map_err(|err| eyre::eyre!("failed to serialize sidecar: {err}"))?;
-            fs::write(&sidecar_path, sidecar_bytes).map_err(|err| {
+            let sidecar_serialize_us = serialize_start.elapsed().as_micros() as u64;
+            let write_start = Instant::now();
+            fs::write(&sidecar_path, &sidecar_bytes).map_err(|err| {
                 eyre::eyre!("failed to write sidecar file {:?}: {err}", sidecar_path)
             })?;
+            let sidecar_write_us = write_start.elapsed().as_micros() as u64;
             let sidecar_bytes_len =
                 fs::metadata(&sidecar_path).map(|m| m.len() as usize).unwrap_or(0);
             let partial_state_trustless_verification_ready =
@@ -955,6 +1431,8 @@ where
                 manifest = %manifest_path.display(),
                 manifest_saved,
                 size = format_bytes(sidecar_bytes_len),
+                sidecar_serialize_us,
+                sidecar_write_us,
                 "Saved witness sidecar successfully"
             );
             Ok(Some(sidecar_path))
@@ -1042,12 +1520,54 @@ where
         "Cache state after update"
     );
 
+    info!(
+        target: "partial_stateless_bench",
+        benchmark = "builder_end_to_end",
+        block = block_number,
+        block_hash = ?block_hash,
+        historical_full_db_evm_us,
+        builder_total_us = builder_total_start.elapsed().as_micros() as u64,
+        sidecar_published = saved_sidecar_path.is_some(),
+        "Builder sidecar end-to-end benchmark"
+    );
+
     Ok(BuilderBlockReport { cache_update: stats, witness, sidecar_path: saved_sidecar_path })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{Address, U256};
+    use partial_stateless::policy::AccountData;
+
+    #[test]
+    fn paired_validation_order_alternates_by_block() {
+        assert!(partial_runs_first(100));
+        assert!(!partial_runs_first(101));
+        assert!(partial_runs_first(102));
+    }
+
+    #[test]
+    fn cold_weak_cache_marks_every_accessed_value_as_a_witness_miss() {
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let code_hash = B256::repeat_byte(0x33);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            address,
+            AccountData { nonce: 7, balance: U256::from(8), code_hash: Some(code_hash) },
+        );
+        accessed.storage.insert((address, slot), U256::from(9));
+        accessed.codes.insert(code_hash, Bytes::from_static(&[1, 2, 3]));
+
+        let miss = CacheConfig::default().new_cache().compute_miss(&accessed);
+
+        assert_eq!(miss.missed_accounts, vec![address]);
+        assert_eq!(miss.missed_storage, vec![(address, slot)]);
+        assert_eq!(miss.missed_codes, vec![code_hash]);
+        assert_eq!(miss.total_missed, accessed.total_keys());
+        assert_eq!(miss.miss_ratio, 1.0);
+    }
 
     #[test]
     fn v2_target_difference_handles_accounts_storage_duplicates_and_min_len() {
