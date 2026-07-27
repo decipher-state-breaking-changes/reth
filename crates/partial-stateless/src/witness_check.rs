@@ -1430,6 +1430,7 @@ mod tests {
         let (_, expected_second_root) = single_account_proof(address, updated_again, None);
         assert_eq!(second_root, expected_second_root);
         assert_eq!(next_trie_cache.state_root(), Some(second_root));
+        assert_eq!(next_trie_cache.account_exists(&address), Some(true));
         next_trie_cache.validate_against_value_cache(&values).unwrap();
     }
 
@@ -1477,6 +1478,7 @@ mod tests {
 
         trie_cache.validate_against_value_cache(&values).unwrap();
         assert!(trie_cache.contains_account_path(&missing_address));
+        assert_eq!(trie_cache.account_exists(&missing_address), Some(false));
         assert_eq!(trie_cache.state_root(), Some(parent_root));
     }
 

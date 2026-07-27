@@ -147,6 +147,17 @@ impl PartialTrieNodeCache {
         self.sparse.is_account_revealed(hashed_address)
     }
 
+    /// Returns whether an account exists when its authenticated path is revealed.
+    ///
+    /// `None` means the sparse trie cannot currently prove the path. `Some(false)` is an
+    /// authenticated exclusion and must not be confused with an existing empty account.
+    pub fn account_exists(&self, address: &Address) -> Option<bool> {
+        let hashed_address = keccak256(address);
+        self.sparse
+            .is_account_revealed(hashed_address)
+            .then(|| self.sparse.get_account_value(&hashed_address).is_some())
+    }
+
     /// Whether the current sparse shape can prove this storage value or absence.
     pub fn contains_storage_path(&self, address: &Address, slot: &B256) -> bool {
         self.contains_hashed_storage_path(keccak256(address), keccak256(slot))
@@ -507,6 +518,7 @@ mod tests {
         assert!(trie.tracks_account(&address));
         assert!(trie.tracks_storage(&address, &slot));
         assert!(!trie.contains_account_path(&address));
+        assert_eq!(trie.account_exists(&address), None);
         assert!(!trie.contains_storage_path(&address, &slot));
         assert_eq!(trie.tracked_account_count(), 1);
         assert_eq!(trie.tracked_storage_slot_count(), 1);

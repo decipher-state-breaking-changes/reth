@@ -160,6 +160,7 @@ where
         };
     let witness_provider = WitnessBackedStateProvider {
         cache: prev_cache,
+        trie_cache,
         witness_accounts: materialized.accounts,
         witness_storage: materialized.storage,
         witness_codes: materialized.codes,
@@ -434,6 +435,7 @@ fn prefilter(
 
 struct WitnessBackedStateProvider<'a> {
     cache: &'a NetworkStateCache,
+    trie_cache: &'a PartialTrieNodeCache,
     witness_accounts: HashMap<Address, Option<Account>>,
     witness_storage: HashMap<(Address, B256), U256>,
     witness_codes: HashMap<B256, Bytes>,
@@ -450,6 +452,15 @@ impl WitnessBackedStateProvider<'_> {
 impl EvmStateProvider for WitnessBackedStateProvider<'_> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         if let Some(entry) = self.cache.accounts().get(address) {
+            match self.trie_cache.account_exists(address) {
+                Some(false) => return Ok(None),
+                Some(true) => {}
+                None => {
+                    return Err(Self::missing(&format!(
+                        "cached account is missing an authenticated trie path for {address:?}"
+                    )))
+                }
+            }
             return Ok(Some(Account {
                 nonce: entry.value.nonce,
                 balance: entry.value.balance,
