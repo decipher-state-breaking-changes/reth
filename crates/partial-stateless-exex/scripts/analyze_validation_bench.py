@@ -37,6 +37,8 @@ def field_hash(line: str, name: str):
 @dataclass
 class SelectionStats:
     before_last_reset: int = 0
+    resets: int = 0
+    orphaned: int = 0
     warmup: int = 0
     invalid: int = 0
     missing_engine: int = 0
@@ -45,16 +47,28 @@ class SelectionStats:
     pending_next_engine: int = 0
 
 
+@dataclass(frozen=True)
+class ResetPoint:
+    position: int
+    reverted_from: int | None
+
+
+def reset_reverted_from(line: str):
+    line = ANSI_ESCAPE.sub("", line)
+    match = re.search(r"(?:from_chain|reverted_chain)=([0-9]+)[.][.]=", line)
+    return int(match.group(1)) if match else None
+
+
 def parse_log_positions(log_path: Path):
     engine_positions = {}
     paired_positions = {}
     ordered_engine_positions = []
-    reset_positions = []
+    reset_points = []
     if not log_path.exists():
-        return engine_positions, paired_positions, ordered_engine_positions, reset_positions
+        return engine_positions, paired_positions, ordered_engine_positions, reset_points
     for position, line in enumerate(log_path.read_text(errors="replace").splitlines()):
         if any(marker in line for marker in RESET_MARKERS):
-            reset_positions.append(position)
+            reset_points.append(ResetPoint(position, reset_reverted_from(line)))
         if "Vanilla Reth Engine V2 benchmark start" in line:
             block_hash = field_hash(line, "block_hash")
             if block_hash:
@@ -65,7 +79,7 @@ def parse_log_positions(log_path: Path):
             if block_hash:
                 paired_positions[block_hash] = position
     ordered_engine_positions.sort()
-    return engine_positions, paired_positions, ordered_engine_positions, reset_positions
+    return engine_positions, paired_positions, ordered_engine_positions, reset_points
 
 
 def select_samples(paired_records, engine_records, log_path: Path, warmup: int, limit=None):
@@ -75,45 +89,63 @@ def select_samples(paired_records, engine_records, log_path: Path, warmup: int, 
         if record.get("block_hash")
     }
     engine_positions, paired_positions, ordered_engine_positions, resets = parse_log_positions(log_path)
-    last_reset = resets[-1] if resets else -1
+    reset_positions = [reset.position for reset in resets]
     stats = SelectionStats()
     accepted = []
-    warmup_remaining = warmup
-
+    candidates = []
     for record in paired_records:
         block_hash = record.get("block_hash", "").lower()
         paired_position = paired_positions.get(block_hash)
         if paired_position is None:
             stats.missing_log_position += 1
             continue
-        if paired_position <= last_reset:
-            stats.before_last_reset += 1
-            continue
-        if not record.get("valid", False):
-            stats.invalid += 1
-            continue
-        engine = engine_by_hash.get(block_hash)
-        own_engine_position = engine_positions.get(block_hash)
-        if engine is None or own_engine_position is None:
-            stats.missing_engine += 1
-            continue
-        if warmup_remaining:
-            warmup_remaining -= 1
-            stats.warmup += 1
-            continue
-        next_index = bisect.bisect_right(ordered_engine_positions, own_engine_position)
-        if next_index >= len(ordered_engine_positions):
-            stats.pending_next_engine += 1
-            continue
-        if ordered_engine_positions[next_index] < paired_position or engine.get("contaminated", False):
-            stats.contaminated += 1
-            continue
-        merged = dict(record)
-        merged["vanilla_engine"] = engine
-        accepted.append(merged)
-        if limit is not None and len(accepted) >= limit:
-            break
-    return accepted, stats
+        epoch = bisect.bisect_right(reset_positions, paired_position)
+        candidates.append((epoch, paired_position, record))
+
+    candidates.sort(key=lambda item: item[1])
+    candidate_index = 0
+    epoch_count = len(resets) + 1
+    for epoch in range(epoch_count):
+        reset = resets[epoch - 1] if epoch else None
+        if reset is not None:
+            if reset.reverted_from is not None:
+                retained = [
+                    record for record in accepted
+                    if record.get("block_number", -1) < reset.reverted_from
+                ]
+                stats.orphaned += len(accepted) - len(retained)
+                accepted = retained
+            if epoch > 1 or resets[0].reverted_from is not None:
+                stats.resets += 1
+
+        warmup_remaining = warmup
+        while candidate_index < len(candidates) and candidates[candidate_index][0] == epoch:
+            _, paired_position, record = candidates[candidate_index]
+            candidate_index += 1
+            block_hash = record.get("block_hash", "").lower()
+            if not record.get("valid", False):
+                stats.invalid += 1
+                continue
+            engine = engine_by_hash.get(block_hash)
+            own_engine_position = engine_positions.get(block_hash)
+            if engine is None or own_engine_position is None:
+                stats.missing_engine += 1
+                continue
+            if warmup_remaining:
+                warmup_remaining -= 1
+                stats.warmup += 1
+                continue
+            next_index = bisect.bisect_right(ordered_engine_positions, own_engine_position)
+            if next_index >= len(ordered_engine_positions):
+                stats.pending_next_engine += 1
+                continue
+            if ordered_engine_positions[next_index] < paired_position or engine.get("contaminated", False):
+                stats.contaminated += 1
+                continue
+            merged = dict(record)
+            merged["vanilla_engine"] = engine
+            accepted.append(merged)
+    return accepted[:limit] if limit is not None else accepted, stats
 
 
 def percentile(values, fraction):
@@ -179,8 +211,8 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines = [
         "# Single-process Vanilla / Partial / Weak benchmark", "",
         f"Accepted same-block samples: **{len(accepted)}**",
-        f"Warm-up blocks excluded: **{stats.warmup}**",
-        f"Excluded: overlap {stats.contaminated}, invalid {stats.invalid}, missing Engine {stats.missing_engine}, pending {stats.pending_next_engine}.", "",
+        f"Warm-up blocks excluded: **{stats.warmup}** across **{stats.resets + 1}** cache epochs",
+        f"Excluded: orphaned {stats.orphaned}, overlap {stats.contaminated}, invalid {stats.invalid}, missing Engine {stats.missing_engine}, pending {stats.pending_next_engine}.", "",
         "## State access + execution (primary)", "",
         "Includes Vanilla provider/prewarming/DB reads and Partial/Weak deserialize, witness checks/materialization, provider setup/lookups, and EVM.", "",
         "| Mode | Average | p50 | p90 | p95 | p99 | Maximum |",

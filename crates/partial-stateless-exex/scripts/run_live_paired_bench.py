@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one bounded reth-partial-stateless process and analyze 600 paired samples."""
+"""Run one bounded reth-partial-stateless process and analyze paired samples."""
 
 import argparse
 import json

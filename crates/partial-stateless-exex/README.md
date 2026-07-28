@@ -155,8 +155,10 @@ diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` i
 
 The default run excludes 60 successful warm-up blocks and collects 600 same-hash accepted samples.
 It discards invalid pairs and any pair whose Partial/Weak interval overlaps the start of the next
-Engine validation. A reorg/revert cold-resets the caches and restarts the warm-up; only samples after
-the last reset are retained. The supervisor sends `SIGINT` after the target and writes `results.md`.
+Engine validation. A reorg/revert cold-resets the caches and starts a new warm-up epoch. Samples
+from earlier canonical heights remain eligible; orphaned heights at or above the reverted range and
+each epoch’s warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
+`SIGINT` after the target and writes `results.md`.
 The output directory must be absent or empty.
 
 ```bash

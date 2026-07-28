@@ -6488,6 +6488,7 @@ dependencies = [
  "futures",
  "libc",
  "partial-stateless",
+ "reth-cli-util",
  "reth-ethereum",
  "reth-evm",
  "reth-primitives-traits",
