@@ -10,6 +10,13 @@
 //! 3. Computes and logs cache miss ratio (= witness requirement)
 //! 4. Builds and measures the canonical parent-state transition witness
 
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+// Required for jemalloc to override the allocator on supported Unix platforms.
+#[cfg(unix)]
+use reth_cli_util::allocator::tikv_jemalloc_sys as _;
+
 mod benchmark;
 mod sidecar_create;
 mod sidecar_io;

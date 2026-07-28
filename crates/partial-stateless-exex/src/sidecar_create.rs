@@ -1338,7 +1338,7 @@ where
                 info!(
                     target: "partial_stateless_bench",
                     block = block_number,
-                    "Paired benchmark retained sidecars in memory; file and manifest writes skipped"
+                    "Paired benchmark serialized sidecars in memory for this block; file and manifest writes skipped"
                 );
                 break 'sidecar Ok(None);
             }

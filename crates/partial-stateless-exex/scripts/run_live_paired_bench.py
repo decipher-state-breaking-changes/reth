@@ -2,6 +2,7 @@
 """Run one bounded reth-partial-stateless process and analyze 600 paired samples."""
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -73,6 +74,48 @@ def current_selection(paired_path, engine_path, log_path, warmup, samples):
     )
 
 
+def process_memory_kib(pid):
+    """Return Linux process RSS/peak RSS, or None after the process exits."""
+    try:
+        fields = {}
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name in {"VmRSS", "VmHWM", "RssAnon", "RssFile", "VmSwap"}:
+                fields[name] = int(value.strip().split()[0])
+        if "VmRSS" not in fields:
+            return None
+        return (
+            fields["VmRSS"],
+            fields.get("VmHWM", fields["VmRSS"]),
+            fields.get("RssAnon", 0),
+            fields.get("RssFile", 0),
+            fields.get("VmSwap", 0),
+        )
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        return None
+
+
+def append_resource_sample(path, pid, accepted):
+    memory = process_memory_kib(pid)
+    if memory is None:
+        return None
+    rss_kib, peak_rss_kib, rss_anon_kib, rss_file_kib, swap_kib = memory
+    record = {
+        "timestamp_unix": time.time(),
+        "pid": pid,
+        "accepted": accepted,
+        "rss_kib": rss_kib,
+        "peak_rss_kib": peak_rss_kib,
+        "rss_anon_kib": rss_anon_kib,
+        "rss_file_kib": rss_file_kib,
+        "swap_kib": swap_kib,
+    }
+    with path.open("a") as output:
+        json.dump(record, output, separators=(",", ":"))
+        output.write("\n")
+    return memory
+
+
 def benchmark_environment(paired_path, engine_path, sidecar_dir):
     env = os.environ.copy()
     env.update(
@@ -116,6 +159,7 @@ def main():
     engine_path = args.output / "engine.jsonl"
     log_path = args.output / "reth-partial-stateless.log"
     report_path = args.output / "results.md"
+    resource_path = args.output / "resources.jsonl"
     sidecar_dir = args.output / "sidecars"
 
     env = benchmark_environment(paired_path, engine_path, sidecar_dir)
@@ -143,10 +187,17 @@ def main():
                 accepted, stats = current_selection(
                     paired_path, engine_path, log_path, args.warmup, args.samples
                 )
+                memory = append_resource_sample(resource_path, process.pid, len(accepted))
                 if len(accepted) != last_count:
+                    memory_summary = (
+                        f" rss={memory[0] / 1024:.0f}MiB peak={memory[1] / 1024:.0f}MiB"
+                        if memory is not None
+                        else ""
+                    )
                     print(
                         f"accepted={len(accepted)}/{args.samples} warmup={stats.warmup} "
-                        f"overlap={stats.contaminated} pending={stats.pending_next_engine}",
+                        f"overlap={stats.contaminated} pending={stats.pending_next_engine}"
+                        f"{memory_summary}",
                         flush=True,
                     )
                     last_count = len(accepted)
@@ -154,8 +205,14 @@ def main():
                     reached_target = True
                     break
                 if exit_code is not None:
+                    detail = (
+                        " (SIGKILL; likely OOM—inspect the kernel log and resources.jsonl)"
+                        if exit_code == -signal.SIGKILL
+                        else ""
+                    )
                     raise RuntimeError(
-                        f"reth exited before the target with status {exit_code}; see {log_path}"
+                        f"reth exited before the target with status {exit_code}{detail}; "
+                        f"see {log_path}"
                     )
                 time.sleep(args.poll_seconds)
         except KeyboardInterrupt:

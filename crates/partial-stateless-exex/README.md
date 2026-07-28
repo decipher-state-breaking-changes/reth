@@ -148,7 +148,8 @@ If builder-side preflight fails, the process remains fail-closed, but writes a r
 bundle below `$PS_SIDECAR_DIR/preflight-failures/`. The bundle contains the exact sidecar, parent
 value cache, a self-contained proof for all retained parent cache paths, and JSON metadata.
 
-Benchmark mode keeps generated sidecars in memory, does not persist the cache, skips
+Benchmark mode serializes generated sidecars in memory for the current block only, does not persist
+them or the cache, skips
 warn-only root-completeness scans, and ignores capture, full-witness-baseline, resource, and trie
 diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` is unset.
 
@@ -172,7 +173,8 @@ python3 crates/partial-stateless-exex/scripts/run_live_paired_bench.py \
 
 The script only starts the node when the user invokes it; building or testing this crate does not
 start a node. Raw records and logs are saved next to the report as `paired.jsonl`, `engine.jsonl`,
-and `reth-partial-stateless.log`.
+`resources.jsonl`, and `reth-partial-stateless.log`. The resource log samples process RSS and peak
+RSS on each supervisor poll so long-run allocator regressions and OOM kills remain diagnosable.
 
 ### Transition-witness construction
 
