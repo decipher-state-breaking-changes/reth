@@ -57,6 +57,7 @@ pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm>(
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
+    expected_cache_policy_id: B256,
     limits: &SidecarReexecLimits,
     trie_cache: &mut PartialTrieNodeCache,
     trie_cache_disposition: TrieCacheDisposition,
@@ -70,6 +71,7 @@ where
         block,
         prev_cache,
         sidecar,
+        expected_cache_policy_id,
         limits,
         trie_cache,
         trie_cache_disposition,
@@ -83,6 +85,7 @@ pub(crate) fn verify_and_apply_trustless_sidecar_for_benchmark<Evm>(
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
+    expected_cache_policy_id: B256,
     limits: &SidecarReexecLimits,
     trie_cache: &mut PartialTrieNodeCache,
     trie_cache_disposition: TrieCacheDisposition,
@@ -96,6 +99,7 @@ where
         block,
         prev_cache,
         sidecar,
+        expected_cache_policy_id,
         limits,
         trie_cache,
         trie_cache_disposition,
@@ -109,6 +113,7 @@ fn verify_and_apply_sidecar_inner<Evm>(
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
+    expected_cache_policy_id: B256,
     limits: &SidecarReexecLimits,
     trie_cache: &mut PartialTrieNodeCache,
     trie_cache_disposition: TrieCacheDisposition,
@@ -119,7 +124,7 @@ where
 {
     let assisted_start = Instant::now();
     let context_start = Instant::now();
-    prefilter(block, prev_cache, sidecar)?;
+    prefilter(block, prev_cache, sidecar, expected_cache_policy_id)?;
     let context_check_us = context_start.elapsed().as_micros() as u64;
 
     let witness_check_start = Instant::now();
@@ -316,7 +321,7 @@ where
         &actual_accessed,
         sidecar.block_number,
         sidecar.block_hash,
-        sidecar.cache_policy_id,
+        expected_cache_policy_id,
         sidecar.next_cache_anchor,
         trie_cache,
         next_trie_cache,
@@ -414,7 +419,9 @@ fn prefilter(
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
+    expected_cache_policy_id: B256,
 ) -> Result<()> {
+    check_expected_cache_policy_id(sidecar.cache_policy_id, expected_cache_policy_id)?;
     if sidecar.block_hash != block.hash() {
         bail!("sidecar block_hash mismatch");
     }
@@ -427,10 +434,24 @@ fn prefilter(
     check_parent_cache_height(block.number(), prev_cache.current_block(), sidecar.cache_block)?;
 
     let local_prev_anchor =
-        prev_cache.cache_anchor(sidecar.cache_block, sidecar.parent_hash, sidecar.cache_policy_id);
+        prev_cache.cache_anchor(sidecar.cache_block, sidecar.parent_hash, expected_cache_policy_id);
     check_sidecar_context(sidecar, &local_prev_anchor)
         .map_err(|err| eyre!("sidecar cache context mismatch: {err:?}"))?;
 
+    Ok(())
+}
+
+fn check_expected_cache_policy_id(
+    sidecar_cache_policy_id: B256,
+    expected_cache_policy_id: B256,
+) -> Result<()> {
+    if sidecar_cache_policy_id != expected_cache_policy_id {
+        bail!(
+            "sidecar cache_policy_id mismatch: expected {:?}, got {:?}",
+            expected_cache_policy_id,
+            sidecar_cache_policy_id
+        );
+    }
     Ok(())
 }
 
@@ -537,13 +558,83 @@ impl EvmStateProvider for WitnessBackedStateProvider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use partial_stateless::policy::{AccountData, LastNBlocksPolicy};
+    use partial_stateless::{
+        check_sidecar_context,
+        policy::{AccountData, LastNBlocksPolicy},
+        PartialExecutionWitness, PartialExecutionWitnessState, WitnessResult, WitnessTargets,
+    };
 
     #[test]
     fn parent_cache_height_is_bound_to_the_block_parent() {
         check_parent_cache_height(100, 99, 99).expect("matching parent context");
         assert!(check_parent_cache_height(100, 98, 99).is_err());
         assert!(check_parent_cache_height(100, 99, 98).is_err());
+    }
+
+    #[test]
+    fn consistently_forged_policy_id_is_rejected() {
+        let expected_policy_id = B256::repeat_byte(0x11);
+        let forged_policy_id = B256::repeat_byte(0x22);
+        let parent_hash = B256::repeat_byte(0x33);
+        let block_hash = B256::repeat_byte(0x44);
+        let mut cache = NetworkStateCache::new(
+            Box::new(LastNBlocksPolicy::new(60)),
+            Box::new(LastNBlocksPolicy::new(30)),
+        );
+        cache.on_block_executed(99, &BlockAccessedState::default());
+        let forged_prev_anchor = cache.cache_anchor(99, parent_hash, forged_policy_id);
+        let sidecar = PartialStatelessSidecar {
+            parent_hash,
+            parent_state_root: B256::repeat_byte(0x55),
+            block_hash,
+            block_number: 100,
+            cache_block: 99,
+            cache_policy_id: forged_policy_id,
+            prev_cache_anchor: forged_prev_anchor,
+            next_cache_anchor: CacheAnchor {
+                block_number: 100,
+                block_hash,
+                cache_policy_id: forged_policy_id,
+                cache_root: B256::repeat_byte(0x66),
+            },
+            cache_policy_metadata: "forged".to_string(),
+            cache_miss_targets: StateTargetSet::default(),
+            witness_commitment: B256::ZERO,
+            miss_manifest: WitnessTargets {
+                missed_accounts: vec![],
+                missed_storage: vec![],
+                missed_code_hashes: vec![],
+            },
+            witness: PartialExecutionWitness {
+                state: PartialExecutionWitnessState::MptMultiProof(vec![]),
+                codes: vec![],
+                keys: vec![],
+                headers: vec![],
+            },
+            stats: WitnessResult {
+                total_size_bytes: 0,
+                account_proof_bytes: 0,
+                storage_proof_bytes: 0,
+                bytecode_bytes: 0,
+                account_proof_nodes: 0,
+                storage_proof_nodes: 0,
+                target_accounts: 0,
+                target_storage_slots: 0,
+                computation_time_ms: None,
+                cpu_time_ms: None,
+                major_page_faults: None,
+                minor_page_faults: None,
+            },
+        };
+
+        // The old core path derived its "local" anchor from the untrusted policy ID, so a
+        // consistently forged sidecar passed the generic context check.
+        check_sidecar_context(&sidecar, &forged_prev_anchor)
+            .expect("internally consistent forged policy context");
+
+        let err = check_expected_cache_policy_id(sidecar.cache_policy_id, expected_policy_id)
+            .expect_err("locally configured policy must bind core verification");
+        assert!(err.to_string().contains("sidecar cache_policy_id mismatch"));
     }
 
     #[test]

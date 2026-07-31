@@ -75,16 +75,19 @@ variables, so the core sidecar generation path stays lean:
 | `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
 | `PS_PARALLEL_INITIAL_PROOF=1` | use Reth's proof workers for eligible initial V2 multiproofs; low-width target sets and later structural deltas stay serial |
-| `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around transition-witness construction (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
+| `PS_RESOURCE_METRICS=1` | capture process CPU time + page faults around transition-witness construction, including parallel proof workers (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) |
 | `PS_ENGINE_BENCH=1` | enable the lightweight Vanilla Engine V2 timing collector; usable by a standard Reth node without the ExEx |
 | `PS_ENGINE_BENCH_OUTPUT=<file>` | JSONL destination for Vanilla Engine V2 timing records (default: `./engine_bench.jsonl`) |
 | `PS_VALIDATION_BENCH=1` | enable in-memory DB-free Partial/Weak validation paired with same-block Vanilla Engine timing; requires `builder-verifier` |
 | `PS_BENCH_OUTPUT=<file>` | JSONL destination for paired Partial/Weak benchmark records |
+| `PS_BUILDER_BENCH_OUTPUT=<file>` | JSONL destination for per-block builder proof, snapshot, commitment, and total-cost records |
+| `PS_FORCE_PREVIOUS_CACHE_SNAPSHOT=1` | benchmark-only B2 control that recreates the old unconditional parent-cache clone |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
 
 The initial parallel-proof gate currently requires at least two distinct storage tries and 64
-total initial targets. Eligible calls use half of the configured proof workers; smaller calls and
-all later structural/context proof deltas stay on the serial provider.
+total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
+of storage workers; smaller calls and all later structural/context proof deltas stay on the serial
+provider.
 
 `PS_SIDECAR_ROLE=builder-verifier` is a single-process test mode: it keeps the
 normal builder output path, but forces the same provider-assisted client preflight
@@ -124,8 +127,9 @@ failure is non-fatal — it never blocks the real (partial) sidecar.
 
 When `PS_RESOURCE_METRICS` is unset, the partial stats' `cpu_time_ms`,
 `major_page_faults`, and `minor_page_faults` are `null` and no `getrusage`
-syscalls are made. The metrics are Linux-only (`RUSAGE_THREAD`); on other
-platforms they log zeros. If comparing against the baseline, note that
+syscalls are made. The metrics are Linux-only (`RUSAGE_SELF`); on other
+platforms they log zeros. They include all process threads, so unrelated concurrent node work can
+also contribute. If comparing against the baseline, note that
 `PS_WITNESS_BASELINE` runs first and can warm the OS page cache, deflating the
 partial witness page-fault counts.
 
@@ -174,14 +178,39 @@ python3 crates/partial-stateless-exex/scripts/run_live_paired_bench.py \
   --output /path/to/benchmark-output \
   --warmup 60 \
   --samples 600 \
+  --parallel-initial-proof off \
   -- \
   --minimal
 ```
 
-The script only starts the node when the user invokes it; building or testing this crate does not
-start a node. Raw records and logs are saved next to the report as `paired.jsonl`, `engine.jsonl`,
-`resources.jsonl`, and `reth-partial-stateless.log`. The resource log samples process RSS and peak
-RSS on each supervisor poll so long-run allocator regressions and OOM kills remain diagnosable.
+The parallel-proof setting is explicit and defaults to `off`; use
+`--parallel-initial-proof on` for the B1 candidate. The script writes the clean primary report,
+an overlap-retaining Engine report, and a structured builder report. Raw records and logs are saved
+as `paired.jsonl`, `engine.jsonl`, `builder.jsonl`, `resources.jsonl`, and
+`reth-partial-stateless.log`.
+
+### Ordinary-builder and P0 comparison benchmark
+
+`scripts/run_live_builder_bench.py` runs `PS_SIDECAR_ROLE=builder`, requires published sidecars,
+and fails if an ordinary builder unexpectedly creates the previous-cache snapshot. Run the same
+block replay twice with `--force-previous-cache-snapshot` off and on to isolate B2 on one binary:
+
+```bash
+python3 crates/partial-stateless-exex/scripts/run_live_builder_bench.py \
+  --reth-bin ./target/release/reth-partial-stateless \
+  --datadir /path/to/reth-data \
+  --jwtsecret /path/to/jwt.hex \
+  --output /path/to/builder-output \
+  --warmup 60 \
+  --samples 600 \
+  --parallel-initial-proof off \
+  -- \
+  --minimal
+```
+
+Use `scripts/compare_p0_bench.py CONTROL/builder.jsonl CANDIDATE/builder.jsonl` to join the two
+runs by block hash, reject witness-commitment differences, and report paired builder, initial-proof,
+and snapshot ratios. Pass `--candidate-source parallel` when isolating B1.
 
 ### Transition-witness construction
 

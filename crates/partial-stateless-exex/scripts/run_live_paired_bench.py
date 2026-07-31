@@ -10,7 +10,13 @@ import sys
 import time
 from pathlib import Path
 
-from analyze_validation_bench import build_report, load_jsonl, select_samples
+from analyze_builder_bench import build_builder_report
+from analyze_validation_bench import (
+    build_overlap_report,
+    build_report,
+    load_jsonl,
+    select_samples,
+)
 
 DISABLED_DIAGNOSTICS = (
     "PS_TRIE_CACHE_DIAGNOSTICS",
@@ -29,6 +35,12 @@ def parse_args():
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--shutdown-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--parallel-initial-proof",
+        choices=("off", "on"),
+        default="off",
+        help="set PS_PARALLEL_INITIAL_PROOF deterministically (default: off)",
+    )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.warmup < 0 or args.samples <= 0:
@@ -64,10 +76,17 @@ def stop_process(process, timeout):
         raise RuntimeError("reth did not stop after SIGINT") from error
 
 
-def current_selection(paired_path, engine_path, log_path, warmup, samples):
+def current_selection(
+    paired_path,
+    engine_path,
+    log_path,
+    warmup,
+    samples,
+    allow_incomplete_tail=False,
+):
     return select_samples(
-        load_jsonl(paired_path),
-        load_jsonl(engine_path),
+        load_jsonl(paired_path, allow_incomplete_tail=allow_incomplete_tail),
+        load_jsonl(engine_path, allow_incomplete_tail=allow_incomplete_tail),
         log_path,
         warmup,
         samples,
@@ -116,15 +135,24 @@ def append_resource_sample(path, pid, accepted):
     return memory
 
 
-def benchmark_environment(paired_path, engine_path, sidecar_dir):
+def benchmark_environment(
+    paired_path,
+    engine_path,
+    builder_path,
+    sidecar_dir,
+    parallel_initial_proof,
+):
     env = os.environ.copy()
     env.update(
         {
             "PS_SIDECAR_ROLE": "builder-verifier",
             "PS_SIDECAR_DIR": str(sidecar_dir),
+            "PS_ENGINE_BENCH": "1",
             "PS_VALIDATION_BENCH": "1",
             "PS_BENCH_OUTPUT": str(paired_path),
             "PS_ENGINE_BENCH_OUTPUT": str(engine_path),
+            "PS_BUILDER_BENCH_OUTPUT": str(builder_path),
+            "PS_PARALLEL_INITIAL_PROOF": "1" if parallel_initial_proof == "on" else "0",
         }
     )
     for name in DISABLED_DIAGNOSTICS:
@@ -157,12 +185,21 @@ def main():
 
     paired_path = args.output / "paired.jsonl"
     engine_path = args.output / "engine.jsonl"
+    builder_path = args.output / "builder.jsonl"
     log_path = args.output / "reth-partial-stateless.log"
     report_path = args.output / "results.md"
+    overlap_report_path = args.output / "results-overlap.md"
+    builder_report_path = args.output / "results-builder.md"
     resource_path = args.output / "resources.jsonl"
     sidecar_dir = args.output / "sidecars"
 
-    env = benchmark_environment(paired_path, engine_path, sidecar_dir)
+    env = benchmark_environment(
+        paired_path,
+        engine_path,
+        builder_path,
+        sidecar_dir,
+        args.parallel_initial_proof,
+    )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
     print(
@@ -185,7 +222,12 @@ def main():
             while True:
                 exit_code = process.poll()
                 accepted, stats = current_selection(
-                    paired_path, engine_path, log_path, args.warmup, args.samples
+                    paired_path,
+                    engine_path,
+                    log_path,
+                    args.warmup,
+                    args.samples,
+                    allow_incomplete_tail=True,
                 )
                 memory = append_resource_sample(resource_path, process.pid, len(accepted))
                 if len(accepted) != last_count:
@@ -229,8 +271,26 @@ def main():
     )
     report = build_report(accepted, stats, args.warmup, args.samples)
     report_path.write_text(report)
+    overlap_accepted, overlap_stats = select_samples(
+        load_jsonl(paired_path),
+        load_jsonl(engine_path),
+        log_path,
+        args.warmup,
+        include_overlap=True,
+    )
+    overlap_report = build_overlap_report(overlap_accepted, overlap_stats, args.warmup)
+    overlap_report_path.write_text(overlap_report)
+    builder_report = build_builder_report(
+        load_jsonl(builder_path),
+        args.warmup,
+        args.samples,
+        expect_snapshot=True,
+    )
+    builder_report_path.write_text(builder_report)
     print(report, end="")
     print(f"Saved report: {report_path}", flush=True)
+    print(f"Saved overlap report: {overlap_report_path}", flush=True)
+    print(f"Saved builder report: {builder_report_path}", flush=True)
 
 
 if __name__ == "__main__":

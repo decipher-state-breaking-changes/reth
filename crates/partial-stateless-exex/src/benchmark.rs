@@ -157,6 +157,34 @@ pub struct ValidationBenchmarkRecord {
     pub valid: bool,
 }
 
+/// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BuilderBenchmarkRecord {
+    pub schema_version: u64,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub historical_full_db_evm_us: u64,
+    pub builder_total_us: u64,
+    pub transition_witness_build_us: u64,
+    pub snapshot_created: bool,
+    pub snapshot_us: u64,
+    pub snapshot_estimated_bytes: usize,
+    pub cache_parent_synced: bool,
+    pub initial_proof_source: &'static str,
+    pub initial_provider_us: u64,
+    pub initial_targets: usize,
+    pub distinct_storage_tries: usize,
+    pub parallel_storage_workers: usize,
+    pub parallel_account_workers: usize,
+    pub initial_proof_nodes: usize,
+    pub initial_proof_bytes: usize,
+    pub witness_commitment: Option<B256>,
+    pub sidecar_constructed: bool,
+    pub sidecar_published: bool,
+    pub value_cache_bytes: usize,
+    pub trie_cache_bytes: usize,
+}
+
 pub fn serialize_sidecar_for_benchmark(sidecar: &PartialStatelessSidecar) -> eyre::Result<Vec<u8>> {
     Ok(bincode::serialize(sidecar)?)
 }
@@ -170,6 +198,14 @@ pub fn deserialize_sidecar_for_benchmark(
 }
 
 pub fn append_record(path: &Path, record: &ValidationBenchmarkRecord) -> eyre::Result<()> {
+    append_json_record(path, record)
+}
+
+pub fn append_builder_record(path: &Path, record: &BuilderBenchmarkRecord) -> eyre::Result<()> {
+    append_json_record(path, record)
+}
+
+fn append_json_record(path: &Path, record: &impl Serialize) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -271,6 +307,22 @@ mod tests {
         assert!(value.get("trie_cache_bytes").is_some());
         assert!(value.get("partial_witness_build_us").is_some());
         assert!(value.get("partial_serialize_us").is_some());
+    }
+
+    #[test]
+    fn builder_json_schema_exposes_p0_proof_and_snapshot_costs() {
+        let value = serde_json::to_value(BuilderBenchmarkRecord::default()).unwrap();
+
+        assert!(value.get("block_hash").is_some());
+        assert!(value.get("builder_total_us").is_some());
+        assert!(value.get("snapshot_created").is_some());
+        assert!(value.get("snapshot_us").is_some());
+        assert!(value.get("initial_proof_source").is_some());
+        assert!(value.get("initial_provider_us").is_some());
+        assert!(value.get("distinct_storage_tries").is_some());
+        assert!(value.get("parallel_storage_workers").is_some());
+        assert!(value.get("parallel_account_workers").is_some());
+        assert!(value.get("witness_commitment").is_some());
     }
 
     #[test]

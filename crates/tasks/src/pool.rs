@@ -204,6 +204,11 @@ impl WorkerPool {
         self.pool.get().is_some()
     }
 
+    /// Returns the configured thread count without initializing the underlying pool.
+    pub const fn configured_num_threads(&self) -> usize {
+        self.num_threads
+    }
+
     /// Returns the total number of threads in the underlying rayon pool.
     pub fn current_num_threads(&self) -> usize {
         self.pool().current_num_threads()

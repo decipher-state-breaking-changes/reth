@@ -268,6 +268,12 @@ struct RuntimeInner {
     /// Proof account worker pool (trie account proof computation).
     #[cfg(feature = "rayon")]
     proof_account_worker_pool: WorkerPool,
+    /// Isolated one-shot proof storage worker pool.
+    #[cfg(feature = "rayon")]
+    one_shot_proof_storage_worker_pool: WorkerPool,
+    /// Isolated one-shot proof account worker pool.
+    #[cfg(feature = "rayon")]
+    one_shot_proof_account_worker_pool: WorkerPool,
     /// Prewarming pool (execution prewarming workers).
     #[cfg(feature = "rayon")]
     prewarming_pool: WorkerPool,
@@ -351,6 +357,18 @@ impl Runtime {
     #[cfg(feature = "rayon")]
     pub fn proof_account_worker_pool(&self) -> &WorkerPool {
         &self.0.proof_account_worker_pool
+    }
+
+    /// Get the isolated one-shot proof storage worker pool.
+    #[cfg(feature = "rayon")]
+    pub fn one_shot_proof_storage_worker_pool(&self) -> &WorkerPool {
+        &self.0.one_shot_proof_storage_worker_pool
+    }
+
+    /// Get the isolated one-shot proof account worker pool.
+    #[cfg(feature = "rayon")]
+    pub fn one_shot_proof_account_worker_pool(&self) -> &WorkerPool {
+        &self.0.one_shot_proof_account_worker_pool
     }
 
     /// Get the prewarming pool.
@@ -520,6 +538,37 @@ impl Runtime {
         R: Send + 'static,
     {
         crate::LazyHandle::new(self.0.worker_map.spawn_on(name, func))
+    }
+
+    /// Atomically queues two blocking closures on dedicated, named OS threads.
+    ///
+    /// Each name has the same stable single-thread execution semantics as
+    /// [`spawn_blocking_named`](Self::spawn_blocking_named). The two closures are inserted into
+    /// their respective FIFO queues as one admission operation, so concurrent paired submissions
+    /// cannot observe opposite queue ordering.
+    ///
+    /// This is useful for cooperating long-lived tasks that must both start before either can
+    /// complete. It does not wait for an earlier task on either named worker to finish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `first_name` and `second_name` are equal.
+    pub fn spawn_blocking_named_pair<F1, R1, F2, R2>(
+        &self,
+        first_name: &'static str,
+        first: F1,
+        second_name: &'static str,
+        second: F2,
+    ) -> (crate::LazyHandle<R1>, crate::LazyHandle<R2>)
+    where
+        F1: FnOnce() -> R1 + Send + 'static,
+        R1: Send + 'static,
+        F2: FnOnce() -> R2 + Send + 'static,
+        R2: Send + 'static,
+    {
+        let (first, second) =
+            self.0.worker_map.spawn_on_pair(first_name, first, second_name, second);
+        (crate::LazyHandle::new(first), crate::LazyHandle::new(second))
     }
 
     /// Spawns the task onto the runtime.
@@ -776,6 +825,8 @@ impl RuntimeBuilder {
             blocking_guard,
             proof_storage_worker_pool,
             proof_account_worker_pool,
+            one_shot_proof_storage_worker_pool,
+            one_shot_proof_account_worker_pool,
             prewarming_pool,
             bal_streaming_pool,
         ) = {
@@ -815,6 +866,11 @@ impl RuntimeBuilder {
             let proof_account_worker_pool =
                 WorkerPool::new(proof_account_worker_threads, "proof-acct");
 
+            let one_shot_proof_storage_worker_threads = (proof_storage_worker_threads / 2).max(1);
+            let one_shot_proof_storage_worker_pool =
+                WorkerPool::new(one_shot_proof_storage_worker_threads, "proof1-strg");
+            let one_shot_proof_account_worker_pool = WorkerPool::new(1, "proof1-acct");
+
             let prewarming_threads = config.rayon.prewarming_threads.unwrap_or(default_threads);
             let prewarming_pool = WorkerPool::new(prewarming_threads, "prewarm");
 
@@ -828,6 +884,8 @@ impl RuntimeBuilder {
                 storage_threads,
                 proof_storage_worker_threads,
                 proof_account_worker_threads,
+                one_shot_proof_storage_worker_threads,
+                one_shot_proof_account_worker_threads = 1,
                 prewarming_threads,
                 bal_streaming_threads,
                 max_blocking_tasks = config.rayon.max_blocking_tasks,
@@ -841,6 +899,8 @@ impl RuntimeBuilder {
                 blocking_guard,
                 proof_storage_worker_pool,
                 proof_account_worker_pool,
+                one_shot_proof_storage_worker_pool,
+                one_shot_proof_account_worker_pool,
                 prewarming_pool,
                 bal_streaming_pool,
             )
@@ -873,6 +933,10 @@ impl RuntimeBuilder {
             proof_storage_worker_pool,
             #[cfg(feature = "rayon")]
             proof_account_worker_pool,
+            #[cfg(feature = "rayon")]
+            one_shot_proof_storage_worker_pool,
+            #[cfg(feature = "rayon")]
+            one_shot_proof_account_worker_pool,
             #[cfg(feature = "rayon")]
             prewarming_pool,
             #[cfg(feature = "rayon")]
@@ -928,6 +992,8 @@ mod tests {
         // Worker pools are lazy — not initialized until first access.
         assert!(!runtime.0.bal_streaming_pool.is_initialized());
         assert!(!runtime.0.proof_storage_worker_pool.is_initialized());
+        assert!(!runtime.0.one_shot_proof_storage_worker_pool.is_initialized());
+        assert!(!runtime.0.one_shot_proof_account_worker_pool.is_initialized());
 
         // Accessing them triggers initialization and returns the configured thread count.
         assert_eq!(runtime.bal_streaming_pool().current_num_threads(), 2);
@@ -935,6 +1001,10 @@ mod tests {
 
         assert_eq!(runtime.proof_storage_worker_pool().current_num_threads(), 2);
         assert_eq!(runtime.proof_account_worker_pool().current_num_threads(), 2);
+        assert_eq!(runtime.one_shot_proof_storage_worker_pool().configured_num_threads(), 1);
+        assert!(!runtime.0.one_shot_proof_storage_worker_pool.is_initialized());
+        assert_eq!(runtime.one_shot_proof_storage_worker_pool().current_num_threads(), 1);
+        assert_eq!(runtime.one_shot_proof_account_worker_pool().current_num_threads(), 1);
         assert_eq!(runtime.prewarming_pool().current_num_threads(), 2);
     }
 }

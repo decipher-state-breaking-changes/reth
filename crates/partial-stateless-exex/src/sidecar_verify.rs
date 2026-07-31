@@ -59,6 +59,7 @@ where
         block,
         cache,
         &sidecar,
+        expected_policy_id,
         limits,
         trie_cache,
         TrieCacheDisposition::Commit,

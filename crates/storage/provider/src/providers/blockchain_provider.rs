@@ -833,12 +833,16 @@ mod tests {
         BlockWriter, CanonChainTracker, ProviderFactory, SaveBlocksMode,
     };
     use alloy_eips::{BlockHashOrNumber, BlockNumHash, BlockNumberOrTag};
-    use alloy_primitives::{keccak256, map::B256Map, Address, BlockNumber, TxNumber, B256};
+    use alloy_primitives::{
+        keccak256,
+        map::{B256Map, HashMap},
+        Address, BlockNumber, TxNumber, B256, U256,
+    };
     use itertools::Itertools;
     use rand::Rng;
     use reth_chain_state::{
         test_utils::TestBlockBuilder, CanonStateNotification, CanonStateSubscriptions,
-        CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain,
+        CanonicalInMemoryState, ComputedTrieData, ExecutedBlock, NewCanonicalChain,
     };
     use reth_chainspec::{ChainSpec, MAINNET};
     use reth_db_api::models::{AccountBeforeTx, StoredBlockBodyIndices};
@@ -847,19 +851,24 @@ mod tests {
     use reth_execution_types::{
         BlockExecutionOutput, BlockExecutionResult, Chain, ExecutionOutcome,
     };
-    use reth_primitives_traits::{RecoveredBlock, SealedBlock, SignerRecoverable};
+    use reth_primitives_traits::{
+        Account, RecoveredBlock, SealedBlock, SignerRecoverable, StorageEntry,
+    };
     use reth_storage_api::{
         BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader,
         BlockReaderIdExt, BlockSource, ChangeSetReader, DBProvider, DatabaseProviderFactory,
-        DatabaseProviderROFactory, HeaderProvider, ReceiptProvider, ReceiptProviderIdExt,
-        StateProofProvider, StateProviderFactory, StateWriteConfig, StateWriter,
-        TransactionVariant, TransactionsProvider,
+        DatabaseProviderROFactory, HashingWriter, HeaderProvider, ReceiptProvider,
+        ReceiptProviderIdExt, StateProofProvider, StateProviderFactory, StateWriteConfig,
+        StateWriter, TransactionVariant, TransactionsProvider,
     };
     use reth_testing_utils::generators::{
         self, random_block, random_block_range, random_changeset_range, random_eoa_accounts,
         random_receipt, BlockParams, BlockRangeParams,
     };
-    use reth_trie::{proof::Proof, MultiProofTargetsV2, ProofV2Target, TrieInput};
+    use reth_trie::{
+        proof::Proof, HashedPostState, KeccakKeyHasher, MultiProofTargetsV2, ProofV2Target,
+        TrieInput,
+    };
     use revm_database::{BundleState, OriginalValuesKnown};
     use std::{
         collections::BTreeMap,
@@ -1026,48 +1035,195 @@ mod tests {
         )
     }
 
+    fn executed_block_with_state(block: &SealedBlock<Block>, state: BundleState) -> ExecutedBlock {
+        let hashed_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(state.state()).into_sorted();
+        let senders = block.senders().expect("failed to recover senders");
+
+        ExecutedBlock::new(
+            Arc::new(RecoveredBlock::new_sealed(block.clone(), senders)),
+            Arc::new(BlockExecutionOutput {
+                state,
+                result: BlockExecutionResult {
+                    receipts: Default::default(),
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+            }),
+            ComputedTrieData { hashed_state: Arc::new(hashed_state), ..Default::default() },
+        )
+    }
+
     #[test]
-    fn canonical_overlay_factory_matches_canonical_parent_proofs() -> eyre::Result<()> {
+    fn canonical_overlay_factory_matches_non_empty_canonical_parent_proofs() -> eyre::Result<()> {
         let mut rng = generators::rng();
-        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
-            &mut rng,
-            2,
-            2,
-            BlockRangeParams { tx_count: 0..0, ..Default::default() },
-        )?;
-        let parent_hash = in_memory_blocks.last().expect("in-memory parent").hash();
+        let (database_blocks, in_memory_blocks) = random_blocks(&mut rng, 2, 2, None, None, 0..0);
+
         let address_a = Address::repeat_byte(0x11);
         let address_b = Address::repeat_byte(0x12);
+        let address_deleted = Address::repeat_byte(0x13);
+        let address_wiped = Address::repeat_byte(0x14);
+        let absent_address = Address::repeat_byte(0x15);
+        let slot_a = U256::from(0x21);
+        let slot_b = U256::from(0x22);
+        let slot_deleted = U256::from(0x23);
+        let slot_wiped = U256::from(0x24);
+        let slot_after_wipe = U256::from(0x25);
+        let absent_slot = U256::from(0x26);
+
+        let account_a = Account { nonce: 1, balance: U256::from(10), bytecode_hash: None };
+        let account_a_block_1 = Account { nonce: 2, balance: U256::from(11), bytecode_hash: None };
+        let account_a_block_2 = Account { nonce: 3, balance: U256::from(12), bytecode_hash: None };
+        let account_b = Account { nonce: 1, balance: U256::from(20), bytecode_hash: None };
+        let deleted_account = Account { nonce: 1, balance: U256::from(30), bytecode_hash: None };
+        let wiped_account = Account { nonce: 1, balance: U256::from(40), bytecode_hash: None };
+        let recreated_account = Account { nonce: 2, balance: U256::from(41), bytecode_hash: None };
+
+        let factory = create_test_provider_factory();
+        let provider_rw = factory.provider_rw()?;
+        for block in &database_blocks {
+            provider_rw.insert_block(
+                &block.clone().try_recover().expect("failed to seal block with senders"),
+            )?;
+        }
+        provider_rw.insert_account_for_hashing([
+            (address_a, Some(account_a)),
+            (address_deleted, Some(deleted_account)),
+            (address_wiped, Some(wiped_account)),
+        ])?;
+        provider_rw.insert_storage_for_hashing([
+            (address_a, [StorageEntry { key: B256::from(slot_a), value: U256::from(10) }]),
+            (
+                address_deleted,
+                [StorageEntry { key: B256::from(slot_deleted), value: U256::from(30) }],
+            ),
+            (address_wiped, [StorageEntry { key: B256::from(slot_wiped), value: U256::from(40) }]),
+        ])?;
+        provider_rw.commit()?;
+
+        let provider = BlockchainProvider::new(factory)?;
+        let first_block_number = in_memory_blocks[0].number;
+        let first_state = BundleState::builder(first_block_number..=first_block_number)
+            .state_original_account_info(address_a, account_a.into())
+            .state_present_account_info(address_a, account_a_block_1.into())
+            .state_storage(
+                address_a,
+                HashMap::from_iter([(slot_a, (U256::from(10), U256::from(11)))]),
+            )
+            .revert_account_info(first_block_number, address_a, Some(Some(account_a.into())))
+            .revert_storage(first_block_number, address_a, vec![(slot_a, U256::from(10))])
+            .state_present_account_info(address_b, account_b.into())
+            .state_storage(address_b, HashMap::from_iter([(slot_b, (U256::ZERO, U256::from(20)))]))
+            .revert_account_info(first_block_number, address_b, Some(None))
+            .revert_storage(first_block_number, address_b, vec![(slot_b, U256::ZERO)])
+            .build();
+
+        let second_block_number = in_memory_blocks[1].number;
+        let mut second_state = BundleState::builder(second_block_number..=second_block_number)
+            .state_original_account_info(address_a, account_a_block_1.into())
+            .state_present_account_info(address_a, account_a_block_2.into())
+            .revert_account_info(
+                second_block_number,
+                address_a,
+                Some(Some(account_a_block_1.into())),
+            )
+            .state_original_account_info(address_deleted, deleted_account.into())
+            .revert_account_info(
+                second_block_number,
+                address_deleted,
+                Some(Some(deleted_account.into())),
+            )
+            .state_original_account_info(address_wiped, wiped_account.into())
+            .state_present_account_info(address_wiped, recreated_account.into())
+            .state_storage(
+                address_wiped,
+                HashMap::from_iter([(slot_after_wipe, (U256::ZERO, U256::from(41)))]),
+            )
+            .revert_account_info(
+                second_block_number,
+                address_wiped,
+                Some(Some(wiped_account.into())),
+            )
+            .revert_storage(second_block_number, address_wiped, vec![(slot_wiped, U256::from(40))])
+            .build();
+        second_state.state.get_mut(&address_wiped).expect("wiped account is present").status =
+            revm_database::AccountStatus::DestroyedChanged;
+
+        let first_executed = executed_block_with_state(&in_memory_blocks[0], first_state);
+        let second_executed = executed_block_with_state(&in_memory_blocks[1], second_state);
+        let first_hashed_state = first_executed.hashed_state();
+        let second_hashed_state = second_executed.hashed_state();
+        assert!(!first_hashed_state.is_empty());
+        assert!(second_hashed_state.accounts.iter().any(|(address, account)| {
+            *address == keccak256(address_deleted) && account.is_none()
+        }));
+        assert!(second_hashed_state
+            .storages
+            .get(&keccak256(address_wiped))
+            .is_some_and(|storage| storage.is_wiped()));
+
+        provider
+            .canonical_in_memory_state
+            .update_chain(NewCanonicalChain::Commit { new: vec![first_executed, second_executed] });
+
         let targets = || MultiProofTargetsV2 {
             account_targets: vec![
                 ProofV2Target::new(keccak256(address_a)),
                 ProofV2Target::new(keccak256(address_b)),
+                ProofV2Target::new(keccak256(address_deleted)),
+                ProofV2Target::new(keccak256(address_wiped)),
+                ProofV2Target::new(keccak256(absent_address)),
             ],
             storage_targets: B256Map::from_iter([
-                (keccak256(address_a), vec![ProofV2Target::new(B256::repeat_byte(0x21))]),
-                (keccak256(address_b), vec![ProofV2Target::new(B256::repeat_byte(0x22))]),
+                (keccak256(address_a), vec![ProofV2Target::new(keccak256(B256::from(slot_a)))]),
+                (keccak256(address_b), vec![ProofV2Target::new(keccak256(B256::from(slot_b)))]),
+                (
+                    keccak256(address_deleted),
+                    vec![ProofV2Target::new(keccak256(B256::from(slot_deleted)))],
+                ),
+                (
+                    keccak256(address_wiped),
+                    vec![
+                        ProofV2Target::new(keccak256(B256::from(slot_wiped))),
+                        ProofV2Target::new(keccak256(B256::from(slot_after_wipe))),
+                    ],
+                ),
+                (
+                    keccak256(absent_address),
+                    vec![ProofV2Target::new(keccak256(B256::from(absent_slot)))],
+                ),
             ]),
         };
 
-        let serial = provider
-            .state_by_block_hash(parent_hash)?
-            .multiproof_v2(TrieInput::default(), targets())?;
-        let parallel_provider =
-            provider.overlay_factory_at_block(parent_hash).database_provider_ro()?;
-        let overlay = Proof::new(&parallel_provider, &parallel_provider).multiproof_v2(targets())?;
+        for hash in [
+            database_blocks.last().expect("persisted base").hash(),
+            in_memory_blocks.first().expect("first in-memory block").hash(),
+            in_memory_blocks.last().expect("in-memory tip").hash(),
+        ] {
+            let serial = provider
+                .state_by_block_hash(hash)?
+                .multiproof_v2(TrieInput::default(), targets())?;
+            let overlay_provider =
+                provider.overlay_factory_at_block(hash).database_provider_ro()?;
+            let overlay =
+                Proof::new(&overlay_provider, &overlay_provider).multiproof_v2(targets())?;
 
-        assert_eq!(overlay, serial);
+            assert_eq!(overlay, serial, "proof mismatch at canonical block {hash}");
+        }
 
-        let historical_hash = database_blocks.first().expect("historical block").hash();
-        let historical_serial = provider
-            .state_by_block_hash(historical_hash)?
-            .multiproof_v2(TrieInput::default(), targets())?;
-        let historical_provider =
-            provider.overlay_factory_at_block(historical_hash).database_provider_ro()?;
-        let historical_overlay =
-            Proof::new(&historical_provider, &historical_provider).multiproof_v2(targets())?;
-
-        assert_eq!(historical_overlay, historical_serial);
+        let tip = provider.state_by_block_hash(in_memory_blocks[1].hash())?;
+        assert_eq!(tip.basic_account(&address_a)?, Some(account_a_block_2));
+        assert_eq!(tip.basic_account(&address_b)?, Some(account_b));
+        assert_eq!(tip.basic_account(&address_deleted)?, None);
+        assert_eq!(tip.basic_account(&address_wiped)?, Some(recreated_account));
+        assert_eq!(tip.basic_account(&absent_address)?, None);
+        assert_eq!(tip.storage(address_a, slot_a.into())?, Some(U256::from(11)));
+        assert_eq!(tip.storage(address_b, slot_b.into())?, Some(U256::from(20)));
+        assert_eq!(tip.storage(address_deleted, slot_deleted.into())?, None);
+        assert_eq!(tip.storage(address_wiped, slot_wiped.into())?, Some(U256::ZERO));
+        assert_eq!(tip.storage(address_wiped, slot_after_wipe.into())?, Some(U256::from(41)));
+        assert_eq!(tip.storage(absent_address, absent_slot.into())?, None);
         Ok(())
     }
 

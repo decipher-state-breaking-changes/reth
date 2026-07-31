@@ -45,7 +45,8 @@ impl<T: Send + 'static> LazyHandle<T> {
     /// Blocks until the background task completes and returns a reference to the result.
     ///
     /// On the first call this awaits the receiver; subsequent calls return the cached value
-    /// without blocking.
+    /// without blocking. Tokio multi-thread runtimes are notified that this section may block;
+    /// for current-thread runtimes, the receive is delegated to a short-lived standard thread.
     ///
     /// # Panics
     ///
@@ -59,8 +60,26 @@ impl<T: Send + 'static> LazyHandle<T> {
                 .expect("lock poisoned")
                 .take()
                 .expect("LazyHandle receiver already taken without value being set");
-            rx.blocking_recv().expect("LazyHandle task dropped without producing a value")
+            Self::blocking_receive(rx)
         })
+    }
+
+    fn blocking_receive(rx: oneshot::Receiver<T>) -> T {
+        let receive =
+            move || rx.blocking_recv().expect("LazyHandle task dropped without producing a value");
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if matches!(
+                    handle.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                tokio::task::block_in_place(receive)
+            }
+            Ok(_) => std::thread::spawn(receive).join().expect("LazyHandle wait thread panicked"),
+            Err(_) => receive(),
+        }
     }
 
     /// Consumes the handle and returns the inner value if this is the only handle.
@@ -102,6 +121,25 @@ mod tests {
         assert_eq!(*handle.get(), 42);
         // subsequent calls return cached value
         assert_eq!(*handle.get(), 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lazy_handle_resolves_inside_current_thread_runtime() {
+        assert_lazy_handle_resolves_inside_runtime();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_lazy_handle_resolves_inside_multi_thread_runtime() {
+        assert_lazy_handle_resolves_inside_runtime();
+    }
+
+    fn assert_lazy_handle_resolves_inside_runtime() {
+        let (tx, rx) = oneshot::channel();
+        let handle = LazyHandle::new(rx);
+        let sender = std::thread::spawn(move || tx.send(123u64).unwrap());
+
+        assert_eq!(*handle.get(), 123);
+        sender.join().unwrap();
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! named task, like a 1-thread thread pool keyed by name.
 
 use dashmap::DashMap;
-use std::{panic::AssertUnwindSafe, thread};
+use std::{panic::AssertUnwindSafe, sync::Mutex, thread};
 use tokio::sync::{mpsc, oneshot};
 
 type BoxedTask = Box<dyn FnOnce() + Send + 'static>;
@@ -41,6 +41,11 @@ impl WorkerThread {
 /// that name. Workers are created lazily on first use.
 pub(crate) struct WorkerMap {
     workers: DashMap<&'static str, WorkerThread>,
+    /// Serializes queue insertion across named workers.
+    ///
+    /// Individual tasks only hold this while cloning a sender and enqueueing. Paired submissions
+    /// use the same lock to ensure no other task can be inserted between the two queue positions.
+    enqueue_lock: Mutex<()>,
 }
 
 impl Default for WorkerMap {
@@ -52,7 +57,12 @@ impl Default for WorkerMap {
 impl WorkerMap {
     /// Creates a new empty `WorkerMap`.
     pub(crate) fn new() -> Self {
-        Self { workers: DashMap::new() }
+        Self { workers: DashMap::new(), enqueue_lock: Mutex::new(()) }
+    }
+
+    /// Returns a sender for the named worker, creating the worker if needed.
+    fn sender(&self, name: &'static str) -> mpsc::UnboundedSender<BoxedTask> {
+        self.workers.entry(name).or_insert_with(|| WorkerThread::new(name)).tx.clone()
     }
 
     /// Spawns a closure on the dedicated worker thread for the given name.
@@ -71,10 +81,49 @@ impl WorkerMap {
             let _ = result_tx.send(f());
         });
 
-        let worker = self.workers.entry(name).or_insert_with(|| WorkerThread::new(name));
-        let _ = worker.tx.send(task);
+        let _enqueue_guard = self.enqueue_lock.lock().expect("worker enqueue lock poisoned");
+        let _ = self.sender(name).send(task);
 
         result_rx
+    }
+
+    /// Atomically queues two closures on their respective named worker threads.
+    ///
+    /// Both tasks are inserted while holding the same enqueue lock used by [`Self::spawn_on`].
+    /// This keeps their relative position aligned across independent FIFO worker queues, which is
+    /// required when the tasks cooperate and remain alive until both have started. The names must
+    /// be distinct so both tasks can start concurrently.
+    pub(crate) fn spawn_on_pair<F1, R1, F2, R2>(
+        &self,
+        first_name: &'static str,
+        first: F1,
+        second_name: &'static str,
+        second: F2,
+    ) -> (oneshot::Receiver<R1>, oneshot::Receiver<R2>)
+    where
+        F1: FnOnce() -> R1 + Send + 'static,
+        R1: Send + 'static,
+        F2: FnOnce() -> R2 + Send + 'static,
+        R2: Send + 'static,
+    {
+        let (first_result_tx, first_result_rx) = oneshot::channel();
+        assert_ne!(first_name, second_name, "paired worker names must be distinct");
+        let (second_result_tx, second_result_rx) = oneshot::channel();
+
+        let first_task: BoxedTask = Box::new(move || {
+            let _ = first_result_tx.send(first());
+        });
+        let second_task: BoxedTask = Box::new(move || {
+            let _ = second_result_tx.send(second());
+        });
+
+        let _enqueue_guard = self.enqueue_lock.lock().expect("worker enqueue lock poisoned");
+        let first_tx = self.sender(first_name);
+        let second_tx = self.sender(second_name);
+        let _ = first_tx.send(first_task);
+        let _ = second_tx.send(second_task);
+
+        (first_result_rx, second_result_rx)
     }
 }
 
@@ -162,5 +211,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "custom-worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_map_pair_submission_keeps_lane_order_aligned() {
+        use std::{
+            sync::{mpsc as std_mpsc, Arc, Barrier, Condvar},
+            time::Duration,
+        };
+
+        fn blocking_task(
+            pair: usize,
+            lane: &'static str,
+            started_tx: std_mpsc::Sender<(usize, &'static str)>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        ) -> impl FnOnce() + Send + 'static {
+            move || {
+                started_tx.send((pair, lane)).unwrap();
+                let (lock, cvar) = &*release;
+                drop(cvar.wait_while(lock.lock().unwrap(), |released| !*released).unwrap());
+            }
+        }
+
+        let map = Arc::new(WorkerMap::new());
+        let start = Arc::new(Barrier::new(3));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std_mpsc::channel();
+
+        let first = {
+            let map = Arc::clone(&map);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            thread::spawn(move || {
+                start.wait();
+                map.spawn_on_pair(
+                    "pair-lane-a",
+                    blocking_task(1, "a", started_tx.clone(), Arc::clone(&release)),
+                    "pair-lane-b",
+                    blocking_task(1, "b", started_tx, release),
+                )
+            })
+        };
+        let second = {
+            let map = Arc::clone(&map);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            thread::spawn(move || {
+                start.wait();
+                map.spawn_on_pair(
+                    "pair-lane-b",
+                    blocking_task(2, "b", started_tx.clone(), Arc::clone(&release)),
+                    "pair-lane-a",
+                    blocking_task(2, "a", started_tx, release),
+                )
+            })
+        };
+
+        start.wait();
+        let first_handles = first.join().unwrap();
+        let second_handles = second.join().unwrap();
+
+        let first_started = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_started = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Release every task before asserting so a regression cannot leave worker threads blocked
+        // during test cleanup.
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        first_handles.0.await.unwrap();
+        first_handles.1.await.unwrap();
+        second_handles.0.await.unwrap();
+        second_handles.1.await.unwrap();
+
+        assert_eq!(
+            first_started.0, second_started.0,
+            "the first task on each lane must belong to the same paired submission"
+        );
+        assert_ne!(first_started.1, second_started.1);
     }
 }

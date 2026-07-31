@@ -14,16 +14,22 @@ RESET_MARKERS = ("Chain reorg detected", "Chain reverted", "Partial Stateless Ex
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def load_jsonl(path: Path):
+def load_jsonl(path: Path, allow_incomplete_tail=False):
     if not path.exists():
         return []
     records = []
-    for line_number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+    lines = path.read_text(errors="replace").splitlines(keepends=True)
+    for line_number, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError as error:
+            is_unterminated_tail = (
+                line_number == len(lines) and not line.endswith(("\n", "\r"))
+            )
+            if allow_incomplete_tail and is_unterminated_tail:
+                continue
             raise ValueError(f"invalid JSONL in {path} at line {line_number}: {error}") from error
     return records
 
@@ -82,7 +88,14 @@ def parse_log_positions(log_path: Path):
     return engine_positions, paired_positions, ordered_engine_positions, reset_points
 
 
-def select_samples(paired_records, engine_records, log_path: Path, warmup: int, limit=None):
+def select_samples(
+    paired_records,
+    engine_records,
+    log_path: Path,
+    warmup: int,
+    limit=None,
+    include_overlap=False,
+):
     engine_by_hash = {
         record.get("block_hash", "").lower(): record
         for record in engine_records
@@ -139,11 +152,17 @@ def select_samples(paired_records, engine_records, log_path: Path, warmup: int, 
             if next_index >= len(ordered_engine_positions):
                 stats.pending_next_engine += 1
                 continue
-            if ordered_engine_positions[next_index] < paired_position or engine.get("contaminated", False):
+            overlap = (
+                ordered_engine_positions[next_index] < paired_position
+                or engine.get("contaminated", False)
+            )
+            if overlap:
                 stats.contaminated += 1
-                continue
+                if not include_overlap:
+                    continue
             merged = dict(record)
             merged["vanilla_engine"] = engine
+            merged["engine_overlap"] = overlap
             accepted.append(merged)
     return accepted[:limit] if limit is not None else accepted, stats
 
@@ -321,6 +340,58 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     return "\n".join(lines) + "\n"
 
 
+def build_overlap_report(accepted, stats: SelectionStats, warmup: int):
+    """Report Engine latency with overlap retained and explicitly stratified."""
+    if not accepted:
+        raise ValueError(f"no valid samples available after warm-up {warmup}")
+
+    clean = [record for record in accepted if not record.get("engine_overlap", False)]
+    overlap = [record for record in accepted if record.get("engine_overlap", False)]
+    lines = [
+        "# Engine / ExEx overlap cohort", "",
+        f"Valid samples after warm-up: **{len(accepted)}**",
+        f"Clean samples: **{len(clean)}**",
+        f"Overlap/contaminated samples: **{len(overlap)}**",
+        (
+            f"Excluded before selection: orphaned {stats.orphaned}, invalid {stats.invalid}, "
+            f"missing Engine {stats.missing_engine}, pending {stats.pending_next_engine}."
+        ), "",
+        "Unlike the primary report, this cohort retains blocks where the next Engine payload "
+        "started before paired ExEx work completed, or Engine marked the sample contaminated.", "",
+        "## Engine state access + execution", "",
+        "| Cohort | Average | p50 | p90 | p95 | p99 | Maximum |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    if clean:
+        lines.append(format_summary(
+            "Clean", [record["vanilla_engine"]["state_access_execution_us"] for record in clean]
+        ))
+    if overlap:
+        lines.append(format_summary(
+            "Overlap", [record["vanilla_engine"]["state_access_execution_us"] for record in overlap]
+        ))
+    lines.extend([
+        format_summary(
+            "All", [record["vanilla_engine"]["state_access_execution_us"] for record in accepted]
+        ), "",
+        "## Engine executor call", "",
+        "| Cohort | Average | p50 | p90 | p95 | p99 | Maximum |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    if clean:
+        lines.append(format_summary(
+            "Clean", [record["vanilla_engine"]["execution_us"] for record in clean]
+        ))
+    if overlap:
+        lines.append(format_summary(
+            "Overlap", [record["vanilla_engine"]["execution_us"] for record in overlap]
+        ))
+    lines.append(format_summary(
+        "All", [record["vanilla_engine"]["execution_us"] for record in accepted]
+    ))
+    return "\n".join(lines) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", required=True, type=Path)
@@ -328,11 +399,27 @@ def main():
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument("--warmup", type=int, default=60)
     parser.add_argument("--samples", type=int, default=600)
+    parser.add_argument(
+        "--include-overlap",
+        action="store_true",
+        help="retain overlap/contaminated samples and emit an Engine overlap report",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    accepted, stats = select_samples(load_jsonl(args.records), load_jsonl(args.engine_records), args.log, args.warmup, args.samples)
+    accepted, stats = select_samples(
+        load_jsonl(args.records),
+        load_jsonl(args.engine_records),
+        args.log,
+        args.warmup,
+        None if args.include_overlap else args.samples,
+        include_overlap=args.include_overlap,
+    )
     try:
-        report = build_report(accepted, stats, args.warmup, args.samples)
+        report = (
+            build_overlap_report(accepted, stats, args.warmup)
+            if args.include_overlap
+            else build_report(accepted, stats, args.warmup, args.samples)
+        )
     except ValueError as error:
         raise SystemExit(str(error)) from error
     print(report, end="")

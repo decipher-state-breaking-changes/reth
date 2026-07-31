@@ -1,16 +1,17 @@
 use crate::{
     benchmark::{
-        append_record, deserialize_sidecar_for_benchmark, serialize_sidecar_for_benchmark,
-        ValidationBenchmarkRecord, WitnessSizeBreakdown,
+        append_builder_record, append_record, deserialize_sidecar_for_benchmark,
+        serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, ValidationBenchmarkRecord,
+        WitnessSizeBreakdown,
     },
-    format_bytes,
+    format_bytes, process_rusage,
     sidecar_io::sidecar_path,
     sidecar_reexec::{
         verify_and_apply_provider_assisted_sidecar,
         verify_and_apply_trustless_sidecar_for_benchmark, SidecarReexecLimits,
         TrieCacheDisposition,
     },
-    thread_rusage, CacheConfig,
+    CacheConfig,
 };
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
@@ -56,12 +57,21 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) trie_cache_diagnostics: bool,
     pub(crate) run_sidecar_preflight: bool,
     pub(crate) validation_bench_output: Option<&'a Path>,
+    pub(crate) builder_bench_output: Option<&'a Path>,
+    pub(crate) force_previous_cache_snapshot: bool,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
     pub(crate) parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ParallelInitialProofOutput {
+    pub(crate) proof: DecodedMultiProofV2,
+    pub(crate) storage_workers: usize,
+    pub(crate) account_workers: usize,
+}
+
 pub(crate) type ParallelInitialProofFn<'a> =
-    dyn Fn(MultiProofTargetsV2) -> ProviderResult<DecodedMultiProofV2> + 'a;
+    dyn Fn(MultiProofTargetsV2) -> ProviderResult<ParallelInitialProofOutput> + 'a;
 
 #[derive(Debug)]
 pub(crate) struct BuilderBlockReport {
@@ -76,8 +86,9 @@ const PARALLEL_INITIAL_PROOF_MIN_TOTAL_TARGETS: usize = 64;
 const fn needs_previous_cache_snapshot(
     run_sidecar_preflight: bool,
     validation_bench_enabled: bool,
+    force_snapshot: bool,
 ) -> bool {
-    run_sidecar_preflight || validation_bench_enabled
+    run_sidecar_preflight || validation_bench_enabled || force_snapshot
 }
 
 fn previous_cache_snapshot(
@@ -86,9 +97,14 @@ fn previous_cache_snapshot(
     cache_parent_synced: bool,
     run_sidecar_preflight: bool,
     validation_bench_enabled: bool,
+    force_snapshot: bool,
 ) -> Option<NetworkStateCache> {
     (cache_parent_synced &&
-        needs_previous_cache_snapshot(run_sidecar_preflight, validation_bench_enabled))
+        needs_previous_cache_snapshot(
+            run_sidecar_preflight,
+            validation_bench_enabled,
+            force_snapshot,
+        ))
     .then(|| {
         cache.fork_for_reexecution(
             Box::new(LastNBlocksPolicy::new(config.account_window)),
@@ -265,6 +281,8 @@ struct CacheAwareBaseProof {
     cache_covered_mutation_targets: usize,
     provider_us: u64,
     proof_source: &'static str,
+    parallel_storage_workers: usize,
+    parallel_account_workers: usize,
 }
 
 fn initial_cache_aware_targets(
@@ -335,13 +353,17 @@ fn generate_cache_aware_base_proof(
     }
 
     let provider_start = Instant::now();
-    let (proof, proof_source) = if targets.is_empty() {
-        (DecodedMultiProofV2::default(), "empty")
+    let (proof, proof_source, parallel_storage_workers, parallel_account_workers) = if targets
+        .is_empty()
+    {
+        (DecodedMultiProofV2::default(), "empty", 0, 0)
     } else if let Some(parallel_initial_proof) = parallel_initial_proof &&
         targets.should_use_parallel_initial_proof()
     {
         match parallel_initial_proof(targets.to_provider_targets()) {
-            Ok(proof) => (proof, "parallel"),
+            Ok(ParallelInitialProofOutput { proof, storage_workers, account_workers }) => {
+                (proof, "parallel", storage_workers, account_workers)
+            }
             Err(err) => {
                 warn!(
                     target: "partial_stateless",
@@ -357,7 +379,7 @@ fn generate_cache_aware_base_proof(
                             "parallel initial V2 multiproof failed ({err}); serial fallback also failed: {serial_err}"
                         )
                     })?;
-                (proof, "serial-after-parallel-error")
+                (proof, "serial-after-parallel-error", 0, 0)
             }
         }
     } else {
@@ -365,7 +387,7 @@ fn generate_cache_aware_base_proof(
             .multiproof_v2(TrieInput::default(), targets.to_provider_targets())
             .map_err(|err| eyre::eyre!("failed to generate initial V2 multiproof: {err}"))?;
         let source = if parallel_initial_proof.is_some() { "serial-low-width" } else { "serial" };
-        (proof, source)
+        (proof, source, 0, 0)
     };
     let provider_us = provider_start.elapsed().as_micros() as u64;
 
@@ -375,6 +397,8 @@ fn generate_cache_aware_base_proof(
         cache_covered_mutation_targets,
         provider_us,
         proof_source,
+        parallel_storage_workers,
+        parallel_account_workers,
     })
 }
 
@@ -768,13 +792,13 @@ pub fn build_weak_stateless_sidecar(
     })
 }
 
-#[expect(clippy::too_many_arguments)]
 fn benchmark_one_sidecar_validation<Evm>(
     evm_config: &Evm,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     cache: &mut NetworkStateCache,
     trie_cache: &mut PartialTrieNodeCache,
     sidecar_bytes: &[u8],
+    expected_cache_policy_id: B256,
     limits: &SidecarReexecLimits,
 ) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
 where
@@ -786,6 +810,7 @@ where
         block,
         cache,
         &sidecar,
+        expected_cache_policy_id,
         limits,
         trie_cache,
         TrieCacheDisposition::Discard,
@@ -850,6 +875,8 @@ where
 
     let mut weak_cache = config.new_cache_at(block.number().saturating_sub(1));
     let mut weak_trie = PartialTrieNodeCache::new();
+    let expected_cache_policy_id =
+        last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
     let partial_first = partial_runs_first(block.number());
     let (partial_report, weak_report) = if partial_first {
         let partial_report = benchmark_one_sidecar_validation(
@@ -858,6 +885,7 @@ where
             prev_cache,
             trie_cache,
             &partial_bytes,
+            expected_cache_policy_id,
             limits,
         )?;
         let weak_report = benchmark_one_sidecar_validation(
@@ -866,6 +894,7 @@ where
             &mut weak_cache,
             &mut weak_trie,
             &weak_bytes,
+            expected_cache_policy_id,
             limits,
         )?;
         (partial_report, weak_report)
@@ -876,6 +905,7 @@ where
             &mut weak_cache,
             &mut weak_trie,
             &weak_bytes,
+            expected_cache_policy_id,
             limits,
         )?;
         let partial_report = benchmark_one_sidecar_validation(
@@ -884,6 +914,7 @@ where
             prev_cache,
             trie_cache,
             &partial_bytes,
+            expected_cache_policy_id,
             limits,
         )?;
         (partial_report, weak_report)
@@ -1075,13 +1106,21 @@ where
     }
     let prev_cache_anchor = cache_parent_synced
         .then(|| cache.cache_anchor(parent_block_number, parent_hash, cache_policy_id));
+    let snapshot_start = Instant::now();
     let mut prev_cache_for_reexec = previous_cache_snapshot(
         cache,
         config,
         cache_parent_synced,
         options.run_sidecar_preflight,
         options.validation_bench_output.is_some(),
+        options.force_previous_cache_snapshot,
     );
+    let snapshot_us = snapshot_start.elapsed().as_micros() as u64;
+    let snapshot_created = prev_cache_for_reexec.is_some();
+    let snapshot_estimated_bytes = prev_cache_for_reexec
+        .as_ref()
+        .map(NetworkStateCache::estimated_memory_bytes)
+        .unwrap_or_default();
     let cache_snapshot_before = cache.snapshot();
     let cache_memory_before = cache.estimated_memory_bytes();
     let miss = cache.compute_miss(&accessed);
@@ -1168,9 +1207,20 @@ where
         )
     })?;
 
-    let rusage_before = options.resource_metrics.then(thread_rusage);
+    let rusage_before = options.resource_metrics.then(process_rusage);
     let start = Instant::now();
     let saved_sidecar_path;
+    let builder_initial_proof_source;
+    let builder_initial_provider_us;
+    let builder_initial_targets;
+    let builder_distinct_storage_tries;
+    let builder_parallel_storage_workers;
+    let builder_parallel_account_workers;
+    let builder_initial_proof_nodes;
+    let builder_initial_proof_bytes;
+    let builder_transition_witness_build_us;
+    let mut builder_witness_commitment = None;
+    let mut sidecar_constructed = false;
     let witness = {
         let base = generate_cache_aware_base_proof(
             state_provider,
@@ -1210,12 +1260,21 @@ where
         let initial_provider_us = base.provider_us;
         let initial_proof_source = base.proof_source;
         let transition_witness_build_us = start.elapsed().as_micros() as u64;
+        builder_initial_proof_source = initial_proof_source;
+        builder_initial_provider_us = initial_provider_us;
+        builder_initial_targets = initial_targets;
+        builder_distinct_storage_tries = base.targets.distinct_storage_tries();
+        builder_parallel_storage_workers = base.parallel_storage_workers;
+        builder_parallel_account_workers = base.parallel_account_workers;
+        builder_initial_proof_nodes = initial_proof_nodes;
+        builder_initial_proof_bytes = initial_proof_bytes;
+        builder_transition_witness_build_us = transition_witness_build_us;
         let elapsed_ms = transition_witness_build_us / 1_000;
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
         let witness_state = PartialExecutionWitnessState::MptTransitionNodes(nodes);
         result.computation_time_ms = Some(elapsed_ms);
         if let Some((cpu_us_before, majflt_before, minflt_before)) = rusage_before {
-            let (cpu_us_after, majflt_after, minflt_after) = thread_rusage();
+            let (cpu_us_after, majflt_after, minflt_after) = process_rusage();
             result.cpu_time_ms = Some(cpu_us_after.saturating_sub(cpu_us_before) / 1000);
             result.major_page_faults = Some(majflt_after.saturating_sub(majflt_before));
             result.minor_page_faults = Some(minflt_after.saturating_sub(minflt_before));
@@ -1225,6 +1284,7 @@ where
         info!(
             target: "partial_stateless",
             block = block_number,
+            block_hash = ?block_hash,
             transition_witness_nodes = result.account_proof_nodes + result.storage_proof_nodes,
             initial_targets,
             structural_targets,
@@ -1292,6 +1352,8 @@ where
             };
             let witness_commitment =
                 partial_witness_commitment(parent_state_root, &sidecar_miss, &witness_payload);
+            builder_witness_commitment = Some(witness_commitment);
+            sidecar_constructed = true;
             let sidecar = PartialStatelessSidecar {
                 parent_hash,
                 parent_state_root,
@@ -1344,6 +1406,7 @@ where
                         block,
                         prev_cache_for_reexec,
                         &sidecar,
+                        cache_policy_id,
                         options.reexec_limits,
                         trie_cache,
                         TrieCacheDisposition::Discard,
@@ -1613,6 +1676,43 @@ where
         );
     }
 
+    let builder_total_us = builder_total_start.elapsed().as_micros() as u64;
+    if let Some(path) = options.builder_bench_output {
+        let record = BuilderBenchmarkRecord {
+            schema_version: 1,
+            block_number,
+            block_hash,
+            historical_full_db_evm_us,
+            builder_total_us,
+            transition_witness_build_us: builder_transition_witness_build_us,
+            snapshot_created,
+            snapshot_us,
+            snapshot_estimated_bytes,
+            cache_parent_synced,
+            initial_proof_source: builder_initial_proof_source,
+            initial_provider_us: builder_initial_provider_us,
+            initial_targets: builder_initial_targets,
+            distinct_storage_tries: builder_distinct_storage_tries,
+            parallel_storage_workers: builder_parallel_storage_workers,
+            parallel_account_workers: builder_parallel_account_workers,
+            initial_proof_nodes: builder_initial_proof_nodes,
+            initial_proof_bytes: builder_initial_proof_bytes,
+            witness_commitment: builder_witness_commitment,
+            sidecar_constructed,
+            sidecar_published: saved_sidecar_path.is_some(),
+            value_cache_bytes: cache.estimated_memory_bytes(),
+            trie_cache_bytes: trie_cache.estimated_memory_bytes(),
+        };
+        if let Err(err) = append_builder_record(path, &record) {
+            warn!(
+                target: "partial_stateless_bench",
+                block = block_number,
+                error = %err,
+                "Failed to append builder benchmark record"
+            );
+        }
+    }
+
     info!(
         target: "partial_stateless",
         block = block_number,
@@ -1635,7 +1735,11 @@ where
         block = block_number,
         block_hash = ?block_hash,
         historical_full_db_evm_us,
-        builder_total_us = builder_total_start.elapsed().as_micros() as u64,
+        builder_total_us,
+        snapshot_created,
+        snapshot_us,
+        initial_proof_source = builder_initial_proof_source,
+        initial_provider_us = builder_initial_provider_us,
         sidecar_published = saved_sidecar_path.is_some(),
         "Builder sidecar end-to-end benchmark"
     );
@@ -1658,10 +1762,11 @@ mod tests {
 
     #[test]
     fn previous_cache_snapshot_is_only_needed_for_reexecution_paths() {
-        assert!(!needs_previous_cache_snapshot(false, false));
-        assert!(needs_previous_cache_snapshot(true, false));
-        assert!(needs_previous_cache_snapshot(false, true));
-        assert!(needs_previous_cache_snapshot(true, true));
+        assert!(!needs_previous_cache_snapshot(false, false, false));
+        assert!(needs_previous_cache_snapshot(true, false, false));
+        assert!(needs_previous_cache_snapshot(false, true, false));
+        assert!(needs_previous_cache_snapshot(true, true, false));
+        assert!(needs_previous_cache_snapshot(false, false, true));
     }
 
     #[test]
@@ -1676,16 +1781,19 @@ mod tests {
         cache.on_block_executed(99, &accessed);
         let parent_root = cache.cache_root();
 
-        assert!(previous_cache_snapshot(&cache, &config, true, false, false).is_none());
-        assert!(previous_cache_snapshot(&cache, &config, false, true, false).is_none());
+        assert!(previous_cache_snapshot(&cache, &config, true, false, false, false).is_none());
+        assert!(previous_cache_snapshot(&cache, &config, false, true, false, false).is_none());
 
-        let preflight =
-            previous_cache_snapshot(&cache, &config, true, true, false).expect("preflight fork");
-        let paired =
-            previous_cache_snapshot(&cache, &config, true, false, true).expect("paired fork");
+        let preflight = previous_cache_snapshot(&cache, &config, true, true, false, false)
+            .expect("preflight fork");
+        let paired = previous_cache_snapshot(&cache, &config, true, false, true, false)
+            .expect("paired fork");
+        let forced = previous_cache_snapshot(&cache, &config, true, false, false, true)
+            .expect("forced diagnostic fork");
         assert_eq!(preflight.current_block(), 99);
         assert_eq!(preflight.cache_root(), parent_root);
         assert_eq!(paired.cache_root(), parent_root);
+        assert_eq!(forced.cache_root(), parent_root);
 
         cache.on_block_executed(100, &accessed);
         assert_ne!(cache.cache_root(), parent_root);

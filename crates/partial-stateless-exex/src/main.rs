@@ -44,10 +44,11 @@ use reth_ethereum::{
     EthPrimitives,
 };
 use reth_provider::{BlockIdReader, CanonicalOverlayFactory, HeaderProvider, ProviderResult};
-use reth_trie_common::{DecodedMultiProofV2, MultiProofTargetsV2};
-use reth_trie_parallel::proof_task::parallel_multiproof_v2;
+use reth_trie_common::MultiProofTargetsV2;
+use reth_trie_parallel::proof_task::parallel_multiproof_v2_with_stats;
 use sidecar_create::{
     create_sidecar_for_block, BuilderBlockReport, BuilderOptions, ParallelInitialProofFn,
+    ParallelInitialProofOutput,
 };
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
@@ -221,6 +222,8 @@ where
             .map(PathBuf::from)
             .unwrap_or_else(|| sidecar_dir.join("validation_bench.jsonl"))
     });
+    let builder_bench_output = std::env::var_os("PS_BUILDER_BENCH_OUTPUT").map(PathBuf::from);
+    let force_previous_cache_snapshot = env_flag("PS_FORCE_PREVIOUS_CACHE_SNAPSHOT");
 
     info!(
         target: "partial_stateless",
@@ -272,7 +275,7 @@ where
         );
     }
 
-    // Optional per-thread resource metrics (CPU time + page faults) captured
+    // Optional process-wide resource metrics (CPU time + page faults) captured
     // around the canonical transition witness, to attribute its cost between
     // compute and disk I/O. Off by default and gated behind `PS_RESOURCE_METRICS`; when
     // disabled the getrusage syscalls are skipped and the metric fields stay None.
@@ -280,12 +283,12 @@ where
     if resource_metrics {
         info!(
             target: "partial_stateless",
-            "Per-thread resource metrics ENABLED (PS_RESOURCE_METRICS) — cpu_time_ms + major/minor_page_faults per block"
+            "Process-wide resource metrics ENABLED (PS_RESOURCE_METRICS) — includes parallel proof-worker CPU and page faults"
         );
         #[cfg(not(target_os = "linux"))]
         warn!(
             target: "partial_stateless",
-            "Per-thread CPU/page-fault metrics require Linux RUSAGE_THREAD; this platform will log default zeros for cpu_time_ms, major_page_faults, and minor_page_faults"
+            "Process CPU/page-fault metrics require getrusage; this platform will log default zeros for cpu_time_ms, major_page_faults, and minor_page_faults"
         );
         if compute_baseline {
             warn!(
@@ -318,6 +321,19 @@ where
             target: "partial_stateless",
             path = %path.display(),
             "Paired Partial/Weak/Vanilla validation benchmark ENABLED (PS_VALIDATION_BENCH)"
+        );
+    }
+    if let Some(path) = &builder_bench_output {
+        info!(
+            target: "partial_stateless",
+            path = %path.display(),
+            "Structured builder benchmark output ENABLED (PS_BUILDER_BENCH_OUTPUT)"
+        );
+    }
+    if force_previous_cache_snapshot {
+        warn!(
+            target: "partial_stateless",
+            "Forced previous-cache snapshot ENABLED for B2 benchmark control"
         );
     }
     if sidecar_role == SidecarRole::Verifier {
@@ -417,15 +433,20 @@ where
                                 .collect())
                         };
                     let parallel_initial_proof =
-                        |targets: MultiProofTargetsV2| -> ProviderResult<DecodedMultiProofV2> {
+                        |targets: MultiProofTargetsV2| -> ProviderResult<ParallelInitialProofOutput> {
                             let parallel_factory =
                                 ctx.provider().overlay_factory_at_block(block.parent_hash);
-                            parallel_multiproof_v2(
+                            parallel_multiproof_v2_with_stats(
                                 ctx.task_executor(),
                                 parallel_factory,
                                 targets,
                                 true,
                             )
+                            .map(|(proof, stats)| ParallelInitialProofOutput {
+                                proof,
+                                storage_workers: stats.storage_workers,
+                                account_workers: stats.account_workers,
+                            })
                             .map_err(Into::into)
                         };
 
@@ -444,6 +465,8 @@ where
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
                             validation_bench_output: bench_output.as_deref(),
+                            builder_bench_output: builder_bench_output.as_deref(),
+                            force_previous_cache_snapshot,
                             reexec_limits: &reexec_limits,
                             parallel_initial_proof: parallel_initial_proof_enabled
                                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
@@ -562,15 +585,20 @@ where
                                 .collect())
                         };
                     let parallel_initial_proof =
-                        |targets: MultiProofTargetsV2| -> ProviderResult<DecodedMultiProofV2> {
+                        |targets: MultiProofTargetsV2| -> ProviderResult<ParallelInitialProofOutput> {
                             let parallel_factory =
                                 ctx.provider().overlay_factory_at_block(block.parent_hash);
-                            parallel_multiproof_v2(
+                            parallel_multiproof_v2_with_stats(
                                 ctx.task_executor(),
                                 parallel_factory,
                                 targets,
                                 true,
                             )
+                            .map(|(proof, stats)| ParallelInitialProofOutput {
+                                proof,
+                                storage_workers: stats.storage_workers,
+                                account_workers: stats.account_workers,
+                            })
                             .map_err(Into::into)
                         };
 
@@ -589,6 +617,8 @@ where
                             trie_cache_diagnostics,
                             run_sidecar_preflight,
                             validation_bench_output: bench_output.as_deref(),
+                            builder_bench_output: builder_bench_output.as_deref(),
+                            force_previous_cache_snapshot,
                             reexec_limits: &reexec_limits,
                             parallel_initial_proof: parallel_initial_proof_enabled
                                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
@@ -683,12 +713,12 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Per-thread resource snapshot used to attribute multiproof cost.
+/// Process-wide resource snapshot used to attribute multiproof cost.
 ///
-/// Returns `(cpu_micros, major_faults, minor_faults)` for the CALLING thread
-/// only. We use `RUSAGE_THREAD` (not `RUSAGE_SELF`) so the numbers isolate the
-/// synchronous `multiproof` call from the rest of the node's threads (execution,
-/// networking, DB writes) running concurrently while the node follows tip.
+/// Returns `(cpu_micros, major_faults, minor_faults)` for the whole process. `RUSAGE_SELF`
+/// intentionally includes the Rayon proof workers used by parallel multiproof. Other node work
+/// running during the interval is also included, so this remains diagnostic rather than protocol
+/// telemetry.
 ///
 /// Diagnostic use: comparing the CPU delta against the wall-clock elapsed
 /// separates compute-bound blocks (cpu ≈ wall) from I/O/wait-bound blocks
@@ -696,24 +726,24 @@ fn format_bytes(bytes: usize) -> String {
 /// disk/swap rather than the page cache — the signature of the environmental
 /// tail. Linux-only; returns zeros elsewhere or if the syscall fails.
 #[cfg(target_os = "linux")]
-fn thread_rusage() -> (u64, u64, u64) {
+fn process_rusage() -> (u64, u64, u64) {
     // SAFETY: `getrusage` only writes into the `rusage` we hand it; the struct
     // is fully zero-initialized before the call.
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_THREAD, &mut ru) != 0 {
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
             return (0, 0, 0);
         }
-        let cpu_us = (ru.ru_utime.tv_sec as u64) * 1_000_000
-            + (ru.ru_utime.tv_usec as u64)
-            + (ru.ru_stime.tv_sec as u64) * 1_000_000
-            + (ru.ru_stime.tv_usec as u64);
+        let cpu_us = (ru.ru_utime.tv_sec as u64) * 1_000_000 +
+            (ru.ru_utime.tv_usec as u64) +
+            (ru.ru_stime.tv_sec as u64) * 1_000_000 +
+            (ru.ru_stime.tv_usec as u64);
         (cpu_us, ru.ru_majflt as u64, ru.ru_minflt as u64)
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn thread_rusage() -> (u64, u64, u64) {
+fn process_rusage() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
