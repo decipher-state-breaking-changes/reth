@@ -1,7 +1,7 @@
 use crate::{
     providers::{
-        ConsistentProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider,
-        StaticFileProviderRWRefMut,
+        ConsistentProvider, OverlayBuilder, OverlayStateProviderFactory, ProviderNodeTypes,
+        RocksDBProvider, StaticFileProvider, StaticFileProviderRWRefMut,
     },
     AccountReader, BalProvider, BalStoreHandle, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, CanonChainTracker, CanonStateNotifications,
@@ -17,7 +17,8 @@ use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use reth_chain_state::{
     BlockState, CanonicalInMemoryState, ForkChoiceNotifications, ForkChoiceSubscriptions,
-    MemoryOverlayStateProvider, PersistedBlockNotifications, PersistedBlockSubscriptions,
+    LazyOverlay, MemoryOverlayStateProvider, PersistedBlockNotifications,
+    PersistedBlockSubscriptions,
 };
 use reth_chainspec::ChainInfo;
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
@@ -29,7 +30,10 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{BlockBodyIndicesProvider, NodePrimitivesProvider, StorageChangeSetReader};
 use reth_storage_errors::provider::ProviderResult;
-use reth_trie::{HashedPostState, KeccakKeyHasher};
+use reth_trie::{
+    hashed_cursor::HashedCursorFactory, trie_cursor::TrieCursorFactory, HashedPostState,
+    KeccakKeyHasher,
+};
 use revm_database::BundleState;
 use std::{
     ops::{RangeBounds, RangeInclusive},
@@ -54,6 +58,24 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     pub(crate) bal_store: BalStoreHandle,
 }
 
+/// Creates a cursor-backed provider factory for a canonical block's exact state.
+///
+/// Implementations must include any in-memory state between the persisted database anchor and the
+/// requested block. The returned factory is suitable for parallel proof workers, each of which
+/// opens an independent read transaction.
+pub trait CanonicalOverlayFactory {
+    /// Factory that opens independent cursor-backed providers at the requested canonical block.
+    type Factory: reth_storage_api::DatabaseProviderROFactory<
+            Provider: TrieCursorFactory + HashedCursorFactory,
+        > + Clone
+        + Send
+        + Sync
+        + 'static;
+
+    /// Returns a provider factory whose state view is anchored at `block_hash`.
+    fn overlay_factory_at_block(&self, block_hash: B256) -> Self::Factory;
+}
+
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
     fn clone(&self) -> Self {
         Self {
@@ -61,6 +83,24 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
             bal_store: self.bal_store.clone(),
         }
+    }
+}
+
+impl<N: ProviderNodeTypes> CanonicalOverlayFactory for BlockchainProvider<N> {
+    type Factory = OverlayStateProviderFactory<Self, N::Primitives>;
+
+    fn overlay_factory_at_block(&self, block_hash: B256) -> Self::Factory {
+        let (anchor_hash, lazy_overlay) = self
+            .canonical_in_memory_state
+            .state_by_hash(block_hash)
+            .map_or((block_hash, None), |state| {
+                let anchor_hash = state.anchor().hash;
+                let blocks = state.chain().map(BlockState::block).collect();
+                (anchor_hash, Some(LazyOverlay::new(blocks)))
+            });
+        let overlay_builder = OverlayBuilder::new(anchor_hash, self.database.changeset_cache())
+            .with_lazy_overlay(lazy_overlay);
+        OverlayStateProviderFactory::new(self.clone(), overlay_builder)
     }
 }
 
@@ -785,7 +825,7 @@ impl<N: ProviderNodeTypes> StateReader for BlockchainProvider<N> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        providers::BlockchainProvider,
+        providers::{BlockchainProvider, CanonicalOverlayFactory},
         test_utils::{
             create_test_provider_factory, create_test_provider_factory_with_chain_spec,
             MockNodeTypesWithDB,
@@ -793,7 +833,7 @@ mod tests {
         BlockWriter, CanonChainTracker, ProviderFactory, SaveBlocksMode,
     };
     use alloy_eips::{BlockHashOrNumber, BlockNumHash, BlockNumberOrTag};
-    use alloy_primitives::{BlockNumber, TxNumber, B256};
+    use alloy_primitives::{keccak256, map::B256Map, Address, BlockNumber, TxNumber, B256};
     use itertools::Itertools;
     use rand::Rng;
     use reth_chain_state::{
@@ -811,13 +851,15 @@ mod tests {
     use reth_storage_api::{
         BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader,
         BlockReaderIdExt, BlockSource, ChangeSetReader, DBProvider, DatabaseProviderFactory,
-        HeaderProvider, ReceiptProvider, ReceiptProviderIdExt, StateProviderFactory,
-        StateWriteConfig, StateWriter, TransactionVariant, TransactionsProvider,
+        DatabaseProviderROFactory, HeaderProvider, ReceiptProvider, ReceiptProviderIdExt,
+        StateProofProvider, StateProviderFactory, StateWriteConfig, StateWriter,
+        TransactionVariant, TransactionsProvider,
     };
     use reth_testing_utils::generators::{
         self, random_block, random_block_range, random_changeset_range, random_eoa_accounts,
         random_receipt, BlockParams, BlockRangeParams,
     };
+    use reth_trie::{proof::Proof, MultiProofTargetsV2, ProofV2Target, TrieInput};
     use revm_database::{BundleState, OriginalValuesKnown};
     use std::{
         collections::BTreeMap,
@@ -982,6 +1024,51 @@ mod tests {
             in_memory_blocks,
             block_range_params,
         )
+    }
+
+    #[test]
+    fn canonical_overlay_factory_matches_canonical_parent_proofs() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, database_blocks, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            2,
+            2,
+            BlockRangeParams { tx_count: 0..0, ..Default::default() },
+        )?;
+        let parent_hash = in_memory_blocks.last().expect("in-memory parent").hash();
+        let address_a = Address::repeat_byte(0x11);
+        let address_b = Address::repeat_byte(0x12);
+        let targets = || MultiProofTargetsV2 {
+            account_targets: vec![
+                ProofV2Target::new(keccak256(address_a)),
+                ProofV2Target::new(keccak256(address_b)),
+            ],
+            storage_targets: B256Map::from_iter([
+                (keccak256(address_a), vec![ProofV2Target::new(B256::repeat_byte(0x21))]),
+                (keccak256(address_b), vec![ProofV2Target::new(B256::repeat_byte(0x22))]),
+            ]),
+        };
+
+        let serial = provider
+            .state_by_block_hash(parent_hash)?
+            .multiproof_v2(TrieInput::default(), targets())?;
+        let parallel_provider =
+            provider.overlay_factory_at_block(parent_hash).database_provider_ro()?;
+        let overlay = Proof::new(&parallel_provider, &parallel_provider).multiproof_v2(targets())?;
+
+        assert_eq!(overlay, serial);
+
+        let historical_hash = database_blocks.first().expect("historical block").hash();
+        let historical_serial = provider
+            .state_by_block_hash(historical_hash)?
+            .multiproof_v2(TrieInput::default(), targets())?;
+        let historical_provider =
+            provider.overlay_factory_at_block(historical_hash).database_provider_ro()?;
+        let historical_overlay =
+            Proof::new(&historical_provider, &historical_provider).multiproof_v2(targets())?;
+
+        assert_eq!(historical_overlay, historical_serial);
+        Ok(())
     }
 
     /// This will persist the last block in-memory and delete it from

@@ -9,8 +9,19 @@ use crate::{
     sidecar::{CacheAnchor, StateTargetSet},
 };
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::OnceLock,
+};
 use tracing::{debug, info};
+
+fn initialized_cache_root(root: Option<B256>) -> OnceLock<B256> {
+    let memoized = OnceLock::new();
+    if let Some(root) = root {
+        memoized.set(root).expect("new OnceLock is empty");
+    }
+    memoized
+}
 
 /// An entry in the network state cache, tracking access metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -80,6 +91,11 @@ pub struct NetworkStateCache {
     storage_policy: Box<dyn CachePolicy>,
     /// Current block number.
     current_block: u64,
+    /// Locally derived root for the current cache contents.
+    ///
+    /// Block, hash, and policy context remain outside this memo and are rebound by
+    /// [`cache_anchor`](Self::cache_anchor) on every call.
+    memoized_cache_root: OnceLock<B256>,
     /// Per-block undo records (oldest→newest) enabling rollback on reorg.
     /// Retained only for the unfinalized window; pruned below the finalized block.
     undo_log: VecDeque<BlockCacheUndo>,
@@ -95,6 +111,7 @@ impl NetworkStateCache {
             account_policy,
             storage_policy,
             current_block: 0,
+            memoized_cache_root: OnceLock::new(),
             undo_log: VecDeque::new(),
         }
     }
@@ -124,6 +141,30 @@ impl NetworkStateCache {
             account_policy,
             storage_policy,
             current_block,
+            memoized_cache_root: OnceLock::new(),
+            undo_log: VecDeque::new(),
+        }
+    }
+
+    /// Fork the current cache values with fresh policies and no undo history.
+    ///
+    /// If the source already has a locally computed cache root, the fork inherits
+    /// it because the value maps and access metadata are cloned exactly. The root
+    /// cannot be supplied by the caller, which prevents an unverified root from
+    /// being seeded into a validation snapshot.
+    pub fn fork_for_reexecution(
+        &self,
+        account_policy: Box<dyn CachePolicy>,
+        storage_policy: Box<dyn CachePolicy>,
+    ) -> Self {
+        Self {
+            accounts: self.accounts.clone(),
+            storage: self.storage.clone(),
+            codes: self.codes.clone(),
+            account_policy,
+            storage_policy,
+            current_block: self.current_block,
+            memoized_cache_root: initialized_cache_root(self.memoized_cache_root.get().copied()),
             undo_log: VecDeque::new(),
         }
     }
@@ -138,10 +179,13 @@ impl NetworkStateCache {
         block_number: u64,
         accessed: &BlockAccessedState,
     ) -> UpdateStats {
+        // Transfer the parent root into the undo record before changing any
+        // root-bound value or access metadata. The next root is computed lazily.
+        let previous_cache_root = self.memoized_cache_root.take();
         // Capture the cache's pre-block state so this block can be rolled back on
         // reorg. For every key we touch or evict we record its prior value:
         // `Some(entry)` = existed before, `None` = absent before.
-        let mut undo = BlockCacheUndo::new(block_number, self.current_block);
+        let mut undo = BlockCacheUndo::new(block_number, self.current_block, previous_cache_root);
         self.current_block = block_number;
         let mut stats = UpdateStats::default();
 
@@ -349,6 +393,11 @@ impl NetworkStateCache {
     /// Local-only metadata such as `first_accessed_block` and `access_count` is
     /// excluded.
     pub fn cache_root(&self) -> B256 {
+        *self.memoized_cache_root.get_or_init(|| self.compute_cache_root_uncached())
+    }
+
+    /// Compute the canonical root directly from the value maps.
+    fn compute_cache_root_uncached(&self) -> B256 {
         fn push_u256(out: &mut Vec<u8>, value: U256) {
             out.extend_from_slice(&value.to_be_bytes::<32>());
         }
@@ -457,8 +506,8 @@ impl NetworkStateCache {
     /// Estimated memory usage in bytes.
     pub fn estimated_memory_bytes(&self) -> usize {
         // Rough estimates:
-        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈ 112
-        // Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
+        // Account entry: 20 (address) + 8 (nonce) + 32 (balance) + 32 (code_hash) + 20 (metadata) ≈
+        // 112 Storage entry: 20 (address) + 32 (slot) + 32 (value) + 20 (metadata) ≈ 104
         // Code entry: 32 (hash) + avg ~8KB (bytecode) + 20 (metadata)
         let accounts_size = self.accounts.len() * 112;
         let storage_size = self.storage.len() * 104;
@@ -486,6 +535,7 @@ impl NetworkStateCache {
         }
 
         let undo = self.undo_log.pop_back().expect("checked non-empty above");
+        let previous_cache_root = undo.previous_cache_root;
         for (address, before) in undo.accounts_before {
             match before {
                 Some(entry) => {
@@ -517,6 +567,7 @@ impl NetworkStateCache {
             }
         }
         self.current_block = undo.previous_block;
+        self.memoized_cache_root = initialized_cache_root(previous_cache_root);
         Ok(())
     }
 
@@ -542,6 +593,7 @@ impl NetworkStateCache {
         self.codes.clear();
         self.undo_log.clear();
         self.current_block = 0;
+        self.memoized_cache_root = OnceLock::new();
     }
 }
 
@@ -590,16 +642,19 @@ struct BlockCacheUndo {
     block_number: u64,
     /// Cache `current_block` before this block was applied (restored on rollback).
     previous_block: u64,
+    /// Locally computed root before this block, if it had already been derived.
+    previous_cache_root: Option<B256>,
     accounts_before: HashMap<Address, Option<CachedEntry<AccountData>>>,
     storage_before: HashMap<(Address, B256), Option<CachedEntry<U256>>>,
     codes_before: HashMap<B256, Option<CachedEntry<Bytes>>>,
 }
 
 impl BlockCacheUndo {
-    fn new(block_number: u64, previous_block: u64) -> Self {
+    fn new(block_number: u64, previous_block: u64, previous_cache_root: Option<B256>) -> Self {
         Self {
             block_number,
             previous_block,
+            previous_cache_root,
             accounts_before: HashMap::new(),
             storage_before: HashMap::new(),
             codes_before: HashMap::new(),
@@ -764,6 +819,134 @@ mod tests {
     }
 
     #[test]
+    fn cache_root_is_memoized_and_invalidated_by_cache_updates() {
+        let mut cache = make_cache(2, 2);
+        assert!(cache.memoized_cache_root.get().is_none());
+
+        let empty_root = cache.cache_root();
+        assert_eq!(cache.memoized_cache_root.get().copied(), Some(empty_root));
+        assert_eq!(cache.cache_root(), empty_root);
+
+        let address = Address::repeat_byte(0x01);
+        let slot = B256::repeat_byte(0x02);
+        let code_hash = B256::repeat_byte(0x03);
+        let mut inserted = BlockAccessedState::default();
+        inserted.accounts.insert(
+            address,
+            AccountData { nonce: 1, balance: U256::from(10), code_hash: Some(code_hash) },
+        );
+        inserted.storage.insert((address, slot), U256::from(20));
+        inserted.codes.insert(code_hash, Bytes::from_static(&[1, 2, 3]));
+
+        cache.on_block_executed(1, &inserted);
+        assert!(cache.memoized_cache_root.get().is_none());
+        let inserted_root = cache.cache_root();
+        assert_eq!(inserted_root, cache.compute_cache_root_uncached());
+        assert_ne!(inserted_root, empty_root);
+
+        let mut refreshed = inserted;
+        refreshed.accounts.get_mut(&address).unwrap().balance = U256::from(11);
+        refreshed.storage.insert((address, slot), U256::from(21));
+        cache.on_block_executed(2, &refreshed);
+        assert!(cache.memoized_cache_root.get().is_none());
+        let refreshed_root = cache.cache_root();
+        assert_eq!(refreshed_root, cache.compute_cache_root_uncached());
+        assert_ne!(refreshed_root, inserted_root);
+
+        cache.on_block_executed(5, &BlockAccessedState::default());
+        assert!(cache.memoized_cache_root.get().is_none());
+        let evicted_root = cache.cache_root();
+        assert_eq!(evicted_root, cache.compute_cache_root_uncached());
+        assert_eq!(evicted_root, empty_root);
+    }
+
+    #[test]
+    fn cache_root_memo_is_restored_by_rollback() {
+        let mut cache = make_cache(10, 10);
+        let mut parent_accessed = BlockAccessedState::default();
+        parent_accessed.accounts.insert(
+            Address::repeat_byte(0x01),
+            AccountData { nonce: 1, balance: U256::from(10), code_hash: None },
+        );
+        cache.on_block_executed(10, &parent_accessed);
+        let parent_root = cache.cache_root();
+
+        let mut child_accessed = BlockAccessedState::default();
+        child_accessed.accounts.insert(
+            Address::repeat_byte(0x02),
+            AccountData { nonce: 2, balance: U256::from(20), code_hash: None },
+        );
+        cache.on_block_executed(11, &child_accessed);
+        assert!(cache.memoized_cache_root.get().is_none());
+        let child_root = cache.cache_root();
+        assert_ne!(child_root, parent_root);
+
+        cache.rollback_block(11).unwrap();
+        assert_eq!(cache.memoized_cache_root.get().copied(), Some(parent_root));
+        assert_eq!(cache.cache_root(), parent_root);
+        assert_eq!(cache.cache_root(), cache.compute_cache_root_uncached());
+    }
+
+    #[test]
+    fn cache_fork_preserves_only_a_locally_computed_root() {
+        let mut parent = make_cache(10, 10);
+        let address = Address::repeat_byte(0x01);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 1, balance: U256::from(10), code_hash: None });
+        parent.on_block_executed(10, &accessed);
+
+        let fork_without_root = parent.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(10)),
+            Box::new(LastNBlocksPolicy::new(10)),
+        );
+        assert!(fork_without_root.memoized_cache_root.get().is_none());
+
+        let parent_root = parent.cache_root();
+        let mut fork = parent.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(10)),
+            Box::new(LastNBlocksPolicy::new(10)),
+        );
+        assert_eq!(fork.memoized_cache_root.get().copied(), Some(parent_root));
+        assert_eq!(fork.cache_root(), parent_root);
+        assert!(fork.undo_log.is_empty());
+        assert!(fork.rollback_block(10).is_err(), "fork must not inherit undo history");
+
+        fork.on_block_executed(11, &BlockAccessedState::default());
+        assert!(fork.memoized_cache_root.get().is_none());
+        assert_eq!(parent.memoized_cache_root.get().copied(), Some(parent_root));
+        assert_eq!(parent.current_block(), 10);
+    }
+
+    #[test]
+    fn reset_and_restore_start_without_a_cached_root() {
+        let mut cache = make_cache(10, 10);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            Address::repeat_byte(0x01),
+            AccountData { nonce: 1, balance: U256::from(10), code_hash: None },
+        );
+        cache.on_block_executed(10, &accessed);
+        let populated_root = cache.cache_root();
+
+        let restored = NetworkStateCache::restore(
+            cache.accounts.clone(),
+            cache.storage.clone(),
+            cache.codes.clone(),
+            cache.current_block,
+            Box::new(LastNBlocksPolicy::new(10)),
+            Box::new(LastNBlocksPolicy::new(10)),
+        );
+        assert!(restored.memoized_cache_root.get().is_none());
+        assert_eq!(restored.cache_root(), populated_root);
+
+        cache.reset();
+        assert!(cache.memoized_cache_root.get().is_none());
+        assert_eq!(cache.cache_root(), make_cache(10, 10).cache_root());
+    }
+
+    #[test]
     fn cache_root_binds_code_bytecode_value() {
         let code_hash = B256::repeat_byte(0x03);
 
@@ -905,11 +1088,15 @@ mod tests {
 
         let policy_id = last_n_blocks_cache_policy_id(10, 10);
         let anchor = cache.cache_anchor(100, B256::repeat_byte(0xaa), policy_id);
+        let different_context =
+            cache.cache_anchor(101, B256::repeat_byte(0xbb), B256::repeat_byte(0xcc));
 
         assert_eq!(anchor.block_number, 100);
         assert_eq!(anchor.block_hash, B256::repeat_byte(0xaa));
         assert_eq!(anchor.cache_policy_id, policy_id);
         assert_eq!(anchor.cache_root, cache.cache_root());
+        assert_ne!(anchor, different_context);
+        assert_eq!(anchor.cache_root, different_context.cache_root);
     }
 
     #[test]

@@ -43,8 +43,12 @@ use reth_ethereum::{
     provider::StateProviderFactory,
     EthPrimitives,
 };
-use reth_provider::{BlockIdReader, HeaderProvider};
-use sidecar_create::{create_sidecar_for_block, BuilderBlockReport, BuilderOptions};
+use reth_provider::{BlockIdReader, CanonicalOverlayFactory, HeaderProvider, ProviderResult};
+use reth_trie_common::{DecodedMultiProofV2, MultiProofTargetsV2};
+use reth_trie_parallel::proof_task::parallel_multiproof_v2;
+use sidecar_create::{
+    create_sidecar_for_block, BuilderBlockReport, BuilderOptions, ParallelInitialProofFn,
+};
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
 use std::{path::PathBuf, time::Duration};
@@ -67,7 +71,15 @@ impl Default for CacheConfig {
 
 impl CacheConfig {
     fn new_cache(&self) -> NetworkStateCache {
-        NetworkStateCache::new(
+        self.new_cache_at(0)
+    }
+
+    fn new_cache_at(&self, current_block: u64) -> NetworkStateCache {
+        NetworkStateCache::restore(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            current_block,
             Box::new(LastNBlocksPolicy::new(self.account_window)),
             Box::new(LastNBlocksPolicy::new(self.storage_window)),
         )
@@ -134,7 +146,10 @@ async fn partial_stateless_exex<
 >(
     mut ctx: ExExContext<Node>,
     config: CacheConfig,
-) -> eyre::Result<()> {
+) -> eyre::Result<()>
+where
+    Node::Provider: CanonicalOverlayFactory,
+{
     // Resolve the cache file path: datadir/partial_stateless_cache.bin
     let cache_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
     let cache_path = cache_dir.as_ref().join("partial_stateless_cache.bin");
@@ -197,6 +212,7 @@ async fn partial_stateless_exex<
     let sidecar_dir = configured_sidecar_dir();
     let verifier_wait = env_millis("PS_SIDECAR_VERIFIER_WAIT_MS", 2_000);
     let validation_bench = env_flag("PS_VALIDATION_BENCH");
+    let parallel_initial_proof_enabled = env_flag("PS_PARALLEL_INITIAL_PROOF");
     if validation_bench && sidecar_role != SidecarRole::BuilderVerifier {
         return Err(eyre::eyre!("PS_VALIDATION_BENCH requires PS_SIDECAR_ROLE=builder-verifier"));
     }
@@ -277,6 +293,12 @@ async fn partial_stateless_exex<
                 "PS_WITNESS_BASELINE runs before the transition witness; resource/page-fault metrics may be lower because the full baseline can warm the OS page cache"
             );
         }
+    }
+    if parallel_initial_proof_enabled {
+        info!(
+            target: "partial_stateless",
+            "Parallel initial V2 multiproof ENABLED (PS_PARALLEL_INITIAL_PROOF); low-width target sets remain serial"
+        );
     }
 
     // Optional provider-assisted validator preflight. This re-executes each
@@ -394,6 +416,18 @@ async fn partial_stateless_exex<
                                 })
                                 .collect())
                         };
+                    let parallel_initial_proof =
+                        |targets: MultiProofTargetsV2| -> ProviderResult<DecodedMultiProofV2> {
+                            let parallel_factory =
+                                ctx.provider().overlay_factory_at_block(block.parent_hash);
+                            parallel_multiproof_v2(
+                                ctx.task_executor(),
+                                parallel_factory,
+                                targets,
+                                true,
+                            )
+                            .map_err(Into::into)
+                        };
 
                     match create_sidecar_for_block(
                         ctx.evm_config(),
@@ -411,6 +445,8 @@ async fn partial_stateless_exex<
                             run_sidecar_preflight,
                             validation_bench_output: bench_output.as_deref(),
                             reexec_limits: &reexec_limits,
+                            parallel_initial_proof: parallel_initial_proof_enabled
+                                .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
                         },
                         parent_state_root_by_hash,
                         ancestor_headers_for_range,
@@ -525,6 +561,18 @@ async fn partial_stateless_exex<
                                 })
                                 .collect())
                         };
+                    let parallel_initial_proof =
+                        |targets: MultiProofTargetsV2| -> ProviderResult<DecodedMultiProofV2> {
+                            let parallel_factory =
+                                ctx.provider().overlay_factory_at_block(block.parent_hash);
+                            parallel_multiproof_v2(
+                                ctx.task_executor(),
+                                parallel_factory,
+                                targets,
+                                true,
+                            )
+                            .map_err(Into::into)
+                        };
 
                     match create_sidecar_for_block(
                         ctx.evm_config(),
@@ -542,6 +590,8 @@ async fn partial_stateless_exex<
                             run_sidecar_preflight,
                             validation_bench_output: bench_output.as_deref(),
                             reexec_limits: &reexec_limits,
+                            parallel_initial_proof: parallel_initial_proof_enabled
+                                .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
                         },
                         parent_state_root_by_hash,
                         ancestor_headers_for_range,
@@ -669,13 +719,22 @@ fn thread_rusage() -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::SidecarRole;
+    use super::{CacheConfig, SidecarRole};
 
     #[test]
     fn only_builder_verifier_runs_builder_side_preflight() {
         assert!(!SidecarRole::Builder.runs_preflight());
         assert!(SidecarRole::BuilderVerifier.runs_preflight());
         assert!(!SidecarRole::Verifier.runs_preflight());
+    }
+
+    #[test]
+    fn empty_cache_can_be_bound_to_a_parent_height() {
+        let cache = CacheConfig::default().new_cache_at(99);
+        assert_eq!(cache.current_block(), 99);
+        assert!(cache.accounts().is_empty());
+        assert!(cache.storage().is_empty());
+        assert!(cache.codes().is_empty());
     }
 }
 

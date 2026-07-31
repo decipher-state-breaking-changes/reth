@@ -424,12 +424,32 @@ fn prefilter(
     if sidecar.block_number != block.number() {
         bail!("sidecar block_number mismatch");
     }
+    check_parent_cache_height(block.number(), prev_cache.current_block(), sidecar.cache_block)?;
 
     let local_prev_anchor =
         prev_cache.cache_anchor(sidecar.cache_block, sidecar.parent_hash, sidecar.cache_policy_id);
     check_sidecar_context(sidecar, &local_prev_anchor)
         .map_err(|err| eyre!("sidecar cache context mismatch: {err:?}"))?;
 
+    Ok(())
+}
+
+fn check_parent_cache_height(
+    block_number: u64,
+    local_cache_block: u64,
+    sidecar_cache_block: u64,
+) -> Result<()> {
+    let expected_parent = block_number.saturating_sub(1);
+    if local_cache_block != expected_parent {
+        bail!(
+            "local cache block mismatch: expected parent {expected_parent}, got {local_cache_block}"
+        );
+    }
+    if sidecar_cache_block != expected_parent {
+        bail!(
+            "sidecar cache_block mismatch: expected parent {expected_parent}, got {sidecar_cache_block}"
+        );
+    }
     Ok(())
 }
 
@@ -518,6 +538,13 @@ impl EvmStateProvider for WitnessBackedStateProvider<'_> {
 mod tests {
     use super::*;
     use partial_stateless::policy::{AccountData, LastNBlocksPolicy};
+
+    #[test]
+    fn parent_cache_height_is_bound_to_the_block_parent() {
+        check_parent_cache_height(100, 99, 99).expect("matching parent context");
+        assert!(check_parent_cache_height(100, 98, 99).is_err());
+        assert!(check_parent_cache_height(100, 99, 98).is_err());
+    }
 
     #[test]
     fn next_anchor_mismatch_rolls_back_cache_transition() {

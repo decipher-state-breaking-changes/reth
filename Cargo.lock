@@ -6495,6 +6495,7 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-trie-common",
+ "reth-trie-parallel",
  "revm",
  "serde",
  "serde_json",

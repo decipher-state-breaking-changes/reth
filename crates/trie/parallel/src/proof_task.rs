@@ -42,7 +42,7 @@ use reth_execution_errors::StateProofError;
 use reth_primitives_traits::{dashmap::DashMap, FastInstant as Instant};
 use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult};
 use reth_storage_errors::db::DatabaseError;
-use reth_tasks::Runtime;
+use reth_tasks::{LazyHandle, Runtime};
 use reth_trie::{
     hashed_cursor::{HashedCursorFactory, HashedStorageCursor, InstrumentedHashedCursor},
     proof_v2,
@@ -148,6 +148,10 @@ pub struct ProofWorkerHandle {
     storage_worker_count: usize,
     /// Total number of account workers spawned
     account_worker_count: usize,
+    /// Completion signal for the storage worker pool.
+    storage_worker_shutdown: LazyHandle<()>,
+    /// Completion signal for the account worker pool.
+    account_worker_shutdown: LazyHandle<()>,
 }
 
 impl ProofWorkerHandle {
@@ -184,10 +188,12 @@ impl ProofWorkerHandle {
         let cached_storage_roots = Arc::<DashMap<_, _>>::default();
 
         let divisor = if halve_workers { 2 } else { 1 };
+        // Keep at least one worker in each pool. A one-thread runtime with `halve_workers`
+        // enabled would otherwise spawn no receivers and every dispatched proof would fail.
         let storage_worker_count =
-            runtime.proof_storage_worker_pool().current_num_threads() / divisor;
+            (runtime.proof_storage_worker_pool().current_num_threads() / divisor).max(1);
         let account_worker_count =
-            runtime.proof_account_worker_pool().current_num_threads() / divisor;
+            (runtime.proof_account_worker_pool().current_num_threads() / divisor).max(1);
 
         let storage_availability = Arc::new(AvailabilitySheet::new(storage_worker_count));
         let account_availability = Arc::new(AvailabilitySheet::new(account_worker_count));
@@ -207,7 +213,7 @@ impl ProofWorkerHandle {
         let storage_avail = storage_availability.clone();
         let storage_roots = cached_storage_roots.clone();
         let storage_parent_span = tracing::Span::current();
-        runtime.spawn_blocking_named("storage-workers", move || {
+        let storage_worker_shutdown = runtime.spawn_blocking_named("storage-workers", move || {
             let worker_id = AtomicUsize::new(0);
             storage_rt.proof_storage_worker_pool().broadcast(storage_worker_count, |_| {
                 let worker_id = worker_id.fetch_add(1, Ordering::Relaxed);
@@ -245,7 +251,7 @@ impl ProofWorkerHandle {
         let account_tx = storage_work_tx.clone();
         let account_avail = account_availability.clone();
         let account_parent_span = tracing::Span::current();
-        runtime.spawn_blocking_named("account-workers", move || {
+        let account_worker_shutdown = runtime.spawn_blocking_named("account-workers", move || {
             let worker_id = AtomicUsize::new(0);
             account_rt.proof_account_worker_pool().broadcast(account_worker_count, |_| {
                 let worker_id = worker_id.fetch_add(1, Ordering::Relaxed);
@@ -287,7 +293,26 @@ impl ProofWorkerHandle {
             account_availability,
             storage_worker_count,
             account_worker_count,
+            storage_worker_shutdown,
+            account_worker_shutdown,
         }
+    }
+
+    /// Closes this handle's worker channels and waits for both pools to release their providers.
+    ///
+    /// This is used only by the one-shot wrapper, which owns the sole handle.
+    fn shutdown_and_wait(self) {
+        let Self {
+            storage_work_tx,
+            account_work_tx,
+            storage_worker_shutdown,
+            account_worker_shutdown,
+            ..
+        } = self;
+        drop(account_work_tx);
+        account_worker_shutdown.get();
+        drop(storage_work_tx);
+        storage_worker_shutdown.get();
     }
 
     /// Returns `true` if more than one storage worker is currently idle.
@@ -370,6 +395,52 @@ impl ProofWorkerHandle {
                 error
             })
     }
+}
+
+/// Computes one V2 multiproof using the existing account and storage proof worker pools.
+///
+/// This submits one account job, which dispatches the targeted storage tries across the storage
+/// workers and overlaps their computation with the account-trie walk. The worker handle is scoped
+/// to this call so every worker's read transaction is released after the proof completes.
+pub fn parallel_multiproof_v2<Factory>(
+    runtime: &Runtime,
+    factory: Factory,
+    targets: MultiProofTargetsV2,
+    halve_workers: bool,
+) -> Result<DecodedMultiProofV2, ParallelStateRootError>
+where
+    Factory: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    if targets.is_empty() {
+        return Ok(DecodedMultiProofV2::default())
+    }
+
+    let (result_tx, result_rx) = unbounded();
+    let proof_handle = ProofWorkerHandle::new(runtime, ProofTaskCtx::new(factory), halve_workers);
+    let proof_result_sender =
+        ProofResultContext::new(result_tx, HashedPostState::default(), Instant::now());
+    if let Err(error) = proof_handle
+        .dispatch_account_multiproof(AccountMultiproofInput { targets, proof_result_sender })
+    {
+        proof_handle.shutdown_and_wait();
+        return Err(error.into())
+    }
+
+    let message = match result_rx.recv() {
+        Ok(message) => message,
+        Err(_) => {
+            proof_handle.shutdown_and_wait();
+            return Err(ParallelStateRootError::Other(
+                "parallel multiproof result channel closed".to_string(),
+            ))
+        }
+    };
+    proof_handle.shutdown_and_wait();
+    message.result
 }
 
 /// Data used for initializing cursor factories that is shared across all proof worker instances.
@@ -1151,8 +1222,16 @@ enum AccountWorkerJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_chainspec::ChainSpec;
-    use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
+    use alloy_primitives::{keccak256, Address, U256};
+    use reth_chainspec::{ChainSpec, EthChainSpec};
+    use reth_ethereum_primitives::{Block, BlockBody};
+    use reth_primitives_traits::{Account, RecoveredBlock, SealedBlock, StorageEntry};
+    use reth_provider::{
+        test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, ExecutionOutcome,
+        HashingWriter,
+    };
+    use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig};
+    use reth_trie::TrieInput;
     use std::sync::Arc;
 
     fn test_ctx<Factory>(factory: Factory) -> ProofTaskCtx<Factory> {
@@ -1175,13 +1254,98 @@ mod tests {
         );
         let ctx = test_ctx(factory);
 
-        let runtime = reth_tasks::Runtime::test();
-        let proof_handle = ProofWorkerHandle::new(&runtime, ctx, false);
+        let rayon = RayonConfig::default()
+            .with_proof_storage_worker_threads(1)
+            .with_proof_account_worker_threads(1);
+        let runtime =
+            RuntimeBuilder::new(RuntimeConfig::default().with_rayon(rayon)).build().unwrap();
+        let proof_handle = ProofWorkerHandle::new(&runtime, ctx, true);
 
         // Verify handle can be cloned
         let _cloned_handle = proof_handle.clone();
+        assert_eq!(proof_handle.total_storage_workers(), 1);
+        assert_eq!(proof_handle.total_account_workers(), 1);
 
         // Workers shut down automatically when handle is dropped
         drop(proof_handle);
+    }
+
+    #[test]
+    fn one_shot_parallel_multiproof_matches_serial() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let anchor_hash = chain_spec.genesis_hash();
+        let provider_factory =
+            create_test_provider_factory_with_chain_spec(Arc::clone(&chain_spec));
+        let address_a = Address::repeat_byte(0x11);
+        let address_b = Address::repeat_byte(0x12);
+        let slot_a = B256::repeat_byte(0x21);
+        let slot_b = B256::repeat_byte(0x22);
+
+        {
+            let provider_rw = provider_factory.provider_rw().unwrap();
+            let genesis_block = RecoveredBlock::new_sealed(
+                SealedBlock::<Block>::seal_parts(
+                    chain_spec.genesis_header().clone(),
+                    BlockBody::default(),
+                ),
+                vec![],
+            );
+            provider_rw
+                .append_blocks_with_state(
+                    vec![genesis_block],
+                    &ExecutionOutcome::default(),
+                    Default::default(),
+                )
+                .unwrap();
+            provider_rw
+                .insert_account_for_hashing([
+                    (
+                        address_a,
+                        Some(Account { nonce: 1, balance: U256::from(2), bytecode_hash: None }),
+                    ),
+                    (
+                        address_b,
+                        Some(Account { nonce: 2, balance: U256::from(3), bytecode_hash: None }),
+                    ),
+                ])
+                .unwrap();
+            provider_rw
+                .insert_storage_for_hashing([
+                    (address_a, [StorageEntry { key: slot_a, value: U256::from(4) }]),
+                    (address_b, [StorageEntry { key: slot_b, value: U256::from(5) }]),
+                ])
+                .unwrap();
+            provider_rw.commit().unwrap();
+        }
+
+        let targets = || MultiProofTargetsV2 {
+            account_targets: vec![
+                ProofV2Target::new(keccak256(address_a)),
+                ProofV2Target::new(keccak256(address_b)),
+            ],
+            storage_targets: B256Map::from_iter([
+                (keccak256(address_a), vec![ProofV2Target::new(keccak256(slot_a))]),
+                (keccak256(address_b), vec![ProofV2Target::new(keccak256(slot_b))]),
+            ]),
+        };
+        let serial = provider_factory
+            .latest()
+            .unwrap()
+            .multiproof_v2(TrieInput::default(), targets())
+            .unwrap();
+        let overlay_factory = reth_provider::providers::OverlayStateProviderFactory::new(
+            provider_factory,
+            reth_provider::providers::OverlayBuilder::<
+                reth_ethereum_primitives::EthPrimitives,
+            >::new(anchor_hash, reth_trie_db::ChangesetCache::new()),
+        );
+
+        let rayon = RayonConfig::default()
+            .with_proof_storage_worker_threads(2)
+            .with_proof_account_worker_threads(1);
+        let runtime =
+            RuntimeBuilder::new(RuntimeConfig::default().with_rayon(rayon)).build().unwrap();
+        let parallel = parallel_multiproof_v2(&runtime, overlay_factory, targets(), false).unwrap();
+        assert_eq!(parallel, serial);
     }
 }

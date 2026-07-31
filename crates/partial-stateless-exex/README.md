@@ -74,12 +74,17 @@ variables, so the core sidecar generation path stays lean:
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
+| `PS_PARALLEL_INITIAL_PROOF=1` | use Reth's proof workers for eligible initial V2 multiproofs; low-width target sets and later structural deltas stay serial |
 | `PS_RESOURCE_METRICS=1` | capture per-thread CPU time + page faults around transition-witness construction (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) to separate compute-bound from disk-I/O-bound blocks |
 | `PS_ENGINE_BENCH=1` | enable the lightweight Vanilla Engine V2 timing collector; usable by a standard Reth node without the ExEx |
 | `PS_ENGINE_BENCH_OUTPUT=<file>` | JSONL destination for Vanilla Engine V2 timing records (default: `./engine_bench.jsonl`) |
 | `PS_VALIDATION_BENCH=1` | enable in-memory DB-free Partial/Weak validation paired with same-block Vanilla Engine timing; requires `builder-verifier` |
 | `PS_BENCH_OUTPUT=<file>` | JSONL destination for paired Partial/Weak benchmark records |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
+
+The initial parallel-proof gate currently requires at least two distinct storage tries and 64
+total initial targets. Eligible calls use half of the configured proof workers; smaller calls and
+all later structural/context proof deltas stay on the serial provider.
 
 `PS_SIDECAR_ROLE=builder-verifier` is a single-process test mode: it keeps the
 normal builder output path, but forces the same provider-assisted client preflight

@@ -25,7 +25,7 @@ use partial_stateless::{
         accessed_to_state_targets, build_sidecar_targets, cache_hit_targets,
         measure_multiproof_size, state_targets_to_proof_targets, WitnessResult,
     },
-    CacheAwareTransitionProgress, CacheAwareTrieTransition, CacheFootprintStats,
+    CacheAnchor, CacheAwareTransitionProgress, CacheAwareTrieTransition, CacheFootprintStats,
     PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
     PartialTrieNodeCache, RootWitnessCompletenessSummary, SidecarBenchmarkManifest, StateTargetSet,
     StateTargetStats, TrieProofTargetV2, WitnessReductionStats,
@@ -33,7 +33,7 @@ use partial_stateless::{
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
-use reth_provider::StateProvider;
+use reth_provider::{ProviderResult, StateProvider};
 use reth_revm::database::StateProviderDatabase;
 use reth_trie_common::{
     DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofV2Target, TrieInput,
@@ -57,13 +57,58 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) run_sidecar_preflight: bool,
     pub(crate) validation_bench_output: Option<&'a Path>,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
+    pub(crate) parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
 }
+
+pub(crate) type ParallelInitialProofFn<'a> =
+    dyn Fn(MultiProofTargetsV2) -> ProviderResult<DecodedMultiProofV2> + 'a;
 
 #[derive(Debug)]
 pub(crate) struct BuilderBlockReport {
     pub(crate) cache_update: UpdateStats,
     pub(crate) witness: Option<WitnessResult>,
     pub(crate) sidecar_path: Option<PathBuf>,
+}
+
+const PARALLEL_INITIAL_PROOF_MIN_STORAGE_TRIES: usize = 2;
+const PARALLEL_INITIAL_PROOF_MIN_TOTAL_TARGETS: usize = 64;
+
+const fn needs_previous_cache_snapshot(
+    run_sidecar_preflight: bool,
+    validation_bench_enabled: bool,
+) -> bool {
+    run_sidecar_preflight || validation_bench_enabled
+}
+
+fn previous_cache_snapshot(
+    cache: &NetworkStateCache,
+    config: &CacheConfig,
+    cache_parent_synced: bool,
+    run_sidecar_preflight: bool,
+    validation_bench_enabled: bool,
+) -> Option<NetworkStateCache> {
+    (cache_parent_synced &&
+        needs_previous_cache_snapshot(run_sidecar_preflight, validation_bench_enabled))
+    .then(|| {
+        cache.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(config.account_window)),
+            Box::new(LastNBlocksPolicy::new(config.storage_window)),
+        )
+    })
+}
+
+fn sidecar_publication_anchors(
+    prev_cache_anchor: Option<CacheAnchor>,
+    next_cache_anchor: Option<CacheAnchor>,
+) -> Option<(CacheAnchor, CacheAnchor)> {
+    prev_cache_anchor.zip(next_cache_anchor)
+}
+
+fn require_previous_cache_snapshot(
+    snapshot: Option<&mut NetworkStateCache>,
+) -> eyre::Result<&mut NetworkStateCache> {
+    snapshot
+        .ok_or_else(|| eyre::eyre!("previous cache snapshot missing for builder-side preflight"))
 }
 
 fn rollback_sidecar_transition(
@@ -159,6 +204,23 @@ impl V2TargetSet {
         self.accounts.len() + self.storage.len()
     }
 
+    fn distinct_storage_tries(&self) -> usize {
+        let mut previous = None;
+        let mut count = 0;
+        for &(hashed_address, _) in self.storage.keys() {
+            if previous != Some(hashed_address) {
+                previous = Some(hashed_address);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn should_use_parallel_initial_proof(&self) -> bool {
+        self.distinct_storage_tries() >= PARALLEL_INITIAL_PROOF_MIN_STORAGE_TRIES &&
+            self.len() >= PARALLEL_INITIAL_PROOF_MIN_TOTAL_TARGETS
+    }
+
     fn to_provider_targets(&self) -> MultiProofTargetsV2 {
         let account_targets = self
             .accounts
@@ -202,6 +264,7 @@ struct CacheAwareBaseProof {
     proof: DecodedMultiProofV2,
     cache_covered_mutation_targets: usize,
     provider_us: u64,
+    proof_source: &'static str,
 }
 
 fn initial_cache_aware_targets(
@@ -260,6 +323,7 @@ fn initial_cache_aware_targets(
 
 fn generate_cache_aware_base_proof(
     state_provider: &dyn StateProvider,
+    parallel_initial_proof: Option<&ParallelInitialProofFn<'_>>,
     post_state: &HashedPostState,
     miss: &MissResult,
     trie_cache: &PartialTrieNodeCache,
@@ -271,16 +335,47 @@ fn generate_cache_aware_base_proof(
     }
 
     let provider_start = Instant::now();
-    let proof = if targets.is_empty() {
-        DecodedMultiProofV2::default()
+    let (proof, proof_source) = if targets.is_empty() {
+        (DecodedMultiProofV2::default(), "empty")
+    } else if let Some(parallel_initial_proof) = parallel_initial_proof &&
+        targets.should_use_parallel_initial_proof()
+    {
+        match parallel_initial_proof(targets.to_provider_targets()) {
+            Ok(proof) => (proof, "parallel"),
+            Err(err) => {
+                warn!(
+                    target: "partial_stateless",
+                    error = %err,
+                    initial_targets = targets.len(),
+                    distinct_storage_tries = targets.distinct_storage_tries(),
+                    "Parallel initial V2 multiproof failed; retrying with the serial parent provider"
+                );
+                let proof = state_provider
+                    .multiproof_v2(TrieInput::default(), targets.to_provider_targets())
+                    .map_err(|serial_err| {
+                        eyre::eyre!(
+                            "parallel initial V2 multiproof failed ({err}); serial fallback also failed: {serial_err}"
+                        )
+                    })?;
+                (proof, "serial-after-parallel-error")
+            }
+        }
     } else {
-        state_provider
+        let proof = state_provider
             .multiproof_v2(TrieInput::default(), targets.to_provider_targets())
-            .map_err(|err| eyre::eyre!("failed to generate initial V2 multiproof: {err}"))?
+            .map_err(|err| eyre::eyre!("failed to generate initial V2 multiproof: {err}"))?;
+        let source = if parallel_initial_proof.is_some() { "serial-low-width" } else { "serial" };
+        (proof, source)
     };
     let provider_us = provider_start.elapsed().as_micros() as u64;
 
-    Ok(CacheAwareBaseProof { targets, proof, cache_covered_mutation_targets, provider_us })
+    Ok(CacheAwareBaseProof {
+        targets,
+        proof,
+        cache_covered_mutation_targets,
+        provider_us,
+        proof_source,
+    })
 }
 
 fn build_cache_aware_flat_transition(
@@ -604,11 +699,17 @@ pub fn build_weak_stateless_sidecar(
     config: &CacheConfig,
 ) -> eyre::Result<WeakStatelessBuild> {
     let build_start = Instant::now();
-    let cold_cache = config.new_cache();
+    let parent_block_number = block_number.saturating_sub(1);
+    let cold_cache = config.new_cache_at(parent_block_number);
     let full_miss = cold_cache.compute_miss(accessed);
     let cold_trie = PartialTrieNodeCache::new();
-    let base =
-        generate_cache_aware_base_proof(state_provider, hashed_post_state, &full_miss, &cold_trie)?;
+    let base = generate_cache_aware_base_proof(
+        state_provider,
+        None,
+        hashed_post_state,
+        &full_miss,
+        &cold_trie,
+    )?;
     let build = build_cache_aware_flat_transition(
         state_provider,
         parent_state_root,
@@ -639,10 +740,9 @@ pub fn build_weak_stateless_sidecar(
     };
     let cache_policy_id =
         last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
-    let parent_block_number = block_number.saturating_sub(1);
     let prev_cache_anchor =
         cold_cache.cache_anchor(parent_block_number, parent_hash, cache_policy_id);
-    let mut next_cache = config.new_cache();
+    let mut next_cache = config.new_cache_at(parent_block_number);
     next_cache.on_block_executed(block_number, accessed);
     let next_cache_anchor = next_cache.cache_anchor(block_number, block_hash, cache_policy_id);
     let witness_commitment = partial_witness_commitment(parent_state_root, &full_targets, &witness);
@@ -748,7 +848,7 @@ where
     let partial_witness = WitnessSizeBreakdown::from_witness(&partial_sidecar.witness)?;
     let weak_witness = WitnessSizeBreakdown::from_witness(&weak_sidecar.witness)?;
 
-    let mut weak_cache = config.new_cache();
+    let mut weak_cache = config.new_cache_at(block.number().saturating_sub(1));
     let mut weak_trie = PartialTrieNodeCache::new();
     let partial_first = partial_runs_first(block.number());
     let (partial_report, weak_report) = if partial_first {
@@ -975,16 +1075,13 @@ where
     }
     let prev_cache_anchor = cache_parent_synced
         .then(|| cache.cache_anchor(parent_block_number, parent_hash, cache_policy_id));
-    let mut prev_cache_for_reexec = cache_parent_synced.then(|| {
-        NetworkStateCache::restore(
-            cache.accounts().clone(),
-            cache.storage().clone(),
-            cache.codes().clone(),
-            cache.current_block(),
-            Box::new(LastNBlocksPolicy::new(config.account_window)),
-            Box::new(LastNBlocksPolicy::new(config.storage_window)),
-        )
-    });
+    let mut prev_cache_for_reexec = previous_cache_snapshot(
+        cache,
+        config,
+        cache_parent_synced,
+        options.run_sidecar_preflight,
+        options.validation_bench_output.is_some(),
+    );
     let cache_snapshot_before = cache.snapshot();
     let cache_memory_before = cache.estimated_memory_bytes();
     let miss = cache.compute_miss(&accessed);
@@ -1075,9 +1172,14 @@ where
     let start = Instant::now();
     let saved_sidecar_path;
     let witness = {
-        let base =
-            generate_cache_aware_base_proof(state_provider, &hashed_post_state, &miss, trie_cache)
-                .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
+        let base = generate_cache_aware_base_proof(
+            state_provider,
+            options.parallel_initial_proof,
+            &hashed_post_state,
+            &miss,
+            trie_cache,
+        )
+        .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
         let CacheAwareFlatBuild {
             nodes,
             decoded_proof: proof,
@@ -1106,6 +1208,7 @@ where
         )
         .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
         let initial_provider_us = base.provider_us;
+        let initial_proof_source = base.proof_source;
         let transition_witness_build_us = start.elapsed().as_micros() as u64;
         let elapsed_ms = transition_witness_build_us / 1_000;
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
@@ -1129,6 +1232,7 @@ where
             provider_calls,
             structural_provider_us,
             initial_provider_us,
+            initial_proof_source,
             initial_proof_nodes,
             initial_proof_bytes,
             cache_covered_mutation_targets,
@@ -1160,8 +1264,8 @@ where
             .then(|| cache.cache_anchor(block_number, block_hash, cache_policy_id));
 
         let sidecar_generation_result: eyre::Result<Option<PathBuf>> = 'sidecar: {
-            let (Some(prev_cache_anchor), Some(next_cache_anchor), Some(prev_cache_for_reexec)) =
-                (prev_cache_anchor, next_cache_anchor, prev_cache_for_reexec.as_mut())
+            let Some((prev_cache_anchor, next_cache_anchor)) =
+                sidecar_publication_anchors(prev_cache_anchor, next_cache_anchor)
             else {
                 break 'sidecar Ok(None);
             };
@@ -1206,6 +1310,11 @@ where
             };
 
             let root_witness_completeness = if options.run_sidecar_preflight {
+                let prev_cache_for_reexec =
+                    match require_previous_cache_snapshot(prev_cache_for_reexec.as_mut()) {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => break 'sidecar Err(err),
+                    };
                 let reexec_report = if let Some(output_path) = options.validation_bench_output {
                     benchmark_sidecar_validation(
                         evm_config,
@@ -1545,6 +1654,115 @@ mod tests {
         assert!(partial_runs_first(100));
         assert!(!partial_runs_first(101));
         assert!(partial_runs_first(102));
+    }
+
+    #[test]
+    fn previous_cache_snapshot_is_only_needed_for_reexecution_paths() {
+        assert!(!needs_previous_cache_snapshot(false, false));
+        assert!(needs_previous_cache_snapshot(true, false));
+        assert!(needs_previous_cache_snapshot(false, true));
+        assert!(needs_previous_cache_snapshot(true, true));
+    }
+
+    #[test]
+    fn normal_builder_skips_snapshot_while_preflight_forks_the_parent_cache() {
+        let config = CacheConfig::default();
+        let mut cache = config.new_cache();
+        let address = Address::repeat_byte(0x11);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 1, balance: U256::from(10), code_hash: None });
+        cache.on_block_executed(99, &accessed);
+        let parent_root = cache.cache_root();
+
+        assert!(previous_cache_snapshot(&cache, &config, true, false, false).is_none());
+        assert!(previous_cache_snapshot(&cache, &config, false, true, false).is_none());
+
+        let preflight =
+            previous_cache_snapshot(&cache, &config, true, true, false).expect("preflight fork");
+        let paired =
+            previous_cache_snapshot(&cache, &config, true, false, true).expect("paired fork");
+        assert_eq!(preflight.current_block(), 99);
+        assert_eq!(preflight.cache_root(), parent_root);
+        assert_eq!(paired.cache_root(), parent_root);
+
+        cache.on_block_executed(100, &accessed);
+        assert_ne!(cache.cache_root(), parent_root);
+        assert_eq!(preflight.current_block(), 99);
+        assert_eq!(preflight.cache_root(), parent_root);
+    }
+
+    #[test]
+    fn sidecar_publication_depends_only_on_cache_anchors() {
+        let prev = CacheAnchor {
+            block_number: 99,
+            block_hash: B256::repeat_byte(0x11),
+            cache_policy_id: B256::repeat_byte(0x22),
+            cache_root: B256::repeat_byte(0x33),
+        };
+        let next = CacheAnchor {
+            block_number: 100,
+            block_hash: B256::repeat_byte(0x44),
+            cache_policy_id: prev.cache_policy_id,
+            cache_root: B256::repeat_byte(0x55),
+        };
+
+        assert_eq!(sidecar_publication_anchors(Some(prev), Some(next)), Some((prev, next)));
+        assert_eq!(sidecar_publication_anchors(None, Some(next)), None);
+        assert_eq!(sidecar_publication_anchors(Some(prev), None), None);
+    }
+
+    #[test]
+    fn requested_preflight_fails_closed_without_previous_cache_snapshot() {
+        assert!(require_previous_cache_snapshot(None).is_err());
+    }
+
+    #[test]
+    fn parallel_initial_proof_requires_both_storage_width_and_total_work() {
+        let storage_a = B256::repeat_byte(0xaa);
+        let storage_b = B256::repeat_byte(0xbb);
+        let mut too_little_work = V2TargetSet::default();
+        too_little_work.insert(TrieProofTargetV2::Storage {
+            hashed_address: storage_a,
+            key: B256::repeat_byte(0x01),
+            min_len: 0,
+        });
+        too_little_work.insert(TrieProofTargetV2::Storage {
+            hashed_address: storage_b,
+            key: B256::repeat_byte(0x02),
+            min_len: 0,
+        });
+        assert_eq!(too_little_work.distinct_storage_tries(), 2);
+        assert!(!too_little_work.should_use_parallel_initial_proof());
+
+        let mut wide = V2TargetSet::default();
+        for index in 0..62u8 {
+            let mut key = [0u8; 32];
+            key[31] = index;
+            wide.insert(TrieProofTargetV2::Account { key: B256::from(key), min_len: 0 });
+        }
+        wide.insert(TrieProofTargetV2::Storage {
+            hashed_address: storage_a,
+            key: B256::repeat_byte(0x01),
+            min_len: 0,
+        });
+        wide.insert(TrieProofTargetV2::Storage {
+            hashed_address: storage_b,
+            key: B256::repeat_byte(0x02),
+            min_len: 0,
+        });
+        assert_eq!(wide.len(), PARALLEL_INITIAL_PROOF_MIN_TOTAL_TARGETS);
+        assert!(wide.should_use_parallel_initial_proof());
+
+        wide.storage.remove(&(storage_b, B256::repeat_byte(0x02)));
+        wide.insert(TrieProofTargetV2::Storage {
+            hashed_address: storage_a,
+            key: B256::repeat_byte(0x03),
+            min_len: 0,
+        });
+        assert_eq!(wide.distinct_storage_tries(), 1);
+        assert!(!wide.should_use_parallel_initial_proof());
     }
 
     #[test]

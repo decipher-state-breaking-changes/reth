@@ -13,6 +13,7 @@ path = "src/main.rs"
 # reth
 reth-ethereum = { workspace = true, features = ["full", "cli"] }
 reth-trie-common = { workspace = true }
+reth-trie-parallel.workspace = true
 reth-provider = { workspace = true, features = ["jemalloc"] }
 reth-evm = { workspace = true }
 reth-revm = { workspace = true }
