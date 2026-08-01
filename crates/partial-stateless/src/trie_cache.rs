@@ -295,9 +295,14 @@ impl PartialTrieNodeCache {
     pub fn mutation_metrics(&self, changed: &TrieChangeSet) -> TrieMutationMetrics {
         let retained_accounts =
             self.retained_account_addresses().into_iter().map(keccak256).collect::<HashSet<_>>();
-        let account_prefixes = prefix_coverage(&retained_accounts, &changed.dirtied_accounts());
+        // Both the leaf count and the prefix coverage read from `dirtied_accounts`, which folds in
+        // storage owners: a slot change rewrites its account's leaf even when the post state lists
+        // no account entry for it. Counting only `changed.accounts` here would report a
+        // storage-only block as dirtying no account leaf while the prefixes above it say otherwise.
+        let dirtied_accounts = changed.dirtied_accounts();
+        let account_prefixes = prefix_coverage(&retained_accounts, &dirtied_accounts);
         let dirtied_account_paths =
-            retained_accounts.iter().filter(|key| changed.accounts.contains(*key)).count();
+            retained_accounts.iter().filter(|key| dirtied_accounts.contains(*key)).count();
 
         let mut retained_by_trie = B256Map::<HashSet<B256>>::default();
         for (address, slot) in &self.warm_storage {

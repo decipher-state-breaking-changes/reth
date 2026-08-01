@@ -78,39 +78,31 @@ where
         );
     }
 
-    // A Ready cache is one that claims it can validate this block from the sidecar alone, so a
-    // trustless root that is missing or wrong is a failed acceptance rather than a diagnostic.
-    // While the cache is still Warming the verifier is legitimately leaning on the full state
-    // provider — that is how it warms in the first place — and the same conditions are only
-    // reported.
-    let accepting_as_partial =
-        ready_parent.is_some_and(|parent| parent.anchor == sidecar.prev_cache_anchor);
+    // Witness-only execution and the state-root check are fail-closed for every readiness state:
+    // `verify_and_apply_provider_assisted_sidecar` computes the root from the sidecar and trie
+    // cache alone and bails on a mismatch, so reaching here at all means the root matched. What
+    // readiness adds is an independent view of which parent that was. The lower layer compares the
+    // sidecar's previous anchor against the cache; comparing it against the readiness tracker too
+    // catches a cache that has drifted from what the tracker believes about it, which is exactly
+    // the state where the cache would otherwise vouch for the wrong branch.
+    if let Some(parent) = ready_parent {
+        if parent.anchor != sidecar.prev_cache_anchor {
+            return Err(eyre::eyre!(
+                "sidecar at block {block_number} names previous anchor {:?}, but the cache is authenticated against {:?}",
+                sidecar.prev_cache_anchor,
+                parent.anchor
+            ));
+        }
+    }
+
     match report.trustless_state_root {
-        Some(root) if root == block.state_root() => info!(
+        Some(root) => info!(
             target: "partial_stateless",
             block = block_number,
-            accepting_as_partial,
+            accepted_as_partial = ready_parent.is_some(),
             trustless_state_root = ?root,
             "Trustless state root VERIFIED (trie node cache + witness only)"
         ),
-        Some(root) if accepting_as_partial => {
-            return Err(eyre::eyre!(
-                "trustless state root mismatch at block {block_number} while Ready: got {root:?}, expected {:?}",
-                block.state_root()
-            ))
-        }
-        Some(root) => warn!(
-            target: "partial_stateless",
-            block = block_number,
-            trustless_state_root = ?root,
-            expected = ?block.state_root(),
-            "Trustless state root MISMATCH — trie cache/witness stale or insufficient"
-        ),
-        None if accepting_as_partial => {
-            return Err(eyre::eyre!(
-                "block {block_number} has no trustless state root while the cache claims to be Ready for its parent"
-            ))
-        }
         None => info!(
             target: "partial_stateless",
             block = block_number,

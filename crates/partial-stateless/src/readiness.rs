@@ -209,8 +209,16 @@ impl CacheReadinessTracker {
         self.window_filled = true;
         let applied = AppliedBlock { number: checkpoint.block_number, hash: checkpoint.block_hash };
         self.last_applied = Some(applied);
-        // A restored checkpoint is a claim about cache contents, not about this ExEx having
-        // processed the blocks below it, so it does not move the acknowledgement watermark.
+        // The watermark starts at the checkpoint rather than staying unset. It is not a claim that
+        // this ExEx processed the blocks below it — it did not — but the watermark's contract is
+        // that no earlier block will be needed again, and a snapshot at this height is exactly the
+        // statement that none will be. Leaving it unset would be worse than useless: the first
+        // block applied afterwards would find no watermark and no gap, and would set it to
+        // `block_number + 1`, making the same claim with nothing vouching for it.
+        //
+        // This holds only while the restored generation is durable. A checkpoint that is never
+        // persisted leaves a restarted node unable to reproduce state it has already acknowledged.
+        self.acknowledgeable = Some(applied);
         self.state = CacheReadiness::Ready(ReadyParent {
             anchor: CacheAnchor {
                 block_number: checkpoint.block_number,
@@ -892,12 +900,14 @@ mod tests {
         assert_eq!(parent.replay_depth, 0, "nothing was replayed");
         assert!(tracker.window_filled());
 
-        // A restored snapshot says nothing about this ExEx having processed the chain below it.
-        assert_eq!(tracker.acknowledgeable_height(), None);
+        // The checkpoint itself is what vouches for not needing earlier blocks, so the watermark
+        // starts there instead of jumping to 5_001 on the first block applied afterwards.
+        assert_eq!(tracker.acknowledgeable_height(), Some((5_000, block_hash(5_000))));
 
         // The restored parent is a real continuation point, not a one-off classification.
         apply_contiguous(&mut tracker, 5_001, 1);
         assert!(tracker.ready_parent().is_some());
+        assert_eq!(tracker.acknowledgeable_height(), Some((5_001, block_hash(5_001))));
     }
 
     #[test]
