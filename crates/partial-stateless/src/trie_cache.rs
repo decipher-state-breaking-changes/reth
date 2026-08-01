@@ -9,6 +9,7 @@ use crate::{
     accessed_state::BlockAccessedState,
     network_cache::{MissResult, NetworkStateCache},
     participant::ParticipantCache,
+    shared_trie::SharedSparseTrie,
 };
 use alloy_primitives::{
     keccak256,
@@ -16,19 +17,37 @@ use alloy_primitives::{
     Address, B256,
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
-use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie, SparseTrie};
-use std::fmt;
+use reth_trie_sparse::{ParallelSparseTrie, RevealableSparseTrie, SparseStateTrie, SparseTrie};
+use std::{fmt, sync::Arc};
+
+/// The sparse state trie this cache runs on.
+///
+/// The account trie is owned outright — every block rewrites the path from the root to each
+/// changed account, so nothing about it is worth sharing — while storage tries are shared
+/// copy-on-write with the generation the snapshot was taken from. See [`SharedSparseTrie`].
+type CacheSparseStateTrie = SparseStateTrie<ParallelSparseTrie, SharedSparseTrie>;
 
 /// Sparse trie plus the value-cache membership whose paths it is required to retain.
 ///
 /// Cloning this type creates a transactional snapshot. Producers and validators apply a block to a
 /// clone, check the post-state root and next anchor, and only then replace the previous cache.
+///
+/// The snapshot deep-copies the account trie and shares every storage trie with its parent until
+/// something writes to it, so a block pays for the storage tries it dirties rather than for every
+/// trie the cache retains. Both outcomes stay exact: a committed snapshot ends up owning what it
+/// wrote and sharing the rest with a parent that is about to be dropped, and an abandoned one
+/// drops its private copies and leaves the parent untouched.
 #[derive(Debug)]
 pub struct PartialTrieNodeCache {
-    sparse: SparseStateTrie,
+    sparse: CacheSparseStateTrie,
     warm_accounts: HashSet<Address>,
     warm_storage: HashSet<(Address, B256)>,
     state_root: Option<B256>,
+    /// The retained slot paths each storage trie was last pruned to, sorted and deduplicated.
+    ///
+    /// Retention is idempotent on a trie that has not been written to since it was pruned to the
+    /// same paths, so this is what makes skipping it safe rather than merely cheap.
+    retained_storage_paths: B256Map<Arc<[Nibbles]>>,
 }
 
 impl Clone for PartialTrieNodeCache {
@@ -38,22 +57,16 @@ impl Clone for PartialTrieNodeCache {
             .state_trie_ref()
             .map(|trie| RevealableSparseTrie::Revealed(Box::new(trie.clone())))
             .unwrap_or_else(RevealableSparseTrie::blind);
-        let mut sparse = SparseStateTrie::new().with_accounts_trie(accounts);
+        let mut sparse = CacheSparseStateTrie::default().with_accounts_trie(accounts);
 
-        // `retain_from_value_cache` removes every storage trie without a warm slot, so this is
-        // the complete semantic storage snapshot. Allocation-reuse buffers and process-local LFU
-        // history are deliberately not copied; value-cache membership is authoritative.
-        let mut storage_addresses: Vec<_> =
-            self.warm_storage.iter().map(|(address, _)| keccak256(address)).collect();
-        storage_addresses.sort_unstable();
-        storage_addresses.dedup();
-        for hashed_address in storage_addresses {
-            if let Some(trie) = self.sparse.storage_trie_ref(&hashed_address) {
-                sparse.insert_storage_trie(
-                    hashed_address,
-                    RevealableSparseTrie::Revealed(Box::new(trie.clone())),
-                );
-            }
+        // Copying the map wholesale is both cheaper and more faithful than rebuilding it from
+        // warm membership: each value is a refcount bump, and `retain_from_value_cache` has
+        // already reduced the map to exactly the tries warm membership requires. Allocation-reuse
+        // buffers and process-local LFU history are deliberately not copied.
+        let storage = sparse.storage_tries_mut();
+        storage.reserve(self.sparse.storage_tries_ref().len());
+        for (hashed_address, trie) in self.sparse.storage_tries_ref() {
+            storage.insert(*hashed_address, trie.clone());
         }
 
         Self {
@@ -61,6 +74,7 @@ impl Clone for PartialTrieNodeCache {
             warm_accounts: self.warm_accounts.clone(),
             warm_storage: self.warm_storage.clone(),
             state_root: self.state_root,
+            retained_storage_paths: self.retained_storage_paths.clone(),
         }
     }
 }
@@ -75,10 +89,11 @@ impl PartialTrieNodeCache {
     /// Creates a cold local sparse trie.
     pub fn new() -> Self {
         Self {
-            sparse: SparseStateTrie::new(),
+            sparse: CacheSparseStateTrie::default(),
             warm_accounts: HashSet::default(),
             warm_storage: HashSet::default(),
             state_root: None,
+            retained_storage_paths: B256Map::default(),
         }
     }
 
@@ -114,7 +129,7 @@ impl PartialTrieNodeCache {
         self.state_root
     }
 
-    pub(crate) fn sparse_mut(&mut self) -> &mut SparseStateTrie {
+    pub(crate) fn sparse_mut(&mut self) -> &mut CacheSparseStateTrie {
         &mut self.sparse
     }
 
@@ -127,6 +142,11 @@ impl PartialTrieNodeCache {
     /// The value cache remains authoritative for hits. Unlike leaf-only pruning,
     /// [`SparseTrie::retain_witness_paths`] keeps terminal extension/leaf mismatches that prove a
     /// cached zero or nonexistent account while blinding unrelated decoded subtrees.
+    ///
+    /// A storage trie is pruned only when the transition wrote to it or when its retained slot set
+    /// moved. Pruning anything else would reproduce the shape it already has, and under
+    /// copy-on-write storage tries that no-op would cost a full copy of a trie the block never
+    /// touched — the copy the snapshot exists to avoid.
     pub fn retain_from_value_cache(&mut self, value_cache: &NetworkStateCache) {
         self.warm_accounts = value_cache.accounts().keys().copied().collect();
         self.warm_storage = value_cache.storage().keys().copied().collect();
@@ -155,13 +175,82 @@ impl PartialTrieNodeCache {
             slots.sort_unstable();
             slots.dedup();
         }
+
+        let previous_paths = std::mem::take(&mut self.retained_storage_paths);
+        let mut current_paths = B256Map::with_capacity_and_hasher(
+            self.sparse.storage_tries_ref().len(),
+            Default::default(),
+        );
         self.sparse.storage_tries_mut().retain(|hashed_address, trie| {
-            let Some(slots) = retained_storage.get(hashed_address) else { return false };
-            if let Some(trie) = trie.as_revealed_mut() {
+            let Some(slots) = retained_storage.get_mut(hashed_address) else { return false };
+            let previous = previous_paths.get(hashed_address);
+            // `as_revealed_ref` first: `as_revealed_mut` hands out a `&mut SharedSparseTrie`, which
+            // is harmless on its own, but reaching for it before knowing whether the prune is
+            // needed makes the skip easy to lose in a later edit.
+            let untouched = trie.as_revealed_ref().is_some_and(SharedSparseTrie::is_untouched);
+            let unchanged = previous.is_some_and(|previous| **previous == slots[..]);
+            if !(untouched && unchanged) &&
+                let Some(trie) = trie.as_revealed_mut()
+            {
                 trie.retain_witness_paths(slots);
             }
+            // Reusing the parent's handle when the set did not move keeps the next snapshot's copy
+            // of this map a refcount bump rather than a walk of every retained slot path.
+            let paths = match previous {
+                Some(previous) if unchanged => previous.clone(),
+                _ => Arc::from(std::mem::take(slots)),
+            };
+            current_paths.insert(*hashed_address, paths);
             true
         });
+        self.retained_storage_paths = current_paths;
+    }
+
+    /// Storage tries this snapshot still shares with the generation it was cloned from.
+    ///
+    /// Reported as a delta against [`Self::storage_trie_count`] so a run can show how much of the
+    /// old per-block deep copy the transition actually needed.
+    pub fn shared_storage_trie_count(&self) -> usize {
+        self.sparse
+            .storage_tries_ref()
+            .values()
+            .filter(|trie| trie.as_revealed_ref().is_some_and(SharedSparseTrie::is_untouched))
+            .count()
+    }
+
+    /// Storage tries the cache holds.
+    pub fn storage_trie_count(&self) -> usize {
+        self.sparse.storage_tries_ref().len()
+    }
+
+    /// Takes a private copy of every storage trie still shared with the parent generation.
+    ///
+    /// This reproduces the eager deep clone that the copy-on-write snapshot replaced, so a
+    /// differential test can run one transition both ways and compare the results.
+    pub fn materialize_shared_storage_tries(&mut self) -> usize {
+        let mut copied = 0;
+        for trie in self.sparse.storage_tries_mut().values_mut() {
+            if let Some(trie) = trie.as_revealed_mut() &&
+                trie.is_untouched()
+            {
+                trie.make_mut();
+                copied += 1;
+            }
+        }
+        copied
+    }
+
+    /// Structural equality of the account trie, every storage trie, membership, and the root.
+    ///
+    /// Deliberately not [`PartialEq`]: it walks every revealed node in every trie, which is a
+    /// differential-test and diagnostic operation rather than something the hot path should reach
+    /// for by accident.
+    pub fn structurally_eq(&self, other: &Self) -> bool {
+        self.state_root == other.state_root &&
+            self.warm_accounts == other.warm_accounts &&
+            self.warm_storage == other.warm_storage &&
+            self.sparse.state_trie_ref() == other.sparse.state_trie_ref() &&
+            self.sparse.storage_tries_ref() == other.sparse.storage_tries_ref()
     }
 
     /// Whether the current sparse shape can prove this account value or absence.

@@ -17,6 +17,7 @@ use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
+    cow_copies_taken,
     fixture::{save_fixture, AccessedStateFixture},
     last_n_blocks_cache_policy_id,
     network_cache::{MissResult, NetworkStateCache, UpdateStats},
@@ -1252,6 +1253,13 @@ where
     let builder_transition_witness_build_us;
     let builder_trie_clone_bytes;
     let builder_trie_clone_rss_delta_bytes;
+    let builder_trie_storage_tries_copied;
+    let builder_trie_storage_tries_total;
+    // The snapshot's copies are spread across the transition and retention rather than paid at the
+    // clone, so counting them means bracketing the whole transaction. The counter is process-wide,
+    // which is exact here because the ExEx applies one transition at a time and the paired
+    // verification runs after this delta is read.
+    let cow_copies_before = cow_copies_taken();
     let mut builder_trie_mutation = None;
     let mut builder_witness_commitment = None;
     let mut sidecar_constructed = false;
@@ -1379,6 +1387,8 @@ where
         let trie_retention_start = Instant::now();
         next_trie_cache.retain_from_value_cache(cache);
         let trie_retention_us = trie_retention_start.elapsed().as_micros() as u64;
+        builder_trie_storage_tries_total = next_trie_cache.storage_trie_count() as u64;
+        builder_trie_storage_tries_copied = cow_copies_taken().saturating_sub(cow_copies_before);
 
         let validation_start = Instant::now();
         let trie_shape_metrics = if options.trie_cache_diagnostics {
@@ -1788,6 +1798,8 @@ where
             trie_cache_bytes: trie_cache.estimated_memory_bytes(),
             trie_clone_bytes: builder_trie_clone_bytes,
             trie_clone_rss_delta_bytes: builder_trie_clone_rss_delta_bytes,
+            trie_storage_tries_copied: builder_trie_storage_tries_copied,
+            trie_storage_tries_total: builder_trie_storage_tries_total,
             trie_mutation: builder_trie_mutation.as_ref().map(TrieMutationSummary::from),
         };
         if let Err(err) = append_builder_record(path, &record) {

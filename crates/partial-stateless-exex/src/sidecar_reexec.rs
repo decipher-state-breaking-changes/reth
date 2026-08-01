@@ -3,7 +3,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
-    check_sidecar_context, check_sidecar_miss_targets,
+    check_sidecar_context, check_sidecar_miss_targets, cow_copies_taken,
     network_cache::{NetworkStateCache, UpdateStats},
     try_compute_trustless_state_root, try_compute_trustless_state_root_v2_with_storage_targets,
     witness_check::{
@@ -203,6 +203,12 @@ where
 
     // Apply the block to a transactional sparse-trie snapshot. The original cache is left
     // untouched until the consensus root and next cache anchor have both been checked.
+    //
+    // The snapshot shares its storage tries with the parent, so the copies it goes on to take are
+    // spread across the transition and retention rather than paid here. Bracketing the whole
+    // transaction is the only way to count them; the counter is process-wide, which is exact
+    // because the ExEx applies one transition at a time.
+    let cow_copies_before = cow_copies_taken();
     let clone_start = Instant::now();
     let mut next_trie_cache = trie_cache.clone();
     let trie_clone_us = clone_start.elapsed().as_micros() as u64;
@@ -327,6 +333,7 @@ where
         next_trie_cache,
         trie_cache_disposition,
     )?;
+    let trie_storage_tries_copied = cow_copies_taken().saturating_sub(cow_copies_before);
 
     let mut timings = ValidationPhaseTimings {
         context_check_us,
@@ -338,6 +345,8 @@ where
         evm_us,
         hash_post_state_us,
         trie_clone_us,
+        trie_storage_tries_copied,
+        trie_storage_tries_total: cache_timings.storage_tries_total,
         state_root_us,
         root_completeness_us,
         miss_policy_check_us,
@@ -376,6 +385,12 @@ struct CacheTransitionTimings {
     retention_us: u64,
     anchor_us: u64,
     commit_us: u64,
+    /// Storage tries the snapshot held after retention.
+    ///
+    /// Paired with the copy count taken across the whole transaction, this is what the
+    /// copy-on-write snapshot saved over the deep clone, which is no longer visible in
+    /// `trie_clone_us` once that stops doing the copying.
+    storage_tries_total: u64,
 }
 
 fn apply_cache_transition_and_check(
@@ -396,6 +411,7 @@ fn apply_cache_transition_and_check(
     let start = Instant::now();
     next_trie_cache.retain_from_value_cache(cache);
     timings.retention_us = start.elapsed().as_micros() as u64;
+    timings.storage_tries_total = next_trie_cache.storage_trie_count() as u64;
     let start = Instant::now();
     let next_cache_anchor = cache.cache_anchor(block_number, block_hash, cache_policy_id);
     timings.anchor_us = start.elapsed().as_micros() as u64;

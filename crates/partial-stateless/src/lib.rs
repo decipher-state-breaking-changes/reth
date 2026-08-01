@@ -16,6 +16,7 @@ pub mod participant;
 pub mod persistence;
 pub mod policy;
 pub mod readiness;
+pub mod shared_trie;
 pub mod trie_cache;
 pub mod witness;
 
@@ -41,6 +42,7 @@ pub use readiness::{
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,
 };
+pub use shared_trie::{cow_copies_taken, SharedSparseTrie};
 pub use sidecar::{
     check_next_cache_anchor, check_sidecar_context, check_sidecar_miss_targets,
     check_sidecar_self_consistency, last_n_blocks_cache_policy_id, partial_witness_commitment,
