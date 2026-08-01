@@ -149,6 +149,42 @@ fn warm_fixture() -> (NetworkStateCache, MultiProof, B256, Address, B256) {
     (cache, proof, state_root, address, slot)
 }
 
+/// A root-anchored exclusion proof for the sentinel path, over a chain that holds one unrelated
+/// account. This is what a provider returns for a snapshot that proves no values of its own.
+fn sentinel_root_proof() -> (MultiProof, B256) {
+    let occupant = Address::repeat_byte(0x33);
+    let occupant_account = Account { nonce: 1, balance: U256::from(5u64), bytecode_hash: None };
+    let sentinel_path = Nibbles::unpack(B256::ZERO);
+    let occupant_path = Nibbles::unpack(keccak256(occupant));
+    let mut builder =
+        HashBuilder::default().with_proof_retainer(ProofRetainer::from_iter([sentinel_path]));
+    builder.add_leaf(
+        occupant_path,
+        &alloy_rlp::encode(occupant_account.into_trie_account(EMPTY_ROOT_HASH)),
+    );
+    let state_root = builder.root();
+    (
+        MultiProof {
+            account_subtree: builder.take_proof_nodes(),
+            branch_node_masks: Default::default(),
+            storages: Default::default(),
+        },
+        state_root,
+    )
+}
+
+fn empty_cache(codes: HashMap<B256, CachedEntry<Bytes>>) -> NetworkStateCache {
+    let (account_policy, storage_policy) = policies();
+    NetworkStateCache::restore(
+        HashMap::new(),
+        HashMap::new(),
+        codes,
+        ANCHOR_BLOCK,
+        account_policy,
+        storage_policy,
+    )
+}
+
 fn expect_reject(result: Result<RestoredBootstrapState, BootstrapError>) -> BootstrapError {
     match result {
         Ok(_) => panic!("expected snapshot to be rejected"),
@@ -290,52 +326,107 @@ fn restores_account_path_for_storage_only_entry() {
 }
 
 #[test]
-fn empty_value_namespaces_restore_with_cold_trie() {
-    let (account_policy, storage_policy) = policies();
-    let cache = NetworkStateCache::restore(
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        ANCHOR_BLOCK,
-        account_policy,
-        storage_policy,
-    );
+fn empty_value_namespaces_restore_with_authenticated_root() {
+    let cache = empty_cache(HashMap::new());
     let anchor = anchor_for(&cache);
-    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &MultiProof::default());
+    let (proof, state_root) = sentinel_root_proof();
+    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &proof);
     let (account_policy, storage_policy) = policies();
     let restored =
-        verify_and_restore(pkg, &anchor, B256::repeat_byte(0x99), account_policy, storage_policy)
-            .unwrap();
+        verify_and_restore(pkg, &anchor, state_root, account_policy, storage_policy).unwrap();
 
-    assert_eq!(restored.trie_cache.state_root(), None);
+    // A snapshot with no leaves is still bound to the canonical state root, so callers can compare
+    // the restored trie root against the canonical parent instead of receiving `None`.
+    assert_eq!(restored.trie_cache.state_root(), Some(state_root));
     assert_eq!(restored.trie_cache.tracked_account_count(), 0);
     assert_eq!(restored.trie_cache.tracked_storage_slot_count(), 0);
 }
 
 #[test]
-fn code_only_cache_restores_without_trie_paths() {
+fn rejects_empty_snapshot_under_forged_state_root() {
+    let cache = empty_cache(HashMap::new());
+    let anchor = anchor_for(&cache);
+    let (proof, state_root) = sentinel_root_proof();
+    let forged = B256::repeat_byte(0x99);
+    assert_ne!(forged, state_root);
+    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &proof);
+    let (account_policy, storage_policy) = policies();
+
+    let err =
+        expect_reject(verify_and_restore(pkg, &anchor, forged, account_policy, storage_policy));
+    assert!(
+        matches!(err, BootstrapError::StateRootMismatch { expected, actual }
+            if expected == forged && actual == state_root),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn rejects_empty_snapshot_without_any_account_proof() {
+    let cache = empty_cache(HashMap::new());
+    let anchor = anchor_for(&cache);
+    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &MultiProof::default());
+    let (account_policy, storage_policy) = policies();
+
+    let err = expect_reject(verify_and_restore(
+        pkg,
+        &anchor,
+        B256::repeat_byte(0x99),
+        account_policy,
+        storage_policy,
+    ));
+    assert!(matches!(err, BootstrapError::MissingStateRootProof), "unexpected error: {err}");
+}
+
+#[test]
+fn code_only_cache_restores_with_authenticated_root() {
     let code = Bytes::from_static(&[0x60, 0x01]);
     let code_hash = keccak256(&code);
     let mut codes = HashMap::new();
     codes.insert(code_hash, entry(code));
-    let (account_policy, storage_policy) = policies();
-    let cache = NetworkStateCache::restore(
-        HashMap::new(),
-        HashMap::new(),
-        codes,
-        ANCHOR_BLOCK,
-        account_policy,
-        storage_policy,
-    );
+    let cache = empty_cache(codes);
     let anchor = anchor_for(&cache);
-    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &MultiProof::default());
+    let (proof, state_root) = sentinel_root_proof();
+    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &proof);
     let (account_policy, storage_policy) = policies();
     let restored =
-        verify_and_restore(pkg, &anchor, B256::repeat_byte(0x99), account_policy, storage_policy)
-            .unwrap();
+        verify_and_restore(pkg, &anchor, state_root, account_policy, storage_policy).unwrap();
 
     assert!(restored.value_cache.contains_code(&code_hash));
-    assert_eq!(restored.trie_cache.state_root(), None);
+    assert_eq!(restored.trie_cache.state_root(), Some(state_root));
+}
+
+#[test]
+fn code_only_package_builder_requests_sentinel_root_proof() {
+    let code = Bytes::from_static(&[0x60, 0x01]);
+    let code_hash = keccak256(&code);
+    let mut codes = HashMap::new();
+    codes.insert(code_hash, entry(code));
+    let cache = empty_cache(codes);
+    let anchor = anchor_for(&cache);
+    let (proof, state_root) = sentinel_root_proof();
+
+    let mut requested = Vec::new();
+    let pkg = build_snapshot_package(&cache, anchor, state_root, |targets| {
+        requested.push(targets);
+        Ok(proof.clone())
+    })
+    .unwrap();
+
+    assert_eq!(requested.len(), 1);
+    assert!(
+        requested[0].contains_key(&B256::ZERO),
+        "builder must request a root-anchoring sentinel path, got {:?}",
+        requested[0]
+    );
+    assert!(!pkg.proof.account_subtree.is_empty());
+
+    // Close the loop: what the builder produces must be exactly what the verifier accepts.
+    let (account_policy, storage_policy) = policies();
+    let restored =
+        verify_and_restore(pkg, &anchor, state_root, account_policy, storage_policy).unwrap();
+    assert_eq!(restored.trie_cache.state_root(), Some(state_root));
+    assert!(restored.value_cache.contains_code(&code_hash));
 }
 
 #[test]

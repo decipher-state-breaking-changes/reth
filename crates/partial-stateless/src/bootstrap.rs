@@ -22,6 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_PROOF_RETRIES: usize = 128;
 
+/// Hashed-address path requested when a snapshot has no account or storage leaf of its own.
+///
+/// Any path works: the point is that the returned proof descends from the account-trie root, so
+/// revealing it authenticates the state root even though the snapshot proves no values. A real
+/// account here would only make this an inclusion proof, which anchors the root just as well.
+const SENTINEL_PROOF_TARGET: B256 = B256::ZERO;
+
 /// Resource limits applied before expensive snapshot verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapLimits {
@@ -116,9 +123,11 @@ pub fn build_snapshot_package(
 
     let mut targets = bootstrap_proof_targets(cache);
     if targets.is_empty() {
-        let pkg = CacheSnapshotPackage::from_cache(cache, anchor, &MultiProof::default());
-        check_package_limits(&pkg, &BootstrapLimits::default())?;
-        return Ok(pkg)
+        // An empty or code-only cache has no leaf to prove, but the restored trie must still be
+        // bound to the canonical state root. Requesting one sentinel exclusion path forces the
+        // provider to return a root-anchored proof, which `restore_trie_cache` then compares
+        // against `state_root`. Without it the snapshot would restore against any claimed root.
+        targets.entry(SENTINEL_PROOF_TARGET).or_default();
     }
 
     let mut retries = 0usize;
@@ -338,10 +347,6 @@ fn restore_trie_cache(
     proof: MultiProof,
     expected_state_root: B256,
 ) -> Result<PartialTrieNodeCache, BootstrapError> {
-    if cache.accounts().is_empty() && cache.storage().is_empty() {
-        return Ok(PartialTrieNodeCache::new())
-    }
-
     let decoded = match multiproof_to_v2_or_request(proof) {
         Ok(decoded) => decoded,
         Err(TrieTransitionError::ProofRequired(targets)) => {
@@ -349,6 +354,14 @@ fn restore_trie_cache(
         }
         Err(TrieTransitionError::Failed(err)) => return Err(BootstrapError::TrieRestore(err)),
     };
+
+    // A snapshot with no account nodes cannot be bound to `expected_state_root`, so it can never
+    // satisfy the readiness invariant that trie state root equals the canonical parent state root.
+    // Empty and code-only snapshots reach here too: they carry a sentinel exclusion path precisely
+    // so that this check passes and the root comparison below can run.
+    if decoded.account_proofs.is_empty() {
+        return Err(BootstrapError::MissingStateRootProof)
+    }
     match PartialTrieNodeCache::restore_from_decoded_multiproof(decoded, expected_state_root, cache)
     {
         Ok(cache) => Ok(cache),
@@ -379,6 +392,7 @@ pub enum BootstrapError {
     TrieRestore(String),
     StateRootMismatch { expected: B256, actual: B256 },
     TrieCacheInvariant(String),
+    MissingStateRootProof,
 }
 
 impl std::fmt::Display for BootstrapError {
@@ -439,6 +453,10 @@ impl std::fmt::Display for BootstrapError {
             Self::TrieCacheInvariant(err) => {
                 write!(f, "bootstrap trie-cache invariant failed: {err}")
             }
+            Self::MissingStateRootProof => f.write_str(
+                "bootstrap snapshot carries no account proof, so its trie cache cannot be bound \
+                 to the expected state root",
+            ),
         }
     }
 }
