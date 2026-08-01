@@ -1,10 +1,10 @@
 use crate::{
     benchmark::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
-        serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, ValidationBenchmarkRecord,
-        WitnessSizeBreakdown,
+        serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, TrieMutationSummary,
+        ValidationBenchmarkRecord, WitnessSizeBreakdown,
     },
-    format_bytes, process_rusage,
+    format_bytes, process_rss_bytes, process_rusage,
     sidecar_io::sidecar_path,
     sidecar_reexec::{
         verify_and_apply_provider_assisted_sidecar,
@@ -47,7 +47,7 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub(crate) struct BuilderOptions<'a> {
     pub(crate) capture_dir: Option<&'a Path>,
@@ -270,6 +270,10 @@ struct CacheAwareFlatBuild {
     structural_storage_targets: usize,
     cache_covered_mutation_targets: usize,
     trie_clone_us: u64,
+    /// Logical size of the trie the per-block snapshot copied.
+    trie_clone_bytes: usize,
+    /// Process RSS moved across the clone. Process-wide, so meaningful only in aggregate.
+    trie_clone_rss_delta_bytes: i64,
     transition_us: u64,
     structural_provider_us: u64,
 }
@@ -411,9 +415,15 @@ fn build_cache_aware_flat_transition(
     trie_cache: &PartialTrieNodeCache,
     base: &CacheAwareBaseProof,
 ) -> eyre::Result<CacheAwareFlatBuild> {
+    // The clone is the cost the transactional-trie design exists to remove, so it is measured three
+    // ways: wall time, the logical size of what was copied, and the process RSS it moved. RSS is
+    // process-wide and noisy per block; it is only interpretable across many blocks.
+    let rss_before = process_rss_bytes();
     let clone_start = Instant::now();
     let mut next_trie_cache = trie_cache.clone();
     let trie_clone_us = clone_start.elapsed().as_micros() as u64;
+    let trie_clone_bytes = next_trie_cache.estimated_memory_bytes();
+    let trie_clone_rss_delta_bytes = process_rss_bytes().saturating_sub(rss_before) as i64;
     let mut requested_flat = base.targets.clone();
     let mut revealed_exact = base.targets.clone();
     let mut flat_nodes = B256Map::<Bytes>::default();
@@ -549,6 +559,8 @@ fn build_cache_aware_flat_transition(
         structural_storage_targets: structural_storage_target_count,
         cache_covered_mutation_targets: base.cache_covered_mutation_targets,
         trie_clone_us,
+        trie_clone_bytes,
+        trie_clone_rss_delta_bytes,
         transition_us,
         structural_provider_us,
     })
@@ -1219,6 +1231,9 @@ where
     let builder_initial_proof_nodes;
     let builder_initial_proof_bytes;
     let builder_transition_witness_build_us;
+    let builder_trie_clone_bytes;
+    let builder_trie_clone_rss_delta_bytes;
+    let mut builder_trie_mutation = None;
     let mut builder_witness_commitment = None;
     let mut sidecar_constructed = false;
     let witness = {
@@ -1245,6 +1260,8 @@ where
             structural_storage_targets,
             cache_covered_mutation_targets,
             trie_clone_us,
+            trie_clone_bytes,
+            trie_clone_rss_delta_bytes,
             transition_us: local_root_us,
             structural_provider_us,
         } = build_cache_aware_flat_transition(
@@ -1269,6 +1286,49 @@ where
         builder_initial_proof_nodes = initial_proof_nodes;
         builder_initial_proof_bytes = initial_proof_bytes;
         builder_transition_witness_build_us = transition_witness_build_us;
+        builder_trie_clone_bytes = trie_clone_bytes;
+        builder_trie_clone_rss_delta_bytes = trie_clone_rss_delta_bytes;
+
+        // Measured against the *parent* trie, which is what the clone copied. Walking every
+        // retained path is linear in cache size, so it stays behind the diagnostics flag.
+        if options.trie_cache_diagnostics {
+            let changed_storage =
+                hashed_post_state.storages.iter().flat_map(|(hashed_address, storage)| {
+                    storage.storage.keys().map(move |hashed_slot| (*hashed_address, *hashed_slot))
+                });
+            let mutation = trie_cache
+                .mutation_metrics(hashed_post_state.accounts.keys().copied(), changed_storage);
+            info!(
+                target: "partial_stateless",
+                block = block_number,
+                dirtied_account_paths = mutation.dirtied_account_paths,
+                retained_account_paths = mutation.retained_account_paths,
+                dirtied_storage_paths = mutation.dirtied_storage_paths,
+                retained_storage_paths = mutation.retained_storage_paths,
+                dirtied_storage_tries = mutation.dirtied_storage_tries,
+                dirtied_path_share = mutation.dirtied_path_share(),
+                deepest_prefix_share = mutation.deepest_account_prefix().dirtied_share(),
+                revealed_nodes = mutation.revealed_nodes(),
+                trie_clone_us,
+                trie_clone_bytes,
+                trie_clone_rss_delta_bytes,
+                "Measured trie mutation footprint against the cloned parent trie"
+            );
+            for trie in
+                mutation.per_storage_trie.iter().filter(|trie| trie.dirtied_paths > 0).take(8)
+            {
+                debug!(
+                    target: "partial_stateless",
+                    block = block_number,
+                    hashed_address = ?trie.hashed_address,
+                    dirtied_paths = trie.dirtied_paths,
+                    retained_paths = trie.retained_paths,
+                    revealed_nodes = trie.revealed_nodes,
+                    "Storage trie mutation footprint"
+                );
+            }
+            builder_trie_mutation = Some(mutation);
+        }
         let elapsed_ms = transition_witness_build_us / 1_000;
         let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
         let witness_state = PartialExecutionWitnessState::MptTransitionNodes(nodes);
@@ -1702,6 +1762,9 @@ where
             sidecar_published: saved_sidecar_path.is_some(),
             value_cache_bytes: cache.estimated_memory_bytes(),
             trie_cache_bytes: trie_cache.estimated_memory_bytes(),
+            trie_clone_bytes: builder_trie_clone_bytes,
+            trie_clone_rss_delta_bytes: builder_trie_clone_rss_delta_bytes,
+            trie_mutation: builder_trie_mutation.as_ref().map(TrieMutationSummary::from),
         };
         if let Err(err) = append_builder_record(path, &record) {
             warn!(

@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use partial_stateless::{PartialExecutionWitness, PartialStatelessSidecar};
+use partial_stateless::{PartialExecutionWitness, PartialStatelessSidecar, TrieMutationMetrics};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -183,6 +183,47 @@ pub struct BuilderBenchmarkRecord {
     pub sidecar_published: bool,
     pub value_cache_bytes: usize,
     pub trie_cache_bytes: usize,
+    /// Logical size of the trie the per-block snapshot copied.
+    pub trie_clone_bytes: usize,
+    /// Process RSS moved across the clone. Process-wide, so meaningful only in aggregate.
+    pub trie_clone_rss_delta_bytes: i64,
+    /// Mutation footprint of this block against the cloned parent trie. Only present under
+    /// `PS_TRIE_CACHE_DIAGNOSTICS`, since measuring it walks every retained path.
+    pub trie_mutation: Option<TrieMutationSummary>,
+}
+
+/// Scalar summary of how much of the cloned trie a block dirtied.
+///
+/// The per-storage-trie breakdown behind these totals goes to the log rather than here: it is
+/// unbounded in length, and a benchmark record is appended once per block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TrieMutationSummary {
+    pub retained_account_paths: usize,
+    pub dirtied_account_paths: usize,
+    pub retained_storage_paths: usize,
+    pub dirtied_storage_paths: usize,
+    pub dirtied_storage_tries: usize,
+    pub revealed_nodes: usize,
+    /// Dirtied share of retained leaf paths.
+    pub dirtied_path_share: f64,
+    /// Dirtied share of distinct account-key prefixes at the deepest level that still fans out.
+    /// Closer than the leaf share to the share of *nodes* a block invalidates.
+    pub deepest_account_prefix_share: f64,
+}
+
+impl From<&TrieMutationMetrics> for TrieMutationSummary {
+    fn from(metrics: &TrieMutationMetrics) -> Self {
+        Self {
+            retained_account_paths: metrics.retained_account_paths,
+            dirtied_account_paths: metrics.dirtied_account_paths,
+            retained_storage_paths: metrics.retained_storage_paths,
+            dirtied_storage_paths: metrics.dirtied_storage_paths,
+            dirtied_storage_tries: metrics.dirtied_storage_tries,
+            revealed_nodes: metrics.revealed_nodes(),
+            dirtied_path_share: metrics.dirtied_path_share(),
+            deepest_account_prefix_share: metrics.deepest_account_prefix().dirtied_share(),
+        }
+    }
 }
 
 pub fn serialize_sidecar_for_benchmark(sidecar: &PartialStatelessSidecar) -> eyre::Result<Vec<u8>> {
@@ -220,7 +261,7 @@ fn append_json_record(path: &Path, record: &impl Serialize) -> eyre::Result<()> 
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
-    use partial_stateless::PartialExecutionWitnessState;
+    use partial_stateless::{PartialExecutionWitnessState, PrefixCoverage};
 
     #[test]
     fn headline_totals_include_deserialization_and_cache_maintenance() {
@@ -323,6 +364,47 @@ mod tests {
         assert!(value.get("parallel_storage_workers").is_some());
         assert!(value.get("parallel_account_workers").is_some());
         assert!(value.get("witness_commitment").is_some());
+    }
+
+    #[test]
+    fn builder_json_schema_exposes_trie_clone_cost_and_mutation_footprint() {
+        let value = serde_json::to_value(BuilderBenchmarkRecord::default()).unwrap();
+
+        assert!(value.get("trie_clone_bytes").is_some());
+        assert!(value.get("trie_clone_rss_delta_bytes").is_some());
+        assert!(
+            value.get("trie_mutation").is_some_and(serde_json::Value::is_null),
+            "the footprint is absent rather than zero when diagnostics are off, so a run without \
+             them cannot be read as a block that dirtied nothing"
+        );
+    }
+
+    #[test]
+    fn trie_mutation_summary_carries_both_dirtied_shares() {
+        let metrics = TrieMutationMetrics {
+            retained_account_paths: 40,
+            dirtied_account_paths: 4,
+            retained_storage_paths: 60,
+            dirtied_storage_paths: 6,
+            dirtied_storage_tries: 2,
+            account_revealed_nodes: 300,
+            storage_revealed_nodes: 200,
+            account_prefixes: std::array::from_fn(|depth| PrefixCoverage {
+                retained: depth + 1,
+                dirtied: 1,
+            }),
+            per_storage_trie: Vec::new(),
+        };
+
+        let summary = TrieMutationSummary::from(&metrics);
+        let value = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(summary.revealed_nodes, 500);
+        // 10 dirtied leaf paths out of 100 retained.
+        assert!((summary.dirtied_path_share - 0.1).abs() < f64::EPSILON);
+        // Deepest level retains 6 prefixes, of which 1 is dirtied.
+        assert!((summary.deepest_account_prefix_share - 1.0 / 6.0).abs() < f64::EPSILON);
+        assert!(value.get("dirtied_storage_tries").is_some());
     }
 
     #[test]

@@ -274,6 +274,85 @@ impl PartialTrieNodeCache {
         }
     }
 
+    /// Reports how much of the retained trie a block's changed keys dirty.
+    ///
+    /// Changing a leaf re-hashes every node between it and the root, so the share of the trie a
+    /// block invalidates is the share of *path prefixes* its changed keys cover. This compares the
+    /// prefixes of `changed_accounts` and `changed_storage` against the prefixes of everything
+    /// retained, at each depth: that ratio is the fraction of the per-block clone a copy-on-write
+    /// or journalling snapshot would avoid copying at that level.
+    ///
+    /// Prefix counts are a structural proxy rather than literal node counts, because Patricia
+    /// extension nodes compress several nibble levels into one. The approximation applies equally
+    /// to both sides of each ratio, which is why the ratios are more trustworthy than either
+    /// count on its own.
+    ///
+    /// Both key iterators take *hashed* keys, matching the trie's own key space.
+    pub fn mutation_metrics(
+        &self,
+        changed_accounts: impl IntoIterator<Item = B256>,
+        changed_storage: impl IntoIterator<Item = (B256, B256)>,
+    ) -> TrieMutationMetrics {
+        let retained_accounts =
+            self.retained_account_addresses().into_iter().map(keccak256).collect::<HashSet<_>>();
+        let dirtied_accounts = changed_accounts
+            .into_iter()
+            .filter(|hashed| retained_accounts.contains(hashed))
+            .collect::<HashSet<_>>();
+        let account_prefixes = prefix_coverage(&retained_accounts, &dirtied_accounts);
+
+        let mut retained_by_trie = B256Map::<HashSet<B256>>::default();
+        for (address, slot) in &self.warm_storage {
+            retained_by_trie.entry(keccak256(address)).or_default().insert(keccak256(slot));
+        }
+        let mut dirtied_by_trie = B256Map::<HashSet<B256>>::default();
+        for (hashed_address, hashed_slot) in changed_storage {
+            // A slot the cache does not retain cannot dirty a node the clone copied.
+            if retained_by_trie
+                .get(&hashed_address)
+                .is_some_and(|slots| slots.contains(&hashed_slot))
+            {
+                dirtied_by_trie.entry(hashed_address).or_default().insert(hashed_slot);
+            }
+        }
+
+        let mut per_storage_trie = Vec::with_capacity(retained_by_trie.len());
+        let mut retained_storage_paths = 0;
+        let mut dirtied_storage_paths = 0;
+        for (hashed_address, retained) in &retained_by_trie {
+            let dirtied = dirtied_by_trie.get(hashed_address).cloned().unwrap_or_default();
+            retained_storage_paths += retained.len();
+            dirtied_storage_paths += dirtied.len();
+            per_storage_trie.push(StorageTrieMutation {
+                hashed_address: *hashed_address,
+                revealed_nodes: self
+                    .sparse
+                    .storage_trie_ref(hashed_address)
+                    .map_or(0, SparseTrie::size_hint),
+                retained_paths: retained.len(),
+                dirtied_paths: dirtied.len(),
+                prefixes: prefix_coverage(retained, &dirtied),
+            });
+        }
+        // Largest first: the tail of this distribution is what a per-trie sharing scheme has to
+        // handle well, and a log line only ever shows the head.
+        per_storage_trie.sort_unstable_by(|a, b| {
+            b.dirtied_paths.cmp(&a.dirtied_paths).then(a.hashed_address.cmp(&b.hashed_address))
+        });
+
+        TrieMutationMetrics {
+            retained_account_paths: retained_accounts.len(),
+            dirtied_account_paths: dirtied_accounts.len(),
+            account_prefixes,
+            account_revealed_nodes: self.sparse.state_trie_ref().map_or(0, SparseTrie::size_hint),
+            retained_storage_paths,
+            dirtied_storage_paths,
+            dirtied_storage_tries: dirtied_by_trie.len(),
+            storage_revealed_nodes: per_storage_trie.iter().map(|trie| trie.revealed_nodes).sum(),
+            per_storage_trie,
+        }
+    }
+
     /// Validates that flat-cache membership, authenticated paths, and the stored state root agree.
     ///
     /// This scans every retained account and storage path and is intended for tests and opt-in ExEx
@@ -384,6 +463,103 @@ pub struct TrieShapeMetrics {
     pub account_prefix_coverage: [f64; TRIE_SHAPE_PREFIX_LEVELS],
 }
 
+/// How much of the retained sparse trie a single block dirties.
+///
+/// The clone-per-block snapshot copies the whole retained trie; these counts say how much of it the
+/// block then invalidates. The gap between the two is the headroom a copy-on-write or journalling
+/// snapshot could recover, and `*_share` near 1.0 means the clone is already close to optimal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrieMutationMetrics {
+    /// Account paths the cache retains.
+    pub retained_account_paths: usize,
+    /// Retained account paths the block changed.
+    pub dirtied_account_paths: usize,
+    /// Account-trie prefix coverage by depth, retained against dirtied.
+    pub account_prefixes: [PrefixCoverage; TRIE_SHAPE_PREFIX_LEVELS],
+    /// Nodes of every kind revealed in the account trie.
+    pub account_revealed_nodes: usize,
+    /// Storage paths the cache retains, across all tries.
+    pub retained_storage_paths: usize,
+    /// Retained storage paths the block changed.
+    pub dirtied_storage_paths: usize,
+    /// Storage tries the block dirtied at all.
+    pub dirtied_storage_tries: usize,
+    /// Nodes of every kind revealed across every retained storage trie.
+    pub storage_revealed_nodes: usize,
+    /// Per-trie breakdown, most dirtied first.
+    pub per_storage_trie: Vec<StorageTrieMutation>,
+}
+
+impl TrieMutationMetrics {
+    /// Retained paths the block changed, across both tries.
+    pub const fn dirtied_paths(&self) -> usize {
+        self.dirtied_account_paths + self.dirtied_storage_paths
+    }
+
+    /// Retained paths in total.
+    pub const fn retained_paths(&self) -> usize {
+        self.retained_account_paths + self.retained_storage_paths
+    }
+
+    /// Nodes the per-block clone copies.
+    pub const fn revealed_nodes(&self) -> usize {
+        self.account_revealed_nodes + self.storage_revealed_nodes
+    }
+
+    /// Share of retained leaf paths the block changed, or 0.0 when nothing is retained.
+    ///
+    /// This is the leaf-level share. Nodes higher up are shared between paths, so the share of
+    /// *nodes* dirtied is larger; [`account_prefixes`](Self::account_prefixes) shows how it grows
+    /// with depth.
+    pub fn dirtied_path_share(&self) -> f64 {
+        fraction(self.dirtied_paths(), self.retained_paths())
+    }
+
+    /// The deepest prefix level where the account trie retains anything, and its coverage.
+    ///
+    /// The shallowest levels saturate — every block touches the root — so the useful signal is at
+    /// the deepest level that still discriminates.
+    pub fn deepest_account_prefix(&self) -> PrefixCoverage {
+        self.account_prefixes
+            .iter()
+            .rev()
+            .find(|coverage| coverage.retained > 0)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Retained against dirtied distinct key prefixes at one trie depth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixCoverage {
+    /// Distinct prefixes across all retained paths.
+    pub retained: usize,
+    /// Distinct prefixes across the paths the block changed.
+    pub dirtied: usize,
+}
+
+impl PrefixCoverage {
+    /// Share of this depth's retained prefixes that the block dirtied.
+    pub fn dirtied_share(&self) -> f64 {
+        fraction(self.dirtied, self.retained)
+    }
+}
+
+/// One storage trie's contribution to [`TrieMutationMetrics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageTrieMutation {
+    /// Hashed address owning the trie.
+    pub hashed_address: B256,
+    /// Nodes of every kind revealed in this trie.
+    pub revealed_nodes: usize,
+    /// Storage paths the cache retains for this address.
+    pub retained_paths: usize,
+    /// Retained paths the block changed.
+    pub dirtied_paths: usize,
+    /// Prefix coverage by depth within this trie.
+    pub prefixes: [PrefixCoverage; TRIE_SHAPE_PREFIX_LEVELS],
+}
+
 /// Invariant failure reported by [`PartialTrieNodeCache::validate_against_value_cache`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrieCacheValidationError {
@@ -472,6 +648,44 @@ impl ParticipantCache for PartialTrieNodeCache {
     fn cache_root(&self) -> B256 {
         PartialTrieNodeCache::cache_root(self)
     }
+}
+
+/// Ratio guarded against an empty denominator, which a cold trie always has.
+fn fraction(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        return 0.0
+    }
+    numerator as f64 / denominator as f64
+}
+
+/// Counts distinct nibble prefixes of `dirtied` against `retained`, per depth.
+///
+/// `dirtied` must be a subset of `retained`, so that each depth's ratio compares the same trie.
+fn prefix_coverage(
+    retained: &HashSet<B256>,
+    dirtied: &HashSet<B256>,
+) -> [PrefixCoverage; TRIE_SHAPE_PREFIX_LEVELS] {
+    let mut retained_prefixes: [HashSet<Vec<u8>>; TRIE_SHAPE_PREFIX_LEVELS] =
+        std::array::from_fn(|_| HashSet::default());
+    let mut dirtied_prefixes: [HashSet<Vec<u8>>; TRIE_SHAPE_PREFIX_LEVELS] =
+        std::array::from_fn(|_| HashSet::default());
+
+    for key in retained {
+        let path = Nibbles::unpack(key);
+        let dirty = dirtied.contains(key);
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            let prefix = path.slice(0..depth).to_vec();
+            if dirty {
+                dirtied_prefixes[depth].insert(prefix.clone());
+            }
+            retained_prefixes[depth].insert(prefix);
+        }
+    }
+
+    std::array::from_fn(|depth| PrefixCoverage {
+        retained: retained_prefixes[depth].len(),
+        dirtied: dirtied_prefixes[depth].len(),
+    })
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub mod network_cache;
 pub mod participant;
 pub mod persistence;
 pub mod policy;
+pub mod readiness;
 pub mod trie_cache;
 pub mod witness;
 
@@ -33,6 +34,10 @@ pub use network_cache::{CachedEntry, NetworkStateCache};
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
 pub use policy::{CachePolicy, LastNBlocksPolicy};
+pub use readiness::{
+    BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
+    ReadinessError, ReadyParent, TrustedCheckpoint,
+};
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,
 };
@@ -45,7 +50,8 @@ pub use sidecar::{
     SidecarCheckError, StateTargetSet, StateTargetStats, WitnessReductionStats, WitnessTargets,
 };
 pub use trie_cache::{
-    PartialTrieNodeCache, TrieCacheValidationError, TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
+    PartialTrieNodeCache, PrefixCoverage, StorageTrieMutation, TrieCacheValidationError,
+    TrieMutationMetrics, TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
 };
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use witness_check::{

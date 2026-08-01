@@ -30,6 +30,8 @@ use partial_stateless::{
     network_cache::NetworkStateCache,
     persistence::{load_from_file, save_to_file},
     policy::LastNBlocksPolicy,
+    readiness::{BlockContext, CacheObservation, CacheReadinessTracker},
+    sidecar::last_n_blocks_cache_policy_id,
     PartialTrieNodeCache,
 };
 use reth_ethereum::{
@@ -43,6 +45,7 @@ use reth_ethereum::{
     provider::StateProviderFactory,
     EthPrimitives,
 };
+use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::{BlockIdReader, CanonicalOverlayFactory, HeaderProvider, ProviderResult};
 use reth_trie_common::MultiProofTargetsV2;
 use reth_trie_parallel::proof_task::parallel_multiproof_v2_with_stats;
@@ -53,7 +56,7 @@ use sidecar_create::{
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
 use std::{path::PathBuf, time::Duration};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Configuration for the partial statelessness cache.
 #[derive(Debug, Clone, Copy)]
@@ -358,6 +361,15 @@ where
         cache.reset();
     }
 
+    // Tracks whether the two caches together still describe the parent of the block being
+    // processed. Both start cold here, and the tracker starts cold with them. The window is the
+    // larger of the two eviction windows: the cache only holds everything its policy identifier
+    // advertises once the longer of the two has been replayed.
+    let mut readiness = CacheReadinessTracker::new(
+        config.account_window.max(config.storage_window),
+        last_n_blocks_cache_policy_id(config.account_window, config.storage_window),
+    );
+
     while let Some(notification) = ctx.notifications.try_next().await? {
         match &notification {
             ExExNotification::ChainCommitted { new } => {
@@ -366,17 +378,27 @@ where
 
                 // Process blocks in chronological order
                 for (block_number, block) in new.blocks() {
-                    let parent_block_number = block_number.saturating_sub(1);
+                    let block_ctx = block_context(block);
+                    if !admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx) {
+                        continue;
+                    }
 
-                    // Get state provider for the parent block to run execution simulation
+                    // The parent is addressed by hash rather than by number: a height can name a
+                    // block on an abandoned branch while a reorg is in flight, and building the
+                    // cache on that state would silently mix two chains.
                     let state_provider =
-                        match ctx.provider().history_by_block_number(parent_block_number) {
+                        match ctx.provider().history_by_block_hash(block.parent_hash) {
                             Ok(provider) => provider,
                             Err(e) => {
+                                // The block is not applied, so every later block would build on
+                                // state these caches never saw. Recording that keeps the gap from
+                                // being papered over on the next block.
+                                let reason = readiness.abandon_block(*block_number);
                                 warn!(
                                     target: "partial_stateless",
                                     block = *block_number,
                                     error = %e,
+                                    ?reason,
                                     "Failed to get state provider for parent block. Skipping block."
                                 );
                                 continue;
@@ -400,6 +422,7 @@ where
                                 block_number
                             ));
                         }
+                        observe_readiness(&mut readiness, &block_ctx, &cache, &trie_cache);
                         continue;
                     }
 
@@ -478,7 +501,9 @@ where
                             cache_update: _cache_update,
                             witness: _witness,
                             sidecar_path: _sidecar_path,
-                        }) => {}
+                        }) => {
+                            observe_readiness(&mut readiness, &block_ctx, &cache, &trie_cache);
+                        }
                         Err(e) => {
                             return Err(eyre::eyre!(
                                 "sidecar builder failed at block {}: {e}",
@@ -512,23 +537,30 @@ where
 
                 // Sparse-trie snapshots currently have no branch-aware undo log. Reset both
                 // caches together so value hits can never outlive their authenticated paths.
+                readiness.begin_recovery();
                 trie_cache = PartialTrieNodeCache::new();
                 cache.reset();
+                readiness.reset();
 
                 // Apply the new canonical chain block-by-block (records value-cache undo).
                 for (block_number, block) in new.blocks() {
-                    let parent_block_number = block_number.saturating_sub(1);
+                    let block_ctx = block_context(block);
+                    if !admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx) {
+                        continue;
+                    }
 
                     let state_provider = match ctx
                         .provider()
-                        .history_by_block_number(parent_block_number)
+                        .history_by_block_hash(block.parent_hash)
                     {
                         Ok(provider) => provider,
                         Err(e) => {
+                            let reason = readiness.abandon_block(*block_number);
                             warn!(
                                 target: "partial_stateless",
                                 block = *block_number,
                                 error = %e,
+                                ?reason,
                                 "Failed to get state provider for block parent on reorg. Skipping."
                             );
                             continue;
@@ -552,6 +584,7 @@ where
                                 block_number
                             ));
                         }
+                        observe_readiness(&mut readiness, &block_ctx, &cache, &trie_cache);
                         continue;
                     }
 
@@ -630,7 +663,9 @@ where
                             cache_update: _cache_update,
                             witness: _witness,
                             sidecar_path: _sidecar_path,
-                        }) => {}
+                        }) => {
+                            observe_readiness(&mut readiness, &block_ctx, &cache, &trie_cache);
+                        }
                         Err(e) => {
                             return Err(eyre::eyre!(
                                 "sidecar builder failed while applying reorg block {}: {e}",
@@ -660,8 +695,10 @@ where
                     "Chain reverted — cold-resetting value and sparse-trie caches"
                 );
 
+                readiness.begin_recovery();
                 trie_cache = PartialTrieNodeCache::new();
                 cache.reset();
+                readiness.reset();
 
                 // Production persists the cold value cache; benchmark mode has no
                 // restart contract and avoids this unrelated disk write.
@@ -693,13 +730,90 @@ where
             .unwrap_or_else(|| cache.current_block().saturating_sub(UNDO_LOG_FALLBACK_DEPTH));
         cache.prune_undo_below(threshold);
 
-        // Acknowledge processed height
+        // Acknowledge processed height. This is a durable promise that everything up to the tip was
+        // processed, and reth prunes below it — so while a block is known to be missing from the
+        // caches, withholding the acknowledgement is what keeps the gap recoverable across a
+        // restart. A cold reset clears the block, since a reset cache no longer claims to describe
+        // any state the gap could corrupt.
         if let Some(committed_chain) = notification.committed_chain() {
-            ctx.events.send(ExExEvent::FinishedHeight(committed_chain.tip().num_hash()))?;
+            if readiness.may_acknowledge_height() {
+                ctx.events.send(ExExEvent::FinishedHeight(committed_chain.tip().num_hash()))?;
+            } else {
+                error!(
+                    target: "partial_stateless",
+                    tip = committed_chain.tip().number,
+                    state = readiness.state().label(),
+                    "Withholding processed-height acknowledgement while the cache is blocked"
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+/// Admits a block for application, cold-resetting both caches first if they no longer describe its
+/// parent.
+///
+/// A block that is not the direct child of the last one applied means the caches describe a state
+/// this chain never passed through. No undo log here is deep enough to unwind an arbitrary gap, so
+/// the only recovery is to drop everything and warm again from this block onwards. Returns whether
+/// the block may be applied at all.
+fn admit_block(
+    readiness: &mut CacheReadinessTracker,
+    cache: &mut NetworkStateCache,
+    trie_cache: &mut PartialTrieNodeCache,
+    block: &BlockContext,
+) -> bool {
+    match readiness.begin_block(block) {
+        Ok(()) => true,
+        Err(reason) => {
+            error!(
+                target: "partial_stateless",
+                block = block.number,
+                ?reason,
+                "Cache continuity broken — cold-resetting both caches and warming again from this block"
+            );
+            *trie_cache = PartialTrieNodeCache::new();
+            cache.reset();
+            readiness.reset();
+            readiness.begin_block(block).is_ok()
+        }
+    }
+}
+
+/// Reclassifies the caches after `block` was applied, logging only genuine changes.
+///
+/// Readiness is advisory here: nothing yet refuses to build or verify a sidecar because the caches
+/// are still warming. Gating on it would change what the benchmark measures.
+fn observe_readiness(
+    readiness: &mut CacheReadinessTracker,
+    block: &BlockContext,
+    cache: &NetworkStateCache,
+    trie_cache: &PartialTrieNodeCache,
+) {
+    let before = readiness.state().label();
+    let after = readiness.finish_block(block, &CacheObservation::capture(cache, trie_cache));
+    if before != after.label() {
+        info!(
+            target: "partial_stateless",
+            block = block.number,
+            from = before,
+            to = after.label(),
+            replay_depth = readiness.replay_depth(),
+            "Cache readiness changed"
+        );
+    }
+}
+
+/// Describes a canonical block for the readiness tracker.
+fn block_context(block: &RecoveredBlock<BlockTy<EthPrimitives>>) -> BlockContext {
+    BlockContext {
+        number: block.number(),
+        hash: block.hash(),
+        parent_hash: block.parent_hash,
+        state_root: block.state_root(),
+    }
 }
 
 /// Format bytes into human-readable string.
@@ -747,9 +861,81 @@ fn process_rusage() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+/// Resident set size of the whole process in bytes.
+///
+/// Sampled around the per-block trie clone to size what that clone costs in real memory, which
+/// `estimated_memory_bytes` cannot show: the estimate counts logical node contents, while RSS also
+/// captures allocator overhead and fragmentation. Process-wide, so concurrent node work lands in
+/// the same number — a single sample is noise, and only the distribution over many blocks is
+/// meaningful. Linux-only; returns 0 elsewhere or if the read fails.
+#[cfg(target_os = "linux")]
+fn process_rss_bytes() -> u64 {
+    // Field 2 of /proc/self/statm is the resident set, counted in pages.
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else { return 0 };
+    let Some(resident_pages) = statm.split_whitespace().nth(1) else { return 0 };
+    let Ok(resident_pages) = resident_pages.parse::<u64>() else { return 0 };
+    // SAFETY: `sysconf` reads a process-global constant and writes nothing.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return 0
+    }
+    resident_pages.saturating_mul(page_size as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_bytes() -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, SidecarRole};
+    use super::{
+        admit_block, block_context, last_n_blocks_cache_policy_id, observe_readiness, BlockContext,
+        CacheConfig, CacheReadinessTracker, NetworkStateCache, PartialTrieNodeCache, SidecarRole,
+    };
+    use alloy_primitives::{Address, B256, U256};
+    use partial_stateless::{
+        accessed_state::BlockAccessedState, policy::AccountData, readiness::CacheReadiness,
+    };
+    use reth_primitives_traits::Block as _;
+
+    const TOUCHED: Address = Address::repeat_byte(0x11);
+
+    fn tracker() -> CacheReadinessTracker {
+        let config = CacheConfig::default();
+        CacheReadinessTracker::new(
+            config.account_window.max(config.storage_window),
+            last_n_blocks_cache_policy_id(config.account_window, config.storage_window),
+        )
+    }
+
+    /// Synthesizes a chain whose hashes and state roots derive from block numbers, so a test can
+    /// name any block without a fixture.
+    fn ctx(number: u64) -> BlockContext {
+        BlockContext {
+            number,
+            hash: numbered(number, 0xbb),
+            parent_hash: numbered(number - 1, 0xbb),
+            state_root: numbered(number, 0x55),
+        }
+    }
+
+    fn numbered(number: u64, tag: u8) -> B256 {
+        let mut value = B256::ZERO;
+        value[0..8].copy_from_slice(&number.to_be_bytes());
+        value[31] = tag;
+        value
+    }
+
+    /// Stands in for a block application: advances the cache height and leaves one entry behind.
+    fn apply(cache: &mut NetworkStateCache, number: u64) {
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            TOUCHED,
+            AccountData { nonce: number, balance: U256::from(number), code_hash: None },
+        );
+        cache.on_block_executed(number, &accessed);
+    }
 
     #[test]
     fn only_builder_verifier_runs_builder_side_preflight() {
@@ -765,6 +951,116 @@ mod tests {
         assert!(cache.accounts().is_empty());
         assert!(cache.storage().is_empty());
         assert!(cache.codes().is_empty());
+    }
+
+    #[test]
+    fn contiguous_blocks_are_admitted_without_disturbing_the_caches() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
+
+        for number in 100..103 {
+            let block = ctx(number);
+            assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &block));
+            apply(&mut cache, number);
+            observe_readiness(&mut readiness, &block, &cache, &trie_cache);
+        }
+
+        assert_eq!(readiness.replay_depth(), 3);
+        assert_eq!(cache.current_block(), 102);
+        assert!(cache.contains_account(&TOUCHED), "contiguous blocks never trigger a reset");
+    }
+
+    #[test]
+    fn a_gap_cold_resets_the_caches_and_restarts_the_replay_count() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
+
+        for number in 100..102 {
+            let block = ctx(number);
+            assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &block));
+            apply(&mut cache, number);
+            observe_readiness(&mut readiness, &block, &cache, &trie_cache);
+        }
+
+        // 105 is not the child of 101, so nothing the caches hold describes its parent.
+        let gapped = ctx(105);
+        assert!(
+            admit_block(&mut readiness, &mut cache, &mut trie_cache, &gapped),
+            "the gapped block is still applied, against caches that were reset first"
+        );
+
+        assert_eq!(cache.current_block(), 0);
+        assert!(!cache.contains_account(&TOUCHED), "stale entries cannot survive the gap");
+        assert_eq!(readiness.replay_depth(), 0);
+        assert_eq!(*readiness.state(), CacheReadiness::Applying { block_number: 105 });
+    }
+
+    #[test]
+    fn a_sibling_at_the_expected_height_is_treated_as_a_gap() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
+
+        let first = ctx(100);
+        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &first));
+        apply(&mut cache, 100);
+        observe_readiness(&mut readiness, &first, &cache, &trie_cache);
+
+        // Right height, wrong branch: only the parent hash distinguishes the two.
+        let sibling = BlockContext { parent_hash: B256::repeat_byte(0xfe), ..ctx(101) };
+        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &sibling));
+
+        assert_eq!(cache.current_block(), 0, "the competing branch's parent forced a reset");
+    }
+
+    #[test]
+    fn an_unapplied_block_withholds_the_height_acknowledgement_until_recovery() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
+
+        let first = ctx(100);
+        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &first));
+        apply(&mut cache, 100);
+        observe_readiness(&mut readiness, &first, &cache, &trie_cache);
+        assert!(readiness.may_acknowledge_height());
+
+        // What the handler does when the parent state provider is unavailable.
+        readiness.abandon_block(101);
+        assert!(
+            !readiness.may_acknowledge_height(),
+            "acknowledging here would let reth prune the block the caches never saw"
+        );
+
+        // The next block's admission performs the recovery reset, which restores the promise.
+        let next = ctx(102);
+        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &next));
+        apply(&mut cache, 102);
+        observe_readiness(&mut readiness, &next, &cache, &trie_cache);
+
+        assert!(readiness.may_acknowledge_height());
+        assert_eq!(readiness.replay_depth(), 1, "recovery warms from scratch");
+    }
+
+    #[test]
+    fn block_context_reads_the_header_fields_it_names() {
+        let parent_hash = B256::repeat_byte(0x77);
+        let state_root = B256::repeat_byte(0x88);
+        let mut block = reth_ethereum::Block::default();
+        block.header.number = 4_242;
+        block.header.parent_hash = parent_hash;
+        block.header.state_root = state_root;
+        let block = block.seal_slow().try_recover().expect("empty body needs no sender recovery");
+
+        let context = block_context(&block);
+
+        assert_eq!(context.number, 4_242);
+        assert_eq!(context.parent_hash, parent_hash);
+        assert_eq!(context.state_root, state_root);
+        assert_eq!(context.hash, block.hash());
+        assert_ne!(context.hash, context.parent_hash);
     }
 }
 
