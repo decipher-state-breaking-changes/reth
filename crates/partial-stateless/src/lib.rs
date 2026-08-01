@@ -9,6 +9,7 @@
 //! block arrives.
 
 pub mod accessed_state;
+pub mod bootstrap;
 pub mod fixture;
 pub mod network_cache;
 pub mod participant;
@@ -22,9 +23,15 @@ pub mod sidecar;
 pub mod witness_check;
 
 pub use accessed_state::BlockAccessedState;
+pub use bootstrap::{
+    bootstrap_proof_targets, build_snapshot_package, verify_and_restore,
+    verify_and_restore_with_limits, BootstrapError, BootstrapLimits, CacheSnapshotPackage,
+    RestoredBootstrapState,
+};
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{CachedEntry, NetworkStateCache};
 pub use participant::ParticipantCache;
+pub use persistence::CacheState;
 pub use policy::{CachePolicy, LastNBlocksPolicy};
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,
