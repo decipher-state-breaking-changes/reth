@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from analyze_builder_bench import build_builder_report
+from analyze_builder_bench import build_builder_report, select_builder_samples
 from analyze_validation_bench import (
     build_overlap_report,
     build_report,
@@ -36,6 +36,12 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="stop gracefully after this wall-clock budget and report what was collected (0: no limit)",
+    )
+    parser.add_argument(
         "--parallel-initial-proof",
         choices=("off", "on"),
         default="off",
@@ -47,6 +53,8 @@ def parse_args():
         parser.error("--warmup must be non-negative and --samples must be positive")
     if args.poll_seconds <= 0 or args.shutdown_timeout <= 0:
         parser.error("poll and shutdown timeouts must be positive")
+    if args.max_seconds < 0:
+        parser.error("--max-seconds must be non-negative")
     if args.node_args and args.node_args[0] == "--":
         args.node_args = args.node_args[1:]
     return args
@@ -91,6 +99,21 @@ def current_selection(
         warmup,
         samples,
     )
+
+
+def warming_progress(builder_path):
+    """Return (builder records seen, records that got past the publication gate).
+
+    A cold cache builds no sidecar until the readiness tracker has an authenticated parent, which
+    takes a full eviction window of contiguous blocks. Those blocks produce builder records with
+    `sidecar_constructed` false and no paired samples at all, so without this the poll line would
+    just print accepted=0 for the whole warm-up with no way to tell progress from a stall.
+
+    Construction, not publication, is the signal: paired mode serializes in memory and skips the
+    sidecar file write, so `sidecar_published` is false for every sample it takes.
+    """
+    records = load_jsonl(builder_path, allow_incomplete_tail=True)
+    return len(records), len(select_builder_samples(records, 0))
 
 
 def process_memory_kib(pid):
@@ -209,7 +232,9 @@ def main():
 
     process = None
     reached_target = False
-    last_count = -1
+    stopped_on_deadline = False
+    deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
+    last_progress = None
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,
@@ -229,8 +254,10 @@ def main():
                     args.samples,
                     allow_incomplete_tail=True,
                 )
+                seen, published = warming_progress(builder_path)
                 memory = append_resource_sample(resource_path, process.pid, len(accepted))
-                if len(accepted) != last_count:
+                progress = (len(accepted), seen, published)
+                if progress != last_progress:
                     memory_summary = (
                         f" rss={memory[0] / 1024:.0f}MiB peak={memory[1] / 1024:.0f}MiB"
                         if memory is not None
@@ -238,13 +265,21 @@ def main():
                     )
                     print(
                         f"accepted={len(accepted)}/{args.samples} warmup={stats.warmup} "
-                        f"overlap={stats.contaminated} pending={stats.pending_next_engine}"
+                        f"overlap={stats.contaminated} pending={stats.pending_next_engine} "
+                        f"blocks={seen} built={published}"
                         f"{memory_summary}",
                         flush=True,
                     )
-                    last_count = len(accepted)
+                    last_progress = progress
                 if len(accepted) >= args.samples:
                     reached_target = True
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    stopped_on_deadline = True
+                    print(
+                        f"Wall-clock budget reached; stopping with {len(accepted)} accepted samples",
+                        flush=True,
+                    )
                     break
                 if exit_code is not None:
                     detail = (
@@ -264,12 +299,21 @@ def main():
             if process is not None:
                 stop_process(process, args.shutdown_timeout)
 
-    if not reached_target:
+    if not reached_target and not stopped_on_deadline:
         raise RuntimeError("benchmark stopped before reaching the sample target")
     accepted, stats = current_selection(
         paired_path, engine_path, log_path, args.warmup, args.samples
     )
-    report = build_report(accepted, stats, args.warmup, args.samples)
+    if not accepted:
+        seen, published = warming_progress(builder_path)
+        raise RuntimeError(
+            f"no paired samples were collected from {seen} blocks ({published} built); "
+            "the cache never became Ready, so the builder published nothing to measure — "
+            f"see {log_path}"
+        )
+    # A deadline stop measures whatever the budget allowed; the sample target only bounds it.
+    collected = len(accepted)
+    report = build_report(accepted, stats, args.warmup, collected)
     report_path.write_text(report)
     overlap_accepted, overlap_stats = select_samples(
         load_jsonl(paired_path),
@@ -280,10 +324,11 @@ def main():
     )
     overlap_report = build_overlap_report(overlap_accepted, overlap_stats, args.warmup)
     overlap_report_path.write_text(overlap_report)
+    builder_records = load_jsonl(builder_path)
     builder_report = build_builder_report(
-        load_jsonl(builder_path),
+        builder_records,
         args.warmup,
-        args.samples,
+        len(select_builder_samples(builder_records, args.warmup)),
         expect_snapshot=True,
     )
     builder_report_path.write_text(builder_report)
