@@ -25,6 +25,7 @@ revm = { workspace = true }
 partial-stateless = { path = "../partial-stateless" }
 
 # alloy
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 

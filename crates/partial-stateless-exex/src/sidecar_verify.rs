@@ -7,6 +7,7 @@ use crate::{
 };
 use partial_stateless::{
     last_n_blocks_cache_policy_id, network_cache::NetworkStateCache, PartialTrieNodeCache,
+    ReadyParent,
 };
 use reth_ethereum::EthPrimitives;
 use reth_evm::ConfigureEvm;
@@ -25,6 +26,7 @@ pub(crate) fn verify_live_sidecar<Evm>(
     sidecar_dir: &Path,
     limits: &SidecarReexecLimits,
     wait: Duration,
+    ready_parent: Option<&ReadyParent>,
 ) -> eyre::Result<()>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -76,13 +78,27 @@ where
         );
     }
 
+    // A Ready cache is one that claims it can validate this block from the sidecar alone, so a
+    // trustless root that is missing or wrong is a failed acceptance rather than a diagnostic.
+    // While the cache is still Warming the verifier is legitimately leaning on the full state
+    // provider — that is how it warms in the first place — and the same conditions are only
+    // reported.
+    let accepting_as_partial =
+        ready_parent.is_some_and(|parent| parent.anchor == sidecar.prev_cache_anchor);
     match report.trustless_state_root {
         Some(root) if root == block.state_root() => info!(
             target: "partial_stateless",
             block = block_number,
+            accepting_as_partial,
             trustless_state_root = ?root,
             "Trustless state root VERIFIED (trie node cache + witness only)"
         ),
+        Some(root) if accepting_as_partial => {
+            return Err(eyre::eyre!(
+                "trustless state root mismatch at block {block_number} while Ready: got {root:?}, expected {:?}",
+                block.state_root()
+            ))
+        }
         Some(root) => warn!(
             target: "partial_stateless",
             block = block_number,
@@ -90,6 +106,11 @@ where
             expected = ?block.state_root(),
             "Trustless state root MISMATCH — trie cache/witness stale or insufficient"
         ),
+        None if accepting_as_partial => {
+            return Err(eyre::eyre!(
+                "block {block_number} has no trustless state root while the cache claims to be Ready for its parent"
+            ))
+        }
         None => info!(
             target: "partial_stateless",
             block = block_number,

@@ -22,6 +22,7 @@ use partial_stateless::{
     network_cache::{MissResult, NetworkStateCache, UpdateStats},
     partial_witness_commitment,
     policy::LastNBlocksPolicy,
+    readiness::ReadyParent,
     witness::{
         accessed_to_state_targets, build_sidecar_targets, cache_hit_targets,
         measure_multiproof_size, state_targets_to_proof_targets, WitnessResult,
@@ -29,7 +30,7 @@ use partial_stateless::{
     CacheAnchor, CacheAwareTransitionProgress, CacheAwareTrieTransition, CacheFootprintStats,
     PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
     PartialTrieNodeCache, RootWitnessCompletenessSummary, SidecarBenchmarkManifest, StateTargetSet,
-    StateTargetStats, TrieProofTargetV2, WitnessReductionStats,
+    StateTargetStats, TrieChangeSet, TrieProofTargetV2, WitnessReductionStats,
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -61,6 +62,14 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) force_previous_cache_snapshot: bool,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
     pub(crate) parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
+    /// The parent the caches are authenticated against, when they are Ready.
+    ///
+    /// Publication requires it. A Warming cache produces an arithmetically correct sidecar while
+    /// holding only part of the LastN window its policy identifier advertises, so a peer that
+    /// accepted it would be trusting a window that was never replayed. Building and measuring the
+    /// sidecar still happens while Warming — that is what the benchmark needs — only the write to
+    /// the shared sidecar directory is withheld.
+    pub(crate) ready_parent: Option<&'a ReadyParent>,
 }
 
 #[derive(Debug)]
@@ -113,11 +122,19 @@ fn previous_cache_snapshot(
     })
 }
 
+/// Decides whether a built sidecar may be written for peers to accept.
+///
+/// Both anchors must exist, and the readiness tracker must independently agree that the cache was
+/// authenticated against exactly the parent the sidecar claims. The two are derived separately —
+/// one from the cache at build time, one from the readiness state machine — so requiring them to
+/// agree catches a cache that drifted from what the tracker believes about it.
 fn sidecar_publication_anchors(
     prev_cache_anchor: Option<CacheAnchor>,
     next_cache_anchor: Option<CacheAnchor>,
+    ready_parent: Option<&ReadyParent>,
 ) -> Option<(CacheAnchor, CacheAnchor)> {
-    prev_cache_anchor.zip(next_cache_anchor)
+    let (prev, next) = prev_cache_anchor.zip(next_cache_anchor)?;
+    (ready_parent?.anchor == prev).then_some((prev, next))
 }
 
 fn require_previous_cache_snapshot(
@@ -418,12 +435,14 @@ fn build_cache_aware_flat_transition(
     // The clone is the cost the transactional-trie design exists to remove, so it is measured three
     // ways: wall time, the logical size of what was copied, and the process RSS it moved. RSS is
     // process-wide and noisy per block; it is only interpretable across many blocks.
-    let rss_before = process_rss_bytes();
+    let rss_before = process_rss_bytes() as i64;
     let clone_start = Instant::now();
     let mut next_trie_cache = trie_cache.clone();
     let trie_clone_us = clone_start.elapsed().as_micros() as u64;
     let trie_clone_bytes = next_trie_cache.estimated_memory_bytes();
-    let trie_clone_rss_delta_bytes = process_rss_bytes().saturating_sub(rss_before) as i64;
+    // Signed: the clone can overlap with memory being released elsewhere in the process, and
+    // clamping those samples to zero would bias the distribution upwards.
+    let trie_clone_rss_delta_bytes = process_rss_bytes() as i64 - rss_before;
     let mut requested_flat = base.targets.clone();
     let mut revealed_exact = base.targets.clone();
     let mut flat_nodes = B256Map::<Bytes>::default();
@@ -1292,12 +1311,8 @@ where
         // Measured against the *parent* trie, which is what the clone copied. Walking every
         // retained path is linear in cache size, so it stays behind the diagnostics flag.
         if options.trie_cache_diagnostics {
-            let changed_storage =
-                hashed_post_state.storages.iter().flat_map(|(hashed_address, storage)| {
-                    storage.storage.keys().map(move |hashed_slot| (*hashed_address, *hashed_slot))
-                });
-            let mutation = trie_cache
-                .mutation_metrics(hashed_post_state.accounts.keys().copied(), changed_storage);
+            let changed = TrieChangeSet::from_hashed_post_state(&hashed_post_state);
+            let mutation = trie_cache.mutation_metrics(&changed);
             info!(
                 target: "partial_stateless",
                 block = block_number,
@@ -1324,6 +1339,7 @@ where
                     dirtied_paths = trie.dirtied_paths,
                     retained_paths = trie.retained_paths,
                     revealed_nodes = trie.revealed_nodes,
+                    wiped = trie.wiped,
                     "Storage trie mutation footprint"
                 );
             }
@@ -1384,9 +1400,17 @@ where
             .then(|| cache.cache_anchor(block_number, block_hash, cache_policy_id));
 
         let sidecar_generation_result: eyre::Result<Option<PathBuf>> = 'sidecar: {
-            let Some((prev_cache_anchor, next_cache_anchor)) =
-                sidecar_publication_anchors(prev_cache_anchor, next_cache_anchor)
-            else {
+            let Some((prev_cache_anchor, next_cache_anchor)) = sidecar_publication_anchors(
+                prev_cache_anchor,
+                next_cache_anchor,
+                options.ready_parent,
+            ) else {
+                debug!(
+                    target: "partial_stateless",
+                    block = block_number,
+                    ready = options.ready_parent.is_some(),
+                    "Sidecar built but not published: the cache is not Ready for this parent"
+                );
                 break 'sidecar Ok(None);
             };
             if cache.current_block() != block_number {
@@ -1865,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_publication_depends_only_on_cache_anchors() {
+    fn publication_requires_anchors_and_a_matching_ready_parent() {
         let prev = CacheAnchor {
             block_number: 99,
             block_hash: B256::repeat_byte(0x11),
@@ -1878,10 +1902,26 @@ mod tests {
             cache_policy_id: prev.cache_policy_id,
             cache_root: B256::repeat_byte(0x55),
         };
+        let ready = ReadyParent {
+            anchor: prev,
+            trie_state_root: B256::repeat_byte(0x66),
+            replay_depth: 61,
+        };
 
-        assert_eq!(sidecar_publication_anchors(Some(prev), Some(next)), Some((prev, next)));
-        assert_eq!(sidecar_publication_anchors(None, Some(next)), None);
-        assert_eq!(sidecar_publication_anchors(Some(prev), None), None);
+        assert_eq!(
+            sidecar_publication_anchors(Some(prev), Some(next), Some(&ready)),
+            Some((prev, next))
+        );
+        assert_eq!(sidecar_publication_anchors(None, Some(next), Some(&ready)), None);
+        assert_eq!(sidecar_publication_anchors(Some(prev), None, Some(&ready)), None);
+
+        // A Warming cache builds the same sidecar and must not publish it: its policy identifier
+        // advertises a window it has not replayed.
+        assert_eq!(sidecar_publication_anchors(Some(prev), Some(next), None), None);
+
+        // Ready for a different parent is not Ready for this one.
+        let stale = ReadyParent { anchor: next, ..ready };
+        assert_eq!(sidecar_publication_anchors(Some(prev), Some(next), Some(&stale)), None);
     }
 
     #[test]

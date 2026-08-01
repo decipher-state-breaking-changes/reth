@@ -23,6 +23,7 @@ mod sidecar_io;
 mod sidecar_reexec;
 mod sidecar_verify;
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use futures::TryStreamExt;
@@ -30,7 +31,7 @@ use partial_stateless::{
     network_cache::NetworkStateCache,
     persistence::{load_from_file, save_to_file},
     policy::LastNBlocksPolicy,
-    readiness::{BlockContext, CacheObservation, CacheReadinessTracker},
+    readiness::{BlockContext, CacheObservation, CacheReadinessTracker, ReadyParent},
     sidecar::last_n_blocks_cache_policy_id,
     PartialTrieNodeCache,
 };
@@ -379,9 +380,11 @@ where
                 // Process blocks in chronological order
                 for (block_number, block) in new.blocks() {
                     let block_ctx = block_context(block);
-                    if !admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx) {
+                    let BlockAdmission::Admitted(ready_parent) =
+                        admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx)
+                    else {
                         continue;
-                    }
+                    };
 
                     // The parent is addressed by hash rather than by number: a height can name a
                     // block on an abandoned branch while a reorg is in flight, and building the
@@ -416,6 +419,7 @@ where
                             &sidecar_dir,
                             &reexec_limits,
                             verifier_wait,
+                            ready_parent.as_ref(),
                         ) {
                             return Err(eyre::eyre!(
                                 "live sidecar verification failed at block {}: {e}",
@@ -493,6 +497,7 @@ where
                             reexec_limits: &reexec_limits,
                             parallel_initial_proof: parallel_initial_proof_enabled
                                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
+                            ready_parent: ready_parent.as_ref(),
                         },
                         parent_state_root_by_hash,
                         ancestor_headers_for_range,
@@ -537,7 +542,7 @@ where
 
                 // Sparse-trie snapshots currently have no branch-aware undo log. Reset both
                 // caches together so value hits can never outlive their authenticated paths.
-                readiness.begin_recovery();
+                readiness.begin_recovery(*old.range().start());
                 trie_cache = PartialTrieNodeCache::new();
                 cache.reset();
                 readiness.reset();
@@ -545,9 +550,11 @@ where
                 // Apply the new canonical chain block-by-block (records value-cache undo).
                 for (block_number, block) in new.blocks() {
                     let block_ctx = block_context(block);
-                    if !admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx) {
+                    let BlockAdmission::Admitted(ready_parent) =
+                        admit_block(&mut readiness, &mut cache, &mut trie_cache, &block_ctx)
+                    else {
                         continue;
-                    }
+                    };
 
                     let state_provider = match ctx
                         .provider()
@@ -578,6 +585,7 @@ where
                             &sidecar_dir,
                             &reexec_limits,
                             verifier_wait,
+                            ready_parent.as_ref(),
                         ) {
                             return Err(eyre::eyre!(
                                 "live sidecar verification failed while applying reorg block {}: {e}",
@@ -655,6 +663,7 @@ where
                             reexec_limits: &reexec_limits,
                             parallel_initial_proof: parallel_initial_proof_enabled
                                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
+                            ready_parent: ready_parent.as_ref(),
                         },
                         parent_state_root_by_hash,
                         ancestor_headers_for_range,
@@ -695,7 +704,7 @@ where
                     "Chain reverted — cold-resetting value and sparse-trie caches"
                 );
 
-                readiness.begin_recovery();
+                readiness.begin_recovery(*old.range().start());
                 trie_cache = PartialTrieNodeCache::new();
                 cache.reset();
                 readiness.reset();
@@ -730,21 +739,35 @@ where
             .unwrap_or_else(|| cache.current_block().saturating_sub(UNDO_LOG_FALLBACK_DEPTH));
         cache.prune_undo_below(threshold);
 
-        // Acknowledge processed height. This is a durable promise that everything up to the tip was
-        // processed, and reth prunes below it — so while a block is known to be missing from the
-        // caches, withholding the acknowledgement is what keeps the gap recoverable across a
-        // restart. A cold reset clears the block, since a reset cache no longer claims to describe
-        // any state the gap could corrupt.
+        // Acknowledge the highest *contiguously* processed block rather than the notification tip.
+        // reth prunes below this height and never redelivers those blocks, so acknowledging a tip
+        // above a block this ExEx skipped would lose that block permanently. Resetting the caches
+        // after a gap restores the caches but does not process the missing block, which is why the
+        // watermark can sit far below the tip while the caches are Ready again.
         if let Some(committed_chain) = notification.committed_chain() {
-            if readiness.may_acknowledge_height() {
-                ctx.events.send(ExExEvent::FinishedHeight(committed_chain.tip().num_hash()))?;
-            } else {
-                error!(
-                    target: "partial_stateless",
-                    tip = committed_chain.tip().number,
-                    state = readiness.state().label(),
-                    "Withholding processed-height acknowledgement while the cache is blocked"
-                );
+            let tip = committed_chain.tip().number;
+            match readiness.acknowledgeable_height() {
+                Some((number, hash)) => {
+                    ctx.events.send(ExExEvent::FinishedHeight(BlockNumHash::new(number, hash)))?;
+                    if let Some(gap) = readiness.first_gap() {
+                        error!(
+                            target: "partial_stateless",
+                            tip,
+                            acknowledged = number,
+                            missing_block = gap,
+                            "Processed-height acknowledgement is pinned below an unprocessed block; \
+                             reth cannot prune above it until a reorg drops that block"
+                        );
+                    }
+                }
+                None => {
+                    error!(
+                        target: "partial_stateless",
+                        tip,
+                        state = readiness.state().label(),
+                        "No block has been processed contiguously; withholding acknowledgement"
+                    );
+                }
             }
         }
     }
@@ -757,16 +780,18 @@ where
 ///
 /// A block that is not the direct child of the last one applied means the caches describe a state
 /// this chain never passed through. No undo log here is deep enough to unwind an arbitrary gap, so
-/// the only recovery is to drop everything and warm again from this block onwards. Returns whether
-/// the block may be applied at all.
+/// the only recovery is to drop everything and warm again from this block onwards.
 fn admit_block(
     readiness: &mut CacheReadinessTracker,
     cache: &mut NetworkStateCache,
     trie_cache: &mut PartialTrieNodeCache,
     block: &BlockContext,
-) -> bool {
+) -> BlockAdmission {
+    // Captured before admission: applying a block moves the tracker to `Applying`, and the token
+    // describes the parent this block builds on, not the block itself.
+    let ready_parent = readiness.ready_parent().cloned();
     match readiness.begin_block(block) {
-        Ok(()) => true,
+        Ok(()) => BlockAdmission::Admitted(ready_parent),
         Err(reason) => {
             error!(
                 target: "partial_stateless",
@@ -777,9 +802,23 @@ fn admit_block(
             *trie_cache = PartialTrieNodeCache::new();
             cache.reset();
             readiness.reset();
-            readiness.begin_block(block).is_ok()
+            // The reset discards whatever the token described, so this block publishes nothing.
+            if readiness.begin_block(block).is_ok() {
+                BlockAdmission::Admitted(None)
+            } else {
+                BlockAdmission::Rejected
+            }
         }
     }
+}
+
+/// Whether a block may be applied, and what the caches were authenticated against beforehand.
+enum BlockAdmission {
+    /// The block may be applied. `Some` carries the parent that partial output may be published
+    /// against; `None` means the caches are not Ready and may only produce local measurements.
+    Admitted(Option<ReadyParent>),
+    /// The block must not be applied.
+    Rejected,
 }
 
 /// Reclassifies the caches after `block` was applied, logging only genuine changes.
@@ -890,8 +929,9 @@ fn process_rss_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_block, block_context, last_n_blocks_cache_policy_id, observe_readiness, BlockContext,
-        CacheConfig, CacheReadinessTracker, NetworkStateCache, PartialTrieNodeCache, SidecarRole,
+        admit_block, block_context, last_n_blocks_cache_policy_id, observe_readiness,
+        BlockAdmission, BlockContext, CacheConfig, CacheReadinessTracker, NetworkStateCache,
+        PartialTrieNodeCache, SidecarRole,
     };
     use alloy_primitives::{Address, B256, U256};
     use partial_stateless::{
@@ -937,6 +977,22 @@ mod tests {
         cache.on_block_executed(number, &accessed);
     }
 
+    /// Runs one block end to end the way the notification handler does.
+    fn process(
+        readiness: &mut CacheReadinessTracker,
+        cache: &mut NetworkStateCache,
+        trie_cache: &mut PartialTrieNodeCache,
+        number: u64,
+    ) -> BlockAdmission {
+        let block = ctx(number);
+        let admission = admit_block(readiness, cache, trie_cache, &block);
+        if matches!(admission, BlockAdmission::Admitted(_)) {
+            apply(cache, number);
+            observe_readiness(readiness, &block, cache, trie_cache);
+        }
+        admission
+    }
+
     #[test]
     fn only_builder_verifier_runs_builder_side_preflight() {
         assert!(!SidecarRole::Builder.runs_preflight());
@@ -960,15 +1016,35 @@ mod tests {
         let mut trie_cache = PartialTrieNodeCache::new();
 
         for number in 100..103 {
-            let block = ctx(number);
-            assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &block));
-            apply(&mut cache, number);
-            observe_readiness(&mut readiness, &block, &cache, &trie_cache);
+            assert!(matches!(
+                process(&mut readiness, &mut cache, &mut trie_cache, number),
+                BlockAdmission::Admitted(_)
+            ));
         }
 
         assert_eq!(readiness.replay_depth(), 3);
         assert_eq!(cache.current_block(), 102);
         assert!(cache.contains_account(&TOUCHED), "contiguous blocks never trigger a reset");
+    }
+
+    #[test]
+    fn warming_blocks_are_admitted_without_a_publication_token() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
+
+        // The trie root is never authenticated here, so the cache stays Warming for good. It still
+        // processes every block — that is what the benchmark measures — but hands the builder no
+        // token, and the builder publishes nothing without one.
+        for number in 100..110 {
+            let admission = process(&mut readiness, &mut cache, &mut trie_cache, number);
+            assert!(
+                matches!(admission, BlockAdmission::Admitted(None)),
+                "a warming cache must not authorize publication at block {number}"
+            );
+        }
+
+        assert_eq!(*readiness.state(), CacheReadiness::Warming { replay_depth: 10 });
     }
 
     #[test]
@@ -978,17 +1054,17 @@ mod tests {
         let mut trie_cache = PartialTrieNodeCache::new();
 
         for number in 100..102 {
-            let block = ctx(number);
-            assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &block));
-            apply(&mut cache, number);
-            observe_readiness(&mut readiness, &block, &cache, &trie_cache);
+            process(&mut readiness, &mut cache, &mut trie_cache, number);
         }
 
         // 105 is not the child of 101, so nothing the caches hold describes its parent.
         let gapped = ctx(105);
         assert!(
-            admit_block(&mut readiness, &mut cache, &mut trie_cache, &gapped),
-            "the gapped block is still applied, against caches that were reset first"
+            matches!(
+                admit_block(&mut readiness, &mut cache, &mut trie_cache, &gapped),
+                BlockAdmission::Admitted(None)
+            ),
+            "the gapped block is applied against caches that were reset first, and publishes nothing"
         );
 
         assert_eq!(cache.current_block(), 0);
@@ -1003,45 +1079,65 @@ mod tests {
         let mut cache = CacheConfig::default().new_cache();
         let mut trie_cache = PartialTrieNodeCache::new();
 
-        let first = ctx(100);
-        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &first));
-        apply(&mut cache, 100);
-        observe_readiness(&mut readiness, &first, &cache, &trie_cache);
+        process(&mut readiness, &mut cache, &mut trie_cache, 100);
 
         // Right height, wrong branch: only the parent hash distinguishes the two.
         let sibling = BlockContext { parent_hash: B256::repeat_byte(0xfe), ..ctx(101) };
-        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &sibling));
+        admit_block(&mut readiness, &mut cache, &mut trie_cache, &sibling);
 
         assert_eq!(cache.current_block(), 0, "the competing branch's parent forced a reset");
     }
 
     #[test]
-    fn an_unapplied_block_withholds_the_height_acknowledgement_until_recovery() {
+    fn an_unapplied_block_pins_the_acknowledgement_below_it_forever() {
         let mut readiness = tracker();
         let mut cache = CacheConfig::default().new_cache();
         let mut trie_cache = PartialTrieNodeCache::new();
 
-        let first = ctx(100);
-        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &first));
-        apply(&mut cache, 100);
-        observe_readiness(&mut readiness, &first, &cache, &trie_cache);
-        assert!(readiness.may_acknowledge_height());
+        process(&mut readiness, &mut cache, &mut trie_cache, 100);
+        assert_eq!(readiness.acknowledgeable_height(), Some((100, numbered(100, 0xbb))));
 
-        // What the handler does when the parent state provider is unavailable.
+        // What the handler does when the parent state provider is unavailable for block 101.
         readiness.abandon_block(101);
-        assert!(
-            !readiness.may_acknowledge_height(),
-            "acknowledging here would let reth prune the block the caches never saw"
+
+        // Later blocks still process, and the caches recover, but 101 was never applied. reth
+        // prunes below the acknowledged height and never redelivers, so acknowledging 102
+        // would lose it.
+        for number in 102..106 {
+            process(&mut readiness, &mut cache, &mut trie_cache, number);
+        }
+
+        assert_eq!(cache.current_block(), 105, "processing continued");
+        assert_eq!(
+            readiness.acknowledgeable_height(),
+            Some((100, numbered(100, 0xbb))),
+            "the acknowledgement must not step over the block that was skipped"
         );
+        assert_eq!(readiness.first_gap(), Some(101));
+    }
 
-        // The next block's admission performs the recovery reset, which restores the promise.
-        let next = ctx(102);
-        assert!(admit_block(&mut readiness, &mut cache, &mut trie_cache, &next));
-        apply(&mut cache, 102);
-        observe_readiness(&mut readiness, &next, &cache, &trie_cache);
+    #[test]
+    fn a_reorg_below_the_gap_releases_the_acknowledgement() {
+        let mut readiness = tracker();
+        let mut cache = CacheConfig::default().new_cache();
+        let mut trie_cache = PartialTrieNodeCache::new();
 
-        assert!(readiness.may_acknowledge_height());
-        assert_eq!(readiness.replay_depth(), 1, "recovery warms from scratch");
+        process(&mut readiness, &mut cache, &mut trie_cache, 100);
+        readiness.abandon_block(101);
+        process(&mut readiness, &mut cache, &mut trie_cache, 102);
+        assert_eq!(readiness.acknowledgeable_height(), Some((100, numbered(100, 0xbb))));
+
+        // The reorg drops everything from 101 up, including the block that was never applied.
+        readiness.begin_recovery(101);
+        trie_cache = PartialTrieNodeCache::new();
+        cache.reset();
+        readiness.reset();
+
+        assert_eq!(readiness.first_gap(), None);
+        for number in 101..104 {
+            process(&mut readiness, &mut cache, &mut trie_cache, number);
+        }
+        assert_eq!(readiness.acknowledgeable_height(), Some((103, numbered(103, 0xbb))));
     }
 
     #[test]

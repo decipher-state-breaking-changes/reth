@@ -34,15 +34,25 @@ use alloy_primitives::B256;
 #[derive(Debug, Clone)]
 pub struct CacheReadinessTracker {
     state: CacheReadiness,
-    /// Blocks that must be replayed after a cold reset before the advertised LastN window is
-    /// actually populated. Callers running separate account and storage windows pass the larger of
-    /// the two: the window is only whole once both are.
+    /// Eviction window the cache policy advertises. Callers running separate account and storage
+    /// windows pass the larger of the two: the window is only whole once both are.
     window_size: u64,
-    /// Cleared by every cold reset. Set by replaying `window_size` blocks, or in one shot by
-    /// restoring a snapshot that already carries a full window.
+    /// Cleared by every cold reset. Set by replaying a whole window, or in one shot by restoring a
+    /// snapshot that already carries one.
     window_filled: bool,
     replay_depth: u64,
     last_applied: Option<AppliedBlock>,
+    /// Highest height for which this and every lower block was applied.
+    ///
+    /// Tracked apart from `last_applied` because a block that was never applied does not stop
+    /// later blocks from being applied: after a gap, `last_applied` keeps advancing while this
+    /// does not.
+    acknowledgeable: Option<AppliedBlock>,
+    /// Height of the first block that was delivered and never applied, if any.
+    ///
+    /// Latches `acknowledgeable` until a reorg or revert unwinds below it, at which point the
+    /// missing block is no longer canonical and no longer needs to have been processed.
+    first_gap: Option<u64>,
     cache_policy_id: B256,
 }
 
@@ -55,8 +65,20 @@ impl CacheReadinessTracker {
             window_filled: false,
             replay_depth: 0,
             last_applied: None,
+            acknowledgeable: None,
+            first_gap: None,
             cache_policy_id,
         }
+    }
+
+    /// Contiguous blocks that must be replayed after a cold reset before the advertised window is
+    /// genuinely populated.
+    ///
+    /// One more than the window size. `LastNBlocksPolicy` retains entries whose last access is at
+    /// or above `current_block - window_size`, so a cache at height `H` covers the closed range
+    /// `[H - window_size, H]` — `window_size + 1` distinct heights, not `window_size`.
+    pub const fn required_replay_depth(&self) -> u64 {
+        self.window_size.saturating_add(1)
     }
 
     /// Current classification.
@@ -89,17 +111,31 @@ impl CacheReadinessTracker {
         matches!(self.state, CacheReadiness::Blocked { .. })
     }
 
-    /// Whether processed height may be acknowledged to the host node.
+    /// The highest block this ExEx may report as processed, if any.
     ///
-    /// Acknowledging a height is a durable promise that every block up to it was processed. Once
-    /// blocked, the cache has *not* processed some block below the tip, so advancing the
-    /// acknowledgement would make the gap permanent across restarts — the skipped block is never
-    /// delivered again.
-    pub const fn may_acknowledge_height(&self) -> bool {
-        !self.is_blocked()
+    /// This is the *contiguous* watermark, not the newest block applied. Acknowledging a height is
+    /// a durable promise to the host node, which prunes below it and never redelivers those blocks;
+    /// a block that was skipped is therefore lost for good if the acknowledgement passes it. After
+    /// a gap the caches can be reset and warmed again from the next block — that restores the
+    /// caches, but it does not retroactively process the block that was missed, so this stops
+    /// advancing.
+    pub const fn acknowledgeable_height(&self) -> Option<(u64, B256)> {
+        match self.acknowledgeable {
+            Some(AppliedBlock { number, hash }) => Some((number, hash)),
+            None => None,
+        }
+    }
+
+    /// The first block that was delivered and never applied, if the watermark is stuck behind one.
+    pub const fn first_gap(&self) -> Option<u64> {
+        self.first_gap
     }
 
     /// Drops all continuity claims, matching a cold reset of both caches.
+    ///
+    /// Deliberately leaves the acknowledgement watermark alone. Resetting the caches makes them
+    /// sound again, but it does not process a block that was skipped, and the watermark is a claim
+    /// about processing rather than about cache contents.
     pub fn reset(&mut self) {
         self.state = CacheReadiness::Cold;
         self.window_filled = false;
@@ -111,17 +147,33 @@ impl CacheReadinessTracker {
     ///
     /// Distinct from [`reset`](Self::reset) so that a reorg whose reset never completes cannot be
     /// mistaken for a clean cold start.
-    pub fn begin_recovery(&mut self) {
+    ///
+    /// `unwound_to` is the lowest height leaving the canonical chain. A gap at or above it is being
+    /// unwound: the block that was never applied is no longer canonical, so nothing is owed for it
+    /// and the watermark is released. The watermark itself drops to just below the unwind, since
+    /// everything above it is about to be replaced.
+    pub fn begin_recovery(&mut self, unwound_to: u64) {
         self.state = CacheReadiness::Recovering;
+        if self.first_gap.is_some_and(|gap| gap >= unwound_to) {
+            self.first_gap = None;
+        }
+        if self.acknowledgeable.is_some_and(|applied| applied.number >= unwound_to) {
+            // Nothing at or above the unwind point is processed any more, and the pre-unwind block
+            // hash is not known here, so the watermark restarts from the replayed chain.
+            self.acknowledgeable = None;
+        }
     }
 
     /// Promotes a snapshot-restored cache to [`CacheReadiness::Ready`] against an
     /// operator-supplied checkpoint.
     ///
-    /// A snapshot bypasses the replay that would otherwise fill the window, so the height, hash and
-    /// state root it claims are checked against a checkpoint the operator supplied out of band
-    /// rather than against the snapshot's own assertions. A rejected snapshot leaves the tracker
-    /// [`Cold`](CacheReadiness::Cold): warming from scratch is always sound.
+    /// A snapshot bypasses the replay that would otherwise fill the window, so everything the
+    /// resulting anchor will claim is checked against a checkpoint the operator supplied out of
+    /// band rather than against the snapshot's own assertions. That includes the cache root and
+    /// policy identifier: a snapshot can reproduce the canonical state root while holding a
+    /// different set of cached values, and peers compare anchors, not state roots. A rejected
+    /// snapshot leaves the tracker [`Cold`](CacheReadiness::Cold): warming from scratch is always
+    /// sound.
     pub fn restore_from_checkpoint(
         &mut self,
         checkpoint: &TrustedCheckpoint,
@@ -141,16 +193,30 @@ impl CacheReadinessTracker {
                 actual: observed.trie_state_root,
             })
         }
+        if observed.cache_root != checkpoint.cache_root {
+            return Err(ReadinessError::CheckpointCacheRootMismatch {
+                expected: checkpoint.cache_root,
+                actual: observed.cache_root,
+            })
+        }
+        if checkpoint.cache_policy_id != self.cache_policy_id {
+            return Err(ReadinessError::CheckpointPolicyMismatch {
+                expected: self.cache_policy_id,
+                actual: checkpoint.cache_policy_id,
+            })
+        }
 
         self.window_filled = true;
-        self.last_applied =
-            Some(AppliedBlock { number: checkpoint.block_number, hash: checkpoint.block_hash });
+        let applied = AppliedBlock { number: checkpoint.block_number, hash: checkpoint.block_hash };
+        self.last_applied = Some(applied);
+        // A restored checkpoint is a claim about cache contents, not about this ExEx having
+        // processed the blocks below it, so it does not move the acknowledgement watermark.
         self.state = CacheReadiness::Ready(ReadyParent {
             anchor: CacheAnchor {
                 block_number: checkpoint.block_number,
                 block_hash: checkpoint.block_hash,
                 cache_policy_id: self.cache_policy_id,
-                cache_root: observed.cache_root,
+                cache_root: checkpoint.cache_root,
             },
             trie_state_root: checkpoint.state_root,
             replay_depth: 0,
@@ -214,9 +280,18 @@ impl CacheReadinessTracker {
         }
 
         self.replay_depth += 1;
-        self.last_applied = Some(AppliedBlock { number: block.number, hash: block.hash });
-        if self.replay_depth >= self.window_size {
+        let applied = AppliedBlock { number: block.number, hash: block.hash };
+        self.last_applied = Some(applied);
+        if self.replay_depth >= self.required_replay_depth() {
             self.window_filled = true;
+        }
+        // Only contiguous from the start counts: once a block has been skipped, later blocks are
+        // applied but the promise "everything below this is processed" is no longer true.
+        let contiguous_from_start =
+            self.acknowledgeable.is_none_or(|previous| block.number == previous.number + 1) &&
+                self.first_gap.is_none();
+        if contiguous_from_start {
+            self.acknowledgeable = Some(applied);
         }
 
         // The trie root proves the caches describe this block's post-state, which is precisely the
@@ -243,13 +318,25 @@ impl CacheReadinessTracker {
     /// Records that a block could not be applied at all.
     ///
     /// Every later block builds on state this cache never saw, so this is terminal until a reset:
-    /// skipping and carrying on is what silently produces a cache that lies about its parent.
+    /// skipping and carrying on is what silently produces a cache that lies about its parent. The
+    /// acknowledgement watermark stops here permanently, because resetting the caches does not
+    /// process this block — only a reorg that drops it from the canonical chain releases it.
     pub fn abandon_block(&mut self, block_number: u64) -> BlockedReason {
         self.block_on(BlockedReason::BlockSkipped { block_number })
     }
 
     /// Enters the blocked state, preserving the reason recorded first.
     fn block_on(&mut self, reason: BlockedReason) -> BlockedReason {
+        // Every blocking reason names a block that was delivered and not applied, so each one
+        // freezes the watermark at the last block that genuinely was.
+        let missing = match &reason {
+            BlockedReason::BlockGap { expected_number, .. } => *expected_number,
+            BlockedReason::BlockSkipped { block_number } |
+            BlockedReason::RecoveryIncomplete { block_number } => *block_number,
+            BlockedReason::CacheDrift { expected_block, .. } => *expected_block,
+        };
+        self.first_gap = Some(self.first_gap.map_or(missing, |first| first.min(missing)));
+
         if let CacheReadiness::Blocked { reason: existing } = &self.state {
             return existing.clone()
         }
@@ -384,10 +471,16 @@ impl CacheObservation {
     }
 }
 
-/// A block the operator vouches for out of band, used to accept a snapshot.
+/// A cache generation the operator vouches for out of band, used to accept a snapshot.
 ///
 /// Snapshots are accepted on operator authority rather than on peer consensus: there is no scoring
 /// or majority vote here, and a snapshot that disagrees with the checkpoint is simply discarded.
+///
+/// It names every field of the [`CacheAnchor`] the restored cache will publish, not just the
+/// canonical state root. Two caches can reproduce the same state root while holding different
+/// values — different eviction windows retain different subsets — and peers compare anchors. An
+/// operator who vouches only for the state root would be vouching for the chain, not for this
+/// cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedCheckpoint {
     /// Height the snapshot must be at.
@@ -396,6 +489,10 @@ pub struct TrustedCheckpoint {
     pub block_hash: B256,
     /// Canonical state root the restored trie must reproduce.
     pub state_root: B256,
+    /// Deterministic root over the value-cache contents the snapshot must hold.
+    pub cache_root: B256,
+    /// Cache policy the snapshot was produced under.
+    pub cache_policy_id: B256,
 }
 
 /// Why a snapshot could not be promoted to [`CacheReadiness::Ready`].
@@ -415,6 +512,20 @@ pub enum ReadinessError {
         /// Restored trie root, or `None` when the trie was never authenticated.
         actual: Option<B256>,
     },
+    /// The restored cache holds different values than the checkpoint vouches for.
+    CheckpointCacheRootMismatch {
+        /// Checkpoint cache root.
+        expected: B256,
+        /// Restored cache root.
+        actual: B256,
+    },
+    /// The checkpoint was produced under a different cache policy than this node runs.
+    CheckpointPolicyMismatch {
+        /// Policy this node runs.
+        expected: B256,
+        /// Policy the checkpoint names.
+        actual: B256,
+    },
 }
 
 /// Last block applied since the most recent cold reset.
@@ -429,6 +540,9 @@ mod tests {
     use super::*;
 
     const WINDOW: u64 = 4;
+    /// `LastNBlocksPolicy` retains the closed range `[H - WINDOW, H]`, so filling the window takes
+    /// one more block than the window size.
+    const REPLAY: u64 = WINDOW + 1;
 
     fn policy_id() -> B256 {
         B256::repeat_byte(0xa0)
@@ -450,24 +564,48 @@ mod tests {
     }
 
     fn block_hash(number: u64) -> B256 {
-        let mut hash = B256::ZERO;
-        hash[0..8].copy_from_slice(&number.to_be_bytes());
-        hash[31] = 0xbb;
-        hash
+        numbered(number, 0xbb)
     }
 
     fn state_root(number: u64) -> B256 {
-        let mut root = B256::ZERO;
-        root[0..8].copy_from_slice(&number.to_be_bytes());
-        root[31] = 0x55;
-        root
+        numbered(number, 0x55)
+    }
+
+    fn cache_root(number: u64) -> B256 {
+        numbered(number, 0xcc)
+    }
+
+    fn numbered(number: u64, tag: u8) -> B256 {
+        let mut value = B256::ZERO;
+        value[0..8].copy_from_slice(&number.to_be_bytes());
+        value[31] = tag;
+        value
+    }
+
+    fn checkpoint_at(number: u64) -> TrustedCheckpoint {
+        TrustedCheckpoint {
+            block_number: number,
+            block_hash: block_hash(number),
+            state_root: state_root(number),
+            cache_root: cache_root(number),
+            cache_policy_id: policy_id(),
+        }
+    }
+
+    /// What a snapshot restored exactly at `checkpoint` reports about itself.
+    fn restored(checkpoint: &TrustedCheckpoint) -> CacheObservation {
+        CacheObservation {
+            cache_block: checkpoint.block_number,
+            cache_root: checkpoint.cache_root,
+            trie_state_root: Some(checkpoint.state_root),
+        }
     }
 
     /// The caches behaving correctly: at the block's height, with the block's authenticated root.
     fn observed(block: &BlockContext) -> CacheObservation {
         CacheObservation {
             cache_block: block.number,
-            cache_root: B256::repeat_byte(0xcc),
+            cache_root: cache_root(block.number),
             trie_state_root: Some(block.state_root),
         }
     }
@@ -491,25 +629,31 @@ mod tests {
     }
 
     #[test]
-    fn ready_only_after_the_window_is_replayed() {
+    fn the_window_needs_one_more_block_than_its_size() {
         let mut tracker = tracker();
-        apply_contiguous(&mut tracker, 100, WINDOW - 1);
-        assert!(tracker.ready_parent().is_none(), "window is one block short");
+        assert_eq!(tracker.required_replay_depth(), WINDOW + 1);
 
-        apply_contiguous(&mut tracker, 100 + WINDOW - 1, 1);
+        // A cache at height H retains entries last accessed at or above H - WINDOW, so replaying
+        // exactly WINDOW blocks leaves the oldest height in that closed range unpopulated.
+        apply_contiguous(&mut tracker, 100, WINDOW);
+        assert!(tracker.ready_parent().is_none(), "{WINDOW} blocks cover only {WINDOW} heights");
+        assert!(!tracker.window_filled());
+
+        apply_contiguous(&mut tracker, 100 + WINDOW, 1);
 
         let parent = tracker.ready_parent().expect("window filled");
-        assert_eq!(parent.anchor.block_number, 100 + WINDOW - 1);
-        assert_eq!(parent.anchor.block_hash, block_hash(100 + WINDOW - 1));
+        assert_eq!(parent.replay_depth, REPLAY);
+        assert_eq!(parent.anchor.block_number, 100 + WINDOW);
+        assert_eq!(parent.anchor.block_hash, block_hash(100 + WINDOW));
         assert_eq!(parent.anchor.cache_policy_id, policy_id());
-        assert_eq!(parent.trie_state_root, state_root(100 + WINDOW - 1));
-        assert_eq!(parent.replay_depth, WINDOW);
+        assert_eq!(parent.anchor.cache_root, cache_root(100 + WINDOW));
+        assert_eq!(parent.trie_state_root, state_root(100 + WINDOW));
     }
 
     #[test]
     fn reset_drops_readiness_and_replay_depth() {
         let mut tracker = tracker();
-        apply_contiguous(&mut tracker, 100, WINDOW);
+        apply_contiguous(&mut tracker, 100, REPLAY);
         assert!(tracker.ready_parent().is_some());
 
         tracker.reset();
@@ -557,18 +701,83 @@ mod tests {
     }
 
     #[test]
-    fn blocked_stops_height_acknowledgement_until_reset() {
+    fn the_watermark_follows_contiguous_blocks() {
+        let mut tracker = tracker();
+        assert_eq!(tracker.acknowledgeable_height(), None, "nothing processed yet");
+
+        apply_contiguous(&mut tracker, 100, 3);
+
+        assert_eq!(tracker.acknowledgeable_height(), Some((102, block_hash(102))));
+        assert_eq!(tracker.first_gap(), None);
+    }
+
+    #[test]
+    fn the_watermark_never_passes_a_skipped_block_even_after_recovery() {
         let mut tracker = tracker();
         apply_contiguous(&mut tracker, 100, 1);
-        assert!(tracker.may_acknowledge_height());
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
 
+        // Block 101 was delivered and could not be applied.
+        tracker.abandon_block(101);
+        assert_eq!(tracker.first_gap(), Some(101));
+
+        // Resetting the caches and warming again from 102 makes the caches sound, but 101 is still
+        // unprocessed and the host node would prune it if the watermark moved.
+        tracker.reset();
+        apply_contiguous(&mut tracker, 102, REPLAY);
+
+        assert!(tracker.ready_parent().is_some(), "the caches themselves recovered");
+        assert_eq!(
+            tracker.acknowledgeable_height(),
+            Some((100, block_hash(100))),
+            "the watermark is a claim about processing, which resetting the caches does not do"
+        );
+    }
+
+    #[test]
+    fn the_watermark_stays_below_a_gap_the_cache_recovered_from() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 2);
+
+        // A non-contiguous notification: 103 is admitted only after a reset.
+        assert!(tracker.begin_block(&block(103)).is_err());
+        tracker.reset();
+        apply_contiguous(&mut tracker, 103, 3);
+
+        assert_eq!(tracker.first_gap(), Some(102));
+        assert_eq!(tracker.acknowledgeable_height(), Some((101, block_hash(101))));
+    }
+
+    #[test]
+    fn unwinding_below_a_gap_releases_the_watermark() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        assert_eq!(tracker.first_gap(), Some(101));
+
+        // A reorg that drops 101 from the canonical chain: nothing is owed for it any more.
+        tracker.begin_recovery(101);
+        tracker.reset();
+
+        assert_eq!(tracker.first_gap(), None);
+        apply_contiguous(&mut tracker, 101, 2);
+        assert_eq!(tracker.acknowledgeable_height(), Some((102, block_hash(102))));
+    }
+
+    #[test]
+    fn unwinding_above_a_gap_leaves_the_watermark_stuck() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
         tracker.abandon_block(101);
 
-        assert!(!tracker.may_acknowledge_height());
-        assert!(tracker.begin_block(&block(102)).is_err(), "blocked state is sticky");
-
+        // The reorg starts above the missing block, so 101 is still canonical and still
+        // unprocessed.
+        tracker.begin_recovery(150);
         tracker.reset();
-        assert!(tracker.may_acknowledge_height());
+
+        assert_eq!(tracker.first_gap(), Some(101));
+        apply_contiguous(&mut tracker, 150, 2);
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
     }
 
     #[test]
@@ -580,15 +789,14 @@ mod tests {
         let reason = tracker.begin_block(&block(105)).expect_err("still blocked");
 
         assert_eq!(reason, BlockedReason::BlockSkipped { block_number: 101 });
+        assert_eq!(tracker.first_gap(), Some(101), "the earliest gap is the binding one");
     }
 
     #[test]
     fn an_unauthenticated_trie_never_reaches_ready() {
         let mut tracker = tracker();
-        apply_contiguous(&mut tracker, 100, WINDOW);
-        tracker.reset();
 
-        for number in 100..100 + WINDOW + 2 {
+        for number in 100..100 + REPLAY + 2 {
             let block = block(number);
             tracker.begin_block(&block).expect("contiguous");
             tracker.finish_block(
@@ -599,14 +807,14 @@ mod tests {
 
         assert!(tracker.ready_parent().is_none());
         assert!(tracker.window_filled(), "the window fills regardless of authentication");
-        assert_eq!(*tracker.state(), CacheReadiness::Warming { replay_depth: WINDOW + 2 });
+        assert_eq!(*tracker.state(), CacheReadiness::Warming { replay_depth: REPLAY + 2 });
     }
 
     #[test]
     fn a_wrong_trie_root_never_reaches_ready() {
         let mut tracker = tracker();
 
-        for number in 100..100 + WINDOW + 2 {
+        for number in 100..100 + REPLAY + 2 {
             let block = block(number);
             tracker.begin_block(&block).expect("contiguous");
             tracker.finish_block(
@@ -635,14 +843,15 @@ mod tests {
                 reason: BlockedReason::CacheDrift { expected_block: 100, cache_block: 99 }
             }
         );
+        assert_eq!(tracker.acknowledgeable_height(), None);
     }
 
     #[test]
     fn recovery_must_complete_before_blocks_resume() {
         let mut tracker = tracker();
-        apply_contiguous(&mut tracker, 100, WINDOW);
+        apply_contiguous(&mut tracker, 100, REPLAY);
 
-        tracker.begin_recovery();
+        tracker.begin_recovery(100);
         assert_eq!(*tracker.state(), CacheReadiness::Recovering);
         assert!(tracker.ready_parent().is_none(), "a recovering cache validates nothing");
 
@@ -657,37 +866,34 @@ mod tests {
     #[test]
     fn an_abandoned_block_blocks_the_next_one() {
         let mut tracker = tracker();
-        apply_contiguous(&mut tracker, 100, WINDOW);
+        apply_contiguous(&mut tracker, 100, REPLAY);
 
         // Admitted, then never completed — the caches saw part of a block, or none of it.
-        tracker.begin_block(&block(100 + WINDOW)).expect("contiguous");
+        tracker.begin_block(&block(100 + REPLAY)).expect("contiguous");
         let reason =
-            tracker.begin_block(&block(101 + WINDOW)).expect_err("previous never finished");
+            tracker.begin_block(&block(101 + REPLAY)).expect_err("previous never finished");
 
-        assert_eq!(reason, BlockedReason::BlockSkipped { block_number: 100 + WINDOW });
+        assert_eq!(reason, BlockedReason::BlockSkipped { block_number: 100 + REPLAY });
     }
 
     #[test]
     fn a_checkpointed_snapshot_is_ready_without_replay() {
         let mut tracker = tracker();
-        let checkpoint = TrustedCheckpoint {
-            block_number: 5_000,
-            block_hash: block_hash(5_000),
-            state_root: state_root(5_000),
-        };
-        let observation = CacheObservation {
-            cache_block: 5_000,
-            cache_root: B256::repeat_byte(0xcc),
-            trie_state_root: Some(state_root(5_000)),
-        };
+        let checkpoint = checkpoint_at(5_000);
 
-        let parent =
-            tracker.restore_from_checkpoint(&checkpoint, &observation).expect("matches checkpoint");
+        let parent = tracker
+            .restore_from_checkpoint(&checkpoint, &restored(&checkpoint))
+            .expect("matches checkpoint");
 
         assert_eq!(parent.anchor.block_number, 5_000);
+        assert_eq!(parent.anchor.cache_root, checkpoint.cache_root);
+        assert_eq!(parent.anchor.cache_policy_id, policy_id());
         assert_eq!(parent.trie_state_root, state_root(5_000));
         assert_eq!(parent.replay_depth, 0, "nothing was replayed");
         assert!(tracker.window_filled());
+
+        // A restored snapshot says nothing about this ExEx having processed the chain below it.
+        assert_eq!(tracker.acknowledgeable_height(), None);
 
         // The restored parent is a real continuation point, not a one-off classification.
         apply_contiguous(&mut tracker, 5_001, 1);
@@ -697,34 +903,17 @@ mod tests {
     #[test]
     fn an_empty_but_authenticated_snapshot_is_ready() {
         let mut tracker = tracker();
-        let checkpoint = TrustedCheckpoint {
-            block_number: 5_000,
-            block_hash: block_hash(5_000),
-            state_root: state_root(5_000),
-        };
         // An empty cache still commits to a cache root and an authenticated trie root.
-        let observation = CacheObservation {
-            cache_block: 5_000,
-            cache_root: B256::ZERO,
-            trie_state_root: Some(state_root(5_000)),
-        };
+        let checkpoint = TrustedCheckpoint { cache_root: B256::ZERO, ..checkpoint_at(5_000) };
 
-        assert!(tracker.restore_from_checkpoint(&checkpoint, &observation).is_ok());
+        assert!(tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).is_ok());
     }
 
     #[test]
     fn a_snapshot_at_the_wrong_height_is_rejected() {
         let mut tracker = tracker();
-        let checkpoint = TrustedCheckpoint {
-            block_number: 5_000,
-            block_hash: block_hash(5_000),
-            state_root: state_root(5_000),
-        };
-        let observation = CacheObservation {
-            cache_block: 4_999,
-            cache_root: B256::repeat_byte(0xcc),
-            trie_state_root: Some(state_root(5_000)),
-        };
+        let checkpoint = checkpoint_at(5_000);
+        let observation = CacheObservation { cache_block: 4_999, ..restored(&checkpoint) };
 
         let error = tracker.restore_from_checkpoint(&checkpoint, &observation).unwrap_err();
 
@@ -742,16 +931,8 @@ mod tests {
     #[test]
     fn a_snapshot_with_an_unauthenticated_trie_is_rejected() {
         let mut tracker = tracker();
-        let checkpoint = TrustedCheckpoint {
-            block_number: 5_000,
-            block_hash: block_hash(5_000),
-            state_root: state_root(5_000),
-        };
-        let observation = CacheObservation {
-            cache_block: 5_000,
-            cache_root: B256::repeat_byte(0xcc),
-            trie_state_root: None,
-        };
+        let checkpoint = checkpoint_at(5_000);
+        let observation = CacheObservation { trie_state_root: None, ..restored(&checkpoint) };
 
         let error = tracker.restore_from_checkpoint(&checkpoint, &observation).unwrap_err();
 
@@ -763,20 +944,52 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_claiming_a_forged_root_is_rejected() {
+    fn a_snapshot_claiming_a_forged_state_root_is_rejected() {
         let mut tracker = tracker();
-        let checkpoint = TrustedCheckpoint {
-            block_number: 5_000,
-            block_hash: block_hash(5_000),
-            state_root: state_root(5_000),
-        };
+        let checkpoint = checkpoint_at(5_000);
         let observation = CacheObservation {
-            cache_block: 5_000,
-            cache_root: B256::repeat_byte(0xcc),
             trie_state_root: Some(B256::repeat_byte(0xad)),
+            ..restored(&checkpoint)
         };
 
         assert!(tracker.restore_from_checkpoint(&checkpoint, &observation).is_err());
+        assert!(tracker.ready_parent().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_holding_different_values_is_rejected() {
+        let mut tracker = tracker();
+        let checkpoint = checkpoint_at(5_000);
+        // Same canonical state root, different cached values: two nodes can agree on the chain and
+        // still hold different subsets of it, and the anchor a peer compares carries the values.
+        let observation =
+            CacheObservation { cache_root: B256::repeat_byte(0xde), ..restored(&checkpoint) };
+
+        let error = tracker.restore_from_checkpoint(&checkpoint, &observation).unwrap_err();
+
+        assert_eq!(
+            error,
+            ReadinessError::CheckpointCacheRootMismatch {
+                expected: cache_root(5_000),
+                actual: B256::repeat_byte(0xde),
+            }
+        );
+        assert!(tracker.ready_parent().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_from_a_different_policy_is_rejected() {
+        let mut tracker = tracker();
+        let foreign = B256::repeat_byte(0x0f);
+        let checkpoint = TrustedCheckpoint { cache_policy_id: foreign, ..checkpoint_at(5_000) };
+
+        let error =
+            tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).unwrap_err();
+
+        assert_eq!(
+            error,
+            ReadinessError::CheckpointPolicyMismatch { expected: policy_id(), actual: foreign }
+        );
         assert!(tracker.ready_parent().is_none());
     }
 }
