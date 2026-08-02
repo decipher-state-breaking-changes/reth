@@ -44,7 +44,7 @@ use reth_trie_common::{
 };
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, mem,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -94,6 +94,15 @@ pub(crate) struct BuilderBlockReport {
     pub(crate) sidecar_path: Option<PathBuf>,
     /// The sidecar as built, when `BuilderOptions::retain_sidecar` asked for it.
     pub(crate) sidecar: Option<PartialStatelessSidecar>,
+    /// The parent trie generation this block's transition displaced, when the transition
+    /// committed.
+    ///
+    /// Handing it back rather than dropping it is what makes a one-deep retained generation
+    /// free: the transition already copies the parent into `next_trie_cache` and then
+    /// overwrites the original, so the object exists either way and the only question is
+    /// whether anything still holds it. `None` means the transition did not commit and the
+    /// caller's trie cache is still the parent.
+    pub(crate) displaced_trie_cache: Option<PartialTrieNodeCache>,
 }
 
 const PARALLEL_INITIAL_PROOF_MIN_STORAGE_TRIES: usize = 2;
@@ -1319,6 +1328,9 @@ where
     let mut builder_witness_commitment = None;
     let mut sidecar_constructed = false;
     let mut retained_sidecar = None;
+    // Declared uninitialized like the timing bindings above: every path that reaches the report
+    // either assigns it or returns, so an initial `None` would be dead.
+    let displaced_trie_cache;
     let witness = {
         let base = generate_cache_aware_base_proof(
             state_provider,
@@ -1771,7 +1783,11 @@ where
         // Advance only after sidecar generation/preflight has either succeeded or been
         // intentionally skipped. Coherent failures return above after rolling back the
         // value cache, so the two caches remain aligned.
-        *trie_cache = next_trie_cache;
+        //
+        // The parent is handed back instead of being dropped here. That is the whole cost of a
+        // one-deep retained generation: the copy was already made above, and the caller decides
+        // whether to keep it or let it fall out of scope.
+        displaced_trie_cache = Some(mem::replace(trie_cache, next_trie_cache));
         if let Some(metrics) = trie_shape_metrics {
             info!(
                 target: "partial_stateless",
@@ -1907,6 +1923,7 @@ where
         witness,
         sidecar_path: saved_sidecar_path,
         sidecar: retained_sidecar,
+        displaced_trie_cache,
     })
 }
 

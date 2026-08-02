@@ -34,7 +34,7 @@ use partial_stateless::{
     policy::{CachePolicy, LastNBlocksPolicy},
     readiness::{
         BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
-        ReadyParent,
+        ReadyParent, TrustedCheckpoint,
     },
     sidecar::last_n_blocks_cache_policy_id,
     PartialStatelessSidecar, PartialTrieNodeCache,
@@ -60,9 +60,9 @@ use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the partial statelessness cache.
 #[derive(Debug, Clone, Copy)]
@@ -438,6 +438,13 @@ struct CoordinatedPair {
     /// `Applying -> Ready` would be logged once per block and the run checklist's "exactly one
     /// transition to ready" would be unreadable.
     last_readiness_label: &'static str,
+    /// The single previous trie generation, kept so a depth-1 reorg does not need a full rebuild.
+    ///
+    /// K is 1 because that is the depth at which retention is free: the transition already copies
+    /// the parent trie and then overwrites it, so keeping the displaced copy costs no extra work.
+    /// Any K beyond 1 would need genuinely extra copies, and a deeper reorg falls back to
+    /// `rebuild_coordinated_pair` instead.
+    previous_generation: Option<RetainedGeneration>,
 }
 
 impl CoordinatedPair {
@@ -447,6 +454,113 @@ impl CoordinatedPair {
             cache_root: self.cache.cache_root(),
             trie_cache_root: self.trie_cache.cache_root(),
             trie_state_root: self.trie_cache.state_root(),
+        }
+    }
+
+    /// Record the trie generation a committed block displaced, so the block can be undone.
+    ///
+    /// `None` means the transition did not commit, in which case the current trie cache is still
+    /// the parent and there is nothing new to keep. The old retention is dropped either way: it
+    /// described a generation two blocks back, which K = 1 does not promise to reach.
+    fn retain_generation(
+        &mut self,
+        displaced: Option<PartialTrieNodeCache>,
+        block_hash: B256,
+        block_number: u64,
+    ) {
+        self.previous_generation =
+            displaced.map(|trie_cache| RetainedGeneration { trie_cache, block_hash, block_number });
+    }
+
+    /// Drop the retained generation because the pair no longer descends from it.
+    ///
+    /// Called wherever the pair is replaced wholesale — cold reset, snapshot restore, canonical
+    /// rebuild. The arithmetic and hash checks in `restore_retained_generation` would reject a
+    /// stale retention anyway; clearing it is the cheaper, more obvious guard.
+    fn forget_retained_generation(&mut self) {
+        self.previous_generation = None;
+    }
+
+    /// Undo exactly one committed block, returning the pair to `target_hash`.
+    ///
+    /// This is the fast path for a depth-1 reorg. It is fail-closed by construction: every
+    /// precondition is checked before anything is mutated, and any rejection returns `None` so the
+    /// caller rebuilds instead. A rebuild is safe even over a half-restored pair, because
+    /// `rebuild_coordinated_pair` never consults the previous generation.
+    ///
+    /// `target_state_root` must come from the canonical header for `target_hash`. Comparing the
+    /// retained trie's own root against it is what makes this an authentication rather than a
+    /// tautology — the same reason `install_rebuilt_pair` leans on the header's state root rather
+    /// than on the self-derived cache root.
+    fn restore_retained_generation(
+        &mut self,
+        target_hash: B256,
+        target_state_root: B256,
+        cache_policy_id: B256,
+    ) -> Option<ReadyParent> {
+        let retained = self.previous_generation.take()?;
+        if retained.block_hash != target_hash {
+            debug!(
+                target: "partial_stateless",
+                retained_block = retained.block_number,
+                retained_hash = ?retained.block_hash,
+                ?target_hash,
+                "Retained generation belongs to a different block; falling back to a rebuild"
+            );
+            return None
+        }
+        // Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has
+        // to move as one generation.
+        if self.cache.current_block() != retained.block_number + 1 {
+            return None
+        }
+        if retained.trie_cache.state_root() != Some(target_state_root) {
+            warn!(
+                target: "partial_stateless",
+                block = retained.block_number,
+                retained_state_root = ?retained.trie_cache.state_root(),
+                canonical_state_root = ?target_state_root,
+                "Retained generation does not match the canonical state root at its own block; \
+                 falling back to a rebuild"
+            );
+            return None
+        }
+
+        let undone = self.cache.current_block();
+        if let Err(err) = self.cache.rollback_block(undone) {
+            warn!(
+                target: "partial_stateless",
+                block = undone,
+                ?err,
+                "Flat rollback refused the block the retained generation undoes"
+            );
+            return None
+        }
+        self.trie_cache = retained.trie_cache;
+
+        let checkpoint = TrustedCheckpoint {
+            block_number: retained.block_number,
+            block_hash: retained.block_hash,
+            state_root: target_state_root,
+            cache_root: self.cache.cache_root(),
+            cache_policy_id,
+        };
+        let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
+        match self.readiness.restore_from_checkpoint(&checkpoint, &observation) {
+            Ok(ready) => {
+                let ready = ready.clone();
+                self.last_readiness_label = self.readiness.state().label();
+                Some(ready)
+            }
+            Err(err) => {
+                warn!(
+                    target: "partial_stateless",
+                    block = retained.block_number,
+                    ?err,
+                    "Readiness rejected the restored generation; falling back to a rebuild"
+                );
+                None
+            }
         }
     }
 }
@@ -463,6 +577,17 @@ struct CoordinatedFingerprint {
     cache_root: B256,
     trie_cache_root: B256,
     trie_state_root: Option<B256>,
+}
+
+/// One previous trie generation, tagged with the block it is the state *after*.
+///
+/// The tag is a hash rather than a number on purpose: mid-reorg a height names whichever block the
+/// database currently calls canonical, which is the failure the whole recovery path exists to
+/// avoid. `NetworkStateCache` needs no counterpart here — its undo log already reaches finality.
+struct RetainedGeneration {
+    trie_cache: PartialTrieNodeCache,
+    block_hash: B256,
+    block_number: u64,
 }
 
 /// State of the in-process bootstrap gate: export once, then carry a second pair for a few blocks.
@@ -716,6 +841,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                             cache: restored.cache,
                             trie_cache: restored.trie_cache,
                             last_readiness_label: restored.readiness.state().label(),
+                            previous_generation: None,
                             readiness: restored.readiness,
                         }
                     }
@@ -806,6 +932,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
         trie_cache: PartialTrieNodeCache::new(),
         readiness: config.new_readiness_tracker(),
         last_readiness_label: CacheReadiness::Cold.label(),
+        previous_generation: None,
     }
 }
 
@@ -855,6 +982,44 @@ where
         );
         return false
     };
+
+    // Depth-1 fast path. The retained generation is only usable when it *is* the target, which is
+    // checked against the canonical header rather than against anything the pair derived itself.
+    // Every rejection falls through to the rebuild below, including a failed header lookup: the
+    // rebuild is the correct answer whenever the cheap answer cannot be proven.
+    match ctx.provider().sealed_header_by_hash(target_hash) {
+        Ok(Some(header)) => {
+            let started = Instant::now();
+            if let Some(ready) = pair.restore_retained_generation(
+                target_hash,
+                header.state_root,
+                options.config.cache_policy_id(),
+            ) {
+                *failures = 0;
+                info!(
+                    target: "partial_stateless",
+                    block = ready.anchor.block_number,
+                    block_hash = ?ready.anchor.block_hash,
+                    restore_us = started.elapsed().as_micros() as u64,
+                    "Recovered by undoing one block from the retained generation instead of \
+                     rebuilding"
+                );
+                return true
+            }
+        }
+        Ok(None) => debug!(
+            target: "partial_stateless",
+            ?target_hash,
+            "No canonical header for the recovery target; rebuilding"
+        ),
+        Err(err) => debug!(
+            target: "partial_stateless",
+            ?target_hash,
+            %err,
+            "Could not read the recovery target's header; rebuilding"
+        ),
+    }
+
     rebuild_pair_at(ctx, options, pair, target_hash, failures)
 }
 
@@ -895,6 +1060,9 @@ where
     match rebuilt {
         Ok(ready) => {
             *failures = 0;
+            // The rebuild replaced the pair from canonical state; whatever was retained described
+            // a generation this one does not descend from.
+            pair.forget_retained_generation();
             pair.last_readiness_label = pair.readiness.state().label();
             info!(
                 target: "partial_stateless",
@@ -1060,7 +1228,9 @@ where
         witness: _witness,
         sidecar_path: _sidecar_path,
         sidecar,
+        displaced_trie_cache,
     } = report;
+    pair.retain_generation(displaced_trie_cache, block.parent_hash, block_number.saturating_sub(1));
     observe_readiness(pair, &block_ctx);
 
     advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
@@ -1203,6 +1373,7 @@ where
                 cache: restored.cache,
                 trie_cache: restored.trie_cache,
                 last_readiness_label: restored.readiness.state().label(),
+                previous_generation: None,
                 readiness: restored.readiness,
             },
             remaining_blocks: gate.self_test_blocks,
@@ -1250,6 +1421,7 @@ fn admit_after_cold_reset(
     pair.trie_cache = PartialTrieNodeCache::new();
     pair.cache.reset();
     pair.readiness.reset();
+    pair.forget_retained_generation();
     match admit_block(&mut pair.readiness, block) {
         // The reset discarded whatever the token described, so this block publishes nothing.
         BlockAdmission::Admitted(_) => Ok(None),
@@ -1389,13 +1561,17 @@ mod tests {
         admit_after_cold_reset, admit_block, block_context, observe_readiness, BlockAdmission,
         BlockContext, CacheConfig, CoordinatedPair, PartialTrieNodeCache, SidecarRole,
     };
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
         accessed_state::BlockAccessedState,
         policy::AccountData,
-        readiness::{BlockedReason, CacheReadiness},
+        readiness::{BlockedReason, CacheReadiness, TrustedCheckpoint},
+        CacheAnchor, CacheSnapshotPackage,
     };
-    use reth_primitives_traits::Block as _;
+    use reth_primitives_traits::{Account, Block as _};
+    use reth_trie_common::{
+        proof::ProofRetainer, HashBuilder, MultiProof, Nibbles, EMPTY_ROOT_HASH,
+    };
 
     const TOUCHED: Address = Address::repeat_byte(0x11);
 
@@ -1406,6 +1582,7 @@ mod tests {
             trie_cache: PartialTrieNodeCache::new(),
             readiness: config.new_readiness_tracker(),
             last_readiness_label: CacheReadiness::Cold.label(),
+            previous_generation: None,
         }
     }
 
@@ -1623,5 +1800,179 @@ mod tests {
         assert_eq!(context.state_root, state_root);
         assert_eq!(context.hash, block.hash());
         assert_ne!(context.hash, context.parent_hash);
+    }
+
+    // --- One-deep retained generation (K = 1) ---------------------------------------------------
+    //
+    // The value of this feature is the accept path, so it is tested against a real authenticated
+    // trie rather than a stub: a snapshot restore is the only way to build a `PartialTrieNodeCache`
+    // carrying a state root from outside the crate that owns it. Every other test here is a
+    // rejection, because a false accept installs a generation that is not the canonical one.
+
+    const SNAP_BLOCK: u64 = 21_000_000;
+    const SNAP_HASH: B256 = B256::repeat_byte(0xb1);
+    const SNAP_ADDRESS: Address = Address::repeat_byte(0x11);
+
+    /// A cache holding one account, plus the multiproof and state root that authenticate it.
+    fn warm_snapshot(config: &CacheConfig) -> (CacheSnapshotPackage, TrustedCheckpoint, B256) {
+        let account = Account { nonce: 7, balance: U256::from(1_000u64), bytecode_hash: None };
+        let hashed_address = keccak256(SNAP_ADDRESS);
+        let mut builder = HashBuilder::default()
+            .with_proof_retainer(ProofRetainer::from_iter([Nibbles::unpack(hashed_address)]));
+        builder.add_leaf(
+            Nibbles::unpack(hashed_address),
+            &alloy_rlp::encode(account.into_trie_account(EMPTY_ROOT_HASH)),
+        );
+        let state_root = builder.root();
+        let proof = MultiProof {
+            account_subtree: builder.take_proof_nodes(),
+            branch_node_masks: Default::default(),
+            storages: Default::default(),
+        };
+
+        let mut cache = config.new_cache_at(SNAP_BLOCK);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            SNAP_ADDRESS,
+            AccountData { nonce: account.nonce, balance: account.balance, code_hash: None },
+        );
+        cache.on_block_executed(SNAP_BLOCK, &accessed);
+
+        let checkpoint = TrustedCheckpoint {
+            block_number: SNAP_BLOCK,
+            block_hash: SNAP_HASH,
+            state_root,
+            cache_root: cache.cache_root(),
+            cache_policy_id: config.cache_policy_id(),
+        };
+        let anchor = CacheAnchor {
+            block_number: SNAP_BLOCK,
+            block_hash: SNAP_HASH,
+            cache_policy_id: config.cache_policy_id(),
+            cache_root: cache.cache_root(),
+        };
+        (CacheSnapshotPackage::from_cache(&cache, anchor, &proof), checkpoint, state_root)
+    }
+
+    /// A pair sitting at `SNAP_BLOCK + 1` with the generation at `SNAP_BLOCK` retained, which is
+    /// exactly the state a depth-1 reorg has to undo.
+    fn pair_one_block_past_a_snapshot() -> (CoordinatedPair, CacheConfig, B256) {
+        let config = CacheConfig::default();
+        let (package, checkpoint, state_root) = warm_snapshot(&config);
+        let retained = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let current = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+            .expect("an honest snapshot restores");
+
+        let mut pair = CoordinatedPair {
+            cache: current.cache,
+            trie_cache: current.trie_cache,
+            readiness: current.readiness,
+            last_readiness_label: CacheReadiness::Cold.label(),
+            previous_generation: None,
+        };
+        // Advance the flat cache one block, which is what leaves the undo record the rollback
+        // consumes, and retain the generation that block displaced.
+        apply(&mut pair, SNAP_BLOCK + 1);
+        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
+        (pair, config, state_root)
+    }
+
+    #[test]
+    fn a_retained_generation_undoes_exactly_one_block() {
+        let (mut pair, config, state_root) = pair_one_block_past_a_snapshot();
+        let expected_root = {
+            let (package, checkpoint, _) = warm_snapshot(&config);
+            crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+                .expect("an honest snapshot restores")
+                .cache
+                .cache_root()
+        };
+        assert_ne!(pair.cache.cache_root(), expected_root, "the applied block must have moved it");
+
+        let ready = pair
+            .restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+            .expect("the retained generation is the block being asked for");
+
+        assert_eq!(ready.anchor.block_number, SNAP_BLOCK);
+        assert_eq!(ready.anchor.block_hash, SNAP_HASH);
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK, "the flat cache rolled back one block");
+        assert_eq!(pair.cache.cache_root(), expected_root, "and to the exact prior generation");
+        assert_eq!(pair.trie_cache.state_root(), Some(state_root));
+        assert!(matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
+        assert!(
+            pair.previous_generation.is_none(),
+            "the retention is consumed: what it described is now the live generation"
+        );
+    }
+
+    #[test]
+    fn a_retained_generation_for_another_branch_is_refused() {
+        let (mut pair, config, state_root) = pair_one_block_past_a_snapshot();
+        let other_branch = B256::repeat_byte(0xee);
+
+        assert!(
+            pair.restore_retained_generation(other_branch, state_root, config.cache_policy_id())
+                .is_none(),
+            "a retention tagged with a different hash must never be installed"
+        );
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1, "and nothing may be mutated");
+        assert!(pair.previous_generation.is_none(), "the rejected retention is dropped");
+    }
+
+    #[test]
+    fn a_retained_generation_is_refused_against_a_forged_state_root() {
+        let (mut pair, config, _) = pair_one_block_past_a_snapshot();
+
+        assert!(
+            pair.restore_retained_generation(
+                SNAP_HASH,
+                B256::repeat_byte(0x77),
+                config.cache_policy_id()
+            )
+            .is_none(),
+            "the retained trie must match the canonical header's state root"
+        );
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1);
+    }
+
+    #[test]
+    fn a_reorg_deeper_than_one_block_is_refused() {
+        let (mut pair, config, state_root) = pair_one_block_past_a_snapshot();
+        // A second block puts the pair two ahead of the retention, which K = 1 does not reach.
+        apply(&mut pair, SNAP_BLOCK + 2);
+
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+                .is_none(),
+            "K = 1 covers depth 1 only; anything deeper must fall back to a rebuild"
+        );
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 2);
+    }
+
+    #[test]
+    fn a_transition_that_did_not_commit_leaves_nothing_retained() {
+        let (mut pair, _, _) = pair_one_block_past_a_snapshot();
+        assert!(pair.previous_generation.is_some());
+
+        // `None` is what the builder reports when the transition rolled back, and the old
+        // retention describes a generation two blocks back that K = 1 does not promise.
+        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1);
+
+        assert!(pair.previous_generation.is_none());
+    }
+
+    #[test]
+    fn a_cold_reset_forgets_the_retained_generation() {
+        let (mut pair, _, _) = pair_one_block_past_a_snapshot();
+        assert!(pair.previous_generation.is_some());
+
+        admit_after_cold_reset(&mut pair, &ctx(SNAP_BLOCK + 2))
+            .expect("a cold reset always readmits");
+
+        assert!(
+            pair.previous_generation.is_none(),
+            "the reset pair does not descend from the retained generation"
+        );
     }
 }
