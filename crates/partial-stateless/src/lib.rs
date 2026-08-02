@@ -10,6 +10,7 @@
 
 pub mod accessed_state;
 pub mod bootstrap;
+pub mod cold_admission;
 pub mod fixture;
 pub mod network_cache;
 pub mod participant;
@@ -26,9 +27,12 @@ pub mod witness_check;
 
 pub use accessed_state::BlockAccessedState;
 pub use bootstrap::{
-    bootstrap_proof_targets, build_snapshot_package, verify_and_restore,
-    verify_and_restore_with_limits, BootstrapError, BootstrapLimits, CacheSnapshotPackage,
-    RestoredBootstrapState,
+    bootstrap_proof_targets, build_snapshot_package, build_snapshot_package_with_limits,
+    rebuild_trie_cache, verify_and_restore, verify_and_restore_with_limits, BootstrapError,
+    BootstrapLimits, CacheSnapshotPackage, RebuiltTrieCache, RestoredBootstrapState,
+};
+pub use cold_admission::{
+    admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{CachedEntry, NetworkStateCache};

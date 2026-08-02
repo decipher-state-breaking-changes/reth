@@ -209,6 +209,13 @@ impl CacheReadinessTracker {
         self.window_filled = true;
         let applied = AppliedBlock { number: checkpoint.block_number, hash: checkpoint.block_hash };
         self.last_applied = Some(applied);
+        // A checkpoint at H asserts that no block at or below H will be needed again, which is
+        // exactly what the gap latch is withholding: the skipped block's effects are inside the
+        // restored generation whether they arrived by replay or by snapshot. A gap *above* the
+        // checkpoint is still owed and still latches.
+        if self.first_gap.is_some_and(|gap| gap <= checkpoint.block_number) {
+            self.first_gap = None;
+        }
         // The watermark starts at the checkpoint rather than staying unset. It is not a claim that
         // this ExEx processed the blocks below it — it did not — but the watermark's contract is
         // that no earlier block will be needed again, and a snapshot at this height is exactly the
@@ -908,6 +915,43 @@ mod tests {
         apply_contiguous(&mut tracker, 5_001, 1);
         assert!(tracker.ready_parent().is_some());
         assert_eq!(tracker.acknowledgeable_height(), Some((5_001, block_hash(5_001))));
+    }
+
+    #[test]
+    fn a_checkpoint_at_or_above_a_gap_releases_the_acknowledgement() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        assert_eq!(tracker.first_gap(), Some(101));
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
+
+        // A rebuild or snapshot restore at 150 reconstructs a generation that already contains
+        // whatever block 101 did, so nothing at or below 150 is owed any more.
+        let checkpoint = checkpoint_at(150);
+        tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).expect("matches");
+
+        assert_eq!(tracker.first_gap(), None);
+        apply_contiguous(&mut tracker, 151, 1);
+        assert_eq!(tracker.acknowledgeable_height(), Some((151, block_hash(151))));
+    }
+
+    #[test]
+    fn a_checkpoint_below_a_gap_leaves_the_acknowledgement_pinned() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+
+        // Restoring *below* the skipped block says nothing about it, so the latch stays.
+        let checkpoint = checkpoint_at(90);
+        tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).expect("matches");
+
+        assert_eq!(tracker.first_gap(), Some(101));
+        apply_contiguous(&mut tracker, 91, 1);
+        assert_eq!(
+            tracker.acknowledgeable_height(),
+            Some((90, block_hash(90))),
+            "the watermark cannot step over a block that is still unprocessed"
+        );
     }
 
     #[test]

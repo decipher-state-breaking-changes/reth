@@ -142,6 +142,9 @@ pub struct ValidationBenchmarkRecord {
     pub historical_gas_used: u64,
     pub tx_count: usize,
     pub verifier_order: &'static str,
+    /// Which witness was *built* first. Alternates independently of `verifier_order` so that
+    /// neither side permanently pays the cold page-cache read; see `weak_builds_first`.
+    pub builder_order: &'static str,
     pub historical_full_db_evm_us: u64,
     pub partial_witness_build_us: u64,
     pub weak_witness_build_us: u64,

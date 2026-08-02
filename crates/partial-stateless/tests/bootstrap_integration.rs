@@ -3,8 +3,9 @@
 use alloy_primitives::{keccak256, map::B256Map, Address, Bytes, B256, U256};
 use partial_stateless::{
     bootstrap::{
-        build_snapshot_package, verify_and_restore, verify_and_restore_with_limits, BootstrapError,
-        BootstrapLimits, CacheSnapshotPackage, RestoredBootstrapState,
+        build_snapshot_package, rebuild_trie_cache, verify_and_restore,
+        verify_and_restore_with_limits, BootstrapError, BootstrapLimits, CacheSnapshotPackage,
+        RestoredBootstrapState,
     },
     network_cache::{CachedEntry, NetworkStateCache},
     policy::{AccountData, LastNBlocksPolicy},
@@ -847,4 +848,88 @@ fn bootstrapped_pair_advances_identically_to_continuous_pair() {
     assert_eq!(bootstrapped.value_cache.cache_root(), continuous_values.cache_root());
     assert_eq!(bootstrapped.trie_cache.cache_root(), continuous_trie.cache_root());
     bootstrapped.trie_cache.validate_against_value_cache(&bootstrapped.value_cache).unwrap();
+}
+
+/// The outer half of the authentication core, exercised on its own.
+///
+/// A provider-side caller — snapshot export or a canonical rebuild — uses this without ever
+/// building a package. It must produce exactly the trie a full snapshot restore does, because
+/// that is the whole claim: every way of reaching an authenticated pair goes through one core.
+#[test]
+fn rebuilding_the_trie_from_a_provider_matches_a_snapshot_restore() {
+    let (cache, proof, state_root, address, slot) = warm_fixture();
+    let anchor = anchor_for(&cache);
+
+    let mut rounds = 0usize;
+    let rebuilt = rebuild_trie_cache(&cache, state_root, |_| {
+        rounds += 1;
+        Ok(proof.clone())
+    })
+    .expect("a provider answering the cache's own leaves is enough to rebuild");
+
+    assert_eq!(rounds, 1, "this fixture needs no structural expansion round");
+    assert_eq!(rebuilt.proof_rounds, 1);
+    assert_eq!(rebuilt.trie_cache.state_root(), Some(state_root));
+    assert!(rebuilt.trie_cache.contains_account_path(&address));
+    assert!(rebuilt.trie_cache.contains_storage_path(&address, &slot));
+
+    let pkg = CacheSnapshotPackage::from_cache(&cache, anchor, &proof);
+    let (account_policy, storage_policy) = policies();
+    let restored = verify_and_restore(pkg, &anchor, state_root, account_policy, storage_policy)
+        .expect("honest snapshot must verify");
+    assert_eq!(rebuilt.trie_cache.cache_root(), restored.trie_cache.cache_root());
+}
+
+#[test]
+fn rebuilding_against_a_forged_state_root_is_rejected() {
+    let (cache, proof, _, _, _) = warm_fixture();
+
+    let error = rebuild_trie_cache(&cache, B256::repeat_byte(0xee), |_| Ok(proof.clone()))
+        .expect_err("a proof that does not descend from the claimed root cannot authenticate it");
+
+    assert!(matches!(error, BootstrapError::ProofVerification(_)), "unexpected: {error:?}");
+}
+
+#[test]
+fn rebuilding_an_empty_cache_still_binds_the_canonical_root() {
+    let cache = empty_cache(HashMap::new());
+    let (sentinel_proof, state_root) = sentinel_root_proof();
+
+    let mut requested = None;
+    let rebuilt = rebuild_trie_cache(&cache, state_root, |targets| {
+        requested = Some(targets);
+        Ok(sentinel_proof.clone())
+    })
+    .expect("the sentinel exclusion path anchors a cache with no leaves of its own");
+
+    let requested = requested.expect("proof provider must be called");
+    assert!(requested.contains_key(&B256::ZERO), "the sentinel path must be requested");
+    assert_eq!(rebuilt.trie_cache.state_root(), Some(state_root));
+}
+
+#[test]
+fn a_provider_that_never_widens_the_target_set_cannot_loop_forever() {
+    let (cache, _, state_root, _, _) = warm_fixture();
+
+    // A proof with no account nodes can never satisfy the root binding, and answering every round
+    // with it makes no progress.
+    let error = rebuild_trie_cache(&cache, state_root, |_| Ok(MultiProof::default()))
+        .expect_err("an empty proof cannot rebuild anything");
+
+    assert!(matches!(error, BootstrapError::ProofVerification(_)), "unexpected: {error:?}");
+}
+
+#[test]
+fn a_failing_proof_provider_is_surfaced_rather_than_retried() {
+    let (cache, _, state_root, _, _) = warm_fixture();
+
+    let mut calls = 0usize;
+    let error = rebuild_trie_cache(&cache, state_root, |_| {
+        calls += 1;
+        Err("provider is unavailable".to_string())
+    })
+    .expect_err("a provider failure must not be papered over");
+
+    assert_eq!(calls, 1, "a provider error is terminal, not a retry trigger");
+    assert_eq!(error, BootstrapError::ProofProvider("provider is unavailable".to_string()));
 }
