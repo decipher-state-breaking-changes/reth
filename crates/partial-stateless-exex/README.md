@@ -45,24 +45,33 @@ or either cache anchor.
 
 ## Reaching a usable cache
 
-Sparse-trie snapshots still have no branch-aware undo representation, so nothing
-here unwinds. Instead there is one primitive — a **provider-backed canonical
-rebuild** ([`rebuild.rs`](./src/rebuild.rs)) — that produces an exact coordinated
-pair at a given canonical block hash, from nothing, without consulting whatever
-the caches held before. It replays `max_window + 1` heights ending at that block
-to rebuild the flat cache, then authenticates the trie in one shot against the
-block's canonical state root. Because it never reads the previous generation, the
-same function serves a cold start, a reorg, and a revert alike; for a reorg,
-replaying forward from the cached generation would be *incorrect* rather than
-merely slow, since that generation sits on the abandoned branch.
+Sparse-trie snapshots still have no general branch-aware undo representation, so
+recovery has two layers. A builder keeps the displaced parent as one **retained
+coordinated generation**: on a depth-1 reorg it rolls the flat cache back once,
+restores that parent trie, and verifies the target hash, canonical state root,
+policy, and readiness before continuing. If the retained generation is absent or
+any check fails, recovery falls back to the **provider-backed canonical rebuild**
+([`rebuild.rs`](./src/rebuild.rs)).
+
+The rebuild produces an exact coordinated pair at a canonical block hash without
+consulting the abandoned generation. It replays `max_window + 1` heights ending
+at that block to rebuild the flat cache, then authenticates the trie in one shot
+against the block's canonical state root. The same primitive serves cold start,
+deep-reorg fallback, and revert. Replaying forward from an abandoned cached
+generation would be *incorrect*, not merely slow.
 
 | Situation | What happens |
 | --- | --- |
 | Cold start | Rebuild at the parent of the first notified block, then publish from its first child. Roughly `window + 1` historical executions and one multiproof, against about twelve minutes of live warming. |
-| `ChainReorged` | Enter `Recovering`, rebuild at the common ancestor — the parent hash of the new chain's first block — then apply the new blocks through the normal path so the builder still produces a sidecar for each. |
+| `ChainReorged` | Enter `Recovering`. A builder first tries the retained parent for a depth-1 reorg; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
 | `ChainReverted` | Enter `Recovering` and rebuild at the new tip, addressed as the parent hash of the reverted chain's first block. |
 | Gap or wrong-branch parent | Try a rebuild at the rejected block's own parent first; only fall back to a cold reset and live warming if that fails. |
 | Rebuild unavailable or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. |
+
+The retained-generation path is currently builder-role only and covers exactly
+one block. It adds no new trie clone: the builder keeps the parent generation it
+already displaced. A deeper reorg falls back to the rebuild; verifier-role
+recovery does not yet retain a parent generation.
 
 The rebuild requires canonical state, so it does not replace the snapshot path: a
 full node cold-starts by replay and needs no snapshot file, while a node without
@@ -70,11 +79,11 @@ the database cannot replay at all and needs one. It also assumes the last
 `max_window + 1` heights are readable through `history_by_block_hash`, which holds
 for a full node but not under aggressive pruning.
 
-**No part of this is reachable from the measured verification path.** The
+**Neither recovery path is reachable from the measured verification path.** The
 validator numbers only mean anything because the benchmark validates from
-serialized sidecar bytes against the cache, trie cache, and witness alone. The
-rebuild is cache *maintenance*, driven by the side that holds the database, and
-runs between measured samples rather than inside one.
+serialized sidecar bytes against the cache, trie cache, and witness alone.
+Recovery is cache *maintenance* and runs between measured samples, never inside
+one.
 
 ## Operator-trusted snapshot bootstrap
 
@@ -235,9 +244,10 @@ diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` i
 
 The default run excludes 60 successful warm-up blocks and collects 600 same-hash accepted samples.
 It discards invalid pairs and any pair whose Partial/Weak interval overlaps the start of the next
-Engine validation. A reorg/revert cold-resets the caches and starts a new warm-up epoch. Samples
-from earlier canonical heights remain eligible; orphaned heights at or above the reverted range and
-each epoch’s warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
+Engine validation. Every reorg/revert starts a new benchmark warm-up epoch after recovery; a
+depth-1 builder reorg normally uses the retained generation, while deeper recovery uses the rebuild.
+Samples from earlier canonical heights remain eligible; orphaned heights at or above the reverted
+range and each epoch's warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
 `SIGINT` after the target and writes `results.md`.
 The output directory must be absent or empty.
 
