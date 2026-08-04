@@ -178,14 +178,6 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Like [`env_flag`], but for a switch that is on unless the operator turns it off.
-fn env_flag_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
-        Err(_) => default,
-    }
-}
-
 fn env_u32(name: &str, default: u32) -> u32 {
     let Ok(value) = std::env::var(name) else { return default };
     // A bare `PS_..=1`-style flag should still mean "on"; a count is the more useful spelling.
@@ -243,6 +235,12 @@ pub struct RunOptions {
     /// Bounds on sidecar witness decoding.
     pub reexec_limits: SidecarReexecLimits,
     /// Whether a cold or recovering pair is rebuilt from canonical state instead of warmed.
+    ///
+    /// Opt-in, because the choice is a trade between two costs rather than a free win: the
+    /// rebuild pays a whole-cache multiproof up front — tens of seconds, in one long-lived read
+    /// transaction — while warming pays a full policy window of live blocks instead, spread out
+    /// and invisible. A run that cannot afford a stall at its start wants it off; a run that
+    /// cannot afford to lose a window of blocks per cache epoch wants it on.
     pub canonical_rebuild: bool,
     /// Where snapshot packages and their checkpoints live.
     pub bootstrap_dir: PathBuf,
@@ -288,7 +286,7 @@ impl RunOptions {
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
             validation_bench,
             reexec_limits: SidecarReexecLimits::default(),
-            canonical_rebuild: env_flag_default("PS_CANONICAL_REBUILD", true),
+            canonical_rebuild: env_flag("PS_CANONICAL_REBUILD"),
             bootstrap_dir: std::env::var_os("PS_BOOTSTRAP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| sidecar_dir.join("bootstrap")),
@@ -951,9 +949,11 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
 
 /// Rebuilds the coordinated pair at `parent_hash` when it is cold and a rebuild is available.
 ///
-/// Cheaper than warming by a full policy window — roughly `window + 1` historical executions and
-/// one multiproof, against about twelve minutes of live blocks at mainnet block time — and it is
-/// the only way a pair that was reset mid-run becomes useful again inside a bounded run.
+/// Trades a bounded stall for a full policy window of live warming — roughly `window + 1`
+/// historical executions and one multiproof, against about twelve minutes of live blocks at
+/// mainnet block time — and it is the only way a pair that was reset mid-run becomes useful again
+/// inside a bounded run. Available only under `PS_CANONICAL_REBUILD`, so a run that would rather
+/// start immediately and warm quietly gets that by default.
 fn maybe_rebuild_before_applying<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
@@ -1048,6 +1048,8 @@ where
     Node::Provider: BlockReader<Block = BlockTy<EthPrimitives>>,
 {
     const MAX_CONSECUTIVE_REBUILD_FAILURES: u32 = 3;
+    // `false` here means the operator did not ask for a rebuild, not that one failed. Callers read
+    // it the same way either way: warm or cold-reset instead, which is the ordinary path now.
     if !options.canonical_rebuild {
         return false
     }

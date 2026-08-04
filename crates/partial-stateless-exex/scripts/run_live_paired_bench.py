@@ -47,6 +47,16 @@ def parse_args():
         default="off",
         help="set PS_PARALLEL_INITIAL_PROOF deterministically (default: off)",
     )
+    parser.add_argument(
+        "--canonical-rebuild",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "set PS_CANONICAL_REBUILD deterministically (default: off). On, a cold or recovered "
+            "pair reaches Ready by rebuilding from canonical state, which stalls the run once per "
+            "cache epoch; off, it warms over a policy window of live blocks instead"
+        ),
+    )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.warmup < 0 or args.samples <= 0:
@@ -164,6 +174,7 @@ def benchmark_environment(
     builder_path,
     sidecar_dir,
     parallel_initial_proof,
+    canonical_rebuild,
 ):
     env = os.environ.copy()
     env.update(
@@ -176,6 +187,7 @@ def benchmark_environment(
             "PS_ENGINE_BENCH_OUTPUT": str(engine_path),
             "PS_BUILDER_BENCH_OUTPUT": str(builder_path),
             "PS_PARALLEL_INITIAL_PROOF": "1" if parallel_initial_proof == "on" else "0",
+            "PS_CANONICAL_REBUILD": "1" if canonical_rebuild == "on" else "0",
         }
     )
     for name in DISABLED_DIAGNOSTICS:
@@ -222,6 +234,7 @@ def main():
         builder_path,
         sidecar_dir,
         args.parallel_initial_proof,
+        args.canonical_rebuild,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)

@@ -60,13 +60,26 @@ against the block's canonical state root. The same primitive serves cold start,
 deep-reorg fallback, and revert. Replaying forward from an abandoned cached
 generation would be *incorrect*, not merely slow.
 
+**The rebuild is opt-in, under `PS_CANONICAL_REBUILD=1`.** It is not free: the
+one-shot multiproof over the whole cache dominates its cost and holds a single
+read transaction open for its whole duration — measured at 120.5 s of 144.8 s
+cold — so a process that turns it on stalls once per cache epoch before it can
+publish anything. Warming instead spreads the same "not usable yet" period over a
+policy window of live blocks. The table below describes an enabled rebuild; every
+row falls through to warming when it is off.
+
 | Situation | What happens |
 | --- | --- |
 | Cold start | Rebuild at the parent of the first notified block, then publish from its first child. Roughly `window + 1` historical executions and one multiproof, against about twelve minutes of live warming. |
 | `ChainReorged` | Enter `Recovering`. Try the retained parent first for a depth-1 reorg against an already-warm pair; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
 | `ChainReverted` | Enter `Recovering` and rebuild at the new tip, addressed as the parent hash of the reverted chain's first block. |
 | Gap or wrong-branch parent | Try a rebuild at the rejected block's own parent first; only fall back to a cold reset and live warming if that fails. |
-| Rebuild unavailable or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. |
+| Rebuild disabled, unavailable, or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. Being switched off is not a failure and is not logged as one: read `canonical_rebuild` in the startup summary line. |
+
+The retained-generation path above is unaffected by the switch. A depth-1 reorg
+against an already-warm pair still recovers in tens of milliseconds with the
+rebuild off; what the switch changes is only what happens when that path does not
+apply.
 
 The retained-generation path covers exactly one block. It adds no new trie clone
 in either role: the transition already copies the parent trie and then overwrites
@@ -121,8 +134,9 @@ separate assertion: that verification path already checks the restored cache's
 own expected miss set against the miss manifest the live pair built.
 
 An imported snapshot is stale by the time the first notification arrives. A node
-that can replay bridges the drift with a canonical rebuild; a node that cannot
-stays Cold until a fresher snapshot is supplied. That is a real limitation of this
+that can replay bridges the drift with a canonical rebuild, which is the one
+situation where turning it on is close to mandatory rather than a trade; a node
+that cannot stays Cold until a fresher snapshot is supplied. That is a real limitation of this
 phase, which is why the gate above restores in-process rather than across a
 restart.
 
@@ -134,10 +148,11 @@ cargo run -p partial-stateless-exex -- node --chain mainnet --datadir /path/to/d
 
 The flat cache is persisted to `<datadir>/partial_stateless_cache.bin`, but the
 matching sparse-trie snapshot is not yet persisted, so a non-empty persisted
-value cache is still cold-reset on restart. A full node no longer pays for that:
-the canonical rebuild above puts it back at `Ready` before the first notified
-block is applied. Atomic value+trie+anchor persistence remains the thing that
-would make a warm restart real.
+value cache is still cold-reset on restart. A full node can buy its way out of
+that with `PS_CANONICAL_REBUILD=1`, which puts the pair back at `Ready` before
+the first notified block is applied — at the cost of the startup stall above.
+Atomic value+trie+anchor persistence remains the thing that would make a warm
+restart real, and free.
 
 ### Configuration
 
@@ -165,7 +180,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_BUILDER_BENCH_OUTPUT=<file>` | JSONL destination for per-block builder proof, snapshot, commitment, and total-cost records |
 | `PS_FORCE_PREVIOUS_CACHE_SNAPSHOT=1` | benchmark-only B2 control that recreates the old unconditional parent-cache clone |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
-| `PS_CANONICAL_REBUILD=0` | disable the provider-backed canonical rebuild and fall back to warming from live blocks (default: enabled) |
+| `PS_CANONICAL_REBUILD=1` | reach `Ready` by rebuilding the pair from canonical state at cold start and after a failed recovery, instead of warming over a policy window of live blocks (default: disabled) |
 | `PS_BOOTSTRAP_DIR=<dir>` | where the snapshot package and its checkpoint live (default: `$PS_SIDECAR_DIR/bootstrap`) |
 | `PS_BOOTSTRAP_EXPORT=1` | export a snapshot the first time the tracker reaches Ready |
 | `PS_BOOTSTRAP_IMPORT=1` | restore from a snapshot at startup, ahead of the persisted flat cache |
