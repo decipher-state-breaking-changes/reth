@@ -88,6 +88,13 @@ the database cannot replay at all and needs one. It also assumes the last
 `max_window + 1` heights are readable through `history_by_block_hash`, which holds
 for a full node but not under aggressive pruning.
 
+**The open end is the stateless verifier past depth 1.** Retention reaches exactly
+one block and the rebuild needs canonical state, so a node without a database has
+nothing between them. Closing it means a recovery-time snapshot request:
+`recover_at` branches only to the retained generation or to the rebuild, and
+`PS_BOOTSTRAP_IMPORT` runs at process start only. The gap does not show up in the
+benchmarks, where even the verifier role runs as an ExEx on a full node.
+
 **Neither recovery path is reachable from the measured verification path.** The
 validator numbers only mean anything because the benchmark validates from
 serialized sidecar bytes against the cache, trie cache, and witness alone.
