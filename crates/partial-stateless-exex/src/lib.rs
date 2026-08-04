@@ -499,6 +499,19 @@ impl CoordinatedPair {
         cache_policy_id: B256,
     ) -> Option<ReadyParent> {
         let retained = self.previous_generation.take()?;
+        // Checked before anything is mutated, and before the cheap hash checks are even worth
+        // running: a pair that is still warming has no `Ready` to return to, so undoing into it
+        // would trade a rebuild that genuinely fills the window for a claim nothing backs. The
+        // tracker refuses this too, but only after the caches have already been rolled back.
+        if !self.readiness.stays_warm_after_one_undo() {
+            debug!(
+                target: "partial_stateless",
+                replay_depth = self.readiness.replay_depth(),
+                required = self.readiness.required_replay_depth(),
+                "Pair is still warming, so undoing one block cannot restore Ready; rebuilding"
+            );
+            return None
+        }
         if retained.block_hash != target_hash {
             debug!(
                 target: "partial_stateless",
@@ -546,7 +559,7 @@ impl CoordinatedPair {
             cache_policy_id,
         };
         let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
-        match self.readiness.restore_from_checkpoint(&checkpoint, &observation) {
+        match self.readiness.restore_from_undone_block(&checkpoint, &observation) {
             Ok(ready) => {
                 let ready = ready.clone();
                 self.last_readiness_label = self.readiness.state().label();
@@ -1152,7 +1165,7 @@ where
     };
 
     if options.sidecar_role == SidecarRole::Verifier {
-        verify_live_sidecar(
+        let displaced_trie_cache = verify_live_sidecar(
             ctx.evm_config(),
             state_provider.as_ref(),
             block,
@@ -1165,6 +1178,13 @@ where
             ready_parent.as_ref(),
         )
         .map_err(|err| eyre::eyre!("live sidecar verification failed: {err}"))?;
+        // Retained on the verifier for the same reason and at the same cost as on the builder: a
+        // depth-1 reorg is the common case, and undoing one block beats replaying a whole window.
+        pair.retain_generation(
+            displaced_trie_cache,
+            block.parent_hash,
+            block_number.saturating_sub(1),
+        );
         observe_readiness(pair, &block_ctx);
         return Ok(())
     }
@@ -1875,6 +1895,18 @@ mod tests {
         // consumes, and retain the generation that block displaced.
         apply(&mut pair, SNAP_BLOCK + 1);
         pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
+        // The tracker has to see the block too, or the pair would claim a depth-1 undo is
+        // available with nothing replayed to give back. The block is described as leaving the
+        // state root where it was, which is the only root this fixture's trie can authenticate
+        // against — the tracker's arithmetic is what is under test here, not the trie's.
+        let applied = BlockContext {
+            number: SNAP_BLOCK + 1,
+            hash: numbered(SNAP_BLOCK + 1, 0xbb),
+            parent_hash: SNAP_HASH,
+            state_root,
+        };
+        admit(&mut pair, &applied);
+        observe_readiness(&mut pair, &applied);
         (pair, config, state_root)
     }
 
@@ -1960,6 +1992,37 @@ mod tests {
         pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1);
 
         assert!(pair.previous_generation.is_none());
+    }
+
+    #[test]
+    fn a_still_warming_pair_refuses_the_undo_and_leaves_the_caches_alone() {
+        // What a reorg finds on a node that never got a canonical rebuild: the pair is sound and
+        // advancing, but it has replayed nowhere near a window and has no `Ready` to return to.
+        // Promoting it anyway would open the sidecar publication gate on an under-warmed cache.
+        let config = CacheConfig::default();
+        let (package, checkpoint, state_root) = warm_snapshot(&config);
+        let retained = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let mut pair = cold_pair();
+        // Warm from cold rather than from the snapshot, so the window was never asserted.
+        for number in (SNAP_BLOCK - 2)..=SNAP_BLOCK {
+            process(&mut pair, number);
+        }
+        assert!(!pair.readiness.window_filled(), "three blocks is not a window");
+        apply(&mut pair, SNAP_BLOCK + 1);
+        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
+
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+                .is_none(),
+            "a warming pair has no Ready to be restored to"
+        );
+        assert_eq!(
+            pair.cache.current_block(),
+            SNAP_BLOCK + 1,
+            "the refusal is taken before anything is mutated, so a rebuild starts from a clean pair"
+        );
+        assert!(!matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
     }
 
     #[test]

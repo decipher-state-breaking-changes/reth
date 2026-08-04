@@ -16,6 +16,12 @@ use reth_provider::StateProvider;
 use std::{path::Path, time::Duration};
 use tracing::{info, warn};
 
+/// Verifies the sidecar for one block and, on success, advances both caches to it.
+///
+/// Returns the parent trie generation the transition displaced, so the caller can retain it for a
+/// depth-1 reorg. A verifier gets this for the same reason a builder does: the transition already
+/// copied the parent trie and then overwrote it, so keeping the copy costs nothing beyond holding
+/// it. On any error nothing was displaced — both caches are still at the parent.
 pub(crate) fn verify_live_sidecar<Evm>(
     evm_config: &Evm,
     state_provider: &dyn StateProvider,
@@ -27,7 +33,7 @@ pub(crate) fn verify_live_sidecar<Evm>(
     limits: &SidecarReexecLimits,
     wait: Duration,
     ready_parent: Option<&ReadyParent>,
-) -> eyre::Result<()>
+) -> eyre::Result<Option<PartialTrieNodeCache>>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
 {
@@ -126,7 +132,7 @@ where
         "Live sidecar verification succeeded"
     );
 
-    Ok(())
+    Ok(report.displaced_trie_cache)
 }
 
 /// Rejects a sidecar whose previous anchor disagrees with the tracker-authenticated Ready parent.

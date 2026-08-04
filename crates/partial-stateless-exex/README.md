@@ -46,12 +46,12 @@ or either cache anchor.
 ## Reaching a usable cache
 
 Sparse-trie snapshots still have no general branch-aware undo representation, so
-recovery has two layers. A builder keeps the displaced parent as one **retained
-coordinated generation**: on a depth-1 reorg it rolls the flat cache back once,
-restores that parent trie, and verifies the target hash, canonical state root,
-policy, and readiness before continuing. If the retained generation is absent or
-any check fails, recovery falls back to the **provider-backed canonical rebuild**
-([`rebuild.rs`](./src/rebuild.rs)).
+recovery has two layers. Every role that advances the caches keeps the displaced
+parent as one **retained coordinated generation**: on a depth-1 reorg it rolls the
+flat cache back once, restores that parent trie, and verifies the target hash,
+canonical state root, policy, and readiness before continuing. If the retained
+generation is absent or any check fails, recovery falls back to the
+**provider-backed canonical rebuild** ([`rebuild.rs`](./src/rebuild.rs)).
 
 The rebuild produces an exact coordinated pair at a canonical block hash without
 consulting the abandoned generation. It replays `max_window + 1` heights ending
@@ -63,15 +63,24 @@ generation would be *incorrect*, not merely slow.
 | Situation | What happens |
 | --- | --- |
 | Cold start | Rebuild at the parent of the first notified block, then publish from its first child. Roughly `window + 1` historical executions and one multiproof, against about twelve minutes of live warming. |
-| `ChainReorged` | Enter `Recovering`. A builder first tries the retained parent for a depth-1 reorg; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
+| `ChainReorged` | Enter `Recovering`. Try the retained parent first for a depth-1 reorg against an already-warm pair; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
 | `ChainReverted` | Enter `Recovering` and rebuild at the new tip, addressed as the parent hash of the reverted chain's first block. |
 | Gap or wrong-branch parent | Try a rebuild at the rejected block's own parent first; only fall back to a cold reset and live warming if that fails. |
 | Rebuild unavailable or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. |
 
-The retained-generation path is currently builder-role only and covers exactly
-one block. It adds no new trie clone: the builder keeps the parent generation it
-already displaced. A deeper reorg falls back to the rebuild; verifier-role
-recovery does not yet retain a parent generation.
+The retained-generation path covers exactly one block. It adds no new trie clone
+in either role: the transition already copies the parent trie and then overwrites
+it, so both the builder and the live verifier keep a copy that exists anyway. A
+builder-side preflight discards its transactional result and displaces nothing, so
+it retains nothing. A deeper reorg falls back to the rebuild.
+
+Restoring a retained generation cannot promote a pair that is still warming. The
+undo gives back exactly one replayed block, so it is accepted only when the window
+stays whole without it — a pair one block past a snapshot qualifies, because the
+generation underneath is the one the checkpoint vouched for, while a pair that
+just barely filled its window by replay does not. Otherwise the pair falls through
+to the rebuild, which is the only thing that genuinely fills a window. Promoting
+instead would open the sidecar publication gate on an under-warmed cache.
 
 The rebuild requires canonical state, so it does not replace the snapshot path: a
 full node cold-starts by replay and needs no snapshot file, while a node without
