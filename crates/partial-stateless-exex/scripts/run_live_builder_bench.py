@@ -13,7 +13,7 @@ from analyze_builder_bench import build_builder_report, select_builder_samples
 from analyze_validation_bench import load_jsonl
 from run_live_paired_bench import (
     DISABLED_DIAGNOSTICS,
-    append_resource_sample,
+    ResourceSampler,
     build_command,
     prepare_output,
     stop_process,
@@ -133,6 +133,7 @@ def main():
     process = None
     reached_target = False
     last_count = -1
+    sampler = ResourceSampler(resource_path)
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,
@@ -150,15 +151,11 @@ def main():
                     args.samples,
                     require_published=True,
                 )
-                memory = append_resource_sample(resource_path, process.pid, len(accepted))
+                memory = sampler.sample(process.pid, len(accepted))
                 if len(accepted) != last_count:
-                    memory_summary = (
-                        f" rss={memory[0] / 1024:.0f}MiB peak={memory[1] / 1024:.0f}MiB"
-                        if memory is not None
-                        else ""
-                    )
                     print(
-                        f"accepted={len(accepted)}/{args.samples}{memory_summary}",
+                        f"accepted={len(accepted)}/{args.samples}"
+                        f"{sampler.progress_summary(memory)}",
                         flush=True,
                     )
                     last_count = len(accepted)

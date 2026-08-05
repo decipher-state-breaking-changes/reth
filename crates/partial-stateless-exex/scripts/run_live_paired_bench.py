@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from analyze_builder_bench import build_builder_report, select_builder_samples
 from analyze_validation_bench import (
@@ -126,8 +127,26 @@ def warming_progress(builder_path):
     return len(records), len(select_builder_samples(records, 0))
 
 
+class ProcessMemory(NamedTuple):
+    """One `/proc/<pid>/status` memory reading, in KiB.
+
+    `anon_kib` is the memory the process actually holds: its heap, private and dirty. `file_kib`
+    is page cache for mapped files, which for this node is overwhelmingly the MDBX mmap. Those
+    file-backed pages are clean, the kernel drops them on demand at no I/O cost, and MDBX will
+    map as much of a database far larger than RAM as it is allowed to. They therefore inflate
+    `rss_kib` and `peak_rss_kib` without representing memory the run needs, and a total-RSS peak
+    climbs for hours on cache warming alone. Report and compare the anon figures.
+    """
+
+    rss_kib: int
+    peak_rss_kib: int
+    anon_kib: int
+    file_kib: int
+    swap_kib: int
+
+
 def process_memory_kib(pid):
-    """Return Linux process RSS/peak RSS, or None after the process exits."""
+    """Return the current `ProcessMemory`, or None once the process has exited."""
     try:
         fields = {}
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -136,36 +155,61 @@ def process_memory_kib(pid):
                 fields[name] = int(value.strip().split()[0])
         if "VmRSS" not in fields:
             return None
-        return (
-            fields["VmRSS"],
-            fields.get("VmHWM", fields["VmRSS"]),
-            fields.get("RssAnon", 0),
-            fields.get("RssFile", 0),
-            fields.get("VmSwap", 0),
+        return ProcessMemory(
+            rss_kib=fields["VmRSS"],
+            peak_rss_kib=fields.get("VmHWM", fields["VmRSS"]),
+            anon_kib=fields.get("RssAnon", 0),
+            file_kib=fields.get("RssFile", 0),
+            swap_kib=fields.get("VmSwap", 0),
         )
     except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
         return None
 
 
-def append_resource_sample(path, pid, accepted):
-    memory = process_memory_kib(pid)
-    if memory is None:
-        return None
-    rss_kib, peak_rss_kib, rss_anon_kib, rss_file_kib, swap_kib = memory
-    record = {
-        "timestamp_unix": time.time(),
-        "pid": pid,
-        "accepted": accepted,
-        "rss_kib": rss_kib,
-        "peak_rss_kib": peak_rss_kib,
-        "rss_anon_kib": rss_anon_kib,
-        "rss_file_kib": rss_file_kib,
-        "swap_kib": swap_kib,
-    }
-    with path.open("a") as output:
-        json.dump(record, output, separators=(",", ":"))
-        output.write("\n")
-    return memory
+class ResourceSampler:
+    """Writes one `resources.jsonl` record per poll and carries the peak anon RSS.
+
+    The kernel publishes a high-water mark for total RSS (`VmHWM`) but none for the anon subset,
+    so the peak that actually bounds a run has to be accumulated across polls. That makes it a
+    sampled maximum: a spike shorter than the poll interval can be missed, which is the price of
+    tracking the figure that is not dominated by reclaimable page cache.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.peak_anon_kib = 0
+
+    def sample(self, pid, accepted):
+        memory = process_memory_kib(pid)
+        if memory is None:
+            return None
+        self.peak_anon_kib = max(self.peak_anon_kib, memory.anon_kib)
+        record = {
+            "timestamp_unix": time.time(),
+            "pid": pid,
+            "accepted": accepted,
+            "rss_anon_kib": memory.anon_kib,
+            "peak_rss_anon_kib": self.peak_anon_kib,
+            "rss_kib": memory.rss_kib,
+            "peak_rss_kib": memory.peak_rss_kib,
+            "rss_file_kib": memory.file_kib,
+            "swap_kib": memory.swap_kib,
+        }
+        with self.path.open("a") as output:
+            json.dump(record, output, separators=(",", ":"))
+            output.write("\n")
+        return memory
+
+    def progress_summary(self, memory):
+        """Console fragment for one sample: anon leads, and the reclaimable rest is labelled."""
+        if memory is None:
+            return ""
+        return (
+            f" anon={memory.anon_kib / 1024:.0f}MiB"
+            f" anon_peak={self.peak_anon_kib / 1024:.0f}MiB"
+            f" rss={memory.rss_kib / 1024:.0f}MiB"
+            f" file_cache={memory.file_kib / 1024:.0f}MiB"
+        )
 
 
 def benchmark_environment(
@@ -248,6 +292,7 @@ def main():
     stopped_on_deadline = False
     deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
     last_progress = None
+    sampler = ResourceSampler(resource_path)
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,
@@ -268,19 +313,14 @@ def main():
                     allow_incomplete_tail=True,
                 )
                 seen, published = warming_progress(builder_path)
-                memory = append_resource_sample(resource_path, process.pid, len(accepted))
+                memory = sampler.sample(process.pid, len(accepted))
                 progress = (len(accepted), seen, published)
                 if progress != last_progress:
-                    memory_summary = (
-                        f" rss={memory[0] / 1024:.0f}MiB peak={memory[1] / 1024:.0f}MiB"
-                        if memory is not None
-                        else ""
-                    )
                     print(
                         f"accepted={len(accepted)}/{args.samples} warmup={stats.warmup} "
                         f"overlap={stats.contaminated} pending={stats.pending_next_engine} "
                         f"blocks={seen} built={published}"
-                        f"{memory_summary}",
+                        f"{sampler.progress_summary(memory)}",
                         flush=True,
                     )
                     last_progress = progress
