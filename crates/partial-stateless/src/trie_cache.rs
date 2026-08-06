@@ -7,7 +7,7 @@
 
 use crate::{
     accessed_state::BlockAccessedState,
-    network_cache::{MissResult, NetworkStateCache},
+    network_cache::{MembershipDelta, MissResult, NetworkStateCache},
     participant::ParticipantCache,
     shared_trie::SharedSparseTrie,
 };
@@ -48,6 +48,21 @@ pub struct PartialTrieNodeCache {
     /// Retention is idempotent on a trie that has not been written to since it was pruned to the
     /// same paths, so this is what makes skipping it safe rather than merely cheap.
     retained_storage_paths: B256Map<Arc<[Nibbles]>>,
+    /// The sorted, deduplicated account-trie paths the last prune retained.
+    ///
+    /// Kept so the next block can patch it with the ~5% of keys that moved instead of rehashing
+    /// and re-sorting every warm account. Equal by construction to what a full rebuild produces —
+    /// [`Self::retain_from_value_cache`] falls back to that rebuild whenever it cannot prove the
+    /// value cache is exactly one block ahead of this state, and the differential test in
+    /// `tests/delta_retention.rs` is what holds the two implementations to the same output.
+    retained_account_paths: Vec<Nibbles>,
+    /// The value-cache height the three derived sets above describe.
+    ///
+    /// `None` on a cache that has never retained. The incremental path is taken only when the
+    /// value cache is exactly one block ahead of this, because that is the only distance the undo
+    /// log can describe; every other distance — a gap, a rollback, a restore — falls back to the
+    /// full rebuild rather than patching state whose base is unproven.
+    synced_to_block: Option<u64>,
 }
 
 impl Clone for PartialTrieNodeCache {
@@ -75,6 +90,8 @@ impl Clone for PartialTrieNodeCache {
             warm_storage: self.warm_storage.clone(),
             state_root: self.state_root,
             retained_storage_paths: self.retained_storage_paths.clone(),
+            retained_account_paths: self.retained_account_paths.clone(),
+            synced_to_block: self.synced_to_block,
         }
     }
 }
@@ -94,6 +111,8 @@ impl PartialTrieNodeCache {
             warm_storage: HashSet::default(),
             state_root: None,
             retained_storage_paths: B256Map::default(),
+            retained_account_paths: Vec::new(),
+            synced_to_block: None,
         }
     }
 
@@ -148,6 +167,67 @@ impl PartialTrieNodeCache {
     /// copy-on-write storage tries that no-op would cost a full copy of a trie the block never
     /// touched — the copy the snapshot exists to avoid.
     pub fn retain_from_value_cache(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
+        // The undo record names the keys the newest block moved, which is the ~5% this cache's
+        // derived sets have to change. It is only usable when it describes the step from the
+        // height these sets already reflect; anything else — a gap, a rollback, a restore, a
+        // pruned undo log — falls back to the rebuild, which is always correct.
+        let delta = match (self.synced_to_block, value_cache.last_block_membership_delta()) {
+            (Some(synced), Some(delta)) if delta.block_number == synced + 1 => Some(delta),
+            _ => None,
+        };
+        let timings = match delta {
+            Some(delta) => self.retain_incrementally(&delta),
+            None => {
+                let mut timings = self.retain_fully(value_cache);
+                timings.full_rebuild = true;
+                timings
+            }
+        };
+        self.synced_to_block = Some(value_cache.current_block());
+        timings
+    }
+
+    /// Retains from scratch, discarding any incremental state.
+    ///
+    /// The reference [`Self::retain_from_value_cache`]'s delta path is held to: the two must leave
+    /// the cache in the same state, and `tests/delta_retention.rs` is where that is enforced.
+    pub fn retain_reference(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
+        let timings = self.retain_fully(value_cache);
+        self.synced_to_block = Some(value_cache.current_block());
+        timings
+    }
+
+    /// Commitment to everything retention derives, so two implementations can be compared as one
+    /// value rather than field by field.
+    ///
+    /// Deliberately separate from [`Self::cache_root`], which commits warm membership and the
+    /// state root — the protocol's surface. The retained *paths* are a local derivation of that
+    /// membership, and this is what proves the derivation itself agrees.
+    pub fn retention_fingerprint(&self) -> B256 {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"PartialTrieNodeCacheRetention/v1");
+        preimage.extend_from_slice(&(self.retained_account_paths.len() as u64).to_be_bytes());
+        for path in &self.retained_account_paths {
+            preimage.extend_from_slice(&path.to_vec());
+        }
+        let mut storage: Vec<_> = self.retained_storage_paths.iter().collect();
+        storage.sort_unstable_by_key(|(hashed_address, _)| **hashed_address);
+        preimage.extend_from_slice(&(storage.len() as u64).to_be_bytes());
+        for (hashed_address, slots) in storage {
+            preimage.extend_from_slice(hashed_address.as_slice());
+            preimage.extend_from_slice(&(slots.len() as u64).to_be_bytes());
+            for path in slots.iter() {
+                preimage.extend_from_slice(&path.to_vec());
+            }
+        }
+        keccak256(preimage)
+    }
+
+    /// Recomputes every retained path from the value cache, ignoring whatever was derived before.
+    ///
+    /// The reference implementation: correct from any starting state, and the oracle
+    /// [`Self::retain_incrementally`] is held to.
+    fn retain_fully(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
         let mut timings = RetentionTimings::default();
 
         let start = Instant::now();
@@ -168,63 +248,200 @@ impl PartialTrieNodeCache {
         timings.storage_paths_us = start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
-        let mut retained_account_paths: Vec<_> = retained_accounts
+        self.retained_account_paths = retained_accounts
             .into_iter()
             .map(|address| Nibbles::unpack(keccak256(address)))
             .collect();
-        retained_account_paths.sort_unstable();
-        retained_account_paths.dedup();
-        timings.account_paths = retained_account_paths.len() as u64;
+        self.retained_account_paths.sort_unstable();
+        self.retained_account_paths.dedup();
+        timings.account_paths = self.retained_account_paths.len() as u64;
         timings.account_paths_us = start.elapsed().as_micros() as u64;
-
-        let start = Instant::now();
-        if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
-            trie.retain_witness_paths(&retained_account_paths);
-        }
-        timings.account_trie_us = start.elapsed().as_micros() as u64;
 
         let start = Instant::now();
         for slots in retained_storage.values_mut() {
             slots.sort_unstable();
             slots.dedup();
         }
+        self.retained_storage_paths = retained_storage
+            .into_iter()
+            .map(|(hashed_address, slots)| (hashed_address, Arc::from(slots)))
+            .collect();
+        timings.storage_paths_us += start.elapsed().as_micros() as u64;
 
-        let previous_paths = std::mem::take(&mut self.retained_storage_paths);
-        let mut current_paths = B256Map::with_capacity_and_hasher(
-            self.sparse.storage_tries_ref().len(),
-            Default::default(),
-        );
+        timings.account_trie_us = self.prune_account_trie();
+        // Nothing is known to be unmoved after a full rebuild, so every trie is pruned. This is
+        // the cost the incremental path exists to avoid, not a case it has to reproduce.
+        let (storage_us, pruned, skipped) = self.prune_storage_tries(&B256Map::default(), true);
+        timings.storage_tries_us = storage_us;
+        timings.storage_tries_pruned = pruned;
+        timings.storage_tries_skipped = skipped;
+        timings
+    }
+
+    /// Patches the retained sets with the keys one block moved.
+    ///
+    /// Every step here is the delta-shaped equivalent of a line in [`Self::retain_fully`], and the
+    /// two must produce byte-identical sets — that equality is a differential test, not a comment.
+    fn retain_incrementally(&mut self, delta: &MembershipDelta) -> RetentionTimings {
+        let mut timings = RetentionTimings::default();
+
+        let start = Instant::now();
+        for address in &delta.accounts_removed {
+            self.warm_accounts.remove(address);
+        }
+        for address in &delta.accounts_added {
+            self.warm_accounts.insert(*address);
+        }
+        for key in &delta.storage_removed {
+            self.warm_storage.remove(key);
+        }
+        for key in &delta.storage_added {
+            self.warm_storage.insert(*key);
+        }
+        timings.warm_membership_us = start.elapsed().as_micros() as u64;
+
+        // Which addresses own a storage slot that moved, and how. Grouping first means an address
+        // whose slots both entered and left rebuilds its sorted vector once.
+        let start = Instant::now();
+        let mut moved = B256Map::<StorageSlotDelta>::default();
+        for (address, slot) in &delta.storage_removed {
+            moved
+                .entry(keccak256(address))
+                .or_insert_with(|| StorageSlotDelta::for_address(*address))
+                .removed
+                .push(Nibbles::unpack(keccak256(slot)));
+        }
+        for (address, slot) in &delta.storage_added {
+            moved
+                .entry(keccak256(address))
+                .or_insert_with(|| StorageSlotDelta::for_address(*address))
+                .added
+                .push(Nibbles::unpack(keccak256(slot)));
+        }
+
+        // An address is retained when it owns a warm account entry or at least one warm slot, so
+        // the account-path set only moves where one of those two crossed zero.
+        let mut paths_added = Vec::new();
+        let mut paths_removed = Vec::new();
+        for (hashed_address, slots) in &moved {
+            let was_retained = self.is_retained_address(&slots.address, *hashed_address);
+            let updated = self.apply_slot_delta(*hashed_address, slots);
+            let is_retained = self.warm_accounts.contains(&slots.address) || !updated.is_empty();
+            match (was_retained, is_retained) {
+                (false, true) => paths_added.push(Nibbles::unpack(*hashed_address)),
+                (true, false) => paths_removed.push(Nibbles::unpack(*hashed_address)),
+                _ => {}
+            }
+            if updated.is_empty() {
+                self.retained_storage_paths.remove(hashed_address);
+            } else {
+                self.retained_storage_paths.insert(*hashed_address, Arc::from(updated));
+            }
+        }
+        timings.storage_paths_us = start.elapsed().as_micros() as u64;
+
+        // Accounts that entered or left the flat window. An address that still owns warm slots is
+        // retained either way, which is why membership is re-read rather than assumed.
+        let start = Instant::now();
+        for address in &delta.accounts_added {
+            let hashed = keccak256(address);
+            let already = self.retained_storage_paths.contains_key(&hashed);
+            if !already && !moved.contains_key(&hashed) {
+                paths_added.push(Nibbles::unpack(hashed));
+            } else if !already {
+                // The storage pass above already decided this address, and it decided "not
+                // retained" only because the account had not been inserted yet.
+                let path = Nibbles::unpack(hashed);
+                if !paths_added.contains(&path) {
+                    paths_added.push(path);
+                }
+            }
+        }
+        for address in &delta.accounts_removed {
+            let hashed = keccak256(address);
+            if !self.retained_storage_paths.contains_key(&hashed) {
+                let path = Nibbles::unpack(hashed);
+                if let Some(position) = paths_added.iter().position(|candidate| *candidate == path)
+                {
+                    paths_added.swap_remove(position);
+                } else {
+                    paths_removed.push(path);
+                }
+            }
+        }
+        splice_sorted(&mut self.retained_account_paths, &mut paths_added, &paths_removed);
+        timings.account_paths = self.retained_account_paths.len() as u64;
+        timings.account_paths_us = start.elapsed().as_micros() as u64;
+
+        timings.account_trie_us = self.prune_account_trie();
+        let (storage_us, pruned, skipped) = self.prune_storage_tries(&moved, false);
+        timings.storage_tries_us = storage_us;
+        timings.storage_tries_pruned = pruned;
+        timings.storage_tries_skipped = skipped;
+        timings
+    }
+
+    /// True when `address` is in the retained account-path set as the cache currently stands.
+    fn is_retained_address(&self, address: &Address, hashed_address: B256) -> bool {
+        self.warm_accounts.contains(address) ||
+            self.retained_storage_paths
+                .get(&hashed_address)
+                .is_some_and(|slots| !slots.is_empty())
+    }
+
+    /// The address's new sorted slot-path set after `delta` is applied to the previous one.
+    fn apply_slot_delta(&self, hashed_address: B256, delta: &StorageSlotDelta) -> Vec<Nibbles> {
+        let mut slots: Vec<Nibbles> = self
+            .retained_storage_paths
+            .get(&hashed_address)
+            .map(|previous| previous.to_vec())
+            .unwrap_or_default();
+        let mut added = delta.added.clone();
+        splice_sorted(&mut slots, &mut added, &delta.removed);
+        slots
+    }
+
+    /// Prunes the account trie to the retained paths, returning what it cost.
+    fn prune_account_trie(&mut self) -> u64 {
+        let start = Instant::now();
+        if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
+            trie.retain_witness_paths(&self.retained_account_paths);
+        }
+        start.elapsed().as_micros() as u64
+    }
+
+    /// Prunes every storage trie the block could have moved, and drops the ones no longer retained.
+    ///
+    /// `moved` names the tries whose retained slot set changed. A trie outside it that the
+    /// transition also never wrote to is already pruned to exactly these paths, and pruning it
+    /// again would reproduce the shape it has — which under copy-on-write costs a full copy of a
+    /// trie the block never touched, the copy the snapshot exists to avoid.
+    fn prune_storage_tries(
+        &mut self,
+        moved: &B256Map<StorageSlotDelta>,
+        prune_everything: bool,
+    ) -> (u64, u64, u64) {
+        let start = Instant::now();
+        let retained = std::mem::take(&mut self.retained_storage_paths);
         let mut pruned = 0;
         let mut skipped = 0;
         self.sparse.storage_tries_mut().retain(|hashed_address, trie| {
-            let Some(slots) = retained_storage.get_mut(hashed_address) else { return false };
-            let previous = previous_paths.get(hashed_address);
+            let Some(slots) = retained.get(hashed_address) else { return false };
             // `as_revealed_ref` first: `as_revealed_mut` hands out a `&mut SharedSparseTrie`, which
             // is harmless on its own, but reaching for it before knowing whether the prune is
             // needed makes the skip easy to lose in a later edit.
             let untouched = trie.as_revealed_ref().is_some_and(SharedSparseTrie::is_untouched);
-            let unchanged = previous.is_some_and(|previous| **previous == slots[..]);
+            let unchanged = !prune_everything && !moved.contains_key(hashed_address);
             if untouched && unchanged {
                 skipped += 1;
             } else if let Some(trie) = trie.as_revealed_mut() {
                 trie.retain_witness_paths(slots);
                 pruned += 1;
             }
-            // Reusing the parent's handle when the set did not move keeps the next snapshot's copy
-            // of this map a refcount bump rather than a walk of every retained slot path.
-            let paths = match previous {
-                Some(previous) if unchanged => previous.clone(),
-                _ => Arc::from(std::mem::take(slots)),
-            };
-            current_paths.insert(*hashed_address, paths);
             true
         });
-        self.retained_storage_paths = current_paths;
-        timings.storage_tries_pruned = pruned;
-        timings.storage_tries_skipped = skipped;
-        timings.storage_tries_us = start.elapsed().as_micros() as u64;
-
-        timings
+        self.retained_storage_paths = retained;
+        (start.elapsed().as_micros() as u64, pruned, skipped)
     }
 
     /// Storage tries this snapshot still shares with the generation it was cloned from.
@@ -563,6 +780,62 @@ impl PartialTrieNodeCache {
     }
 }
 
+/// The slot paths one address gained and lost in a block, plus the address they belong to.
+///
+/// Keyed by hashed address so it can be looked up against the storage-trie map directly; the
+/// unhashed address is carried because warm account membership is keyed the other way.
+#[derive(Debug, Clone)]
+struct StorageSlotDelta {
+    address: Address,
+    added: Vec<Nibbles>,
+    removed: Vec<Nibbles>,
+}
+
+impl StorageSlotDelta {
+    const fn for_address(address: Address) -> Self {
+        Self { address, added: Vec::new(), removed: Vec::new() }
+    }
+}
+
+/// Removes `removed` from the sorted `target`, then merges `added` into it, keeping it sorted and
+/// deduplicated.
+///
+/// One pass over `target` rather than a binary-search insert per key: a block moves thousands of
+/// keys in a set of tens of thousands, so shifting the tail once beats shifting it once per key.
+/// `added` is sorted in place because the caller has no use for its original order.
+fn splice_sorted(target: &mut Vec<Nibbles>, added: &mut Vec<Nibbles>, removed: &[Nibbles]) {
+    if !removed.is_empty() {
+        let drop: HashSet<Nibbles> = removed.iter().copied().collect();
+        target.retain(|path| !drop.contains(path));
+    }
+    if added.is_empty() {
+        return
+    }
+    added.sort_unstable();
+    added.dedup();
+
+    let mut merged = Vec::with_capacity(target.len() + added.len());
+    let mut left = target.iter().copied().peekable();
+    let mut right = added.iter().copied().peekable();
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some(a), Some(b)) if a < b => merged.push(left.next().expect("peeked")),
+            (Some(a), Some(b)) => {
+                // Equal keys collapse: the full rebuild deduplicates through a set, so an address
+                // already retained must not appear twice here either.
+                if a == b {
+                    left.next();
+                }
+                merged.push(right.next().expect("peeked"));
+            }
+            (Some(_), None) => merged.push(left.next().expect("peeked")),
+            (None, Some(_)) => merged.push(right.next().expect("peeked")),
+            (None, None) => break,
+        }
+    }
+    *target = merged;
+}
+
 /// Where [`PartialTrieNodeCache::retain_from_value_cache`] spent a block's retention budget.
 ///
 /// Retention is the largest validator phase, and its published cost has only ever been one
@@ -589,6 +862,14 @@ pub struct RetentionTimings {
     pub storage_tries_pruned: u64,
     /// Storage tries skipped because they were untouched and their slot set had not moved.
     pub storage_tries_skipped: u64,
+    /// True when the retained sets were rebuilt from the whole value cache rather than patched.
+    ///
+    /// The delta path needs the value cache to be exactly one block ahead of the state the trie
+    /// cache already reflects, which every ordinary block satisfies. Anything else — a rollback, a
+    /// gap, a restore, an undo log pruned below finality — falls back here. Reported because the
+    /// fallback is correct but expensive, so its *rate* is the thing worth watching in production:
+    /// a run where it fires often has lost the optimization without losing correctness.
+    pub full_rebuild: bool,
 }
 
 impl RetentionTimings {

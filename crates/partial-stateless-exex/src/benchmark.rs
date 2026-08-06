@@ -51,6 +51,11 @@ pub struct ValidationPhaseTimings {
     pub retention_account_paths: u64,
     pub retention_storage_tries_pruned: u64,
     pub retention_storage_tries_skipped: u64,
+    /// 1 when the retained sets were rebuilt from the whole value cache instead of patched.
+    ///
+    /// Summed over a run this is the fallback count: the delta path is correct either way, so
+    /// this measures how much of the optimization a run actually got.
+    pub retention_full_rebuild: u64,
     pub next_cache_anchor_us: u64,
     pub trie_commit_us: u64,
     /// Measured validator work outside the named phase boundaries (executor setup/fingerprints).

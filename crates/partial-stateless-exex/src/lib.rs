@@ -706,12 +706,18 @@ where
                     "Chain reorg detected — recovering the coordinated pair at the common ancestor"
                 );
 
-                pair.readiness.begin_recovery(*old.range().start());
                 // The pair still sits on the abandoned branch until a rebuild replaces it. It is
                 // left in place rather than cleared: `Recovering` already refuses every block, and
                 // clearing it here would make a failed recovery look like a clean cold start,
                 // which is exactly the distinction the state exists to preserve.
-                recover_at(&ctx, &options, &mut pair, ancestor_hash, &mut rebuild_failures);
+                recover_at(
+                    &ctx,
+                    &options,
+                    &mut pair,
+                    *old.range().start(),
+                    ancestor_hash,
+                    &mut rebuild_failures,
+                );
 
                 // Apply the new canonical chain block-by-block, so the builder still produces a
                 // sidecar for each block on the new branch. Rebuilding directly at the new tip
@@ -745,9 +751,14 @@ where
                     "Chain reverted — recovering the coordinated pair at the new tip"
                 );
 
-                pair.readiness.begin_recovery(*old.range().start());
-                let recovered =
-                    recover_at(&ctx, &options, &mut pair, new_tip_hash, &mut rebuild_failures);
+                let recovered = recover_at(
+                    &ctx,
+                    &options,
+                    &mut pair,
+                    *old.range().start(),
+                    new_tip_hash,
+                    &mut rebuild_failures,
+                );
 
                 // A pair that could not be rebuilt still describes the reverted branch, and
                 // persisting it would let a restart reload exactly that.
@@ -980,6 +991,7 @@ fn recover_at<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
     pair: &mut CoordinatedPair,
+    unwound_from: u64,
     target_hash: Option<B256>,
     failures: &mut u32,
 ) -> bool
@@ -988,6 +1000,7 @@ where
     Node::Provider: BlockReader<Block = BlockTy<EthPrimitives>>,
 {
     let Some(target_hash) = target_hash else {
+        pair.readiness.begin_recovery(unwound_from);
         error!(
             target: "partial_stateless",
             "Recovery target is unknown: the notification carried no blocks to take a parent hash \
@@ -996,44 +1009,109 @@ where
         return false
     };
 
-    // Depth-1 fast path. The retained generation is only usable when it *is* the target, which is
-    // checked against the canonical header rather than against anything the pair derived itself.
-    // Every rejection falls through to the rebuild below, including a failed header lookup: the
-    // rebuild is the correct answer whenever the cheap answer cannot be proven.
-    match ctx.provider().sealed_header_by_hash(target_hash) {
-        Ok(Some(header)) => {
-            let started = Instant::now();
-            if let Some(ready) = pair.restore_retained_generation(
-                target_hash,
-                header.state_root,
-                options.config.cache_policy_id(),
-            ) {
-                *failures = 0;
-                info!(
-                    target: "partial_stateless",
-                    block = ready.anchor.block_number,
-                    block_hash = ?ready.anchor.block_hash,
-                    restore_us = started.elapsed().as_micros() as u64,
-                    "Recovered by undoing one block from the retained generation instead of \
-                     rebuilding"
-                );
-                return true
-            }
-        }
-        Ok(None) => debug!(
-            target: "partial_stateless",
-            ?target_hash,
-            "No canonical header for the recovery target; rebuilding"
-        ),
-        Err(err) => debug!(
-            target: "partial_stateless",
-            ?target_hash,
-            %err,
-            "Could not read the recovery target's header; rebuilding"
-        ),
+    // Depth-1 fast path. Every rejection falls through to the rebuild below, including a failed
+    // header lookup: the rebuild is the correct answer whenever the cheap answer cannot be proven.
+    if inject_recovery(
+        pair,
+        &CanonicalChain(ctx.provider()),
+        unwound_from,
+        target_hash,
+        options.config.cache_policy_id(),
+    )
+    .is_some()
+    {
+        *failures = 0;
+        return true
     }
 
     rebuild_pair_at(ctx, options, pair, target_hash, failures)
+}
+
+/// The canonical state root for a block hash — the only thing depth-1 recovery asks of the node.
+///
+/// This is a trait rather than a direct `ctx.provider()` call so the fast path can be driven
+/// without a database. The retained generation is only usable when it *is* the recovery target,
+/// and that is checked against the canonical header rather than against anything the pair derived
+/// itself; a fake chain that answers this one question is therefore enough to exercise the whole
+/// path, which is what [`inject_recovery`] and the equivalence gate rely on.
+trait CanonicalStateRoots {
+    /// `None` means there is no canonical header for `hash`, which is a rejection, not an error.
+    fn state_root_of(&self, hash: B256) -> ProviderResult<Option<B256>>;
+}
+
+/// Adapts a node provider to [`CanonicalStateRoots`].
+struct CanonicalChain<P>(P);
+
+impl<P: HeaderProvider<Header: AlloyBlockHeader>> CanonicalStateRoots for CanonicalChain<P> {
+    fn state_root_of(&self, hash: B256) -> ProviderResult<Option<B256>> {
+        Ok(self.0.sealed_header_by_hash(hash)?.map(|header| header.state_root()))
+    }
+}
+
+/// Drives the recovery half of a `ChainReorged` or `ChainReverted` notification.
+///
+/// This is the notification-injection hook. Both handlers do exactly this — mark the tracker
+/// `Recovering` at the first unwound height, then attempt the depth-1 undo — and everything after
+/// it differs only in whether a new branch follows. Mainnet produces the notification that reaches
+/// this code roughly once a day and never at a depth the test chooses, so the gate on recovery
+/// *equivalence* cannot be a live observation; injecting the notification against a chain the test
+/// controls is what makes it a gate.
+///
+/// The rebuild fallback is deliberately on the caller's side. It needs a database, and a stateless
+/// verifier does not have one, so a verifier's only recovery is the path this function covers.
+fn inject_recovery(
+    pair: &mut CoordinatedPair,
+    chain: &impl CanonicalStateRoots,
+    unwound_from: u64,
+    target_hash: B256,
+    cache_policy_id: B256,
+) -> Option<ReadyParent> {
+    pair.readiness.begin_recovery(unwound_from);
+    try_depth_one_recovery(pair, chain, target_hash, cache_policy_id)
+}
+
+/// Undoes exactly one block to return the pair to `target_hash`, or `None` to fall back.
+///
+/// Split out of [`recover_at`] so that everything between a notification and the restored pair can
+/// run against a fake chain. Nothing here touches the database, and the rebuild — which does — is
+/// deliberately left on the caller's side of the seam.
+fn try_depth_one_recovery(
+    pair: &mut CoordinatedPair,
+    chain: &impl CanonicalStateRoots,
+    target_hash: B256,
+    cache_policy_id: B256,
+) -> Option<ReadyParent> {
+    let state_root = match chain.state_root_of(target_hash) {
+        Ok(Some(state_root)) => state_root,
+        Ok(None) => {
+            debug!(
+                target: "partial_stateless",
+                ?target_hash,
+                "No canonical header for the recovery target; rebuilding"
+            );
+            return None
+        }
+        Err(err) => {
+            debug!(
+                target: "partial_stateless",
+                ?target_hash,
+                %err,
+                "Could not read the recovery target's header; rebuilding"
+            );
+            return None
+        }
+    };
+
+    let started = Instant::now();
+    let ready = pair.restore_retained_generation(target_hash, state_root, cache_policy_id)?;
+    info!(
+        target: "partial_stateless",
+        block = ready.anchor.block_number,
+        block_hash = ?ready.anchor.block_hash,
+        restore_us = started.elapsed().as_micros() as u64,
+        "Recovered by undoing one block from the retained generation instead of rebuilding"
+    );
+    Some(ready)
 }
 
 fn rebuild_pair_at<Node>(
@@ -1580,8 +1658,9 @@ fn process_rss_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_after_cold_reset, admit_block, block_context, observe_readiness, BlockAdmission,
-        BlockContext, CacheConfig, CoordinatedPair, PartialTrieNodeCache, SidecarRole,
+        admit_after_cold_reset, admit_block, block_context, inject_recovery, observe_readiness,
+        BlockAdmission, BlockContext, CacheConfig, CanonicalStateRoots, CoordinatedPair,
+        PartialTrieNodeCache, ProviderResult, SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -2025,6 +2104,178 @@ mod tests {
             "the refusal is taken before anything is mutated, so a rebuild starts from a clean pair"
         );
         assert!(!matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
+    /// A canonical chain the test controls, answering the one question recovery asks of a node.
+    enum FakeChain {
+        /// The recovery target is canonical and has this state root.
+        Canonical(B256, B256),
+        /// No canonical header for the target — a rejection, not an error.
+        Unknown,
+        /// The lookup itself failed, which must be a fallback rather than a false recovery.
+        Unavailable,
+    }
+
+    impl CanonicalStateRoots for FakeChain {
+        fn state_root_of(&self, hash: B256) -> ProviderResult<Option<B256>> {
+            match self {
+                Self::Canonical(known, state_root) if *known == hash => Ok(Some(*state_root)),
+                Self::Canonical(..) | Self::Unknown => Ok(None),
+                Self::Unavailable => {
+                    Err(reth_provider::ProviderError::TrieWitnessError("injected".to_string()))
+                }
+            }
+        }
+    }
+
+    /// Advances the flat cache by a block that touches `address`, so two branches can be made to
+    /// leave different residue behind.
+    fn apply_touching(pair: &mut CoordinatedPair, number: u64, address: Address) {
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            address,
+            AccountData { nonce: number, balance: U256::from(number), code_hash: None },
+        );
+        pair.cache.on_block_executed(number, &accessed);
+    }
+
+    /// The pair a depth-1 reorg finds, plus a reference pair that never saw the abandoned block.
+    ///
+    /// The abandoned block touches `ABANDONED` and nothing else does, so any residue the rollback
+    /// fails to remove shows up as a `cache_root` divergence rather than having to be looked for.
+    fn pair_and_reference_before_a_reorg() -> (CoordinatedPair, CoordinatedPair, CacheConfig, B256)
+    {
+        const ABANDONED: Address = Address::repeat_byte(0xa1);
+        let config = CacheConfig::default();
+        let (package, checkpoint, state_root) = warm_snapshot(&config);
+        let retained = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let current = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let reference = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+            .expect("an honest snapshot restores");
+
+        let mut pair = CoordinatedPair {
+            cache: current.cache,
+            trie_cache: current.trie_cache,
+            readiness: current.readiness,
+            last_readiness_label: CacheReadiness::Cold.label(),
+            previous_generation: None,
+        };
+        let reference = CoordinatedPair {
+            cache: reference.cache,
+            trie_cache: reference.trie_cache,
+            readiness: reference.readiness,
+            last_readiness_label: CacheReadiness::Cold.label(),
+            previous_generation: None,
+        };
+
+        apply_touching(&mut pair, SNAP_BLOCK + 1, ABANDONED);
+        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
+        let applied = BlockContext {
+            number: SNAP_BLOCK + 1,
+            hash: numbered(SNAP_BLOCK + 1, 0xaa),
+            parent_hash: SNAP_HASH,
+            state_root,
+        };
+        admit(&mut pair, &applied);
+        observe_readiness(&mut pair, &applied);
+
+        (pair, reference, config, state_root)
+    }
+
+    #[test]
+    fn a_recovered_pair_is_indistinguishable_from_one_that_never_saw_the_block() {
+        let (mut pair, mut reference, config, state_root) = pair_and_reference_before_a_reorg();
+        let chain = FakeChain::Canonical(SNAP_HASH, state_root);
+
+        assert_ne!(
+            pair.fingerprint(),
+            reference.fingerprint(),
+            "the abandoned block must have moved the pair, or this proves nothing"
+        );
+
+        inject_recovery(&mut pair, &chain, SNAP_BLOCK + 1, SNAP_HASH, config.cache_policy_id())
+            .expect("the retained generation is exactly the reorg target");
+
+        assert_eq!(
+            pair.fingerprint(),
+            reference.fingerprint(),
+            "a recovered pair must equal one that never saw the abandoned block, on every field"
+        );
+
+        // Equality at the anchor is necessary but not sufficient: `last_accessed_block` decides
+        // what the *next* eviction does, and no state proof attests to it. Driving both pairs
+        // through the winning block is what would expose residue the rollback left behind.
+        const WINNER: Address = Address::repeat_byte(0xb2);
+        apply_touching(&mut pair, SNAP_BLOCK + 1, WINNER);
+        apply_touching(&mut reference, SNAP_BLOCK + 1, WINNER);
+        assert_eq!(
+            pair.fingerprint(),
+            reference.fingerprint(),
+            "and it must still agree after the winning branch is applied to both"
+        );
+    }
+
+    #[test]
+    fn a_pure_revert_returns_the_pair_to_the_new_tip_with_no_branch_to_follow() {
+        let (mut pair, reference, config, state_root) = pair_and_reference_before_a_reorg();
+        let chain = FakeChain::Canonical(SNAP_HASH, state_root);
+
+        // `ChainReverted` carries only the dropped branch: the pair recovers at the new tip and
+        // then simply stops, with no replacement blocks to apply.
+        let ready =
+            inject_recovery(&mut pair, &chain, SNAP_BLOCK + 1, SNAP_HASH, config.cache_policy_id())
+                .expect(
+                    "a revert to the retained generation takes the same fast path a reorg does",
+                );
+
+        assert_eq!(ready.anchor.block_number, SNAP_BLOCK);
+        assert_eq!(ready.anchor.block_hash, SNAP_HASH);
+        assert_eq!(pair.fingerprint(), reference.fingerprint());
+        assert!(
+            matches!(pair.readiness.state(), CacheReadiness::Ready(_)),
+            "a reverted pair is Ready at the new tip, not left Recovering"
+        );
+    }
+
+    #[test]
+    fn an_unknown_recovery_target_leaves_a_verifier_with_nothing_to_fall_back_to() {
+        let (mut pair, _, config, _) = pair_and_reference_before_a_reorg();
+
+        assert!(
+            inject_recovery(
+                &mut pair,
+                &FakeChain::Unknown,
+                SNAP_BLOCK + 1,
+                SNAP_HASH,
+                config.cache_policy_id()
+            )
+            .is_none(),
+            "an unproven target must never install the retained generation"
+        );
+        // A full node rebuilds from here. A stateless verifier has no database to rebuild from, so
+        // this is where its recovery ends — recorded as the shape of the gap, not as a pass.
+        assert!(matches!(pair.readiness.state(), CacheReadiness::Recovering { .. }));
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1, "and nothing was mutated");
+    }
+
+    #[test]
+    fn a_failed_header_lookup_is_a_fallback_rather_than_a_false_recovery() {
+        let (mut pair, _, config, _) = pair_and_reference_before_a_reorg();
+
+        assert!(
+            inject_recovery(
+                &mut pair,
+                &FakeChain::Unavailable,
+                SNAP_BLOCK + 1,
+                SNAP_HASH,
+                config.cache_policy_id()
+            )
+            .is_none(),
+            "a lookup that errored proves nothing, so it must be treated as a rejection"
+        );
+        assert!(matches!(pair.readiness.state(), CacheReadiness::Recovering { .. }));
     }
 
     #[test]

@@ -368,6 +368,7 @@ where
         retention_account_paths: cache_timings.retention.account_paths,
         retention_storage_tries_pruned: cache_timings.retention.storage_tries_pruned,
         retention_storage_tries_skipped: cache_timings.retention.storage_tries_skipped,
+        retention_full_rebuild: u64::from(cache_timings.retention.full_rebuild),
         next_cache_anchor_us: cache_timings.anchor_us,
         trie_commit_us: cache_timings.commit_us,
         provider_root_us,

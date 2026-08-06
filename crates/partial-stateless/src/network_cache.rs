@@ -138,6 +138,37 @@ pub struct UpdateStats {
     pub codes_evicted: usize,
 }
 
+/// Which keys entered or left the cache when the newest undo record's block was applied.
+///
+/// Derived from the undo record rather than recorded alongside it: the record already names every
+/// key the block touched or evicted, so this is a read over roughly the 5% of the cache a block
+/// moves rather than a second pass over the whole map. Refreshes are deliberately absent — they
+/// change `last_accessed_block`, which the cache root commits, but not membership, which is the
+/// only thing trie retention is a function of.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MembershipDelta {
+    /// The block whose application produced this delta.
+    pub block_number: u64,
+    /// Accounts absent before the block and present after it.
+    pub accounts_added: Vec<Address>,
+    /// Accounts present before the block and absent after it, whether evicted or rolled back.
+    pub accounts_removed: Vec<Address>,
+    /// Storage slots absent before the block and present after it.
+    pub storage_added: Vec<(Address, B256)>,
+    /// Storage slots present before the block and absent after it.
+    pub storage_removed: Vec<(Address, B256)>,
+}
+
+impl MembershipDelta {
+    /// True when nothing entered or left, so a consumer's derived state is already correct.
+    pub fn is_empty(&self) -> bool {
+        self.accounts_added.is_empty() &&
+            self.accounts_removed.is_empty() &&
+            self.storage_added.is_empty() &&
+            self.storage_removed.is_empty()
+    }
+}
+
 /// Snapshot of the cache state at a point in time.
 #[derive(Debug, Clone, Default)]
 pub struct CacheSnapshot {
@@ -595,6 +626,34 @@ impl NetworkStateCache {
     /// block); otherwise [`CacheError::RollbackMismatch`] is returned and the caller
     /// should cold-reset via [`reset`](Self::reset). Reorgs revert blocks newest→oldest,
     /// matching the undo stack order.
+    /// The membership change the most recently applied block produced, if it can still be named.
+    ///
+    /// `None` once the undo record is pruned below finality, or on a cache that has applied
+    /// nothing — both of which mean a consumer must rebuild its derived state from scratch rather
+    /// than patch it. That is the fail-safe direction: a missing delta costs a full recomputation,
+    /// never a wrong one.
+    pub fn last_block_membership_delta(&self) -> Option<MembershipDelta> {
+        let undo = self.undo_log.back()?;
+        let mut delta = MembershipDelta { block_number: undo.block_number, ..Default::default() };
+        for (address, before) in &undo.accounts_before {
+            match (before.is_some(), self.accounts.contains_key(address)) {
+                (false, true) => delta.accounts_added.push(*address),
+                (true, false) => delta.accounts_removed.push(*address),
+                // Present both sides is a refresh; absent both sides is a key the block touched
+                // and the same block evicted. Neither moves membership.
+                _ => {}
+            }
+        }
+        for (key, before) in &undo.storage_before {
+            match (before.is_some(), self.storage.contains_key(key)) {
+                (false, true) => delta.storage_added.push(*key),
+                (true, false) => delta.storage_removed.push(*key),
+                _ => {}
+            }
+        }
+        Some(delta)
+    }
+
     pub fn rollback_block(&mut self, block_number: u64) -> Result<(), CacheError> {
         match self.undo_log.back() {
             Some(undo) if undo.block_number == block_number => {}

@@ -35,7 +35,7 @@ pub use cold_admission::{
     admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
-pub use network_cache::{CachedEntry, NetworkStateCache};
+pub use network_cache::{CachedEntry, MembershipDelta, NetworkStateCache};
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
 pub use policy::{CachePolicy, LastNBlocksPolicy};

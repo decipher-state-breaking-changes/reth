@@ -295,6 +295,14 @@ def build_retention_split_section(accepted):
         f"- Retained account paths per block: **{paths:.0f}**",
         f"- Storage tries pruned / skipped per block: **{pruned:.0f} / {skipped:.0f}** "
         f"({skip_share} skipped as untouched and unmoved)"])
+
+    # How much of the delta optimization the run actually got. The fallback is correct but pays
+    # the full rebuild, so a high rate means the preparation rows above are not what steady-state
+    # costs -- it does not mean anything is wrong.
+    rebuilds = sum(r["partial"].get("retention_full_rebuild", 0) for r in accepted)
+    rate = f"{100 * rebuilds / len(accepted):.1f}%" if accepted else "n/a"
+    lines.append(
+        f"- Blocks that fell back to a full retained-set rebuild: **{rebuilds} ({rate})**")
     return lines
 
 
