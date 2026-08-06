@@ -53,7 +53,7 @@ def build_builder_report(
     lines = [
         "# Partial-stateless builder benchmark", "",
         f"Accepted builder samples: **{len(selected)}**",
-        f"Warm-up records excluded: **{warmup}**", "",
+        f"Post-Ready sample-warm-up records excluded: **{warmup}**", "",
         "## Builder timings", "",
         "| Operation | Average | p50 | p90 | p95 | p99 | Maximum |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -108,7 +108,12 @@ def build_builder_report(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", required=True, type=Path)
-    parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        required=True,
+        help="builder records excluded after Ready; use the value selected by the runner",
+    )
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument("--require-published", action="store_true")
     parser.add_argument(

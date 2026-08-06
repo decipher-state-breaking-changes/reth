@@ -15,8 +15,10 @@ from run_live_paired_bench import (
     DISABLED_DIAGNOSTICS,
     ResourceSampler,
     build_command,
+    default_sample_warmup,
     prepare_output,
     stop_process,
+    warming_progress,
 )
 
 
@@ -30,7 +32,14 @@ def parse_args():
     parser.add_argument("--datadir", type=Path, required=True)
     parser.add_argument("--jwtsecret", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        help=(
+            "builder records to exclude after Ready (default: 0 with live bootstrap, "
+            "60 with --canonical-rebuild on)"
+        ),
+    )
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--shutdown-timeout", type=float, default=120.0)
@@ -57,6 +66,8 @@ def parse_args():
     )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.warmup is None:
+        args.warmup = default_sample_warmup(args.canonical_rebuild)
     if args.warmup < 0 or args.samples <= 0:
         parser.error("--warmup must be non-negative and --samples must be positive")
     if args.poll_seconds <= 0 or args.shutdown_timeout <= 0:
@@ -126,13 +137,14 @@ def main():
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
     print(
-        f"Collecting warm-up {args.warmup} plus {args.samples} published builder samples",
+        f"Collecting {args.warmup} sample-warm-up plus {args.samples} published builder samples "
+        f"(canonical_rebuild={args.canonical_rebuild})",
         flush=True,
     )
 
     process = None
     reached_target = False
-    last_count = -1
+    last_progress = None
     sampler = ResourceSampler(resource_path)
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
@@ -151,14 +163,19 @@ def main():
                     args.samples,
                     require_published=True,
                 )
+                warming = warming_progress(builder_path)
                 memory = sampler.sample(process.pid, len(accepted))
-                if len(accepted) != last_count:
+                progress = (len(accepted), warming.blocks_seen, warming.sidecars_constructed)
+                if progress != last_progress:
                     print(
-                        f"accepted={len(accepted)}/{args.samples}"
+                        f"accepted={len(accepted)}/{args.samples} "
+                        f"sample_warmup={min(warming.sidecars_constructed, args.warmup)}"
+                        f"/{args.warmup} bootstrap={warming.bootstrap_blocks} "
+                        f"paired_sampling={'yes' if warming.sampling_started else 'no'}"
                         f"{sampler.progress_summary(memory)}",
                         flush=True,
                     )
-                    last_count = len(accepted)
+                    last_progress = progress
                 if len(accepted) >= args.samples:
                     reached_target = True
                     break

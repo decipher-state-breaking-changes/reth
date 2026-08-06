@@ -323,7 +323,8 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines = [
         "# Single-process Vanilla / Partial / Weak benchmark", "",
         f"Accepted same-block samples: **{len(accepted)}**",
-        f"Warm-up blocks excluded: **{stats.warmup}** across **{stats.cold_epochs}** cold cache epochs",
+        f"Paired sample-warm-up records excluded: **{stats.warmup}** across "
+        f"**{stats.cold_epochs}** re-armed epochs",
         f"Branch switches survived warm: **{stats.warm_branch_switches}** (no warm-up re-armed)",
         f"Excluded: orphaned {stats.orphaned}, overlap {stats.contaminated}, invalid {stats.invalid}, missing Engine {stats.missing_engine}, pending {stats.pending_next_engine}.", "",
         "## State access + execution (primary)", "",
@@ -445,7 +446,7 @@ def build_overlap_report(accepted, stats: SelectionStats, warmup: int):
     overlap = [record for record in accepted if record.get("engine_overlap", False)]
     lines = [
         "# Engine / ExEx overlap cohort", "",
-        f"Valid samples after warm-up: **{len(accepted)}**",
+        f"Valid samples after paired sample warm-up: **{len(accepted)}**",
         f"Clean samples: **{len(clean)}**",
         f"Overlap/contaminated samples: **{len(overlap)}**",
         (
@@ -493,7 +494,12 @@ def main():
     parser.add_argument("--records", required=True, type=Path)
     parser.add_argument("--engine-records", required=True, type=Path)
     parser.add_argument("--log", required=True, type=Path)
-    parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        required=True,
+        help="paired records excluded after Ready; use the value selected by the runner",
+    )
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument(
         "--include-overlap",

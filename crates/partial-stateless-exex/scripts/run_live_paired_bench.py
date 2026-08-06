@@ -26,13 +26,30 @@ DISABLED_DIAGNOSTICS = (
 )
 
 
+def default_sample_warmup(canonical_rebuild):
+    """Return the warm-up needed after the path that established Ready.
+
+    Live policy-window bootstrap has already evolved the trie for a complete window. A canonical
+    rebuild instead installs the minimum multiproof for the retained paths, whose extra revealed
+    intermediate nodes converge over about 50 subsequent blocks.
+    """
+    return 60 if canonical_rebuild == "on" else 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--reth-bin", type=Path, default=Path("./target/release/reth-partial-stateless"))
     parser.add_argument("--datadir", type=Path, required=True)
     parser.add_argument("--jwtsecret", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--warmup", type=int, default=60)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        help=(
+            "paired records to exclude after Ready (default: 0 with live bootstrap, "
+            "60 with --canonical-rebuild on)"
+        ),
+    )
     parser.add_argument("--samples", type=int, default=600)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--shutdown-timeout", type=float, default=120.0)
@@ -60,6 +77,8 @@ def parse_args():
     )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.warmup is None:
+        args.warmup = default_sample_warmup(args.canonical_rebuild)
     if args.warmup < 0 or args.samples <= 0:
         parser.error("--warmup must be non-negative and --samples must be positive")
     if args.poll_seconds <= 0 or args.shutdown_timeout <= 0:
@@ -112,19 +131,36 @@ def current_selection(
     )
 
 
+class WarmingProgress(NamedTuple):
+    blocks_seen: int
+    bootstrap_blocks: int
+    sidecars_constructed: int
+    sampling_started: bool
+
+
 def warming_progress(builder_path):
-    """Return (builder records seen, records that got past the publication gate).
+    """Separate readiness bootstrap from post-Ready sample warm-up.
 
     A cold cache builds no sidecar until the readiness tracker has an authenticated parent, which
     takes a full eviction window of contiguous blocks. Those blocks produce builder records with
-    `sidecar_constructed` false and no paired samples at all, so without this the poll line would
-    just print accepted=0 for the whole warm-up with no way to tell progress from a stall.
+    `sidecar_constructed` false and no paired samples at all. They are readiness bootstrap, not
+    analysis warm-up: there is no paired observation that the selector could exclude yet.
 
     Construction, not publication, is the signal: paired mode serializes in memory and skips the
     sidecar file write, so `sidecar_published` is false for every sample it takes.
     """
     records = load_jsonl(builder_path, allow_incomplete_tail=True)
-    return len(records), len(select_builder_samples(records, 0))
+    constructed = len(select_builder_samples(records, 0))
+    first_constructed = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if record.get("sidecar_constructed", False)
+        ),
+        None,
+    )
+    bootstrap = len(records) if first_constructed is None else first_constructed
+    return WarmingProgress(len(records), bootstrap, constructed, first_constructed is not None)
 
 
 class ProcessMemory(NamedTuple):
@@ -283,7 +319,9 @@ def main():
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
     print(
-        f"Collecting warm-up {args.warmup} plus {args.samples} accepted same-block samples",
+        "Waiting for cache readiness, then collecting "
+        f"{args.warmup} sample-warm-up plus {args.samples} accepted same-block samples "
+        f"(canonical_rebuild={args.canonical_rebuild})",
         flush=True,
     )
 
@@ -312,14 +350,17 @@ def main():
                     args.samples,
                     allow_incomplete_tail=True,
                 )
-                seen, published = warming_progress(builder_path)
+                warming = warming_progress(builder_path)
                 memory = sampler.sample(process.pid, len(accepted))
-                progress = (len(accepted), seen, published)
+                progress = (len(accepted), warming.blocks_seen, warming.sidecars_constructed)
                 if progress != last_progress:
                     print(
-                        f"accepted={len(accepted)}/{args.samples} warmup={stats.warmup} "
+                        f"accepted={len(accepted)}/{args.samples} "
+                        f"sample_warmup={stats.warmup}/{args.warmup} "
+                        f"bootstrap={warming.bootstrap_blocks} "
+                        f"paired_sampling={'yes' if warming.sampling_started else 'no'} "
                         f"overlap={stats.contaminated} pending={stats.pending_next_engine} "
-                        f"blocks={seen} built={published}"
+                        f"blocks={warming.blocks_seen} built={warming.sidecars_constructed}"
                         f"{sampler.progress_summary(memory)}",
                         flush=True,
                     )
@@ -358,9 +399,10 @@ def main():
         paired_path, engine_path, log_path, args.warmup, args.samples
     )
     if not accepted:
-        seen, published = warming_progress(builder_path)
+        warming = warming_progress(builder_path)
         raise RuntimeError(
-            f"no paired samples were collected from {seen} blocks ({published} built); "
+            f"no paired samples were collected from {warming.blocks_seen} blocks "
+            f"({warming.sidecars_constructed} built, {warming.bootstrap_blocks} bootstrap); "
             "the cache never became Ready, so the builder published nothing to measure — "
             f"see {log_path}"
         )

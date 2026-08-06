@@ -273,13 +273,28 @@ them or the cache, skips
 warn-only root-completeness scans, and ignores capture, full-witness-baseline, resource, and trie
 diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` is unset.
 
-The default run excludes 60 successful warm-up blocks and collects 600 same-hash accepted samples.
-It discards invalid pairs and any pair whose Partial/Weak interval overlaps the start of the next
-Engine validation. Every reorg/revert starts a new benchmark warm-up epoch after recovery; a
-depth-1 builder reorg normally uses the retained generation, while deeper recovery uses the rebuild.
-Samples from earlier canonical heights remain eligible; orphaned heights at or above the reverted
-range and each epoch's warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
-`SIGINT` after the target and writes `results.md`.
+With canonical rebuild disabled, a cold pair first spends `window_size + 1`
+contiguous blocks (61 under the default policy) establishing an authenticated
+`Ready` parent. No sidecar or paired record exists during this readiness
+bootstrap. Because those live blocks already evolve both caches for a complete
+policy window, the default paired sample warm-up is **0**. Progress reads
+`bootstrap=N paired_sampling=no` until the first sidecar, then
+`paired_sampling=yes sample_warmup=0/0`.
+
+`--canonical-rebuild on` is different: it installs a minimal whole-cache
+multiproof at Ready rather than evolving the trie through live blocks. Historical
+A.4 data shows its revealed intermediate-node set converging for about 50 more
+blocks, so the runner automatically uses 60 paired warm-up records in that mode.
+An explicit `--warmup N` overrides either default. When invoking either offline
+analyzer directly, pass that run's selected value explicitly; the raw paired
+records do not encode which Ready path established the cache.
+
+The default run then collects 600 same-hash accepted samples. It discards invalid pairs and any
+pair whose Partial/Weak interval overlaps the start of the next Engine validation. A warm retained-
+generation branch switch removes orphaned samples but does not re-arm sample warm-up; only a cold
+reset opens a new warm-up epoch. Samples from earlier canonical heights remain eligible, and the
+cumulative target spans all epochs. The supervisor sends `SIGINT` after the target and writes
+`results.md`.
 The output directory must be absent or empty.
 
 ```bash
@@ -288,7 +303,6 @@ python3 crates/partial-stateless-exex/scripts/run_live_paired_bench.py \
   --datadir /path/to/reth-data \
   --jwtsecret /path/to/jwt.hex \
   --output /path/to/benchmark-output \
-  --warmup 60 \
   --samples 600 \
   --parallel-initial-proof off \
   -- \
@@ -313,7 +327,6 @@ python3 crates/partial-stateless-exex/scripts/run_live_builder_bench.py \
   --datadir /path/to/reth-data \
   --jwtsecret /path/to/jwt.hex \
   --output /path/to/builder-output \
-  --warmup 60 \
   --samples 600 \
   --parallel-initial-proof off \
   -- \
