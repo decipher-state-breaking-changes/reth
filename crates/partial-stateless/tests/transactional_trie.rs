@@ -289,6 +289,32 @@ fn a_block_copies_only_the_storage_tries_it_writes_to() {
 }
 
 #[test]
+fn a_retained_parent_only_costs_the_tries_its_child_copied_away() {
+    let (parent, _, _) = warm_cache();
+    let (bundle, accessed) = transition();
+
+    // Held together, exactly as the K = 1 pair holds them: `parent` is the retained generation and
+    // `child` is live. The question the memory control asks is what dropping `parent` would free.
+    let (child, _, _) = apply_block(&parent, &bundle, &accessed, false);
+
+    assert!(
+        parent.exclusive_memory_bytes() < parent.estimated_memory_bytes(),
+        "a parent sharing storage tries with its child cannot cost its full apparent size"
+    );
+    assert_eq!(
+        child.shared_storage_trie_count(),
+        CONTRACTS - 2,
+        "the accounting below is only meaningful while most tries are still shared"
+    );
+
+    // Alone, every trie is its own, so apparent and exclusive size agree. This is the same cache
+    // measured twice, which is what makes the gap above attributable to sharing rather than to
+    // the two figures counting different things.
+    drop(child);
+    assert_eq!(parent.exclusive_memory_bytes(), parent.estimated_memory_bytes());
+}
+
+#[test]
 fn an_abandoned_transition_leaves_the_parent_exactly_as_it_was() {
     let (mut parent, values, parent_root) = warm_cache();
 

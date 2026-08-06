@@ -548,6 +548,30 @@ impl PartialTrieNodeCache {
         self.sparse.memory_size()
     }
 
+    /// Of [`Self::estimated_memory_bytes`], the part that would actually be freed by dropping
+    /// this cache.
+    ///
+    /// A snapshot shares storage tries with the generation it was cloned from, so the total
+    /// counts the same allocation once per generation holding it. That is the right number for
+    /// "how large is this cache" and the wrong one for "what does keeping it cost": the answer to
+    /// the second is the account trie, which is never shared, plus only those storage tries this
+    /// cache is the last owner of.
+    ///
+    /// Storage tries retained for allocation reuse after clearing are counted as exclusive
+    /// because the sparse trie does not expose them, which makes this an upper bound on the
+    /// marginal cost rather than an underestimate of it.
+    pub fn exclusive_memory_bytes(&self) -> usize {
+        let shared: usize = self
+            .sparse
+            .storage_tries_ref()
+            .values()
+            .filter_map(|trie| trie.as_revealed_ref())
+            .filter(|trie| !trie.is_sole_owner())
+            .map(SparseTrie::memory_size)
+            .sum();
+        self.estimated_memory_bytes().saturating_sub(shared)
+    }
+
     /// Returns diagnostics for comparing deterministic path retention with a fixed-depth pinned
     /// account-trie cache.
     ///

@@ -99,6 +99,17 @@ impl<T> SharedSparseTrie<T> {
     pub fn shared_ref(&self) -> &T {
         &self.inner
     }
+
+    /// Whether dropping this handle would free the trie behind it.
+    ///
+    /// Distinct from [`Self::is_untouched`], which describes how this handle came to exist. This
+    /// describes who holds the allocation *now*: a handle can be untouched and still be the only
+    /// one left if every other generation sharing it has been dropped. The K = 1 memory
+    /// measurement needs exactly this question — bytes a retained generation would give back —
+    /// and neither ownership flag answers it.
+    pub fn is_sole_owner(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
+    }
 }
 
 impl<T: Clone> SharedSparseTrie<T> {

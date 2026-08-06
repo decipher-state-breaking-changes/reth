@@ -1,8 +1,8 @@
 use crate::{
     benchmark::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
-        serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, TrieMutationSummary,
-        ValidationBenchmarkRecord, WitnessSizeBreakdown,
+        serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, RetainedGenerationBytes,
+        TrieMutationSummary, ValidationBenchmarkRecord, WitnessSizeBreakdown,
     },
     format_bytes, process_rss_bytes, process_rusage,
     rebuild::{simulate_block, HistoricalSimulation},
@@ -60,6 +60,8 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) validation_bench_output: Option<&'a Path>,
     pub(crate) builder_bench_output: Option<&'a Path>,
     pub(crate) force_previous_cache_snapshot: bool,
+    /// What the K = 1 retained generation held when this block began.
+    pub(crate) retained_generation: RetainedGenerationBytes,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
     pub(crate) parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
     /// The parent the caches are authenticated against, when they are Ready.
@@ -907,6 +909,7 @@ fn benchmark_sidecar_validation<Evm>(
     historical_requests_hash: B256,
     historical_requests_empty: bool,
     value_cache_bytes: usize,
+    retained_generation: RetainedGenerationBytes,
 ) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -1022,7 +1025,7 @@ where
         weak_report.execution_receipts_root == expected_receipts_root &&
         requests_valid;
     let record = ValidationBenchmarkRecord {
-        schema_version: 2,
+        schema_version: 3,
         block_number: block.number(),
         block_hash: block.hash(),
         gas_used: expected_gas_used,
@@ -1043,6 +1046,7 @@ where
         weak_sidecar_bytes: weak_bytes.len(),
         value_cache_bytes,
         trie_cache_bytes: trie_cache.estimated_memory_bytes(),
+        retained_generation,
         expected_state_root: expected_root,
         partial_state_root: partial_root,
         weak_state_root: weak_root,
@@ -1563,6 +1567,7 @@ where
                         historical_requests_hash,
                         historical_requests_empty,
                         cache_memory_before,
+                        options.retained_generation,
                     )
                 } else {
                     verify_and_apply_provider_assisted_sidecar(
@@ -1848,7 +1853,7 @@ where
     let builder_total_us = builder_total_start.elapsed().as_micros() as u64;
     if let Some(path) = options.builder_bench_output {
         let record = BuilderBenchmarkRecord {
-            schema_version: 1,
+            schema_version: 2,
             block_number,
             block_hash,
             historical_full_db_evm_us,
@@ -1871,6 +1876,7 @@ where
             sidecar_published: saved_sidecar_path.is_some(),
             value_cache_bytes: cache.estimated_memory_bytes(),
             trie_cache_bytes: trie_cache.estimated_memory_bytes(),
+            retained_generation: options.retained_generation,
             trie_clone_bytes: builder_trie_clone_bytes,
             trie_clone_rss_delta_bytes: builder_trie_clone_rss_delta_bytes,
             trie_storage_tries_copied: builder_trie_storage_tries_copied,

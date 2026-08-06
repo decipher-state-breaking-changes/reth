@@ -174,6 +174,7 @@ pub struct ValidationBenchmarkRecord {
     pub weak_sidecar_bytes: usize,
     pub value_cache_bytes: usize,
     pub trie_cache_bytes: usize,
+    pub retained_generation: RetainedGenerationBytes,
     pub expected_state_root: B256,
     pub partial_state_root: B256,
     pub weak_state_root: B256,
@@ -186,6 +187,23 @@ pub struct ValidationBenchmarkRecord {
     pub partial_requests_hash: B256,
     pub weak_requests_hash: B256,
     pub valid: bool,
+}
+
+/// What the K = 1 retained generation was holding when a block began.
+///
+/// `total_bytes` is what the retained trie cache measures on its own; `exclusive_bytes` is the
+/// part of it that no other generation shares, which is what dropping it would give back. The two
+/// are reported together because the gap between them is the point: a snapshot shares storage
+/// tries with its parent, so the cost of keeping one is far below its apparent size, and only the
+/// exclusive figure is comparable with a resident-memory difference.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct RetainedGenerationBytes {
+    /// Whether this run retains at all. False is the memory control, not a failure.
+    pub enabled: bool,
+    /// Whether a generation was actually being held. False while cold, warming, or recovering.
+    pub present: bool,
+    pub total_bytes: usize,
+    pub exclusive_bytes: usize,
 }
 
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
@@ -214,6 +232,7 @@ pub struct BuilderBenchmarkRecord {
     pub sidecar_published: bool,
     pub value_cache_bytes: usize,
     pub trie_cache_bytes: usize,
+    pub retained_generation: RetainedGenerationBytes,
     /// Logical size of the trie the per-block snapshot covers.
     ///
     /// Since V3 the snapshot shares storage tries with its parent, so this is the size it stands
@@ -387,6 +406,7 @@ mod tests {
         assert!(value.get("expected_requests_hash").is_some());
         assert!(value.get("value_cache_bytes").is_some());
         assert!(value.get("trie_cache_bytes").is_some());
+        assert!(value["retained_generation"].get("exclusive_bytes").is_some());
         assert!(value.get("partial_witness_build_us").is_some());
         assert!(value.get("partial_serialize_us").is_some());
     }
@@ -405,6 +425,7 @@ mod tests {
         assert!(value.get("parallel_storage_workers").is_some());
         assert!(value.get("parallel_account_workers").is_some());
         assert!(value.get("witness_commitment").is_some());
+        assert!(value["retained_generation"].get("exclusive_bytes").is_some());
     }
 
     #[test]

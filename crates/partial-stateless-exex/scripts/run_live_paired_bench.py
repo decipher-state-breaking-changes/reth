@@ -75,6 +75,17 @@ def parse_args():
             "cache epoch; off, it warms over a policy window of live blocks instead"
         ),
     )
+    parser.add_argument(
+        "--retain-generation",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "set PS_RETAIN_GENERATION deterministically (default: on, which is production). Off "
+            "is the K = 1 memory control: the transition still copies the parent trie and still "
+            "hands it back, but the copy is dropped instead of kept, so every reorg costs a full "
+            "rebuild and the run must not be read for recovery timings"
+        ),
+    )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.warmup is None:
@@ -255,6 +266,7 @@ def benchmark_environment(
     sidecar_dir,
     parallel_initial_proof,
     canonical_rebuild,
+    retain_generation,
 ):
     env = os.environ.copy()
     env.update(
@@ -268,6 +280,7 @@ def benchmark_environment(
             "PS_BUILDER_BENCH_OUTPUT": str(builder_path),
             "PS_PARALLEL_INITIAL_PROOF": "1" if parallel_initial_proof == "on" else "0",
             "PS_CANONICAL_REBUILD": "1" if canonical_rebuild == "on" else "0",
+            "PS_RETAIN_GENERATION": "1" if retain_generation == "on" else "0",
         }
     )
     for name in DISABLED_DIAGNOSTICS:
@@ -315,6 +328,7 @@ def main():
         sidecar_dir,
         args.parallel_initial_proof,
         args.canonical_rebuild,
+        args.retain_generation,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)

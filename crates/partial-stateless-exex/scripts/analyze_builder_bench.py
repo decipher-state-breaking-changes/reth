@@ -6,7 +6,11 @@ import collections
 import statistics
 from pathlib import Path
 
-from analyze_validation_bench import format_summary, load_jsonl
+from analyze_validation_bench import (
+    format_summary,
+    load_jsonl,
+    retained_generation_lines,
+)
 
 
 def select_builder_samples(records, warmup, limit=None, require_published=False):
@@ -101,7 +105,9 @@ def build_builder_report(
         format_summary(
             "Trie cache", [r["trie_cache_bytes"] for r in selected], 1024 * 1024, "MiB"
         ),
+        "",
     ])
+    lines.extend(retained_generation_lines(selected))
     return "\n".join(lines) + "\n"
 
 

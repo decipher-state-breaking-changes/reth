@@ -44,6 +44,12 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="stop gracefully after this wall-clock budget and report what was collected (0: no limit)",
+    )
+    parser.add_argument(
         "--parallel-initial-proof",
         choices=("off", "on"),
         default="off",
@@ -64,6 +70,17 @@ def parse_args():
         action="store_true",
         help="recreate the old unconditional clone as the B2 control",
     )
+    parser.add_argument(
+        "--retain-generation",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "set PS_RETAIN_GENERATION deterministically (default: on, which is production). Off "
+            "is the K = 1 memory control: the transition still copies the parent trie and still "
+            "hands it back, but the copy is dropped instead of kept, so every reorg costs a full "
+            "rebuild and the run must not be read for recovery timings"
+        ),
+    )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.warmup is None:
@@ -72,6 +89,8 @@ def parse_args():
         parser.error("--warmup must be non-negative and --samples must be positive")
     if args.poll_seconds <= 0 or args.shutdown_timeout <= 0:
         parser.error("poll and shutdown timeouts must be positive")
+    if args.max_seconds < 0:
+        parser.error("--max-seconds must be non-negative")
     if args.node_args and args.node_args[0] == "--":
         args.node_args = args.node_args[1:]
     return args
@@ -84,6 +103,7 @@ def benchmark_environment(
     parallel_initial_proof,
     canonical_rebuild,
     force_previous_cache_snapshot,
+    retain_generation,
 ):
     env = os.environ.copy()
     env.update(
@@ -97,6 +117,7 @@ def benchmark_environment(
                 "1" if parallel_initial_proof == "on" else "0"
             ),
             "PS_CANONICAL_REBUILD": "1" if canonical_rebuild == "on" else "0",
+            "PS_RETAIN_GENERATION": "1" if retain_generation == "on" else "0",
             "PS_FORCE_PREVIOUS_CACHE_SNAPSHOT": (
                 "1" if force_previous_cache_snapshot else "0"
             ),
@@ -133,6 +154,7 @@ def main():
         args.parallel_initial_proof,
         args.canonical_rebuild,
         args.force_previous_cache_snapshot,
+        args.retain_generation,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
@@ -144,7 +166,9 @@ def main():
 
     process = None
     reached_target = False
+    stopped_on_deadline = False
     last_progress = None
+    deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
     sampler = ResourceSampler(resource_path)
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
@@ -179,6 +203,13 @@ def main():
                 if len(accepted) >= args.samples:
                     reached_target = True
                     break
+                if deadline is not None and time.monotonic() >= deadline:
+                    stopped_on_deadline = True
+                    print(
+                        f"Wall-clock budget reached; stopping with {len(accepted)} accepted samples",
+                        flush=True,
+                    )
+                    break
                 if exit_code is not None:
                     detail = (
                         " (SIGKILL; inspect resources.jsonl)"
@@ -197,16 +228,25 @@ def main():
             if process is not None:
                 stop_process(process, args.shutdown_timeout)
 
-    if not reached_target:
+    if not reached_target and not stopped_on_deadline:
         raise RuntimeError("benchmark stopped before reaching the sample target")
     if "Chain reorg detected" in log_path.read_text(errors="replace"):
         raise RuntimeError(
             "builder benchmark observed a reorg; repeat from a deterministic replay"
         )
+    collected = len(
+        select_builder_samples(
+            load_jsonl(builder_path), args.warmup, args.samples, require_published=True
+        )
+    )
+    if not collected:
+        raise RuntimeError(
+            f"no published builder samples were collected; see {log_path}"
+        )
     report = build_builder_report(
         load_jsonl(builder_path),
         args.warmup,
-        args.samples,
+        collected,
         expect_snapshot=args.force_previous_cache_snapshot,
         require_published=True,
     )

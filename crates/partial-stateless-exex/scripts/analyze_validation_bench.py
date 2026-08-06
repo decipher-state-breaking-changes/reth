@@ -306,6 +306,40 @@ def build_retention_split_section(accepted):
     return lines
 
 
+def retained_generation_lines(accepted):
+    """Report what the K = 1 retained generation costs, or that this run kept none.
+
+    Reported for both arms of the memory control, because "0 blocks retained" is the control's
+    result rather than missing data. Records written before the telemetry existed have no field at
+    all, which is a third case and is reported as such rather than as zero.
+    """
+    present = [r["retained_generation"] for r in accepted if "retained_generation" in r]
+    if not present:
+        return [
+            "## K = 1 retained generation", "",
+            "- Not recorded: these records predate retained-generation telemetry.", "",
+        ]
+    enabled = [r for r in present if r.get("enabled")]
+    held = [r for r in present if r.get("present")]
+    lines = [
+        "## K = 1 retained generation", "",
+        f"- Retention enabled: **{len(enabled)}/{len(present)}** blocks",
+        f"- Generation actually held: **{len(held)}/{len(present)}** blocks",
+    ]
+    if held:
+        lines += [
+            "",
+            "| Measure | Average | p50 | p90 | p95 | p99 | Maximum |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            format_summary("Retained trie, apparent size", [r["total_bytes"] for r in held], 1024 * 1024, "MiB"),
+            format_summary("Retained trie, exclusive", [r["exclusive_bytes"] for r in held], 1024 * 1024, "MiB"),
+            "",
+            "Exclusive is the marginal cost: the apparent size counts storage tries the live cache "
+            "still shares, which dropping the retained generation would not free.",
+        ]
+    return lines + [""]
+
+
 def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     if len(accepted) < requested:
         raise ValueError(f"only {len(accepted)} accepted samples; requested {requested} after warm-up {warmup}")
@@ -359,6 +393,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         format_summary("Value cache", [r["value_cache_bytes"] for r in accepted], 1024 * 1024, "MiB"),
         format_summary("Sparse trie cache", [r["trie_cache_bytes"] for r in accepted], 1024 * 1024, "MiB"), "",
+        *retained_generation_lines(accepted),
         "## Paired ratios", "",
         f"- Partial / Vanilla primary, ratio of means: **{ratio_of_means(partial_primary, vanilla_primary):.3f}x**",
         f"- Partial / Vanilla median same-block ratio: **{statistics.median(p / v for p, v in zip(partial_primary, vanilla_primary) if v):.3f}x**",

@@ -27,6 +27,7 @@ mod sidecar_verify;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
+use benchmark::RetainedGenerationBytes;
 use futures::TryStreamExt;
 use partial_stateless::{
     network_cache::NetworkStateCache,
@@ -178,6 +179,17 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads a flag whose absence means on rather than off.
+///
+/// Separate from [`env_flag`] because the two answer different questions. `env_flag` asks whether
+/// a run opted into something extra; this asks whether a run opted *out* of production behaviour,
+/// which a benchmark control does and nothing else should.
+fn env_flag_enabled_by_default(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+}
+
 fn env_u32(name: &str, default: u32) -> u32 {
     let Ok(value) = std::env::var(name) else { return default };
     // A bare `PS_..=1`-style flag should still mean "on"; a count is the more useful spelling.
@@ -228,6 +240,12 @@ pub struct RunOptions {
     pub builder_bench_output: Option<PathBuf>,
     /// B2 benchmark control that recreates the old unconditional parent-cache clone.
     pub force_previous_cache_snapshot: bool,
+    /// Whether a committed block's displaced trie generation is kept for depth-1 recovery.
+    ///
+    /// On in production: K = 1 is what makes a depth-1 reorg an undo rather than a rebuild. The
+    /// only reason to turn it off is the memory control — an otherwise identical run that pays no
+    /// retention, so the difference in resident memory is attributable to retention alone.
+    pub retain_generation: bool,
     /// Whether eligible initial V2 multiproofs use reth's proof workers.
     pub parallel_initial_proof: bool,
     /// Whether the paired in-memory validation benchmark is running.
@@ -283,6 +301,7 @@ impl RunOptions {
             }),
             builder_bench_output: std::env::var_os("PS_BUILDER_BENCH_OUTPUT").map(PathBuf::from),
             force_previous_cache_snapshot: env_flag("PS_FORCE_PREVIOUS_CACHE_SNAPSHOT"),
+            retain_generation: env_flag_enabled_by_default("PS_RETAIN_GENERATION"),
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
             validation_bench,
             reexec_limits: SidecarReexecLimits::default(),
@@ -352,6 +371,14 @@ impl RunOptions {
                 "Parallel initial V2 multiproof ENABLED (PS_PARALLEL_INITIAL_PROOF); low-width target sets remain serial"
             );
         }
+        if !self.retain_generation {
+            warn!(
+                target: "partial_stateless",
+                "Depth-1 retained generation DISABLED (PS_RETAIN_GENERATION=0) — benchmark memory \
+                 control only. Every reorg and revert now costs a full rebuild; do not read this \
+                 run's recovery timings as production behaviour"
+            );
+        }
         if self.run_sidecar_preflight {
             info!(
                 target: "partial_stateless",
@@ -405,6 +432,7 @@ impl RunOptions {
         parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
         ready_parent: Option<&'a ReadyParent>,
         retain_sidecar: bool,
+        retained_generation: RetainedGenerationBytes,
     ) -> BuilderOptions<'a> {
         BuilderOptions {
             capture_dir: self.capture_dir.as_deref(),
@@ -416,6 +444,7 @@ impl RunOptions {
             validation_bench_output: self.validation_bench_output.as_deref(),
             builder_bench_output: self.builder_bench_output.as_deref(),
             force_previous_cache_snapshot: self.force_previous_cache_snapshot,
+            retained_generation,
             reexec_limits: &self.reexec_limits,
             parallel_initial_proof,
             ready_parent,
@@ -465,9 +494,33 @@ impl CoordinatedPair {
         displaced: Option<PartialTrieNodeCache>,
         block_hash: B256,
         block_number: u64,
+        enabled: bool,
     ) {
-        self.previous_generation =
-            displaced.map(|trie_cache| RetainedGeneration { trie_cache, block_hash, block_number });
+        // Dropping `displaced` here rather than declining to produce it is deliberate: the
+        // transition still copies the parent trie and still hands the copy back, so the control
+        // arm pays exactly the work the production arm pays and differs only in what it keeps.
+        // A control that also skipped the copy would be measuring two changes at once.
+        self.previous_generation = enabled
+            .then_some(displaced)
+            .flatten()
+            .map(|trie_cache| RetainedGeneration { trie_cache, block_hash, block_number });
+    }
+
+    /// What the retained generation costs right now, for the K = 1 memory control.
+    ///
+    /// Read before a block is built, so it describes the generation the *previous* block
+    /// displaced — the steady state a run spends every block in, rather than the instant after a
+    /// transition when the live cache has not yet diverged from it.
+    fn retained_generation_bytes(&self, enabled: bool) -> RetainedGenerationBytes {
+        let Some(retained) = &self.previous_generation else {
+            return RetainedGenerationBytes { enabled, ..Default::default() }
+        };
+        RetainedGenerationBytes {
+            enabled,
+            present: true,
+            total_bytes: retained.trie_cache.estimated_memory_bytes(),
+            exclusive_bytes: retained.trie_cache.exclusive_memory_bytes(),
+        }
     }
 
     /// Drop the retained generation because the pair no longer descends from it.
@@ -1260,7 +1313,12 @@ where
         .map_err(|err| eyre::eyre!("live sidecar verification failed: {err}"))?;
         // Retained on the verifier for the same reason and at the same cost as on the builder: a
         // depth-1 reorg is the common case, and undoing one block beats replaying a whole window.
-        finish_committed_transition(pair, displaced_trie_cache, &block_ctx);
+        finish_committed_transition(
+            pair,
+            displaced_trie_cache,
+            &block_ctx,
+            options.retain_generation,
+        );
         return Ok(())
     }
 
@@ -1288,6 +1346,10 @@ where
             })
             .collect())
     };
+    // Measured before the transition, so it describes the generation the previous block displaced
+    // rather than the one this block is about to. Taking it after would report a retained trie that
+    // still shares nearly every storage trie with the live cache and understate the steady cost.
+    let retained_generation = pair.retained_generation_bytes(options.retain_generation);
     let parallel_initial_proof =
         |targets: MultiProofTargetsV2| -> ProviderResult<ParallelInitialProofOutput> {
             let parallel_factory = ctx.provider().overlay_factory_at_block(block.parent_hash);
@@ -1313,6 +1375,7 @@ where
                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
             ready_parent.as_ref(),
             gate.wants_sidecar(),
+            retained_generation,
         ),
         parent_state_root_by_hash,
         ancestor_headers_for_range,
@@ -1325,7 +1388,7 @@ where
         sidecar,
         displaced_trie_cache,
     } = report;
-    finish_committed_transition(pair, displaced_trie_cache, &block_ctx);
+    finish_committed_transition(pair, displaced_trie_cache, &block_ctx, options.retain_generation);
 
     advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
 }
@@ -1340,8 +1403,14 @@ fn finish_committed_transition(
     pair: &mut CoordinatedPair,
     displaced_trie_cache: Option<PartialTrieNodeCache>,
     block: &BlockContext,
+    retain_generation: bool,
 ) {
-    pair.retain_generation(displaced_trie_cache, block.parent_hash, block.number.saturating_sub(1));
+    pair.retain_generation(
+        displaced_trie_cache,
+        block.parent_hash,
+        block.number.saturating_sub(1),
+        retain_generation,
+    );
     observe_readiness(pair, block);
 }
 
@@ -1967,6 +2036,14 @@ mod tests {
     /// A pair sitting at `SNAP_BLOCK + 1` with the generation at `SNAP_BLOCK` retained, which is
     /// exactly the state a depth-1 reorg has to undo.
     fn pair_one_block_past_a_snapshot() -> (CoordinatedPair, CacheConfig, B256) {
+        pair_one_block_past_a_snapshot_with(true)
+    }
+
+    /// The same pair, built with retention either on or off.
+    ///
+    /// `retain` false is the K = 1 memory control, which reaches the identical block by the
+    /// identical route and differs only in whether the displaced generation is kept.
+    fn pair_one_block_past_a_snapshot_with(retain: bool) -> (CoordinatedPair, CacheConfig, B256) {
         let config = CacheConfig::default();
         let (package, checkpoint, state_root) = warm_snapshot(&config);
         let retained = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
@@ -1995,7 +2072,7 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied);
+        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied, retain);
         (pair, config, state_root)
     }
 
@@ -2025,6 +2102,42 @@ mod tests {
             pair.previous_generation.is_none(),
             "the retention is consumed: what it described is now the live generation"
         );
+    }
+
+    #[test]
+    fn the_memory_control_keeps_nothing_and_says_so() {
+        let (control, _, _) = pair_one_block_past_a_snapshot_with(false);
+        let (retaining, _, _) = pair_one_block_past_a_snapshot_with(true);
+
+        // Both pairs took the same route to the same block, so the caches themselves must agree.
+        // A control that also changed the state would not isolate the memory it saves.
+        assert_eq!(control.fingerprint(), retaining.fingerprint());
+        assert!(control.previous_generation.is_none());
+        assert!(retaining.previous_generation.is_some());
+
+        let control_bytes = control.retained_generation_bytes(false);
+        assert!(!control_bytes.enabled);
+        assert!(!control_bytes.present);
+        assert_eq!(control_bytes.exclusive_bytes, 0);
+
+        let retained_bytes = retaining.retained_generation_bytes(true);
+        assert!(retained_bytes.enabled && retained_bytes.present);
+        assert!(retained_bytes.exclusive_bytes > 0, "a held generation costs something");
+        assert!(retained_bytes.exclusive_bytes <= retained_bytes.total_bytes);
+    }
+
+    #[test]
+    fn the_memory_control_gives_up_the_depth_one_undo_it_is_not_paying_for() {
+        let (mut pair, config, state_root) = pair_one_block_past_a_snapshot_with(false);
+
+        // The recovery the control declines is the one the production arm takes for free; a run
+        // with this flag set must not be read for reorg timings, and this is why.
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+                .is_none(),
+            "with nothing retained there is nothing to undo, so recovery must fall through"
+        );
+        assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1, "and nothing was mutated");
     }
 
     #[test]
@@ -2078,7 +2191,7 @@ mod tests {
 
         // `None` is what the builder reports when the transition rolled back, and the old
         // retention describes a generation two blocks back that K = 1 does not promise.
-        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1);
+        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1, true);
 
         assert!(pair.previous_generation.is_none());
     }
@@ -2099,7 +2212,7 @@ mod tests {
         }
         assert!(!pair.readiness.window_filled(), "three blocks is not a window");
         apply(&mut pair, SNAP_BLOCK + 1);
-        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
+        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK, true);
 
         assert!(
             pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
@@ -2186,7 +2299,7 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied);
+        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied, true);
 
         (pair, reference, config, state_root)
     }
