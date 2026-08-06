@@ -286,6 +286,24 @@ impl PartialTrieNodeCache {
         let mut timings = RetentionTimings::default();
 
         let start = Instant::now();
+        // Capture the old retention state before changing either membership set. Account and
+        // storage membership can both cross zero for the same address in one block. Reading the
+        // old state after inserting the new warm account would make a genuinely new
+        // account+storage pair look as though it had already been retained, leaving its account
+        // path out of `retained_account_paths`.
+        let mut affected = B256Map::<(Address, bool)>::default();
+        for address in delta.accounts_removed.iter().chain(&delta.accounts_added) {
+            let hashed = keccak256(address);
+            affected
+                .entry(hashed)
+                .or_insert_with(|| (*address, self.is_retained_address(address, hashed)));
+        }
+        for (address, _) in delta.storage_removed.iter().chain(&delta.storage_added) {
+            let hashed = keccak256(address);
+            affected
+                .entry(hashed)
+                .or_insert_with(|| (*address, self.is_retained_address(address, hashed)));
+        }
         for address in &delta.accounts_removed {
             self.warm_accounts.remove(address);
         }
@@ -307,31 +325,20 @@ impl PartialTrieNodeCache {
         for (address, slot) in &delta.storage_removed {
             moved
                 .entry(keccak256(address))
-                .or_insert_with(|| StorageSlotDelta::for_address(*address))
+                .or_insert_with(StorageSlotDelta::new)
                 .removed
                 .push(Nibbles::unpack(keccak256(slot)));
         }
         for (address, slot) in &delta.storage_added {
             moved
                 .entry(keccak256(address))
-                .or_insert_with(|| StorageSlotDelta::for_address(*address))
+                .or_insert_with(StorageSlotDelta::new)
                 .added
                 .push(Nibbles::unpack(keccak256(slot)));
         }
 
-        // An address is retained when it owns a warm account entry or at least one warm slot, so
-        // the account-path set only moves where one of those two crossed zero.
-        let mut paths_added = Vec::new();
-        let mut paths_removed = Vec::new();
         for (hashed_address, slots) in &moved {
-            let was_retained = self.is_retained_address(&slots.address, *hashed_address);
             let updated = self.apply_slot_delta(*hashed_address, slots);
-            let is_retained = self.warm_accounts.contains(&slots.address) || !updated.is_empty();
-            match (was_retained, is_retained) {
-                (false, true) => paths_added.push(Nibbles::unpack(*hashed_address)),
-                (true, false) => paths_removed.push(Nibbles::unpack(*hashed_address)),
-                _ => {}
-            }
             if updated.is_empty() {
                 self.retained_storage_paths.remove(hashed_address);
             } else {
@@ -340,33 +347,19 @@ impl PartialTrieNodeCache {
         }
         timings.storage_paths_us = start.elapsed().as_micros() as u64;
 
-        // Accounts that entered or left the flat window. An address that still owns warm slots is
-        // retained either way, which is why membership is re-read rather than assumed.
+        // An address is retained when it owns a warm account entry or at least one warm slot. Now
+        // that both membership dimensions have reached their new state, compare them with the
+        // snapshot above exactly once per address. This covers account-only, storage-only, and
+        // simultaneous account+storage transitions without order-dependent special cases.
         let start = Instant::now();
-        for address in &delta.accounts_added {
-            let hashed = keccak256(address);
-            let already = self.retained_storage_paths.contains_key(&hashed);
-            if !already && !moved.contains_key(&hashed) {
-                paths_added.push(Nibbles::unpack(hashed));
-            } else if !already {
-                // The storage pass above already decided this address, and it decided "not
-                // retained" only because the account had not been inserted yet.
-                let path = Nibbles::unpack(hashed);
-                if !paths_added.contains(&path) {
-                    paths_added.push(path);
-                }
-            }
-        }
-        for address in &delta.accounts_removed {
-            let hashed = keccak256(address);
-            if !self.retained_storage_paths.contains_key(&hashed) {
-                let path = Nibbles::unpack(hashed);
-                if let Some(position) = paths_added.iter().position(|candidate| *candidate == path)
-                {
-                    paths_added.swap_remove(position);
-                } else {
-                    paths_removed.push(path);
-                }
+        let mut paths_added = Vec::new();
+        let mut paths_removed = Vec::new();
+        for (hashed_address, (address, was_retained)) in affected {
+            let is_retained = self.is_retained_address(&address, hashed_address);
+            match (was_retained, is_retained) {
+                (false, true) => paths_added.push(Nibbles::unpack(hashed_address)),
+                (true, false) => paths_removed.push(Nibbles::unpack(hashed_address)),
+                _ => {}
             }
         }
         splice_sorted(&mut self.retained_account_paths, &mut paths_added, &paths_removed);
@@ -780,20 +773,18 @@ impl PartialTrieNodeCache {
     }
 }
 
-/// The slot paths one address gained and lost in a block, plus the address they belong to.
+/// The slot paths one address gained and lost in a block.
 ///
-/// Keyed by hashed address so it can be looked up against the storage-trie map directly; the
-/// unhashed address is carried because warm account membership is keyed the other way.
+/// Keyed by hashed address so it can be looked up against the storage-trie map directly.
 #[derive(Debug, Clone)]
 struct StorageSlotDelta {
-    address: Address,
     added: Vec<Nibbles>,
     removed: Vec<Nibbles>,
 }
 
 impl StorageSlotDelta {
-    const fn for_address(address: Address) -> Self {
-        Self { address, added: Vec::new(), removed: Vec::new() }
+    const fn new() -> Self {
+        Self { added: Vec::new(), removed: Vec::new() }
     }
 }
 

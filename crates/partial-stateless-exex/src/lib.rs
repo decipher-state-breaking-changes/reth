@@ -1260,12 +1260,7 @@ where
         .map_err(|err| eyre::eyre!("live sidecar verification failed: {err}"))?;
         // Retained on the verifier for the same reason and at the same cost as on the builder: a
         // depth-1 reorg is the common case, and undoing one block beats replaying a whole window.
-        pair.retain_generation(
-            displaced_trie_cache,
-            block.parent_hash,
-            block_number.saturating_sub(1),
-        );
-        observe_readiness(pair, &block_ctx);
+        finish_committed_transition(pair, displaced_trie_cache, &block_ctx);
         return Ok(())
     }
 
@@ -1330,10 +1325,24 @@ where
         sidecar,
         displaced_trie_cache,
     } = report;
-    pair.retain_generation(displaced_trie_cache, block.parent_hash, block_number.saturating_sub(1));
-    observe_readiness(pair, &block_ctx);
+    finish_committed_transition(pair, displaced_trie_cache, &block_ctx);
 
     advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
+}
+
+/// Installs the parent generation displaced by a successful transition and makes that transition
+/// visible to readiness as one operation.
+///
+/// Both production roles call this exact tail: the builder gets `displaced_trie_cache` from
+/// sidecar creation, while the verifier gets it from committed reexecution. Keeping the sequence
+/// shared prevents either arm from becoming unable to service the same depth-1 recovery hook.
+fn finish_committed_transition(
+    pair: &mut CoordinatedPair,
+    displaced_trie_cache: Option<PartialTrieNodeCache>,
+    block: &BlockContext,
+) {
+    pair.retain_generation(displaced_trie_cache, block.parent_hash, block.number.saturating_sub(1));
+    observe_readiness(pair, block);
 }
 
 /// Runs the in-process sync/bootstrap gate: export at the first Ready, then compare.
@@ -1658,9 +1667,9 @@ fn process_rss_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_after_cold_reset, admit_block, block_context, inject_recovery, observe_readiness,
-        BlockAdmission, BlockContext, CacheConfig, CanonicalStateRoots, CoordinatedPair,
-        PartialTrieNodeCache, ProviderResult, SidecarRole,
+        admit_after_cold_reset, admit_block, block_context, finish_committed_transition,
+        inject_recovery, observe_readiness, BlockAdmission, BlockContext, CacheConfig,
+        CanonicalStateRoots, CoordinatedPair, PartialTrieNodeCache, ProviderResult, SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -1975,7 +1984,6 @@ mod tests {
         // Advance the flat cache one block, which is what leaves the undo record the rollback
         // consumes, and retain the generation that block displaced.
         apply(&mut pair, SNAP_BLOCK + 1);
-        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
         // The tracker has to see the block too, or the pair would claim a depth-1 undo is
         // available with nothing replayed to give back. The block is described as leaving the
         // state root where it was, which is the only root this fixture's trie can authenticate
@@ -1987,7 +1995,7 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        observe_readiness(&mut pair, &applied);
+        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied);
         (pair, config, state_root)
     }
 
@@ -2171,7 +2179,6 @@ mod tests {
         };
 
         apply_touching(&mut pair, SNAP_BLOCK + 1, ABANDONED);
-        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK);
         let applied = BlockContext {
             number: SNAP_BLOCK + 1,
             hash: numbered(SNAP_BLOCK + 1, 0xaa),
@@ -2179,7 +2186,7 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        observe_readiness(&mut pair, &applied);
+        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied);
 
         (pair, reference, config, state_root)
     }
@@ -2258,6 +2265,17 @@ mod tests {
         // this is where its recovery ends — recorded as the shape of the gap, not as a pass.
         assert!(matches!(pair.readiness.state(), CacheReadiness::Recovering { .. }));
         assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1, "and nothing was mutated");
+        let next = BlockContext {
+            number: SNAP_BLOCK + 2,
+            hash: numbered(SNAP_BLOCK + 2, 0xcc),
+            parent_hash: numbered(SNAP_BLOCK + 1, 0xaa),
+            state_root: B256::repeat_byte(0xdd),
+        };
+        assert!(matches!(
+            admit_block(&mut pair.readiness, &next),
+            BlockAdmission::Rejected(BlockedReason::RecoveryIncomplete { block_number })
+                if block_number == SNAP_BLOCK + 2
+        ));
     }
 
     #[test]

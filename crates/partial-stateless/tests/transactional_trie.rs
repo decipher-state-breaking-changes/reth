@@ -383,3 +383,65 @@ fn a_trie_that_loses_slots_is_still_pruned() {
     assert!(!child.tracks_storage(&address(0), &slot(0)));
     child.validate_against_value_cache(&evicted_values).unwrap();
 }
+
+#[test]
+fn a_simultaneous_account_and_slot_insertion_matches_a_full_rebuild_on_real_tries() {
+    // Reveal the complete authenticated fixture, then make contract 0 cold. Its account and
+    // storage paths are genuinely blinded here; this is not a membership-only comparison over an
+    // empty sparse trie.
+    let (initial_proof, state_root) = parent_state();
+    let mut parent = PartialTrieNodeCache::new();
+    assert_eq!(
+        try_compute_trustless_state_root(initial_proof, &mut parent, &BundleState::default())
+            .unwrap(),
+        state_root
+    );
+
+    let cold_contract = address(0);
+    let mut initial_access = full_access();
+    initial_access.accounts.remove(&cold_contract);
+    initial_access.storage.retain(|(address, _), _| *address != cold_contract);
+    let mut values = NetworkStateCache::new(
+        Box::new(LastNBlocksPolicy::new(60)),
+        Box::new(LastNBlocksPolicy::new(30)),
+    );
+    values.on_block_executed(1, &initial_access);
+    parent.retain_from_value_cache(&values);
+    parent.validate_against_value_cache(&values).unwrap();
+    assert!(!parent.contains_account_path(&cold_contract));
+
+    // Updating contract 0 makes its account and first slot enter their warm sets in the same
+    // block. Supply the parent proof to both children, exactly as a live miss would, so the
+    // transition re-reveals the cold authenticated paths before retention runs.
+    let (bundle, accessed) = transition();
+    let (transition_proof, _) = parent_state();
+    let mut incremental = parent.clone();
+    let mut reference = parent.clone();
+    let incremental_root =
+        try_compute_trustless_state_root(transition_proof.clone(), &mut incremental, &bundle)
+            .unwrap();
+    let reference_root =
+        try_compute_trustless_state_root(transition_proof, &mut reference, &bundle).unwrap();
+    assert_eq!(incremental_root, reference_root);
+
+    values.on_block_executed(2, &accessed);
+    let delta = values.last_block_membership_delta().unwrap();
+    assert!(delta.accounts_added.contains(&cold_contract));
+    assert!(
+        delta.storage_added.iter().any(|(address, _)| *address == cold_contract),
+        "the fixture must add account and storage membership together"
+    );
+
+    let timings = incremental.retain_from_value_cache(&values);
+    assert!(!timings.full_rebuild, "the test must score the delta path");
+    reference.retain_reference(&values);
+
+    assert_eq!(incremental.retention_fingerprint(), reference.retention_fingerprint());
+    assert_eq!(incremental.cache_root(), reference.cache_root());
+    assert!(
+        incremental.structurally_eq(&reference),
+        "delta and full retention produced different sparse tries"
+    );
+    incremental.validate_against_value_cache(&values).unwrap();
+    reference.validate_against_value_cache(&values).unwrap();
+}

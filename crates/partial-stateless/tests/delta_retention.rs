@@ -64,7 +64,15 @@ fn block_access(number: u64) -> BlockAccessedState {
 
 /// Applies `number` to the cache and returns the membership delta it produced.
 fn apply(values: &mut NetworkStateCache, number: u64) -> MembershipDelta {
-    values.on_block_executed(number, &block_access(number));
+    apply_access(values, number, &block_access(number))
+}
+
+fn apply_access(
+    values: &mut NetworkStateCache,
+    number: u64,
+    accessed: &BlockAccessedState,
+) -> MembershipDelta {
+    values.on_block_executed(number, accessed);
     values.last_block_membership_delta().expect("a just-applied block always has an undo record")
 }
 
@@ -102,6 +110,42 @@ fn the_delta_path_equals_a_full_rebuild_on_every_block() {
         reference.retain_reference(&values);
         assert_agrees(&incremental, &reference, &format!("at block {number}"));
     }
+}
+
+#[test]
+fn a_new_account_and_its_first_slot_add_the_account_path_once() {
+    let mut values = cache();
+    let mut incremental = PartialTrieNodeCache::new();
+    let mut reference = PartialTrieNodeCache::new();
+
+    let mut first = BlockAccessedState::default();
+    first
+        .accounts
+        .insert(address(1), AccountData { nonce: 1, balance: U256::from(1), code_hash: None });
+    apply_access(&mut values, 1, &first);
+    incremental.retain_reference(&values);
+    reference.retain_reference(&values);
+
+    // This is the production failure shape: a previously unseen contract enters the account and
+    // storage windows in the same block. The old implementation mutated `warm_accounts` before
+    // asking whether the address used to be retained, then omitted this account path entirely.
+    let contract = address(2);
+    let mut second = BlockAccessedState::default();
+    second.accounts.insert(
+        contract,
+        AccountData { nonce: 2, balance: U256::from(2), code_hash: Some(keccak256(b"code")) },
+    );
+    second.storage.insert((contract, slot(0)), U256::from(3));
+    let delta = apply_access(&mut values, 2, &second);
+    assert_eq!(delta.accounts_added, vec![contract]);
+    assert_eq!(delta.storage_added, vec![(contract, slot(0))]);
+
+    let timings = incremental.retain_from_value_cache(&values);
+    assert!(!timings.full_rebuild, "the regression must exercise the delta path");
+    reference.retain_reference(&values);
+    assert_agrees(&incremental, &reference, "after a simultaneous account and slot insertion");
+    assert!(incremental.tracks_account(&contract));
+    assert!(incremental.tracks_storage(&contract, &slot(0)));
 }
 
 #[test]
