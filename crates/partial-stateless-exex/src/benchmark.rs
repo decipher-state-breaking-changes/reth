@@ -40,6 +40,17 @@ pub struct ValidationPhaseTimings {
     pub miss_policy_check_us: u64,
     pub cache_update_us: u64,
     pub trie_retention_us: u64,
+    /// Retention's internal split. Reported beside `trie_retention_us`, never summed into a total:
+    /// the phases below are measured inside it, so adding them would double-count.
+    pub retention_warm_membership_us: u64,
+    pub retention_storage_paths_us: u64,
+    pub retention_account_paths_us: u64,
+    pub retention_account_trie_us: u64,
+    pub retention_storage_tries_us: u64,
+    /// Retained account paths handed to the account-trie prune.
+    pub retention_account_paths: u64,
+    pub retention_storage_tries_pruned: u64,
+    pub retention_storage_tries_skipped: u64,
     pub next_cache_anchor_us: u64,
     pub trie_commit_us: u64,
     /// Measured validator work outside the named phase boundaries (executor setup/fingerprints).

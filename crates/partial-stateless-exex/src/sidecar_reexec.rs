@@ -11,7 +11,7 @@ use partial_stateless::{
         root_witness_completeness_from_bundle_with_cache, SidecarWitnessCheckLimits,
     },
     CacheAnchor, MaterializedStateProof, PartialStatelessSidecar, PartialTrieNodeCache,
-    RootWitnessCompletenessReport, StateTargetSet,
+    RetentionTimings, RootWitnessCompletenessReport, StateTargetSet,
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -360,6 +360,14 @@ where
         miss_policy_check_us,
         cache_update_us: cache_timings.update_us,
         trie_retention_us: cache_timings.retention_us,
+        retention_warm_membership_us: cache_timings.retention.warm_membership_us,
+        retention_storage_paths_us: cache_timings.retention.storage_paths_us,
+        retention_account_paths_us: cache_timings.retention.account_paths_us,
+        retention_account_trie_us: cache_timings.retention.account_trie_us,
+        retention_storage_tries_us: cache_timings.retention.storage_tries_us,
+        retention_account_paths: cache_timings.retention.account_paths,
+        retention_storage_tries_pruned: cache_timings.retention.storage_tries_pruned,
+        retention_storage_tries_skipped: cache_timings.retention.storage_tries_skipped,
         next_cache_anchor_us: cache_timings.anchor_us,
         trie_commit_us: cache_timings.commit_us,
         provider_root_us,
@@ -392,6 +400,8 @@ where
 struct CacheTransitionTimings {
     update_us: u64,
     retention_us: u64,
+    /// The retention phase's internal split. See [`RetentionTimings`].
+    retention: RetentionTimings,
     anchor_us: u64,
     commit_us: u64,
     /// Storage tries the snapshot held after retention.
@@ -418,7 +428,7 @@ fn apply_cache_transition_and_check(
     let cache_update = cache.on_block_executed(block_number, accessed);
     timings.update_us = start.elapsed().as_micros() as u64;
     let start = Instant::now();
-    next_trie_cache.retain_from_value_cache(cache);
+    timings.retention = next_trie_cache.retain_from_value_cache(cache);
     timings.retention_us = start.elapsed().as_micros() as u64;
     timings.storage_tries_total = next_trie_cache.storage_trie_count() as u64;
     let start = Instant::now();

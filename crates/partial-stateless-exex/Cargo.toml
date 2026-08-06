@@ -13,6 +13,26 @@ path = "src/lib.rs"
 name = "reth-partial-stateless"
 path = "src/main.rs"
 
+[features]
+# Match the production `reth` binary's default build profile.
+#
+# `bin/reth` enables these by default, but this crate is built with
+# `cargo build -p partial-stateless-exex`, which selects only this package's
+# dependency graph — so none of `bin/reth`'s defaults reach it through feature
+# unification. Every benchmark run before 2026-08-06 therefore measured a keccak
+# implementation the production node does not use, on both the Partial path and
+# the in-process Vanilla Engine baseline it is compared against.
+default = ["asm-keccak", "keccak-cache-global", "min-debug-logs"]
+
+# The reth facade does not re-export `asm-keccak`, but the feature bottoms out at
+# `alloy-primitives`/`revm`, which this crate depends on directly. Enabling it
+# here applies to the whole graph, because features unify per package.
+asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
+# Memoizes keccak of inputs up to 87 bytes, which covers the hashed-address and
+# hashed-slot calls that dominate trie retention.
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+min-debug-logs = ["tracing/release_max_level_debug"]
+
 [dependencies]
 # reth
 reth-ethereum = { workspace = true, features = ["full", "cli"] }

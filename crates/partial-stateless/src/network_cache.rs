@@ -8,7 +8,7 @@ use crate::{
     policy::{AccountData, CachePolicy},
     sidecar::{CacheAnchor, StateTargetSet},
 };
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, Keccak256, B256, U256};
 use std::{
     collections::{HashMap, VecDeque},
     sync::OnceLock,
@@ -21,6 +21,80 @@ fn initialized_cache_root(root: Option<B256>) -> OnceLock<B256> {
         memoized.set(root).expect("new OnceLock is empty");
     }
     memoized
+}
+
+fn push_u256(out: &mut Vec<u8>, value: U256) {
+    out.extend_from_slice(&value.to_be_bytes::<32>());
+}
+
+fn namespace_root(label: &[u8], leaves: &[B256]) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"NetworkStateCacheNamespaceRoot/v1");
+    preimage.extend_from_slice(label);
+    preimage.extend_from_slice(&(leaves.len() as u64).to_be_bytes());
+    for leaf in leaves {
+        preimage.extend_from_slice(leaf.as_slice());
+    }
+    keccak256(preimage)
+}
+
+fn hash_account(address: Address, entry: &CachedEntry<AccountData>) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/account");
+    preimage.extend_from_slice(address.as_slice());
+    preimage.extend_from_slice(&entry.value.nonce.to_be_bytes());
+    push_u256(&mut preimage, entry.value.balance);
+    match entry.value.code_hash {
+        Some(code_hash) => {
+            preimage.extend_from_slice(b"code_hash");
+            preimage.extend_from_slice(code_hash.as_slice());
+        }
+        None => preimage.extend_from_slice(b"no_code_hash"),
+    }
+    preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
+    keccak256(preimage)
+}
+
+fn hash_storage(address: Address, slot: B256, entry: &CachedEntry<U256>) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/storage");
+    preimage.extend_from_slice(address.as_slice());
+    preimage.extend_from_slice(slot.as_slice());
+    push_u256(&mut preimage, entry.value);
+    preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
+    keccak256(preimage)
+}
+
+/// Absorbs every part of a code leaf preimage that `last_accessed_block` does not follow.
+///
+/// The bytecode is the largest input in the whole cache root — about 23 MiB per block on the
+/// 2026-08-05 mainnet run — and it is a function of `code_hash` alone, so absorbing it once and
+/// keeping the sponge state turns each later block's code leaf into a single 8-byte update.
+/// Keccak is a sponge, so `absorb(prefix) → clone → absorb(suffix) → finalize` is bit-identical to
+/// hashing the concatenation; [`hash_code_reference`] is the differential check on that.
+fn code_leaf_prefix_hasher(code_hash: B256, code: &Bytes) -> Keccak256 {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"NetworkStateCacheLeaf/v1/code");
+    hasher.update(code_hash.as_slice());
+    hasher.update((code.len() as u64).to_be_bytes());
+    hasher.update(code);
+    hasher
+}
+
+fn finish_code_leaf(mut hasher: Keccak256, last_accessed_block: u64) -> B256 {
+    hasher.update(last_accessed_block.to_be_bytes());
+    hasher.finalize()
+}
+
+/// Hashes a code leaf without consulting any memo. The reference the memoized path must equal.
+fn hash_code_reference(code_hash: B256, entry: &CachedEntry<Bytes>) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/code");
+    preimage.extend_from_slice(code_hash.as_slice());
+    preimage.extend_from_slice(&(entry.value.len() as u64).to_be_bytes());
+    preimage.extend_from_slice(&entry.value);
+    preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
+    keccak256(preimage)
 }
 
 /// An entry in the network state cache, tracking access metadata.
@@ -96,6 +170,15 @@ pub struct NetworkStateCache {
     /// Block, hash, and policy context remain outside this memo and are rebound by
     /// [`cache_anchor`](Self::cache_anchor) on every call.
     memoized_cache_root: OnceLock<B256>,
+    /// Per code hash, a Keccak sponge that has already absorbed that code leaf's preimage up to
+    /// but not including `last_accessed_block`.
+    ///
+    /// Purely derived: the absorbed bytes are a function of the map key, so a missing entry is a
+    /// slower recomputation rather than a wrong answer, and no rollback, reorg, or restart path
+    /// has to invalidate it. That is what keeps it out of the correctness surface — contrast
+    /// [`Self::memoized_cache_root`], whose value depends on cache contents and therefore does
+    /// need explicit invalidation.
+    code_leaf_hashers: HashMap<B256, Keccak256>,
     /// Per-block undo records (oldest→newest) enabling rollback on reorg.
     /// Retained only for the unfinalized window; pruned below the finalized block.
     undo_log: VecDeque<BlockCacheUndo>,
@@ -112,6 +195,7 @@ impl NetworkStateCache {
             storage_policy,
             current_block: 0,
             memoized_cache_root: OnceLock::new(),
+            code_leaf_hashers: HashMap::new(),
             undo_log: VecDeque::new(),
         }
     }
@@ -134,6 +218,12 @@ impl NetworkStateCache {
         // history, so a reorg deeper than what arrives after restart triggers a
         // cold reset (see `reset`). This is safe — only accuracy of the affected
         // blocks degrades until the cache warms again.
+        let code_leaf_hashers = codes
+            .iter()
+            .map(|(code_hash, entry)| {
+                (*code_hash, code_leaf_prefix_hasher(*code_hash, &entry.value))
+            })
+            .collect();
         Self {
             accounts,
             storage,
@@ -142,6 +232,7 @@ impl NetworkStateCache {
             storage_policy,
             current_block,
             memoized_cache_root: OnceLock::new(),
+            code_leaf_hashers,
             undo_log: VecDeque::new(),
         }
     }
@@ -165,6 +256,7 @@ impl NetworkStateCache {
             storage_policy,
             current_block: self.current_block,
             memoized_cache_root: initialized_cache_root(self.memoized_cache_root.get().copied()),
+            code_leaf_hashers: self.code_leaf_hashers.clone(),
             undo_log: VecDeque::new(),
         }
     }
@@ -237,6 +329,9 @@ impl NetworkStateCache {
                 }
                 None => {
                     self.codes.insert(*code_hash, CachedEntry::new(bytecode.clone(), block_number));
+                    self.code_leaf_hashers
+                        .entry(*code_hash)
+                        .or_insert_with(|| code_leaf_prefix_hasher(*code_hash, bytecode));
                     stats.codes_added += 1;
                 }
             }
@@ -272,6 +367,12 @@ impl NetworkStateCache {
         stats.accounts_evicted = accounts_pre_evict.len().saturating_sub(self.accounts.len());
         stats.storage_evicted = storage_pre_evict.len().saturating_sub(self.storage.len());
         stats.codes_evicted = codes_pre_evict.len().saturating_sub(self.codes.len());
+
+        // Bound the memo to live codes. It is a few thousand entries, so this scan is far cheaper
+        // than the ~200 bytes per stale sponge it would otherwise accumulate for the run's life.
+        if stats.codes_evicted > 0 {
+            self.code_leaf_hashers.retain(|code_hash, _| self.codes.contains_key(code_hash));
+        }
 
         self.undo_log.push_back(undo);
 
@@ -396,60 +497,31 @@ impl NetworkStateCache {
         *self.memoized_cache_root.get_or_init(|| self.compute_cache_root_uncached())
     }
 
-    /// Compute the canonical root directly from the value maps.
+    /// Compute the canonical root directly from the value maps, using the code leaf memo.
     fn compute_cache_root_uncached(&self) -> B256 {
-        fn push_u256(out: &mut Vec<u8>, value: U256) {
-            out.extend_from_slice(&value.to_be_bytes::<32>());
-        }
-
-        fn namespace_root(label: &[u8], leaves: &[B256]) -> B256 {
-            let mut preimage = Vec::new();
-            preimage.extend_from_slice(b"NetworkStateCacheNamespaceRoot/v1");
-            preimage.extend_from_slice(label);
-            preimage.extend_from_slice(&(leaves.len() as u64).to_be_bytes());
-            for leaf in leaves {
-                preimage.extend_from_slice(leaf.as_slice());
+        self.compute_cache_root_with(|code_hash, entry| {
+            match self.code_leaf_hashers.get(&code_hash) {
+                Some(hasher) => finish_code_leaf(hasher.clone(), entry.last_accessed_block),
+                // A memo miss is only reachable through a path that inserted a code without going
+                // through `on_block_executed`, `restore`, or `rollback_block`. Recompute rather
+                // than assume, so the root never depends on the memo being populated.
+                None => hash_code_reference(code_hash, entry),
             }
-            keccak256(preimage)
-        }
+        })
+    }
 
-        fn hash_account(address: Address, entry: &CachedEntry<AccountData>) -> B256 {
-            let mut preimage = Vec::new();
-            preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/account");
-            preimage.extend_from_slice(address.as_slice());
-            preimage.extend_from_slice(&entry.value.nonce.to_be_bytes());
-            push_u256(&mut preimage, entry.value.balance);
-            match entry.value.code_hash {
-                Some(code_hash) => {
-                    preimage.extend_from_slice(b"code_hash");
-                    preimage.extend_from_slice(code_hash.as_slice());
-                }
-                None => preimage.extend_from_slice(b"no_code_hash"),
-            }
-            preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
-            keccak256(preimage)
-        }
+    /// Compute the canonical root without consulting the code leaf memo.
+    ///
+    /// The slow reference [`Self::compute_cache_root_uncached`] is differential-tested against, and
+    /// the periodic diagnostic a run can use to prove the memo has not drifted.
+    pub fn compute_cache_root_reference(&self) -> B256 {
+        self.compute_cache_root_with(hash_code_reference)
+    }
 
-        fn hash_storage(address: Address, slot: B256, entry: &CachedEntry<U256>) -> B256 {
-            let mut preimage = Vec::new();
-            preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/storage");
-            preimage.extend_from_slice(address.as_slice());
-            preimage.extend_from_slice(slot.as_slice());
-            push_u256(&mut preimage, entry.value);
-            preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
-            keccak256(preimage)
-        }
-
-        fn hash_code(code_hash: B256, entry: &CachedEntry<Bytes>) -> B256 {
-            let mut preimage = Vec::new();
-            preimage.extend_from_slice(b"NetworkStateCacheLeaf/v1/code");
-            preimage.extend_from_slice(code_hash.as_slice());
-            preimage.extend_from_slice(&(entry.value.len() as u64).to_be_bytes());
-            preimage.extend_from_slice(&entry.value);
-            preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
-            keccak256(preimage)
-        }
-
+    fn compute_cache_root_with(
+        &self,
+        hash_code: impl Fn(B256, &CachedEntry<Bytes>) -> B256,
+    ) -> B256 {
         let mut account_entries: Vec<_> = self.accounts.iter().collect();
         account_entries.sort_by_key(|(address, _)| **address);
 
@@ -559,10 +631,17 @@ impl NetworkStateCache {
         for (code_hash, before) in undo.codes_before {
             match before {
                 Some(entry) => {
+                    // Restoring a code the block evicted also restores its memo, which eviction
+                    // pruned. Correctness does not depend on this — a miss recomputes — but a
+                    // reorg would otherwise rehash that bytecode on the next root.
+                    self.code_leaf_hashers
+                        .entry(code_hash)
+                        .or_insert_with(|| code_leaf_prefix_hasher(code_hash, &entry.value));
                     self.codes.insert(code_hash, entry);
                 }
                 None => {
                     self.codes.remove(&code_hash);
+                    self.code_leaf_hashers.remove(&code_hash);
                 }
             }
         }
@@ -591,6 +670,7 @@ impl NetworkStateCache {
         self.accounts.clear();
         self.storage.clear();
         self.codes.clear();
+        self.code_leaf_hashers.clear();
         self.undo_log.clear();
         self.current_block = 0;
         self.memoized_cache_root = OnceLock::new();
@@ -687,6 +767,7 @@ impl std::error::Error for CacheError {}
 mod tests {
     use super::*;
     use crate::{policy::LastNBlocksPolicy, sidecar::last_n_blocks_cache_policy_id};
+    use alloy_primitives::b256;
 
     fn make_cache(account_window: u64, storage_window: u64) -> NetworkStateCache {
         NetworkStateCache::new(
@@ -885,6 +966,168 @@ mod tests {
         assert_eq!(cache.memoized_cache_root.get().copied(), Some(parent_root));
         assert_eq!(cache.cache_root(), parent_root);
         assert_eq!(cache.cache_root(), cache.compute_cache_root_uncached());
+    }
+
+    /// Bytecode of a distinctive length, keyed by its real hash as the cache's invariants require.
+    fn code(byte: u8, len: usize) -> (B256, Bytes) {
+        let bytes = Bytes::from(vec![byte; len]);
+        (keccak256(&bytes), bytes)
+    }
+
+    fn accessed_with_code(code_hash: B256, bytes: Bytes) -> BlockAccessedState {
+        let mut accessed = BlockAccessedState::default();
+        accessed.codes.insert(code_hash, bytes);
+        accessed
+    }
+
+    /// The memoized code leaf must be bit-identical to hashing the whole preimage, at every point
+    /// in a code entry's life: insertion, refresh at a new height, eviction, and rollback.
+    #[test]
+    fn code_leaf_memo_equals_slow_reference_across_the_entry_lifecycle() {
+        let mut cache = make_cache(10, 3);
+        let (first_hash, first_bytes) = code(0xab, 4096);
+        let (second_hash, second_bytes) = code(0xcd, 1);
+
+        // Empty cache: the code namespace is hashed over zero leaves either way.
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        cache.on_block_executed(10, &accessed_with_code(first_hash, first_bytes.clone()));
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        // Refresh: only `last_accessed_block` moves, which is exactly the suffix the memo does not
+        // absorb. A memo that had baked it in would fail here.
+        let root_at_10 = cache.cache_root();
+        cache.on_block_executed(11, &accessed_with_code(first_hash, first_bytes.clone()));
+        assert_ne!(cache.cache_root(), root_at_10);
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        // A second code with a very different length exercises a different sponge block boundary.
+        cache.on_block_executed(12, &accessed_with_code(second_hash, second_bytes));
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        // Storage window 3 evicts the first code at block 15 (cutoff 12, last accessed 11).
+        cache.on_block_executed(15, &BlockAccessedState::default());
+        assert!(!cache.contains_code(&first_hash));
+        assert!(cache.contains_code(&second_hash));
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        // Rolling that eviction back restores the entry, and the root must return to what the
+        // reference says about the restored contents.
+        cache.rollback_block(15).unwrap();
+        assert!(cache.contains_code(&first_hash));
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+    }
+
+    /// The memo is derived state, so discarding it may cost time but must not change the root.
+    #[test]
+    fn cache_root_is_unchanged_when_the_code_leaf_memo_is_absent() {
+        let mut cache = make_cache(10, 10);
+        let (code_hash, bytes) = code(0x7f, 2048);
+        cache.on_block_executed(10, &accessed_with_code(code_hash, bytes));
+        let memoized_root = cache.cache_root();
+
+        cache.code_leaf_hashers.clear();
+        assert_eq!(cache.compute_cache_root_uncached(), memoized_root);
+        assert_eq!(cache.compute_cache_root_reference(), memoized_root);
+    }
+
+    /// The memo must track the codes map rather than accumulate for the life of the process.
+    #[test]
+    fn code_leaf_memo_follows_code_membership() {
+        let mut cache = make_cache(10, 2);
+        let (code_hash, bytes) = code(0x11, 64);
+
+        cache.on_block_executed(10, &accessed_with_code(code_hash, bytes.clone()));
+        assert_eq!(cache.code_leaf_hashers.len(), 1);
+
+        // Cutoff 11 at block 13 evicts the entry, and the memo is pruned with it.
+        cache.on_block_executed(13, &BlockAccessedState::default());
+        assert!(!cache.contains_code(&code_hash));
+        assert!(cache.code_leaf_hashers.is_empty());
+
+        // Rollback restores both, so a reorg does not leave the next root rehashing the bytecode.
+        cache.rollback_block(13).unwrap();
+        assert!(cache.contains_code(&code_hash));
+        assert_eq!(cache.code_leaf_hashers.len(), 1);
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+    }
+
+    /// Pins the v2 cache root against a value captured from the implementation that predates the
+    /// code leaf memo (commit `432efb77d2`).
+    ///
+    /// The other tests here compare the memoized path with the reference path in the same build,
+    /// which cannot catch a change that moves both. This one can: the expected root was produced by
+    /// running this exact fixture before the memo existed. Peers compare anchors, so a change to
+    /// this value is a protocol change and needs a commitment version, not a new constant.
+    #[test]
+    fn cache_root_matches_the_pre_memo_test_vector() {
+        let mut cache = make_cache(50, 50);
+        let mut accessed = BlockAccessedState::default();
+        for i in 0u8..8 {
+            accessed.accounts.insert(
+                Address::repeat_byte(i),
+                AccountData {
+                    nonce: i as u64,
+                    balance: U256::from(1_000u64 * i as u64 + 7),
+                    code_hash: if i % 2 == 0 { None } else { Some(B256::repeat_byte(0xf0 | i)) },
+                },
+            );
+            for j in 0u8..4 {
+                accessed.storage.insert(
+                    (Address::repeat_byte(i), B256::repeat_byte(j)),
+                    U256::from(i * 10 + j),
+                );
+            }
+            // Lengths from 32 to 256 bytes straddle the keccak rate boundary, so the memo's
+            // absorbed prefix ends mid-block for some codes and on a block boundary for others.
+            let bytes = Bytes::from(vec![i; 32 * (i as usize + 1)]);
+            accessed.codes.insert(keccak256(&bytes), bytes);
+        }
+        cache.on_block_executed(1_000, &accessed);
+
+        // A second block refreshes one account and adds one code, so the vector covers a cache
+        // whose entries do not all share a `last_accessed_block`.
+        let mut second = BlockAccessedState::default();
+        second.accounts.insert(
+            Address::repeat_byte(3),
+            AccountData { nonce: 99, balance: U256::from(12345u64), code_hash: None },
+        );
+        let bytes = Bytes::from(vec![0xee; 11]);
+        second.codes.insert(keccak256(&bytes), bytes);
+        cache.on_block_executed(1_001, &second);
+
+        let expected = b256!("0x7ab01b6994f2e7d54db8cb7118e1a2a7051c7fc2b3e4ad6392330da15d9bcf83");
+        assert_eq!(cache.cache_root(), expected);
+        assert_eq!(cache.compute_cache_root_reference(), expected);
+    }
+
+    /// A restored or forked cache must arrive with a populated memo and the same root.
+    #[test]
+    fn code_leaf_memo_survives_restore_and_fork() {
+        let mut cache = make_cache(10, 10);
+        let (code_hash, bytes) = code(0x22, 512);
+        cache.on_block_executed(10, &accessed_with_code(code_hash, bytes));
+        let root = cache.cache_root();
+
+        let fork = cache.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(10)),
+            Box::new(LastNBlocksPolicy::new(10)),
+        );
+        assert_eq!(fork.code_leaf_hashers.len(), 1);
+        assert_eq!(fork.compute_cache_root_uncached(), root);
+        assert_eq!(fork.compute_cache_root_reference(), root);
+
+        let restored = NetworkStateCache::restore(
+            cache.accounts.clone(),
+            cache.storage.clone(),
+            cache.codes.clone(),
+            cache.current_block,
+            Box::new(LastNBlocksPolicy::new(10)),
+            Box::new(LastNBlocksPolicy::new(10)),
+        );
+        assert_eq!(restored.code_leaf_hashers.len(), 1);
+        assert_eq!(restored.compute_cache_root_uncached(), root);
+        assert_eq!(restored.compute_cache_root_reference(), root);
     }
 
     #[test]

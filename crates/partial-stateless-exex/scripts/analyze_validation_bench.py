@@ -248,6 +248,56 @@ def faster_share(numerators, denominators):
     return sum(n < d for n, d in zip(numerators, denominators)) / len(numerators)
 
 
+RETENTION_SPLIT_FIELDS = [
+    ("Warm membership rebuild", "retention_warm_membership_us"),
+    ("Storage key hashing / path build", "retention_storage_paths_us"),
+    ("Account path hashing / sort", "retention_account_paths_us"),
+    ("Account trie prune", "retention_account_trie_us"),
+    ("Storage trie sort / prune", "retention_storage_tries_us"),
+]
+
+
+def build_retention_split_section(accepted):
+    """Break the largest validator phase into preparation versus trie work.
+
+    Emitted only when the records carry the split, so reports regenerated from runs written
+    before the fields existed stay readable instead of printing a table of zeros.
+    """
+    if not any(
+        field in record["partial"] for record in accepted for _, field in RETENTION_SPLIT_FIELDS
+    ):
+        return []
+
+    total = statistics.fmean(r["partial"].get("trie_retention_us", 0) for r in accepted) / 1000
+    lines = [
+        "", "### Trie retention split (Partial)", "",
+        "Measured inside `trie_retention_us`; the rows are components of it, not additions to it.",
+        "", "| Component | Avg | Share of retention |", "| --- | ---: | ---: |",
+    ]
+    preparation = 0.0
+    for label, field in RETENTION_SPLIT_FIELDS:
+        avg = statistics.fmean(r["partial"].get(field, 0) for r in accepted) / 1000
+        if field.endswith(("membership_us", "paths_us")):
+            preparation += avg
+        share = f"{100 * avg / total:.1f}%" if total else "n/a"
+        lines.append(f"| {label} | {avg:.2f} ms | {share} |")
+    prep_share = f"{100 * preparation / total:.1f}%" if total else "n/a"
+    lines.append(f"| **Key preparation subtotal** | **{preparation:.2f} ms** | **{prep_share}** |")
+
+    paths = statistics.fmean(r["partial"].get("retention_account_paths", 0) for r in accepted)
+    pruned = statistics.fmean(
+        r["partial"].get("retention_storage_tries_pruned", 0) for r in accepted)
+    skipped = statistics.fmean(
+        r["partial"].get("retention_storage_tries_skipped", 0) for r in accepted)
+    tries = pruned + skipped
+    skip_share = f"{100 * skipped / tries:.1f}%" if tries else "n/a"
+    lines.extend(["",
+        f"- Retained account paths per block: **{paths:.0f}**",
+        f"- Storage tries pruned / skipped per block: **{pruned:.0f} / {skipped:.0f}** "
+        f"({skip_share} skipped as untouched and unmoved)"])
+    return lines
+
+
 def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     if len(accepted) < requested:
         raise ValueError(f"only {len(accepted)} accepted samples; requested {requested} after warm-up {warmup}")
@@ -357,6 +407,8 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         p_avg = statistics.fmean(r["partial"].get(field, 0) for r in accepted) / 1000
         w_avg = statistics.fmean(r["weak"].get(field, 0) for r in accepted) / 1000
         lines.append(f"| {label} | {p_avg:.2f} ms | {w_avg:.2f} ms |")
+
+    lines.extend(build_retention_split_section(accepted))
 
     orders = [r["verifier_order"] for r in accepted]
     tx_average = statistics.fmean(r["tx_count"] for r in accepted)

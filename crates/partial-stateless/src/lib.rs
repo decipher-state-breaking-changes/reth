@@ -56,8 +56,9 @@ pub use sidecar::{
     SidecarCheckError, StateTargetSet, StateTargetStats, WitnessReductionStats, WitnessTargets,
 };
 pub use trie_cache::{
-    PartialTrieNodeCache, PrefixCoverage, StorageTrieMutation, TrieCacheValidationError,
-    TrieChangeSet, TrieMutationMetrics, TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
+    PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation,
+    TrieCacheValidationError, TrieChangeSet, TrieMutationMetrics, TrieShapeMetrics,
+    TRIE_SHAPE_PREFIX_LEVELS,
 };
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use witness_check::{

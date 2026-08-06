@@ -18,7 +18,7 @@ use alloy_primitives::{
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
 use reth_trie_sparse::{ParallelSparseTrie, RevealableSparseTrie, SparseStateTrie, SparseTrie};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Instant};
 
 /// The sparse state trie this cache runs on.
 ///
@@ -147,10 +147,15 @@ impl PartialTrieNodeCache {
     /// moved. Pruning anything else would reproduce the shape it already has, and under
     /// copy-on-write storage tries that no-op would cost a full copy of a trie the block never
     /// touched — the copy the snapshot exists to avoid.
-    pub fn retain_from_value_cache(&mut self, value_cache: &NetworkStateCache) {
+    pub fn retain_from_value_cache(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
+        let mut timings = RetentionTimings::default();
+
+        let start = Instant::now();
         self.warm_accounts = value_cache.accounts().keys().copied().collect();
         self.warm_storage = value_cache.storage().keys().copied().collect();
+        timings.warm_membership_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let mut retained_accounts = self.warm_accounts.clone();
         let mut retained_storage = B256Map::<Vec<Nibbles>>::default();
         for (address, slot) in &self.warm_storage {
@@ -160,17 +165,25 @@ impl PartialTrieNodeCache {
                 .or_default()
                 .push(Nibbles::unpack(keccak256(slot)));
         }
+        timings.storage_paths_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let mut retained_account_paths: Vec<_> = retained_accounts
             .into_iter()
             .map(|address| Nibbles::unpack(keccak256(address)))
             .collect();
         retained_account_paths.sort_unstable();
         retained_account_paths.dedup();
+        timings.account_paths = retained_account_paths.len() as u64;
+        timings.account_paths_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
         if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
             trie.retain_witness_paths(&retained_account_paths);
         }
+        timings.account_trie_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         for slots in retained_storage.values_mut() {
             slots.sort_unstable();
             slots.dedup();
@@ -181,6 +194,8 @@ impl PartialTrieNodeCache {
             self.sparse.storage_tries_ref().len(),
             Default::default(),
         );
+        let mut pruned = 0;
+        let mut skipped = 0;
         self.sparse.storage_tries_mut().retain(|hashed_address, trie| {
             let Some(slots) = retained_storage.get_mut(hashed_address) else { return false };
             let previous = previous_paths.get(hashed_address);
@@ -189,10 +204,11 @@ impl PartialTrieNodeCache {
             // needed makes the skip easy to lose in a later edit.
             let untouched = trie.as_revealed_ref().is_some_and(SharedSparseTrie::is_untouched);
             let unchanged = previous.is_some_and(|previous| **previous == slots[..]);
-            if !(untouched && unchanged) &&
-                let Some(trie) = trie.as_revealed_mut()
-            {
+            if untouched && unchanged {
+                skipped += 1;
+            } else if let Some(trie) = trie.as_revealed_mut() {
                 trie.retain_witness_paths(slots);
+                pruned += 1;
             }
             // Reusing the parent's handle when the set did not move keeps the next snapshot's copy
             // of this map a refcount bump rather than a walk of every retained slot path.
@@ -204,6 +220,11 @@ impl PartialTrieNodeCache {
             true
         });
         self.retained_storage_paths = current_paths;
+        timings.storage_tries_pruned = pruned;
+        timings.storage_tries_skipped = skipped;
+        timings.storage_tries_us = start.elapsed().as_micros() as u64;
+
+        timings
     }
 
     /// Storage tries this snapshot still shares with the generation it was cloned from.
@@ -539,6 +560,50 @@ impl PartialTrieNodeCache {
         }
 
         keccak256(preimage)
+    }
+}
+
+/// Where [`PartialTrieNodeCache::retain_from_value_cache`] spent a block's retention budget.
+///
+/// Retention is the largest validator phase, and its published cost has only ever been one
+/// number. That number scales with the value cache at roughly the same rate per account as per
+/// storage slot, which points at the per-key preparation rather than at the account-trie walk —
+/// but pointing is not measuring. These fields separate the two so the next optimization is
+/// aimed rather than guessed, and so `storage_tries_skipped` keeps reporting what the
+/// untouched-trie skip is actually worth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionTimings {
+    /// Rebuilding warm account and storage membership from the value cache's key sets.
+    pub warm_membership_us: u64,
+    /// Hashing every warm storage key into per-trie retained slot paths.
+    pub storage_paths_us: u64,
+    /// Hashing, sorting, and deduplicating the retained account paths.
+    pub account_paths_us: u64,
+    /// Pruning the account trie to those paths.
+    pub account_trie_us: u64,
+    /// Sorting each storage trie's slot set and pruning the tries that moved.
+    pub storage_tries_us: u64,
+    /// Retained account paths the account-trie prune was given.
+    pub account_paths: u64,
+    /// Storage tries whose prune ran.
+    pub storage_tries_pruned: u64,
+    /// Storage tries skipped because they were untouched and their slot set had not moved.
+    pub storage_tries_skipped: u64,
+}
+
+impl RetentionTimings {
+    /// Time attributable to preparing key sets, as opposed to walking either trie.
+    pub const fn preparation_us(&self) -> u64 {
+        self.warm_membership_us
+            .saturating_add(self.storage_paths_us)
+            .saturating_add(self.account_paths_us)
+    }
+
+    /// Sum of the measured phases. Slightly below the caller's outer timer by the timer calls.
+    pub const fn total_us(&self) -> u64 {
+        self.preparation_us()
+            .saturating_add(self.account_trie_us)
+            .saturating_add(self.storage_tries_us)
     }
 }
 
