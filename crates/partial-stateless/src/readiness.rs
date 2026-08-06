@@ -37,9 +37,16 @@ pub struct CacheReadinessTracker {
     /// Eviction window the cache policy advertises. Callers running separate account and storage
     /// windows pass the larger of the two: the window is only whole once both are.
     window_size: u64,
-    /// Cleared by every cold reset. Set by replaying a whole window, or in one shot by restoring a
-    /// snapshot that already carries one.
-    window_filled: bool,
+    /// The [`replay_depth`](Self::replay_depth) at which the window became whole, if it has.
+    ///
+    /// A depth rather than a flag because undoing a block has to know how far back the window
+    /// stays whole. Replaying from cold fills it at exactly `required_replay_depth`, so one block
+    /// given back un-fills it; a snapshot arrives whole at depth 0, so every block replayed on top
+    /// of it can be given back and the generation underneath is still the one the checkpoint
+    /// vouched for. A single boolean cannot tell those two apart.
+    ///
+    /// Cleared by every cold reset, and never raised once set: the window only ever grows.
+    window_filled_at: Option<u64>,
     replay_depth: u64,
     last_applied: Option<AppliedBlock>,
     /// Highest height for which this and every lower block was applied.
@@ -62,7 +69,7 @@ impl CacheReadinessTracker {
         Self {
             state: CacheReadiness::Cold,
             window_size,
-            window_filled: false,
+            window_filled_at: None,
             replay_depth: 0,
             last_applied: None,
             acknowledgeable: None,
@@ -103,7 +110,7 @@ impl CacheReadinessTracker {
 
     /// Whether the cache holds the full window its policy identifier advertises.
     pub const fn window_filled(&self) -> bool {
-        self.window_filled
+        self.window_filled_at.is_some()
     }
 
     /// Whether progress has stopped pending operator action.
@@ -138,7 +145,7 @@ impl CacheReadinessTracker {
     /// about processing rather than about cache contents.
     pub fn reset(&mut self) {
         self.state = CacheReadiness::Cold;
-        self.window_filled = false;
+        self.window_filled_at = None;
         self.replay_depth = 0;
         self.last_applied = None;
     }
@@ -180,7 +187,75 @@ impl CacheReadinessTracker {
         observed: &CacheObservation,
     ) -> Result<&ReadyParent, ReadinessError> {
         self.reset();
+        self.check_checkpoint(checkpoint, observed)?;
+        // A snapshot brought its own history and none of it was replayed here, so the window is
+        // asserted rather than counted and arrives whole at depth zero.
+        self.promote_to_checkpoint(checkpoint, 0, 0);
+        Ok(self.ready_parent().expect("just set to Ready"))
+    }
 
+    /// Promotes a pair that undid exactly one applied block back to
+    /// [`CacheReadiness::Ready`] at that block's parent.
+    ///
+    /// Distinct from [`restore_from_checkpoint`](Self::restore_from_checkpoint) because a depth-1
+    /// undo is the one restore whose replay history this tracker already owns. A snapshot has to
+    /// assert the window — nothing else vouches for it — but an undo must not: the pair ends up
+    /// exactly as warm as it was before the reorg, minus the block given back. Asserting it here
+    /// would promote a still-warming pair to `Ready` on the strength of a reorg, and `Ready` is
+    /// what opens the sidecar publication gate.
+    ///
+    /// Refuses with [`ReadinessError::UndoneBlockStillWarming`] when the pair would not stay warm,
+    /// leaving the tracker untouched so the caller can fall back to a rebuild — which is the only
+    /// thing that genuinely fills the window. Every other rejection resets to
+    /// [`Cold`](CacheReadiness::Cold), matching a checkpoint restore.
+    pub fn restore_from_undone_block(
+        &mut self,
+        checkpoint: &TrustedCheckpoint,
+        observed: &CacheObservation,
+    ) -> Result<&ReadyParent, ReadinessError> {
+        let Some((replay_depth, window_filled_at)) = self.depth_after_one_undo() else {
+            return Err(ReadinessError::UndoneBlockStillWarming {
+                replay_depth: self.replay_depth.saturating_sub(1),
+                required: self.window_filled_at.unwrap_or_else(|| self.required_replay_depth()),
+            })
+        };
+
+        self.reset();
+        self.check_checkpoint(checkpoint, observed)?;
+        self.replay_depth = replay_depth;
+        self.promote_to_checkpoint(checkpoint, replay_depth, window_filled_at);
+        Ok(self.ready_parent().expect("just set to Ready"))
+    }
+
+    /// Whether undoing the last applied block would leave the window still whole.
+    ///
+    /// Exposed so a caller can decline the undo before it mutates anything, rather than rolling
+    /// the caches back and learning from [`restore_from_undone_block`](
+    /// Self::restore_from_undone_block) that the result has no `Ready` to return to.
+    pub const fn stays_warm_after_one_undo(&self) -> bool {
+        self.depth_after_one_undo().is_some()
+    }
+
+    /// The replay depth an undo would land on, and the depth the window became whole at.
+    ///
+    /// `None` when the undo is not available at all: either nothing was replayed to give back —
+    /// a checkpoint is a floor, not a block this run applied — or giving one back would drop the
+    /// pair below where its window became whole.
+    const fn depth_after_one_undo(&self) -> Option<(u64, u64)> {
+        match (self.replay_depth.checked_sub(1), self.window_filled_at) {
+            (Some(replay_depth), Some(filled_at)) if replay_depth >= filled_at => {
+                Some((replay_depth, filled_at))
+            }
+            _ => None,
+        }
+    }
+
+    /// Checks a checkpoint against what the caches actually hold, changing nothing.
+    fn check_checkpoint(
+        &self,
+        checkpoint: &TrustedCheckpoint,
+        observed: &CacheObservation,
+    ) -> Result<(), ReadinessError> {
         if observed.cache_block != checkpoint.block_number {
             return Err(ReadinessError::CheckpointHeightMismatch {
                 expected: checkpoint.block_number,
@@ -205,10 +280,26 @@ impl CacheReadinessTracker {
                 actual: checkpoint.cache_policy_id,
             })
         }
+        Ok(())
+    }
 
-        self.window_filled = true;
+    /// Moves an already-checked checkpoint into `Ready`, along with the watermarks it settles.
+    fn promote_to_checkpoint(
+        &mut self,
+        checkpoint: &TrustedCheckpoint,
+        replay_depth: u64,
+        window_filled_at: u64,
+    ) {
+        self.window_filled_at = Some(window_filled_at);
         let applied = AppliedBlock { number: checkpoint.block_number, hash: checkpoint.block_hash };
         self.last_applied = Some(applied);
+        // A checkpoint at H asserts that no block at or below H will be needed again, which is
+        // exactly what the gap latch is withholding: the skipped block's effects are inside the
+        // restored generation whether they arrived by replay or by snapshot. A gap *above* the
+        // checkpoint is still owed and still latches.
+        if self.first_gap.is_some_and(|gap| gap <= checkpoint.block_number) {
+            self.first_gap = None;
+        }
         // The watermark starts at the checkpoint rather than staying unset. It is not a claim that
         // this ExEx processed the blocks below it — it did not — but the watermark's contract is
         // that no earlier block will be needed again, and a snapshot at this height is exactly the
@@ -227,10 +318,8 @@ impl CacheReadinessTracker {
                 cache_root: checkpoint.cache_root,
             },
             trie_state_root: checkpoint.state_root,
-            replay_depth: 0,
+            replay_depth,
         });
-
-        Ok(self.ready_parent().expect("just set to Ready"))
     }
 
     /// Admits a block for application.
@@ -290,8 +379,10 @@ impl CacheReadinessTracker {
         self.replay_depth += 1;
         let applied = AppliedBlock { number: block.number, hash: block.hash };
         self.last_applied = Some(applied);
-        if self.replay_depth >= self.required_replay_depth() {
-            self.window_filled = true;
+        // Recorded at the depth it first happened and never raised afterwards, so that undoing a
+        // block compares against where the window became whole rather than against where it is now.
+        if self.window_filled_at.is_none() && self.replay_depth >= self.required_replay_depth() {
+            self.window_filled_at = Some(self.replay_depth);
         }
         // Only contiguous from the start counts: once a block has been skipped, later blocks are
         // applied but the promise "everything below this is processed" is no longer true.
@@ -305,7 +396,7 @@ impl CacheReadinessTracker {
         // The trie root proves the caches describe this block's post-state, which is precisely the
         // state the *next* block executes against.
         let authenticated = observed.trie_state_root == Some(block.state_root);
-        self.state = if authenticated && self.window_filled {
+        self.state = if authenticated && self.window_filled() {
             CacheReadiness::Ready(ReadyParent {
                 anchor: CacheAnchor {
                     block_number: block.number,
@@ -533,6 +624,16 @@ pub enum ReadinessError {
         expected: B256,
         /// Policy the checkpoint names.
         actual: B256,
+    },
+    /// Undoing one block would leave the pair short of a full policy window.
+    ///
+    /// Not a corruption: the pair is sound, it just has no `Ready` to return to. Only a rebuild
+    /// can fill the window, so this is the signal to take that path rather than to reset.
+    UndoneBlockStillWarming {
+        /// Blocks that would remain replayed after the undo.
+        replay_depth: u64,
+        /// Blocks a full policy window needs.
+        required: u64,
     },
 }
 
@@ -908,6 +1009,159 @@ mod tests {
         apply_contiguous(&mut tracker, 5_001, 1);
         assert!(tracker.ready_parent().is_some());
         assert_eq!(tracker.acknowledgeable_height(), Some((5_001, block_hash(5_001))));
+    }
+
+    #[test]
+    fn undoing_one_block_keeps_the_replay_history_it_did_not_undo() {
+        let mut tracker = tracker();
+        // One more than the window needs, so the pair survives giving one block back.
+        apply_contiguous(&mut tracker, 100, REPLAY + 1);
+        let undone_to = 100 + REPLAY - 1;
+        tracker.begin_recovery(undone_to + 1);
+
+        let checkpoint = checkpoint_at(undone_to);
+        let parent = tracker
+            .restore_from_undone_block(&checkpoint, &restored(&checkpoint))
+            .expect("still warm after giving one block back");
+
+        assert_eq!(parent.anchor.block_number, undone_to);
+        assert_eq!(
+            parent.replay_depth, REPLAY,
+            "the undo gives back exactly one block, not the whole replay history"
+        );
+        assert_eq!(tracker.replay_depth(), REPLAY);
+        assert!(tracker.window_filled());
+
+        // The restored parent is a real continuation point, not a one-off classification.
+        apply_contiguous(&mut tracker, undone_to + 1, 1);
+        assert!(tracker.ready_parent().is_some());
+    }
+
+    #[test]
+    fn undoing_one_block_from_a_warming_pair_is_refused() {
+        let mut tracker = tracker();
+        // Exactly at the boundary: the window is filled, but only by the block being undone.
+        apply_contiguous(&mut tracker, 100, REPLAY);
+        assert!(tracker.window_filled(), "the window did fill before the reorg");
+        let undone_to = 100 + REPLAY - 2;
+        tracker.begin_recovery(undone_to + 1);
+
+        let checkpoint = checkpoint_at(undone_to);
+        let error = tracker
+            .restore_from_undone_block(&checkpoint, &restored(&checkpoint))
+            .expect_err("one block short of a window");
+
+        assert_eq!(
+            error,
+            ReadinessError::UndoneBlockStillWarming { replay_depth: REPLAY - 1, required: REPLAY }
+        );
+        assert_eq!(
+            *tracker.state(),
+            CacheReadiness::Recovering,
+            "a refusal leaves the caller free to rebuild rather than forcing a cold start"
+        );
+    }
+
+    #[test]
+    fn a_block_applied_on_a_snapshot_can_be_undone_without_replaying_a_window() {
+        // The snapshot's own generation is warm by assertion, so a pair one block past it can give
+        // that block back and land on a generation the checkpoint already vouched for — even
+        // though it has replayed nowhere near a window's worth of blocks.
+        let mut tracker = tracker();
+        let restore = checkpoint_at(5_000);
+        tracker.restore_from_checkpoint(&restore, &restored(&restore)).expect("matches");
+        apply_contiguous(&mut tracker, 5_001, 1);
+        assert_eq!(tracker.replay_depth(), 1);
+        tracker.begin_recovery(5_001);
+
+        let parent = tracker
+            .restore_from_undone_block(&restore, &restored(&restore))
+            .expect("the generation underneath is the checkpointed one");
+
+        assert_eq!(parent.anchor.block_number, 5_000);
+        assert_eq!(parent.replay_depth, 0);
+
+        // But only back to the checkpoint: there is nothing underneath it to undo into.
+        tracker.begin_recovery(5_000);
+        let error = tracker
+            .restore_from_undone_block(&checkpoint_at(4_999), &restored(&checkpoint_at(4_999)))
+            .expect_err("the checkpoint is the floor");
+        assert!(matches!(error, ReadinessError::UndoneBlockStillWarming { .. }));
+    }
+
+    #[test]
+    fn a_snapshot_promotes_a_warming_pair_but_an_undo_does_not() {
+        // The asymmetry is the point: a checkpoint arrives with its own history and asserts the
+        // window, while an undo can only give back what this run already replayed.
+        let checkpoint = checkpoint_at(100);
+
+        let mut snapshotted = tracker();
+        apply_contiguous(&mut snapshotted, 96, 1);
+        assert!(!snapshotted.window_filled());
+        assert!(snapshotted.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).is_ok());
+
+        let mut undone = tracker();
+        apply_contiguous(&mut undone, 96, 1);
+        assert!(undone.restore_from_undone_block(&checkpoint, &restored(&checkpoint)).is_err());
+    }
+
+    #[test]
+    fn an_undo_still_checks_the_checkpoint_it_is_handed() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, REPLAY + 1);
+        tracker.begin_recovery(100 + REPLAY);
+
+        // Warm enough to undo, but the caches do not reproduce the canonical root.
+        let checkpoint = checkpoint_at(100 + REPLAY - 1);
+        let observation = CacheObservation {
+            trie_state_root: Some(B256::repeat_byte(0xfe)),
+            ..restored(&checkpoint)
+        };
+        let error = tracker.restore_from_undone_block(&checkpoint, &observation).unwrap_err();
+
+        assert!(matches!(error, ReadinessError::CheckpointRootMismatch { .. }));
+        assert_eq!(
+            *tracker.state(),
+            CacheReadiness::Cold,
+            "a pair that failed authentication is reset, not left claiming a recovery"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_at_or_above_a_gap_releases_the_acknowledgement() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        assert_eq!(tracker.first_gap(), Some(101));
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
+
+        // A rebuild or snapshot restore at 150 reconstructs a generation that already contains
+        // whatever block 101 did, so nothing at or below 150 is owed any more.
+        let checkpoint = checkpoint_at(150);
+        tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).expect("matches");
+
+        assert_eq!(tracker.first_gap(), None);
+        apply_contiguous(&mut tracker, 151, 1);
+        assert_eq!(tracker.acknowledgeable_height(), Some((151, block_hash(151))));
+    }
+
+    #[test]
+    fn a_checkpoint_below_a_gap_leaves_the_acknowledgement_pinned() {
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+
+        // Restoring *below* the skipped block says nothing about it, so the latch stays.
+        let checkpoint = checkpoint_at(90);
+        tracker.restore_from_checkpoint(&checkpoint, &restored(&checkpoint)).expect("matches");
+
+        assert_eq!(tracker.first_gap(), Some(101));
+        apply_contiguous(&mut tracker, 91, 1);
+        assert_eq!(
+            tracker.acknowledgeable_height(),
+            Some((90, block_hash(90))),
+            "the watermark cannot step over a block that is still unprocessed"
+        );
     }
 
     #[test]

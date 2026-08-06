@@ -471,6 +471,19 @@ impl SparseTrie for ParallelSparseTrie {
                 .is_some_and(|node| node.cached_rlp_node().is_some())
     }
 
+    fn cached_root(&self) -> Option<B256> {
+        // Deliberately the same condition `root` early-returns on, so this can only answer where
+        // `root` would have returned the same hash without recomputing anything.
+        if !self.prefix_set.is_empty() {
+            return None
+        }
+        self.upper_subtrie
+            .nodes
+            .get(&Nibbles::default())
+            .and_then(|node| node.cached_rlp_node())
+            .and_then(|rlp_node| rlp_node.as_hash())
+    }
+
     #[instrument(level = "trace", target = "trie::sparse::parallel", skip(self))]
     fn update_subtrie_hashes(&mut self) {
         trace!(target: "trie::parallel_sparse", "Updating subtrie hashes");

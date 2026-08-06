@@ -6,7 +6,10 @@ the network-level state cache as the chain advances and, per block, measures the
 witness ("sidecar") a partially-stateless validator would need.
 
 The binary is `reth-partial-stateless` — a full Ethereum node with the ExEx
-installed.
+installed. The crate is split into a library and a thin binary so that the
+recovery, bootstrap, and admission paths can be tested from `tests/`: each of
+those needs a state provider and an EVM, which `partial-stateless` deliberately
+does not depend on.
 
 ## What it does per committed block
 
@@ -40,12 +43,102 @@ The flat `NetworkStateCache` alone decides hits, misses, eviction, and cache anc
 shape is local validation state: additional revealed nodes do not change the sidecar miss manifest
 or either cache anchor.
 
-Sparse-trie snapshots currently have no branch-aware undo representation. On
-`ChainReorged` and `ChainReverted`, both flat and trie caches are cold-reset so a
-flat value cannot outlive its authenticated path. A builder can initialize from
-the full provider while processing the new branch. The library can verify and
-restore a synchronized joint cache snapshot, but this ExEx does not yet load that
-package during startup, so a sidecar-only verifier cannot recover from the reset.
+## Reaching a usable cache
+
+Sparse-trie snapshots still have no general branch-aware undo representation, so
+recovery has two layers. Every role that advances the caches keeps the displaced
+parent as one **retained coordinated generation**: on a depth-1 reorg it rolls the
+flat cache back once, restores that parent trie, and verifies the target hash,
+canonical state root, policy, and readiness before continuing. If the retained
+generation is absent or any check fails, recovery falls back to the
+**provider-backed canonical rebuild** ([`rebuild.rs`](./src/rebuild.rs)).
+
+The rebuild produces an exact coordinated pair at a canonical block hash without
+consulting the abandoned generation. It replays `max_window + 1` heights ending
+at that block to rebuild the flat cache, then authenticates the trie in one shot
+against the block's canonical state root. The same primitive serves cold start,
+deep-reorg fallback, and revert. Replaying forward from an abandoned cached
+generation would be *incorrect*, not merely slow.
+
+**The rebuild is opt-in, under `PS_CANONICAL_REBUILD=1`.** It is not free: the
+one-shot multiproof over the whole cache dominates its cost and holds a single
+read transaction open for its whole duration — measured at 120.5 s of 144.8 s
+cold — so a process that turns it on stalls once per cache epoch before it can
+publish anything. Warming instead spreads the same "not usable yet" period over a
+policy window of live blocks. The table below describes an enabled rebuild; every
+row falls through to warming when it is off.
+
+| Situation | What happens |
+| --- | --- |
+| Cold start | Rebuild at the parent of the first notified block, then publish from its first child. Roughly `window + 1` historical executions and one multiproof, against about twelve minutes of live warming. |
+| `ChainReorged` | Enter `Recovering`. Try the retained parent first for a depth-1 reorg against an already-warm pair; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
+| `ChainReverted` | Enter `Recovering` and rebuild at the new tip, addressed as the parent hash of the reverted chain's first block. |
+| Gap or wrong-branch parent | Try a rebuild at the rejected block's own parent first; only fall back to a cold reset and live warming if that fails. |
+| Rebuild disabled, unavailable, or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. Being switched off is not a failure and is not logged as one: read `canonical_rebuild` in the startup summary line. |
+
+The retained-generation path above is unaffected by the switch. A depth-1 reorg
+against an already-warm pair still recovers in tens of milliseconds with the
+rebuild off; what the switch changes is only what happens when that path does not
+apply.
+
+The retained-generation path covers exactly one block. It adds no new trie clone
+in either role: the transition already copies the parent trie and then overwrites
+it, so both the builder and the live verifier keep a copy that exists anyway. A
+builder-side preflight discards its transactional result and displaces nothing, so
+it retains nothing. A deeper reorg falls back to the rebuild.
+
+Restoring a retained generation cannot promote a pair that is still warming. The
+undo gives back exactly one replayed block, so it is accepted only when the window
+stays whole without it — a pair one block past a snapshot qualifies, because the
+generation underneath is the one the checkpoint vouched for, while a pair that
+just barely filled its window by replay does not. Otherwise the pair falls through
+to the rebuild, which is the only thing that genuinely fills a window. Promoting
+instead would open the sidecar publication gate on an under-warmed cache.
+
+The rebuild requires canonical state, so it does not replace the snapshot path: a
+full node cold-starts by replay and needs no snapshot file, while a node without
+the database cannot replay at all and needs one. It also assumes the last
+`max_window + 1` heights are readable through `history_by_block_hash`, which holds
+for a full node but not under aggressive pruning.
+
+**The open end is the stateless verifier past depth 1.** Retention reaches exactly
+one block and the rebuild needs canonical state, so a node without a database has
+nothing between them. Closing it means a recovery-time snapshot request:
+`recover_at` branches only to the retained generation or to the rebuild, and
+`PS_BOOTSTRAP_IMPORT` runs at process start only. The gap does not show up in the
+benchmarks, where even the verifier role runs as an ExEx on a full node.
+
+**Neither recovery path is reachable from the measured verification path.** The
+validator numbers only mean anything because the benchmark validates from
+serialized sidecar bytes against the cache, trie cache, and witness alone.
+Recovery is cache *maintenance* and runs between measured samples, never inside
+one.
+
+## Operator-trusted snapshot bootstrap
+
+[`bootstrap_io.rs`](./src/bootstrap_io.rs) exports and imports the joint cache
+snapshot the library can already build, verify, and restore. The importing side
+authenticates everything against a `TrustedCheckpoint` — number, hash, canonical
+state root, cache root, policy ID — that the operator supplies out of band, and
+discards a package that disagrees with it. **A node bootstrapped this way trusts
+whoever configured the checkpoint; this is not trustless new-node sync.**
+
+`PS_BOOTSTRAP_SELF_TEST=<n>` closes the sync/bootstrap gate inside one process,
+because two live runs cannot overlap on one datadir and sequencing them lets the
+chain advance across the restart. The run warms normally, exports at `Ready(H)`,
+restores a *second* coordinated pair from that package in the same process, and
+then validates the next `n` blocks against both pairs through the same
+provider-free path — asserting they agree on cache anchor, trie state root, trie
+cache root, and retained paths. Miss-set agreement is structural rather than a
+separate assertion: that verification path already checks the restored cache's
+own expected miss set against the miss manifest the live pair built.
+
+An imported snapshot is stale by the time the first notification arrives. A node
+that can replay bridges the drift with a canonical rebuild, which is the one
+situation where turning it on is close to mandatory rather than a trade; a node
+that cannot stays Cold until a fresher snapshot is supplied. That is a real limitation of this
+phase, which is why the gate above restores in-process rather than across a
+restart.
 
 ## Run
 
@@ -54,12 +147,16 @@ cargo run -p partial-stateless-exex -- node --chain mainnet --datadir /path/to/d
 ```
 
 The flat cache is persisted to `<datadir>/partial_stateless_cache.bin`, but the
-matching sparse-trie snapshot is not yet persisted. A non-empty persisted value
-cache is therefore cold-reset on restart.
+matching sparse-trie snapshot is not yet persisted, so a non-empty persisted
+value cache is still cold-reset on restart. A full node can buy its way out of
+that with `PS_CANONICAL_REBUILD=1`, which puts the pair back at `Ready` before
+the first notified block is applied — at the cost of the startup stall above.
+Atomic value+trie+anchor persistence remains the thing that would make a warm
+restart real, and free.
 
 ### Configuration
 
-The cache windows are set in `CacheConfig` ([main.rs](./src/main.rs)) — default
+The cache windows are set in `CacheConfig` ([lib.rs](./src/lib.rs)) — default
 `account_window = 60`, `storage_window = 30` blocks. Adjust there and rebuild.
 (Use [`cache_window_bench`](../partial-stateless/src/bin/README.md) to pick good
 values offline before committing to them.)
@@ -83,6 +180,11 @@ variables, so the core sidecar generation path stays lean:
 | `PS_BUILDER_BENCH_OUTPUT=<file>` | JSONL destination for per-block builder proof, snapshot, commitment, and total-cost records |
 | `PS_FORCE_PREVIOUS_CACHE_SNAPSHOT=1` | benchmark-only B2 control that recreates the old unconditional parent-cache clone |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
+| `PS_CANONICAL_REBUILD=1` | reach `Ready` by rebuilding the pair from canonical state at cold start and after a failed recovery, instead of warming over a policy window of live blocks (default: disabled) |
+| `PS_BOOTSTRAP_DIR=<dir>` | where the snapshot package and its checkpoint live (default: `$PS_SIDECAR_DIR/bootstrap`) |
+| `PS_BOOTSTRAP_EXPORT=1` | export a snapshot the first time the tracker reaches Ready |
+| `PS_BOOTSTRAP_IMPORT=1` | restore from a snapshot at startup, ahead of the persisted flat cache |
+| `PS_BOOTSTRAP_SELF_TEST=<n>` | export at the first Ready, restore a second pair in-process, and compare both pairs for the next `n` blocks (implies export) |
 
 The initial parallel-proof gate currently requires at least two distinct storage tries and 64
 total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
@@ -101,9 +203,10 @@ sidecars. For each canonical block it reads
 cache, re-executes with cache hits plus sidecar miss witnesses, and advances the
 local cache only after verification succeeds. The verifier must start with a
 cache synchronized to the parent block; the sidecar file alone is not enough to
-reconstruct that previous cache. Because sparse-trie snapshots are not persisted,
-the current binary cold-resets a persisted flat cache at startup; ordinary
-mid-chain verifier restart/cold-start is therefore not implemented yet.
+reconstruct that previous cache. A snapshot import (`PS_BOOTSTRAP_IMPORT=1`) is
+how a verifier gets one, but an imported snapshot is stale by the time the first
+notification arrives, and a verifier cannot replay to bridge the drift. Ordinary
+mid-chain verifier restart therefore still needs a fresh snapshot per start.
 
 Preflight re-executes from cache hits plus sidecar misses, applies the execution
 diff to a cloned local sparse trie, checks that root against the consensus block
@@ -114,12 +217,20 @@ The manifest and verifier logs expose
 `partial_state_trustless_verification_ready`. The readiness calculation includes
 miss paths from the sidecar and cache-hit paths retained by the local sparse trie.
 
-When the first processed block is not synchronized to the cache parent, the
-builder obtains a local-only proof for the union of captured access paths and
-execution-diff paths. It uses that proof to initialize both local caches and does
-not publish a cache-coherent sidecar for that block. This is local ExEx startup,
-not a protocol bootstrap mechanism for a new stateless node. Cold-EOA mempool
-admission and new-node cache bootstrap remain out of scope.
+## Cold-EOA admission
+
+`partial_stateless::admit_cold_sender` turns a verified account proof into an
+admission decision: it applies the cold precondition (the sender must be absent
+from the account cache *at the current head*), verifies the proof, and then
+applies balance, nonce, and EIP-3607 rules. It takes canonicality as a closure,
+which [`cold_eoa.rs`](./src/cold_eoa.rs) supplies from two header reads. Keeping
+the two apart is what makes the no-state-access property structural: the crate
+holding the admission logic does not depend on `reth-provider` at all.
+
+This is a caller-level path, not a transaction-pool integration. Reth's pooled
+transaction type carries no proof field, so a real pool integration forces a
+custom transaction type; that, along with p2p/RPC proof distribution, relay and
+caching, DoS accounting, and pending-head/reorg behaviour, is deferred.
 
 When `PS_WITNESS_BASELINE` is unset, the manifest's `full_sidecar_baseline_stats`
 and `reduction` are `null` and no baseline multiproof is computed. A baseline
@@ -164,9 +275,10 @@ diagnostics flags. Production behavior is unchanged when `PS_VALIDATION_BENCH` i
 
 The default run excludes 60 successful warm-up blocks and collects 600 same-hash accepted samples.
 It discards invalid pairs and any pair whose Partial/Weak interval overlaps the start of the next
-Engine validation. A reorg/revert cold-resets the caches and starts a new warm-up epoch. Samples
-from earlier canonical heights remain eligible; orphaned heights at or above the reverted range and
-each epoch’s warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
+Engine validation. Every reorg/revert starts a new benchmark warm-up epoch after recovery; a
+depth-1 builder reorg normally uses the retained generation, while deeper recovery uses the rebuild.
+Samples from earlier canonical heights remain eligible; orphaned heights at or above the reverted
+range and each epoch's warm-up are excluded. The cumulative target spans all epochs. The supervisor sends
 `SIGINT` after the target and writes `results.md`.
 The output directory must be absent or empty.
 

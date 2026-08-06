@@ -10,12 +10,14 @@
 
 pub mod accessed_state;
 pub mod bootstrap;
+pub mod cold_admission;
 pub mod fixture;
 pub mod network_cache;
 pub mod participant;
 pub mod persistence;
 pub mod policy;
 pub mod readiness;
+pub mod shared_trie;
 pub mod trie_cache;
 pub mod witness;
 
@@ -25,9 +27,12 @@ pub mod witness_check;
 
 pub use accessed_state::BlockAccessedState;
 pub use bootstrap::{
-    bootstrap_proof_targets, build_snapshot_package, verify_and_restore,
-    verify_and_restore_with_limits, BootstrapError, BootstrapLimits, CacheSnapshotPackage,
-    RestoredBootstrapState,
+    bootstrap_proof_targets, build_snapshot_package, build_snapshot_package_with_limits,
+    rebuild_trie_cache, verify_and_restore, verify_and_restore_with_limits, BootstrapError,
+    BootstrapLimits, CacheSnapshotPackage, RebuiltTrieCache, RestoredBootstrapState,
+};
+pub use cold_admission::{
+    admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{CachedEntry, NetworkStateCache};
@@ -41,6 +46,7 @@ pub use readiness::{
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,
 };
+pub use shared_trie::{cow_copies_taken, SharedSparseTrie};
 pub use sidecar::{
     check_next_cache_anchor, check_sidecar_context, check_sidecar_miss_targets,
     check_sidecar_self_consistency, last_n_blocks_cache_policy_id, partial_witness_commitment,

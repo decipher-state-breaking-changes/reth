@@ -152,6 +152,15 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// Returns true if the root node is cached and does not need any recomputation.
     fn is_root_cached(&self) -> bool;
 
+    /// Returns the root hash when it is already cached and needs no recomputation.
+    ///
+    /// [`Self::root`] takes `&mut self` even on this path, which forces a copy-on-write wrapper to
+    /// copy a trie it is only reading. Implementations that cannot answer without recomputing
+    /// return `None`, which is always sound: the caller falls back to [`Self::root`].
+    fn cached_root(&self) -> Option<B256> {
+        None
+    }
+
     /// Recalculates and updates the RLP hashes of subtries deeper than a certain level. The level
     /// is defined in the implementation.
     ///
@@ -433,6 +442,10 @@ mod configurable_sparse_trie {
 
         fn is_root_cached(&self) -> bool {
             delegate!(self, is_root_cached)
+        }
+
+        fn cached_root(&self) -> Option<B256> {
+            delegate!(self, cached_root)
         }
 
         fn update_subtrie_hashes(&mut self) {

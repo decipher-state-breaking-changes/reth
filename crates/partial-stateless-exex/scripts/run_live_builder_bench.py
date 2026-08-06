@@ -13,7 +13,7 @@ from analyze_builder_bench import build_builder_report, select_builder_samples
 from analyze_validation_bench import load_jsonl
 from run_live_paired_bench import (
     DISABLED_DIAGNOSTICS,
-    append_resource_sample,
+    ResourceSampler,
     build_command,
     prepare_output,
     stop_process,
@@ -41,6 +41,16 @@ def parse_args():
         help="set PS_PARALLEL_INITIAL_PROOF deterministically (default: off)",
     )
     parser.add_argument(
+        "--canonical-rebuild",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "set PS_CANONICAL_REBUILD deterministically (default: off). On, a cold or recovered "
+            "pair reaches Ready by rebuilding from canonical state, which stalls the run once per "
+            "cache epoch; off, it warms over a policy window of live blocks instead"
+        ),
+    )
+    parser.add_argument(
         "--force-previous-cache-snapshot",
         action="store_true",
         help="recreate the old unconditional clone as the B2 control",
@@ -61,6 +71,7 @@ def benchmark_environment(
     engine_path,
     sidecar_dir,
     parallel_initial_proof,
+    canonical_rebuild,
     force_previous_cache_snapshot,
 ):
     env = os.environ.copy()
@@ -74,6 +85,7 @@ def benchmark_environment(
             "PS_PARALLEL_INITIAL_PROOF": (
                 "1" if parallel_initial_proof == "on" else "0"
             ),
+            "PS_CANONICAL_REBUILD": "1" if canonical_rebuild == "on" else "0",
             "PS_FORCE_PREVIOUS_CACHE_SNAPSHOT": (
                 "1" if force_previous_cache_snapshot else "0"
             ),
@@ -108,6 +120,7 @@ def main():
         engine_path,
         sidecar_dir,
         args.parallel_initial_proof,
+        args.canonical_rebuild,
         args.force_previous_cache_snapshot,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
@@ -120,6 +133,7 @@ def main():
     process = None
     reached_target = False
     last_count = -1
+    sampler = ResourceSampler(resource_path)
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,
@@ -137,15 +151,11 @@ def main():
                     args.samples,
                     require_published=True,
                 )
-                memory = append_resource_sample(resource_path, process.pid, len(accepted))
+                memory = sampler.sample(process.pid, len(accepted))
                 if len(accepted) != last_count:
-                    memory_summary = (
-                        f" rss={memory[0] / 1024:.0f}MiB peak={memory[1] / 1024:.0f}MiB"
-                        if memory is not None
-                        else ""
-                    )
                     print(
-                        f"accepted={len(accepted)}/{args.samples}{memory_summary}",
+                        f"accepted={len(accepted)}/{args.samples}"
+                        f"{sampler.progress_summary(memory)}",
                         flush=True,
                     )
                     last_count = len(accepted)

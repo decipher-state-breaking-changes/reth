@@ -10,7 +10,21 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
-RESET_MARKERS = ("Chain reorg detected", "Chain reverted", "Partial Stateless ExEx started")
+# Both caches were discarded and warming restarts from nothing, so the blocks that follow are not
+# measuring a warm cache and must be excluded. These are the only two places the ExEx does that:
+# process start, and `admit_after_cold_reset` once recovery and rebuild have both been ruled out.
+COLD_MARKERS = (
+    "Partial Stateless ExEx started",
+    "Cold-resetting both caches and warming again from this block",
+)
+
+# The canonical chain moved, so samples on the abandoned branch have to go. This says nothing about
+# cache warmth: a depth-1 reorg restored from the retained generation leaves the pair Ready at the
+# common ancestor and the very next block verifies trustlessly, so re-arming warm-up here would
+# discard a policy window of perfectly warm samples per reorg. When recovery genuinely fails the
+# ExEx logs a cold marker of its own, which is what re-arms warm-up.
+BRANCH_MARKERS = ("Chain reorg detected", "Chain reverted")
+
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -42,8 +56,8 @@ def field_hash(line: str, name: str):
 
 @dataclass
 class SelectionStats:
-    before_last_reset: int = 0
-    resets: int = 0
+    cold_epochs: int = 0
+    warm_branch_switches: int = 0
     orphaned: int = 0
     warmup: int = 0
     invalid: int = 0
@@ -55,8 +69,16 @@ class SelectionStats:
 
 @dataclass(frozen=True)
 class ResetPoint:
+    """A log position where sample selection has to change what it is doing.
+
+    `reverted_from` drops samples the chain abandoned; `cold` re-arms warm-up. They are
+    independent, and the reason this type carries both is that the two used to be conflated: every
+    reorg was treated as a cache epoch even when the caches never lost warmth.
+    """
+
     position: int
     reverted_from: int | None
+    cold: bool
 
 
 def reset_reverted_from(line: str):
@@ -73,8 +95,10 @@ def parse_log_positions(log_path: Path):
     if not log_path.exists():
         return engine_positions, paired_positions, ordered_engine_positions, reset_points
     for position, line in enumerate(log_path.read_text(errors="replace").splitlines()):
-        if any(marker in line for marker in RESET_MARKERS):
-            reset_points.append(ResetPoint(position, reset_reverted_from(line)))
+        if any(marker in line for marker in COLD_MARKERS):
+            reset_points.append(ResetPoint(position, None, cold=True))
+        elif any(marker in line for marker in BRANCH_MARKERS):
+            reset_points.append(ResetPoint(position, reset_reverted_from(line), cold=False))
         if "Vanilla Reth Engine V2 benchmark start" in line:
             block_hash = field_hash(line, "block_hash")
             if block_hash:
@@ -118,6 +142,12 @@ def select_samples(
     candidates.sort(key=lambda item: item[1])
     candidate_index = 0
     epoch_count = len(resets) + 1
+    # Warm-up carries across epoch boundaries rather than restarting at each one, and is re-armed
+    # only by a cold marker. A branch switch that the pair survived warm therefore costs exactly
+    # the samples the chain abandoned and nothing else; a branch switch that arrived mid-warm-up
+    # still finishes the warm-up it interrupted.
+    warmup_remaining = warmup
+    cold_epoch_counted = False
     for epoch in range(epoch_count):
         reset = resets[epoch - 1] if epoch else None
         if reset is not None:
@@ -128,10 +158,12 @@ def select_samples(
                 ]
                 stats.orphaned += len(accepted) - len(retained)
                 accepted = retained
-            if epoch > 1 or resets[0].reverted_from is not None:
-                stats.resets += 1
+            if reset.cold:
+                warmup_remaining = warmup
+                cold_epoch_counted = False
+            else:
+                stats.warm_branch_switches += 1
 
-        warmup_remaining = warmup
         while candidate_index < len(candidates) and candidates[candidate_index][0] == epoch:
             _, paired_position, record = candidates[candidate_index]
             candidate_index += 1
@@ -147,6 +179,9 @@ def select_samples(
             if warmup_remaining:
                 warmup_remaining -= 1
                 stats.warmup += 1
+                if not cold_epoch_counted:
+                    stats.cold_epochs += 1
+                    cold_epoch_counted = True
                 continue
             next_index = bisect.bisect_right(ordered_engine_positions, own_engine_position)
             if next_index >= len(ordered_engine_positions):
@@ -230,7 +265,8 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines = [
         "# Single-process Vanilla / Partial / Weak benchmark", "",
         f"Accepted same-block samples: **{len(accepted)}**",
-        f"Warm-up blocks excluded: **{stats.warmup}** across **{stats.resets + 1}** cache epochs",
+        f"Warm-up blocks excluded: **{stats.warmup}** across **{stats.cold_epochs}** cold cache epochs",
+        f"Branch switches survived warm: **{stats.warm_branch_switches}** (no warm-up re-armed)",
         f"Excluded: orphaned {stats.orphaned}, overlap {stats.contaminated}, invalid {stats.invalid}, missing Engine {stats.missing_engine}, pending {stats.pending_next_engine}.", "",
         "## State access + execution (primary)", "",
         "Includes Vanilla provider/prewarming/DB reads and Partial/Weak deserialize, witness checks/materialization, provider setup/lookups, and EVM.", "",

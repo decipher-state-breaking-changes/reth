@@ -3,7 +3,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
-    check_sidecar_context, check_sidecar_miss_targets,
+    check_sidecar_context, check_sidecar_miss_targets, cow_copies_taken,
     network_cache::{NetworkStateCache, UpdateStats},
     try_compute_trustless_state_root, try_compute_trustless_state_root_v2_with_storage_targets,
     witness_check::{
@@ -20,7 +20,7 @@ use reth_provider::{ProviderError, ProviderResult, StateProvider};
 use reth_revm::database::{EvmStateProvider, StateProviderDatabase};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::State;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, mem, time::Instant};
 
 pub(crate) type SidecarReexecLimits = SidecarWitnessCheckLimits;
 
@@ -34,7 +34,9 @@ pub(crate) enum TrieCacheDisposition {
     Discard,
 }
 
-#[derive(Debug, Clone)]
+/// Deliberately not `Clone`: it carries a whole trie generation, and copying a report to read a
+/// number off it would silently pay for a deep trie copy.
+#[derive(Debug)]
 pub(crate) struct SidecarReexecReport {
     pub computed_state_root: B256,
     pub actual_accessed: BlockAccessedState,
@@ -49,6 +51,11 @@ pub(crate) struct SidecarReexecReport {
     pub execution_requests_hash: B256,
     pub execution_requests_empty: bool,
     pub timings: ValidationPhaseTimings,
+    /// The parent trie generation this transition displaced, when it committed.
+    ///
+    /// `None` under [`TrieCacheDisposition::Discard`], where nothing was displaced and the
+    /// caller's trie cache is still the parent.
+    pub displaced_trie_cache: Option<PartialTrieNodeCache>,
 }
 
 pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm>(
@@ -203,6 +210,12 @@ where
 
     // Apply the block to a transactional sparse-trie snapshot. The original cache is left
     // untouched until the consensus root and next cache anchor have both been checked.
+    //
+    // The snapshot shares its storage tries with the parent, so the copies it goes on to take are
+    // spread across the transition and retention rather than paid here. Bracketing the whole
+    // transaction is the only way to count them; the counter is process-wide, which is exact
+    // because the ExEx applies one transition at a time.
+    let cow_copies_before = cow_copies_taken();
     let clone_start = Instant::now();
     let mut next_trie_cache = trie_cache.clone();
     let trie_clone_us = clone_start.elapsed().as_micros() as u64;
@@ -316,17 +329,19 @@ where
         .map_err(|err| eyre!("cache-miss-only check failed: {err:?}"))?;
     let miss_policy_check_us = miss_policy_start.elapsed().as_micros() as u64;
 
-    let (cache_update, next_cache_anchor, cache_timings) = apply_cache_transition_and_check(
-        prev_cache,
-        &actual_accessed,
-        sidecar.block_number,
-        sidecar.block_hash,
-        expected_cache_policy_id,
-        sidecar.next_cache_anchor,
-        trie_cache,
-        next_trie_cache,
-        trie_cache_disposition,
-    )?;
+    let (cache_update, next_cache_anchor, cache_timings, displaced_trie_cache) =
+        apply_cache_transition_and_check(
+            prev_cache,
+            &actual_accessed,
+            sidecar.block_number,
+            sidecar.block_hash,
+            expected_cache_policy_id,
+            sidecar.next_cache_anchor,
+            trie_cache,
+            next_trie_cache,
+            trie_cache_disposition,
+        )?;
+    let trie_storage_tries_copied = cow_copies_taken().saturating_sub(cow_copies_before);
 
     let mut timings = ValidationPhaseTimings {
         context_check_us,
@@ -338,6 +353,8 @@ where
         evm_us,
         hash_post_state_us,
         trie_clone_us,
+        trie_storage_tries_copied,
+        trie_storage_tries_total: cache_timings.storage_tries_total,
         state_root_us,
         root_completeness_us,
         miss_policy_check_us,
@@ -367,6 +384,7 @@ where
         execution_requests_hash,
         execution_requests_empty,
         timings,
+        displaced_trie_cache,
     })
 }
 
@@ -376,6 +394,12 @@ struct CacheTransitionTimings {
     retention_us: u64,
     anchor_us: u64,
     commit_us: u64,
+    /// Storage tries the snapshot held after retention.
+    ///
+    /// Paired with the copy count taken across the whole transaction, this is what the
+    /// copy-on-write snapshot saved over the deep clone, which is no longer visible in
+    /// `trie_clone_us` once that stops doing the copying.
+    storage_tries_total: u64,
 }
 
 fn apply_cache_transition_and_check(
@@ -388,7 +412,7 @@ fn apply_cache_transition_and_check(
     trie_cache: &mut PartialTrieNodeCache,
     mut next_trie_cache: PartialTrieNodeCache,
     trie_cache_disposition: TrieCacheDisposition,
-) -> Result<(UpdateStats, CacheAnchor, CacheTransitionTimings)> {
+) -> Result<(UpdateStats, CacheAnchor, CacheTransitionTimings, Option<PartialTrieNodeCache>)> {
     let mut timings = CacheTransitionTimings::default();
     let start = Instant::now();
     let cache_update = cache.on_block_executed(block_number, accessed);
@@ -396,6 +420,7 @@ fn apply_cache_transition_and_check(
     let start = Instant::now();
     next_trie_cache.retain_from_value_cache(cache);
     timings.retention_us = start.elapsed().as_micros() as u64;
+    timings.storage_tries_total = next_trie_cache.storage_trie_count() as u64;
     let start = Instant::now();
     let next_cache_anchor = cache.cache_anchor(block_number, block_hash, cache_policy_id);
     timings.anchor_us = start.elapsed().as_micros() as u64;
@@ -407,12 +432,19 @@ fn apply_cache_transition_and_check(
             "next cache anchor mismatch: expected {expected_next_anchor:?}, got {next_cache_anchor:?}"
         );
     }
-    if trie_cache_disposition == TrieCacheDisposition::Commit {
+    // Committing hands the displaced parent back rather than dropping it, which is what makes a
+    // one-deep retained generation free: `next_trie_cache` is already a copy of the parent, so the
+    // object exists either way and the only question is whether anything still holds it. A
+    // discarded transition never displaced anything — the caller's trie cache is still the parent.
+    let displaced_trie_cache = if trie_cache_disposition == TrieCacheDisposition::Commit {
         let start = Instant::now();
-        *trie_cache = next_trie_cache;
+        let displaced = mem::replace(trie_cache, next_trie_cache);
         timings.commit_us = start.elapsed().as_micros() as u64;
-    }
-    Ok((cache_update, next_cache_anchor, timings))
+        Some(displaced)
+    } else {
+        None
+    };
+    Ok((cache_update, next_cache_anchor, timings, displaced_trie_cache))
 }
 
 fn prefilter(
@@ -677,8 +709,9 @@ mod tests {
         assert!(!cache.contains_account(&address));
     }
 
-    #[test]
-    fn successful_preflight_can_discard_transactional_trie_cache() {
+    /// Everything a transition at block 100 needs: a parent cache, the block's access set, and the
+    /// next anchor the sidecar would have to name for the transition to be accepted.
+    fn transition_fixture() -> (NetworkStateCache, BlockAccessedState, CacheAnchor, Address) {
         fn cache_at_block_99() -> NetworkStateCache {
             let mut cache = NetworkStateCache::new(
                 Box::new(LastNBlocksPolicy::new(60)),
@@ -688,8 +721,6 @@ mod tests {
             cache
         }
 
-        let block_hash = B256::repeat_byte(0x22);
-        let policy_id = B256::repeat_byte(0x33);
         let address = Address::repeat_byte(0x11);
         let mut accessed = BlockAccessedState::default();
         accessed
@@ -698,16 +729,22 @@ mod tests {
 
         let mut expected_cache = cache_at_block_99();
         expected_cache.on_block_executed(100, &accessed);
-        let expected_anchor = expected_cache.cache_anchor(100, block_hash, policy_id);
+        let expected_anchor =
+            expected_cache.cache_anchor(100, B256::repeat_byte(0x22), B256::repeat_byte(0x33));
 
-        let mut cache = cache_at_block_99();
+        (cache_at_block_99(), accessed, expected_anchor, address)
+    }
+
+    #[test]
+    fn successful_preflight_can_discard_transactional_trie_cache() {
+        let (mut cache, accessed, expected_anchor, address) = transition_fixture();
         let mut trie_cache = PartialTrieNodeCache::new();
-        apply_cache_transition_and_check(
+        let (_, _, _, displaced) = apply_cache_transition_and_check(
             &mut cache,
             &accessed,
             100,
-            block_hash,
-            policy_id,
+            B256::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
             expected_anchor,
             &mut trie_cache,
             PartialTrieNodeCache::new(),
@@ -717,5 +754,39 @@ mod tests {
 
         assert_eq!(cache.current_block(), 100);
         assert!(!trie_cache.tracks_account(&address));
+        assert!(
+            displaced.is_none(),
+            "a discarded transition displaced nothing: the caller's trie cache is still the parent"
+        );
+    }
+
+    #[test]
+    fn a_committed_transition_hands_back_the_parent_generation() {
+        let (mut cache, accessed, expected_anchor, address) = transition_fixture();
+        let mut trie_cache = PartialTrieNodeCache::new();
+        let (_, _, _, displaced) = apply_cache_transition_and_check(
+            &mut cache,
+            &accessed,
+            100,
+            B256::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            expected_anchor,
+            &mut trie_cache,
+            PartialTrieNodeCache::new(),
+            TrieCacheDisposition::Commit,
+        )
+        .expect("valid transition should succeed");
+
+        assert_eq!(cache.current_block(), 100);
+        assert!(
+            trie_cache.tracks_account(&address),
+            "the caller's trie cache advanced to the child generation"
+        );
+        let displaced = displaced.expect("a committed transition displaces the parent");
+        assert!(
+            !displaced.tracks_account(&address),
+            "and what came back is the generation before this block, which is what a depth-1 \
+             reorg undoes into"
+        );
     }
 }

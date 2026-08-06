@@ -105,7 +105,28 @@ pub fn build_snapshot_package(
     cache: &NetworkStateCache,
     anchor: CacheAnchor,
     state_root: B256,
-    mut proof_provider: impl FnMut(MultiProofTargets) -> Result<MultiProof, String>,
+    proof_provider: impl FnMut(MultiProofTargets) -> Result<MultiProof, String>,
+) -> Result<CacheSnapshotPackage, BootstrapError> {
+    build_snapshot_package_with_limits(
+        cache,
+        anchor,
+        state_root,
+        proof_provider,
+        &BootstrapLimits::default(),
+    )
+}
+
+/// Build and locally validate a package under caller-chosen limits.
+///
+/// The defaults are sized for an untrusted peer snapshot. A live mainnet Last-N window is much
+/// larger than that, so a node exporting its own cache has to say so explicitly rather than have
+/// the conservative bound silently decide that its state is unshippable.
+pub fn build_snapshot_package_with_limits(
+    cache: &NetworkStateCache,
+    anchor: CacheAnchor,
+    state_root: B256,
+    proof_provider: impl FnMut(MultiProofTargets) -> Result<MultiProof, String>,
+    limits: &BootstrapLimits,
 ) -> Result<CacheSnapshotPackage, BootstrapError> {
     if cache.current_block() != anchor.block_number {
         return Err(BootstrapError::StateBlockMismatch {
@@ -121,6 +142,33 @@ pub fn build_snapshot_package(
         });
     }
 
+    let rebuilt = rebuild_trie_cache(cache, state_root, proof_provider)?;
+    let pkg = CacheSnapshotPackage::from_cache(cache, anchor, &rebuilt.proof);
+    check_package_limits(&pkg, limits)?;
+    Ok(pkg)
+}
+
+/// Rebuild an authenticated trie cache for `cache` from a live proof provider.
+///
+/// This is the outer half of the bootstrap authentication core, and it only makes sense for a
+/// caller that holds a provider: when the trie asks for structural nodes the value cache's own
+/// leaves did not cover, only such a caller can go back and request more. The inner half — verify
+/// every cached value against the proof, reveal it, compare the root to `state_root`, retain
+/// exactly the paths the value cache needs, validate membership — is shared verbatim with
+/// [`verify_and_restore`], which receives its proof rather than requesting it.
+///
+/// Every way of reaching an authenticated coordinated pair at a canonical block goes through that
+/// same core. Snapshot export, full-node cold start, and reorg recovery differ only in where the
+/// proof and the flat values come from.
+///
+/// `state_root` must be the canonical Ethereum state root at the block `cache` sits on, and
+/// `proof_provider` must answer against that same state. Neither is checked here: a proof that
+/// does not descend from `state_root` fails the root comparison instead.
+pub fn rebuild_trie_cache(
+    cache: &NetworkStateCache,
+    state_root: B256,
+    mut proof_provider: impl FnMut(MultiProofTargets) -> Result<MultiProof, String>,
+) -> Result<RebuiltTrieCache, BootstrapError> {
     let mut targets = bootstrap_proof_targets(cache);
     if targets.is_empty() {
         // An empty or code-only cache has no leaf to prove, but the restored trie must still be
@@ -135,10 +183,8 @@ pub fn build_snapshot_package(
         let proof = proof_provider(targets.clone()).map_err(BootstrapError::ProofProvider)?;
         verify_cache_values_against_proof(cache, &proof, state_root)?;
         match restore_trie_cache(cache, proof.clone(), state_root) {
-            Ok(_) => {
-                let pkg = CacheSnapshotPackage::from_cache(cache, anchor, &proof);
-                check_package_limits(&pkg, &BootstrapLimits::default())?;
-                return Ok(pkg)
+            Ok(trie_cache) => {
+                return Ok(RebuiltTrieCache { trie_cache, proof, proof_rounds: retries + 1 })
             }
             Err(BootstrapError::AdditionalProofTargetsRequired(required)) => {
                 let before = targets.chunking_length();
@@ -167,6 +213,20 @@ pub fn build_snapshot_package(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// An authenticated trie cache and the proof it was rebuilt from.
+#[derive(Debug)]
+pub struct RebuiltTrieCache {
+    /// Trie paths retained for exactly the value cache's entries, rooted at the canonical state
+    /// root that was passed in.
+    pub trie_cache: PartialTrieNodeCache,
+    /// The final proof, including any structural targets the first round did not ask for. Snapshot
+    /// export ships this; a canonical rebuild discards it.
+    pub proof: MultiProof,
+    /// Provider round trips it took, including the first. More than one means the value cache's
+    /// own leaves did not cover every node the trie needed.
+    pub proof_rounds: usize,
 }
 
 /// Verify a snapshot with conservative default resource limits.

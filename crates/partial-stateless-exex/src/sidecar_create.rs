@@ -5,6 +5,7 @@ use crate::{
         ValidationBenchmarkRecord, WitnessSizeBreakdown,
     },
     format_bytes, process_rss_bytes, process_rusage,
+    rebuild::{simulate_block, HistoricalSimulation},
     sidecar_io::sidecar_path,
     sidecar_reexec::{
         verify_and_apply_provider_assisted_sidecar,
@@ -17,6 +18,7 @@ use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
+    cow_copies_taken,
     fixture::{save_fixture, AccessedStateFixture},
     last_n_blocks_cache_policy_id,
     network_cache::{MissResult, NetworkStateCache, UpdateStats},
@@ -33,18 +35,16 @@ use partial_stateless::{
     StateTargetStats, TrieChangeSet, TrieProofTargetV2, WitnessReductionStats,
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::{ProviderResult, StateProvider};
-use reth_revm::database::StateProviderDatabase;
 use reth_trie_common::{
     DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofV2Target, TrieInput,
     EMPTY_ROOT_HASH,
 };
-use revm::database::State;
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, mem,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -70,6 +70,11 @@ pub(crate) struct BuilderOptions<'a> {
     /// sidecar still happens while Warming — that is what the benchmark needs — only the write to
     /// the shared sidecar directory is withheld.
     pub(crate) ready_parent: Option<&'a ReadyParent>,
+    /// Whether the constructed sidecar is returned to the caller.
+    ///
+    /// Only the in-process bootstrap gate needs it, and it pays a clone of the whole witness, so
+    /// the ordinary builder leaves it off.
+    pub(crate) retain_sidecar: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +92,17 @@ pub(crate) struct BuilderBlockReport {
     pub(crate) cache_update: UpdateStats,
     pub(crate) witness: Option<WitnessResult>,
     pub(crate) sidecar_path: Option<PathBuf>,
+    /// The sidecar as built, when `BuilderOptions::retain_sidecar` asked for it.
+    pub(crate) sidecar: Option<PartialStatelessSidecar>,
+    /// The parent trie generation this block's transition displaced, when the transition
+    /// committed.
+    ///
+    /// Handing it back rather than dropping it is what makes a one-deep retained generation
+    /// free: the transition already copies the parent into `next_trie_cache` and then
+    /// overwrites the original, so the object exists either way and the only question is
+    /// whether anything still holds it. `None` means the transition did not commit and the
+    /// caller's trie cache is still the parent.
+    pub(crate) displaced_trie_cache: Option<PartialTrieNodeCache>,
 }
 
 const PARALLEL_INITIAL_PROOF_MIN_STORAGE_TRIES: usize = 2;
@@ -854,6 +870,21 @@ const fn partial_runs_first(block_number: u64) -> bool {
     block_number % 2 == 0
 }
 
+/// Whether the Weak witness is *built* before the Partial one for this block.
+///
+/// The two sidecars are proved against the same state, so whichever is built first pays the cold
+/// page-cache read and the second reuses the pages the first warmed. Left fixed, that is a
+/// systematic bias worth hundreds of milliseconds: Weak proves a strictly larger target set than
+/// Partial — every accessed key against a cold cache, rather than only the miss set — yet measured
+/// *faster* purely because it always ran second.
+///
+/// This alternates on bit 1 while [`partial_runs_first`] alternates on bit 0, so build order and
+/// validation order are independent and all four combinations occur equally often. Using the same
+/// bit for both would leave them perfectly correlated and simply trade one fixed bias for another.
+const fn weak_builds_first(block_number: u64) -> bool {
+    (block_number >> 1) % 2 == 1
+}
+
 #[expect(clippy::too_many_arguments)]
 fn benchmark_sidecar_validation<Evm>(
     evm_config: &Evm,
@@ -862,6 +893,7 @@ fn benchmark_sidecar_validation<Evm>(
     prev_cache: &mut NetworkStateCache,
     trie_cache: &mut PartialTrieNodeCache,
     partial_sidecar: &PartialStatelessSidecar,
+    prebuilt_weak: Option<WeakStatelessBuild>,
     hashed_post_state: &HashedPostState,
     accessed: &BlockAccessedState,
     ancestor_headers: &[Bytes],
@@ -879,8 +911,11 @@ fn benchmark_sidecar_validation<Evm>(
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
 {
-    let WeakStatelessBuild { sidecar: weak_sidecar, build_us: weak_build_us } =
-        build_weak_stateless_sidecar(
+    // Already built if this block's turn was Weak-first; otherwise build it now, after Partial.
+    let WeakStatelessBuild { sidecar: weak_sidecar, build_us: weak_build_us } = match prebuilt_weak
+    {
+        Some(prebuilt) => prebuilt,
+        None => build_weak_stateless_sidecar(
             state_provider,
             partial_sidecar.parent_state_root,
             block.state_root(),
@@ -891,7 +926,8 @@ where
             accessed,
             ancestor_headers,
             config,
-        )?;
+        )?,
+    };
 
     // Serialization is builder-side preparation and is outside both execution timers. Each
     // sidecar is deserialized immediately before its execution so decode order follows EVM order.
@@ -909,6 +945,7 @@ where
     let expected_cache_policy_id =
         last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
     let partial_first = partial_runs_first(block.number());
+    let weak_first_build = weak_builds_first(block.number());
     let (partial_report, weak_report) = if partial_first {
         let partial_report = benchmark_one_sidecar_validation(
             evm_config,
@@ -992,6 +1029,7 @@ where
         historical_gas_used,
         tx_count: block.transaction_count(),
         verifier_order: if partial_first { "partial-then-weak" } else { "weak-then-partial" },
+        builder_order: if weak_first_build { "weak-then-partial" } else { "partial-then-weak" },
         historical_full_db_evm_us,
         partial_witness_build_us,
         weak_witness_build_us: weak_build_us,
@@ -1025,6 +1063,7 @@ where
         block = block.number(),
         block_hash = ?block.hash(),
         verifier_order = record.verifier_order,
+        builder_order = record.builder_order,
         historical_full_db_evm_us,
         partial_state_access_execution_us = partial_report.timings.state_access_execution_us,
         weak_state_access_execution_us = weak_report.timings.state_access_execution_us,
@@ -1066,20 +1105,15 @@ where
     let builder_total_start = Instant::now();
     let parent_block_number = block_number.saturating_sub(1);
 
-    let historical_execution_start = Instant::now();
-    let state_provider_db = StateProviderDatabase::new(state_provider);
-    let mut db = State::builder().with_bundle_update().with_database(state_provider_db).build();
-    let block_executor = evm_config.executor(&mut db);
-
-    let mut accessed = BlockAccessedState::default();
-    let mut lowest_block_number = None;
-    let execution_output = block_executor
-        .execute_with_state_closure(block, |statedb: &State<_>| {
-            accessed = BlockAccessedState::from_simulated_state(statedb);
-            lowest_block_number = statedb.block_hashes.lowest().map(|(num, _)| num);
-        })
-        .map_err(|err| eyre::eyre!("simulation failed for block: {err}"))?;
-    let historical_full_db_evm_us = historical_execution_start.elapsed().as_micros() as u64;
+    // Shared with the canonical rebuild, which has to replay exactly what this applies: the cache
+    // is a function of *accessed* state, so an execution diff would miss read-only accounts, code
+    // reads, and reads made by calls that later reverted.
+    let HistoricalSimulation {
+        accessed,
+        lowest_block_number,
+        output: execution_output,
+        elapsed_us: historical_full_db_evm_us,
+    } = simulate_block(evm_config, state_provider, block)?;
     let historical_gas_used = execution_output.result.gas_used;
     let historical_receipts_root =
         calculate_receipt_root_no_memo(&execution_output.result.receipts);
@@ -1238,6 +1272,37 @@ where
         )
     })?;
 
+    // Hoisted out of the sidecar block below because a Weak-first block needs it before the
+    // Partial witness is built. `ancestor_headers_for_range` is `FnOnce`, so it is resolved once
+    // here and reused; the cost is one extra header range read on blocks that end up publishing
+    // nothing.
+    let ancestor_headers = ancestor_headers_for_range(lowest_block_number, block_number)
+        .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
+
+    // Build order alternates so that neither witness permanently pays the cold page-cache read.
+    // Measured before this: Weak proved a strictly larger target set than Partial yet came out
+    // 215.8 ms against 552.2 ms, because it always ran second on pages Partial had just warmed.
+    let prebuilt_weak =
+        if options.validation_bench_output.is_some() && weak_builds_first(block_number) {
+            Some(
+                build_weak_stateless_sidecar(
+                    state_provider,
+                    parent_state_root,
+                    block.state_root(),
+                    parent_hash,
+                    block_hash,
+                    block_number,
+                    &hashed_post_state,
+                    &accessed,
+                    &ancestor_headers,
+                    config,
+                )
+                .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?,
+            )
+        } else {
+            None
+        };
+
     let rusage_before = options.resource_metrics.then(process_rusage);
     let start = Instant::now();
     let saved_sidecar_path;
@@ -1252,9 +1317,20 @@ where
     let builder_transition_witness_build_us;
     let builder_trie_clone_bytes;
     let builder_trie_clone_rss_delta_bytes;
+    let builder_trie_storage_tries_copied;
+    let builder_trie_storage_tries_total;
+    // The snapshot's copies are spread across the transition and retention rather than paid at the
+    // clone, so counting them means bracketing the whole transaction. The counter is process-wide,
+    // which is exact here because the ExEx applies one transition at a time and the paired
+    // verification runs after this delta is read.
+    let cow_copies_before = cow_copies_taken();
     let mut builder_trie_mutation = None;
     let mut builder_witness_commitment = None;
     let mut sidecar_constructed = false;
+    let mut retained_sidecar = None;
+    // Declared uninitialized like the timing bindings above: every path that reaches the report
+    // either assigns it or returns, so an initial `None` would be dead.
+    let displaced_trie_cache;
     let witness = {
         let base = generate_cache_aware_base_proof(
             state_provider,
@@ -1379,6 +1455,8 @@ where
         let trie_retention_start = Instant::now();
         next_trie_cache.retain_from_value_cache(cache);
         let trie_retention_us = trie_retention_start.elapsed().as_micros() as u64;
+        builder_trie_storage_tries_total = next_trie_cache.storage_trie_count() as u64;
+        builder_trie_storage_tries_copied = cow_copies_taken().saturating_sub(cow_copies_before);
 
         let validation_start = Instant::now();
         let trie_shape_metrics = if options.trie_cache_diagnostics {
@@ -1424,7 +1502,6 @@ where
                 break 'sidecar Ok(None);
             }
 
-            let ancestor_headers = ancestor_headers_for_range(lowest_block_number, block_number)?;
             // The flat canonical witness contains every parent-state node required for
             // both cache misses and the post-state trie transition.
             let sidecar_miss = StateTargetSet::from(&raw_targets);
@@ -1454,6 +1531,9 @@ where
                 witness: witness_payload,
                 stats: result.clone(),
             };
+            if options.retain_sidecar {
+                retained_sidecar = Some(sidecar.clone());
+            }
 
             let root_witness_completeness = if options.run_sidecar_preflight {
                 let prev_cache_for_reexec =
@@ -1469,6 +1549,7 @@ where
                         prev_cache_for_reexec,
                         trie_cache,
                         &sidecar,
+                        prebuilt_weak,
                         &hashed_post_state,
                         &accessed,
                         &ancestor_headers,
@@ -1702,7 +1783,11 @@ where
         // Advance only after sidecar generation/preflight has either succeeded or been
         // intentionally skipped. Coherent failures return above after rolling back the
         // value cache, so the two caches remain aligned.
-        *trie_cache = next_trie_cache;
+        //
+        // The parent is handed back instead of being dropped here. That is the whole cost of a
+        // one-deep retained generation: the copy was already made above, and the caller decides
+        // whether to keep it or let it fall out of scope.
+        displaced_trie_cache = Some(mem::replace(trie_cache, next_trie_cache));
         if let Some(metrics) = trie_shape_metrics {
             info!(
                 target: "partial_stateless",
@@ -1788,6 +1873,8 @@ where
             trie_cache_bytes: trie_cache.estimated_memory_bytes(),
             trie_clone_bytes: builder_trie_clone_bytes,
             trie_clone_rss_delta_bytes: builder_trie_clone_rss_delta_bytes,
+            trie_storage_tries_copied: builder_trie_storage_tries_copied,
+            trie_storage_tries_total: builder_trie_storage_tries_total,
             trie_mutation: builder_trie_mutation.as_ref().map(TrieMutationSummary::from),
         };
         if let Err(err) = append_builder_record(path, &record) {
@@ -1831,7 +1918,13 @@ where
         "Builder sidecar end-to-end benchmark"
     );
 
-    Ok(BuilderBlockReport { cache_update: stats, witness, sidecar_path: saved_sidecar_path })
+    Ok(BuilderBlockReport {
+        cache_update: stats,
+        witness,
+        sidecar_path: saved_sidecar_path,
+        sidecar: retained_sidecar,
+        displaced_trie_cache,
+    })
 }
 
 #[cfg(test)]
@@ -1839,6 +1932,24 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
     use partial_stateless::policy::AccountData;
+
+    #[test]
+    fn builder_and_verifier_order_alternate_independently() {
+        // Bit 0 drives validation order, bit 1 drives build order, so all four combinations occur
+        // equally often. Sharing a bit would leave the two perfectly correlated and would trade
+        // the fixed build-order bias for a fixed pairing instead of removing it.
+        let combinations: std::collections::HashSet<_> =
+            (100..104).map(|n| (partial_runs_first(n), weak_builds_first(n))).collect();
+        assert_eq!(combinations.len(), 4, "every order pairing must occur: {combinations:?}");
+    }
+
+    #[test]
+    fn weak_does_not_always_build_second() {
+        assert!(!weak_builds_first(100));
+        assert!(!weak_builds_first(101));
+        assert!(weak_builds_first(102));
+        assert!(weak_builds_first(103));
+    }
 
     #[test]
     fn paired_validation_order_alternates_by_block() {

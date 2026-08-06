@@ -22,7 +22,19 @@ pub struct ValidationPhaseTimings {
     /// performed by the EVM: Full DB/cache reads for Vanilla, in-memory witness/cache reads here.
     pub evm_us: u64,
     pub hash_post_state_us: u64,
+    /// Cost of opening the transactional trie snapshot.
+    ///
+    /// Since V3 this is the account-trie copy plus a refcount bump per storage trie. The storage
+    /// copies the block turns out to need are paid inside `state_root_us` and `trie_retention_us`
+    /// instead, and counted by `trie_storage_tries_copied`.
     pub trie_clone_us: u64,
+    /// Copy-on-write copies of storage tries taken across the whole transaction.
+    ///
+    /// Counts copies, not survivors: a trie copied and then dropped by retention still counts, and
+    /// a trie the transition created rather than copied does not.
+    pub trie_storage_tries_copied: u64,
+    /// Storage tries the snapshot held after retention, copied or shared.
+    pub trie_storage_tries_total: u64,
     pub state_root_us: u64,
     pub root_completeness_us: u64,
     pub miss_policy_check_us: u64,
@@ -130,6 +142,9 @@ pub struct ValidationBenchmarkRecord {
     pub historical_gas_used: u64,
     pub tx_count: usize,
     pub verifier_order: &'static str,
+    /// Which witness was *built* first. Alternates independently of `verifier_order` so that
+    /// neither side permanently pays the cold page-cache read; see `weak_builds_first`.
+    pub builder_order: &'static str,
     pub historical_full_db_evm_us: u64,
     pub partial_witness_build_us: u64,
     pub weak_witness_build_us: u64,
@@ -183,10 +198,20 @@ pub struct BuilderBenchmarkRecord {
     pub sidecar_published: bool,
     pub value_cache_bytes: usize,
     pub trie_cache_bytes: usize,
-    /// Logical size of the trie the per-block snapshot copied.
+    /// Logical size of the trie the per-block snapshot covers.
+    ///
+    /// Since V3 the snapshot shares storage tries with its parent, so this is the size it stands
+    /// for rather than the size it copied; `trie_storage_tries_copied` is what it really copied.
     pub trie_clone_bytes: usize,
     /// Process RSS moved across the clone. Process-wide, so meaningful only in aggregate.
     pub trie_clone_rss_delta_bytes: i64,
+    /// Copy-on-write copies of storage tries the builder's transaction took.
+    ///
+    /// Counts copies, not survivors: a trie copied and then dropped by retention still counts, and
+    /// a trie the transition created rather than copied does not.
+    pub trie_storage_tries_copied: u64,
+    /// Storage tries the snapshot held after retention, copied or shared.
+    pub trie_storage_tries_total: u64,
     /// Mutation footprint of this block against the cloned parent trie. Only present under
     /// `PS_TRIE_CACHE_DIAGNOSTICS`, since measuring it walks every retained path.
     pub trie_mutation: Option<TrieMutationSummary>,

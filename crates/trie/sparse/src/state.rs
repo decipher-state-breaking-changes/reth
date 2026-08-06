@@ -241,6 +241,11 @@ where
         self.storage.tries.get_mut(address).and_then(|e| e.as_revealed_mut())
     }
 
+    /// Returns reference to storage tries.
+    pub const fn storage_tries_ref(&self) -> &B256Map<RevealableSparseTrie<S>> {
+        &self.storage.tries
+    }
+
     /// Returns mutable reference to storage tries.
     pub const fn storage_tries_mut(&mut self) -> &mut B256Map<RevealableSparseTrie<S>> {
         &mut self.storage.tries
