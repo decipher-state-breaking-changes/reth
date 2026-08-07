@@ -1,11 +1,73 @@
 use alloy_primitives::B256;
-use partial_stateless::{PartialExecutionWitness, PartialStatelessSidecar, TrieMutationMetrics};
+use partial_stateless::{
+    PartialExecutionWitness, PartialStatelessSidecar, RetainWitnessPathsMetrics,
+    TrieMutationMetrics,
+};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
 };
+
+/// Current on-disk schema for paired validation benchmark records.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 4;
+
+/// Serializable trie-walk detail kept inside the enclosing retention total.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RetentionWalkMetrics {
+    pub calls: u64,
+    pub full_range_calls: u64,
+    pub presorted_inputs: u64,
+    pub sorted_input_fallbacks: u64,
+    pub input_us: u64,
+    pub traversal_us: u64,
+    pub mutation_us: u64,
+    pub finalization_us: u64,
+    pub nodes_visited: u64,
+    pub edges_visited: u64,
+    pub global_prefix_lookups: u64,
+    pub retained_path_comparisons: u64,
+    pub branch_clones: u64,
+    pub branch_clone_bytes: u64,
+    pub prune_roots: u64,
+    pub nodes_converted: u64,
+    pub finalization_upper_nodes_scanned: u64,
+    pub finalization_upper_values_scanned: u64,
+    pub finalization_branch_masks_scanned: u64,
+    pub finalization_lower_subtries_scanned: u64,
+    pub unprunable_dirty: u64,
+    pub unprunable_inline: u64,
+}
+
+impl From<&RetainWitnessPathsMetrics> for RetentionWalkMetrics {
+    fn from(metrics: &RetainWitnessPathsMetrics) -> Self {
+        Self {
+            calls: metrics.calls,
+            full_range_calls: metrics.full_range_calls,
+            presorted_inputs: metrics.presorted_inputs,
+            sorted_input_fallbacks: metrics.sorted_input_fallbacks,
+            input_us: metrics.input_us,
+            traversal_us: metrics.traversal_us,
+            mutation_us: metrics.mutation_us,
+            finalization_us: metrics.finalization_us,
+            nodes_visited: metrics.nodes_visited,
+            edges_visited: metrics.edges_visited,
+            global_prefix_lookups: metrics.global_prefix_lookups,
+            retained_path_comparisons: metrics.retained_path_comparisons,
+            branch_clones: metrics.branch_clones,
+            branch_clone_bytes: metrics.branch_clone_bytes,
+            prune_roots: metrics.prune_roots,
+            nodes_converted: metrics.nodes_converted,
+            finalization_upper_nodes_scanned: metrics.finalization_upper_nodes_scanned,
+            finalization_upper_values_scanned: metrics.finalization_upper_values_scanned,
+            finalization_branch_masks_scanned: metrics.finalization_branch_masks_scanned,
+            finalization_lower_subtries_scanned: metrics.finalization_lower_subtries_scanned,
+            unprunable_dirty: metrics.unprunable_dirty,
+            unprunable_inline: metrics.unprunable_inline,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ValidationPhaseTimings {
@@ -46,7 +108,11 @@ pub struct ValidationPhaseTimings {
     pub retention_storage_paths_us: u64,
     pub retention_account_paths_us: u64,
     pub retention_account_trie_us: u64,
+    /// Account-trie subphases and range-walk work; included in `retention_account_trie_us`.
+    pub retention_account_trie_detail: RetentionWalkMetrics,
     pub retention_storage_tries_us: u64,
+    /// Aggregated storage-trie subphases and work; included in `retention_storage_tries_us`.
+    pub retention_storage_trie_detail: RetentionWalkMetrics,
     /// Retained account paths handed to the account-trie prune.
     pub retention_account_paths: u64,
     pub retention_storage_tries_pruned: u64,
@@ -360,6 +426,13 @@ mod tests {
             next_cache_anchor_us: 13,
             trie_commit_us: 14,
             unattributed_us: 15,
+            // Detail is nested inside `trie_retention_us` and must not be re-added.
+            retention_account_trie_detail: RetentionWalkMetrics {
+                traversal_us: 10_000,
+                mutation_us: 20_000,
+                finalization_us: 30_000,
+                ..Default::default()
+            },
             ..Default::default()
         };
         timings.recompute_totals();
@@ -398,9 +471,15 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 4);
         assert_eq!(value["schema_version"], 0);
         assert!(value.get("block_hash").is_some());
         assert!(value["partial"].get("state_access_execution_us").is_some());
+        assert!(value["partial"].get("retention_account_trie_detail").is_some());
+        assert!(value["partial"]["retention_account_trie_detail"]
+            .get("global_prefix_lookups")
+            .is_some());
+        assert!(value["partial"].get("retention_storage_trie_detail").is_some());
         assert!(value["weak"].get("raw_total_us").is_some());
         assert!(value.get("expected_receipts_root").is_some());
         assert!(value.get("expected_requests_hash").is_some());

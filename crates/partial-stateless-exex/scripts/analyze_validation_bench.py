@@ -303,6 +303,44 @@ def build_retention_split_section(accepted):
     rate = f"{100 * rebuilds / len(accepted):.1f}%" if accepted else "n/a"
     lines.append(
         f"- Blocks that fell back to a full retained-set rebuild: **{rebuilds} ({rate})**")
+
+    walk_details = [
+        ("Account trie", "retention_account_trie_detail"),
+        ("Storage tries", "retention_storage_trie_detail"),
+    ]
+    if any(
+        key in record["partial"] for record in accepted for _, key in walk_details
+    ):
+        lines.extend([
+            "", "#### Retention walk internals", "",
+            "These rows are nested inside the account/storage totals above.", "",
+            "| Trie | Input | Traversal / prefix | Mutation | Finalization | Nodes / edges |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for label, key in walk_details:
+            details = [record["partial"].get(key, {}) for record in accepted]
+
+            def avg(field):
+                return statistics.fmean(detail.get(field, 0) for detail in details)
+
+            lines.append(
+                f"| {label} | {avg('input_us') / 1000:.2f} ms | "
+                f"{avg('traversal_us') / 1000:.2f} ms | {avg('mutation_us') / 1000:.2f} ms | "
+                f"{avg('finalization_us') / 1000:.2f} ms | "
+                f"{avg('nodes_visited'):.0f} / {avg('edges_visited'):.0f} |"
+            )
+            fallbacks = sum(detail.get("sorted_input_fallbacks", 0) for detail in details)
+            dirty = sum(detail.get("unprunable_dirty", 0) for detail in details)
+            inline = sum(detail.get("unprunable_inline", 0) for detail in details)
+            global_lookups = sum(detail.get("global_prefix_lookups", 0) for detail in details)
+            branch_clones = sum(detail.get("branch_clones", 0) for detail in details)
+            full_range_calls = sum(detail.get("full_range_calls", 0) for detail in details)
+            lines.append(
+                f"- {label}: full-range calls **{full_range_calls}**, sorted fallbacks "
+                f"**{fallbacks}**, global prefix lookups "
+                f"**{global_lookups}**, branch clones **{branch_clones}**, "
+                f"unprunable dirty / inline **{dirty} / {inline}**"
+            )
     return lines
 
 

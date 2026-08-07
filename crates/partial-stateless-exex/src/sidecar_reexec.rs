@@ -1,4 +1,4 @@
-use crate::benchmark::ValidationPhaseTimings;
+use crate::benchmark::{RetentionWalkMetrics, ValidationPhaseTimings};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
 use partial_stateless::{
@@ -364,7 +364,13 @@ where
         retention_storage_paths_us: cache_timings.retention.storage_paths_us,
         retention_account_paths_us: cache_timings.retention.account_paths_us,
         retention_account_trie_us: cache_timings.retention.account_trie_us,
+        retention_account_trie_detail: RetentionWalkMetrics::from(
+            &cache_timings.retention.account_trie,
+        ),
         retention_storage_tries_us: cache_timings.retention.storage_tries_us,
+        retention_storage_trie_detail: RetentionWalkMetrics::from(
+            &cache_timings.retention.storage_tries,
+        ),
         retention_account_paths: cache_timings.retention.account_paths,
         retention_storage_tries_pruned: cache_timings.retention.storage_tries_pruned,
         retention_storage_tries_skipped: cache_timings.retention.storage_tries_skipped,

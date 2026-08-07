@@ -17,7 +17,10 @@ use alloy_primitives::{
     Address, B256,
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
-use reth_trie_sparse::{ParallelSparseTrie, RevealableSparseTrie, SparseStateTrie, SparseTrie};
+use reth_trie_sparse::{
+    ParallelSparseTrie, RetainWitnessPathsMetrics, RetentionOptions, RevealableSparseTrie,
+    SparseStateTrie, SparseTrie,
+};
 use std::{fmt, sync::Arc, time::Instant};
 
 /// The sparse state trie this cache runs on.
@@ -268,11 +271,13 @@ impl PartialTrieNodeCache {
             .collect();
         timings.storage_paths_us += start.elapsed().as_micros() as u64;
 
-        timings.account_trie_us = self.prune_account_trie();
+        (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
         // Nothing is known to be unmoved after a full rebuild, so every trie is pruned. This is
         // the cost the incremental path exists to avoid, not a case it has to reproduce.
-        let (storage_us, pruned, skipped) = self.prune_storage_tries(&B256Map::default(), true);
+        let (storage_us, pruned, skipped, storage_metrics) =
+            self.prune_storage_tries(&B256Map::default(), true);
         timings.storage_tries_us = storage_us;
+        timings.storage_tries = storage_metrics;
         timings.storage_tries_pruned = pruned;
         timings.storage_tries_skipped = skipped;
         timings
@@ -366,9 +371,11 @@ impl PartialTrieNodeCache {
         timings.account_paths = self.retained_account_paths.len() as u64;
         timings.account_paths_us = start.elapsed().as_micros() as u64;
 
-        timings.account_trie_us = self.prune_account_trie();
-        let (storage_us, pruned, skipped) = self.prune_storage_tries(&moved, false);
+        (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
+        let (storage_us, pruned, skipped, storage_metrics) =
+            self.prune_storage_tries(&moved, false);
         timings.storage_tries_us = storage_us;
+        timings.storage_tries = storage_metrics;
         timings.storage_tries_pruned = pruned;
         timings.storage_tries_skipped = skipped;
         timings
@@ -395,12 +402,21 @@ impl PartialTrieNodeCache {
     }
 
     /// Prunes the account trie to the retained paths, returning what it cost.
-    fn prune_account_trie(&mut self) -> u64 {
+    fn prune_account_trie(&mut self) -> (u64, RetainWitnessPathsMetrics) {
         let start = Instant::now();
-        if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
-            trie.retain_witness_paths(&self.retained_account_paths);
-        }
-        start.elapsed().as_micros() as u64
+        let metrics = self
+            .sparse
+            .trie_mut()
+            .as_revealed_mut()
+            .map(|trie| {
+                trie.retain_witness_paths_with_options(
+                    &self.retained_account_paths,
+                    RetentionOptions::sorted_input(),
+                )
+                .metrics
+            })
+            .unwrap_or_default();
+        (start.elapsed().as_micros() as u64, metrics)
     }
 
     /// Prunes every storage trie the block could have moved, and drops the ones no longer retained.
@@ -413,11 +429,12 @@ impl PartialTrieNodeCache {
         &mut self,
         moved: &B256Map<StorageSlotDelta>,
         prune_everything: bool,
-    ) -> (u64, u64, u64) {
+    ) -> (u64, u64, u64, RetainWitnessPathsMetrics) {
         let start = Instant::now();
         let retained = std::mem::take(&mut self.retained_storage_paths);
         let mut pruned = 0;
         let mut skipped = 0;
+        let mut metrics = RetainWitnessPathsMetrics::default();
         self.sparse.storage_tries_mut().retain(|hashed_address, trie| {
             let Some(slots) = retained.get(hashed_address) else { return false };
             // `as_revealed_ref` first: `as_revealed_mut` hands out a `&mut SharedSparseTrie`, which
@@ -428,13 +445,16 @@ impl PartialTrieNodeCache {
             if untouched && unchanged {
                 skipped += 1;
             } else if let Some(trie) = trie.as_revealed_mut() {
-                trie.retain_witness_paths(slots);
+                let outcome = trie
+                    .make_mut()
+                    .retain_witness_paths_with_options(slots, RetentionOptions::sorted_input());
+                metrics.accumulate(&outcome.metrics);
                 pruned += 1;
             }
             true
         });
         self.retained_storage_paths = retained;
-        (start.elapsed().as_micros() as u64, pruned, skipped)
+        (start.elapsed().as_micros() as u64, pruned, skipped, metrics)
     }
 
     /// Storage tries this snapshot still shares with the generation it was cloned from.
@@ -869,8 +889,12 @@ pub struct RetentionTimings {
     pub account_paths_us: u64,
     /// Pruning the account trie to those paths.
     pub account_trie_us: u64,
+    /// Internal account-trie retention phases and work counters.
+    pub account_trie: RetainWitnessPathsMetrics,
     /// Sorting each storage trie's slot set and pruning the tries that moved.
     pub storage_tries_us: u64,
+    /// Aggregate internal retention phases and work counters for all pruned storage tries.
+    pub storage_tries: RetainWitnessPathsMetrics,
     /// Retained account paths the account-trie prune was given.
     pub account_paths: u64,
     /// Storage tries whose prune ran.

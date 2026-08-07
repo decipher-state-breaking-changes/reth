@@ -3,6 +3,7 @@ use crate::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
         serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, RetainedGenerationBytes,
         TrieMutationSummary, ValidationBenchmarkRecord, WitnessSizeBreakdown,
+        VALIDATION_BENCHMARK_SCHEMA_VERSION,
     },
     format_bytes, process_rss_bytes, process_rusage,
     rebuild::{simulate_block, HistoricalSimulation},
@@ -1025,7 +1026,7 @@ where
         weak_report.execution_receipts_root == expected_receipts_root &&
         requests_valid;
     let record = ValidationBenchmarkRecord {
-        schema_version: 3,
+        schema_version: VALIDATION_BENCHMARK_SCHEMA_VERSION,
         block_number: block.number(),
         block_hash: block.hash(),
         gas_used: expected_gas_used,

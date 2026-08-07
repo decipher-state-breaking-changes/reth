@@ -43,6 +43,7 @@ pub use readiness::{
     BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
     ReadinessError, ReadyParent, TrustedCheckpoint,
 };
+pub use reth_trie_sparse::RetainWitnessPathsMetrics;
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,
 };

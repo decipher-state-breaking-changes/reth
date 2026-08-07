@@ -11,7 +11,10 @@ use alloy_primitives::{
 };
 use alloy_rlp::Decodable;
 use alloy_trie::{BranchNodeCompact, TrieMask, EMPTY_ROOT_HASH};
-use core::cmp::{Ord, Ordering, PartialOrd};
+use core::{
+    cmp::{Ord, Ordering, PartialOrd},
+    ops::Range,
+};
 use reth_execution_errors::{SparseTrieError, SparseTrieErrorKind, SparseTrieResult};
 #[cfg(feature = "metrics")]
 use reth_primitives_traits::FastInstant as Instant;
@@ -21,6 +24,8 @@ use reth_trie_common::{
     ProofTrieNodeV2, RlpNode, TrieNodeV2,
 };
 use smallvec::SmallVec;
+#[cfg(feature = "std")]
+use std::time::Instant as StdInstant;
 use tracing::{instrument, trace};
 
 /// The maximum length of a path, in nibbles, which belongs to the upper subtrie of a
@@ -40,6 +45,145 @@ pub struct ParallelismThresholds {
     /// for hash updates. When updating subtrie hashes with fewer changed keys than this threshold,
     /// the updates will be processed serially.
     pub min_updated_nodes: usize,
+}
+
+/// Options for pruning a trie to the witness paths that must remain revealed.
+///
+/// The default accepts paths in any order and canonicalizes them into a sorted copy. Callers that
+/// already maintain a sorted path index can request [`Self::sorted_input`] to avoid that copy and
+/// sort. The optimized entry point still verifies the order and falls back safely if the caller's
+/// invariant is broken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionOptions {
+    sorted_input: bool,
+}
+
+impl RetentionOptions {
+    /// Uses `retained_paths` directly when it is sorted, otherwise falls back to copying and
+    /// sorting it.
+    pub const fn sorted_input() -> Self {
+        Self { sorted_input: true }
+    }
+}
+
+/// Internal phase and work counters for one or more witness-path retention calls.
+///
+/// Durations are microseconds and are zero in `no_std` builds. The counters are additive so a
+/// caller can aggregate the many storage-trie retention calls performed for one block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainWitnessPathsMetrics {
+    /// Retention calls represented by this value.
+    pub calls: u64,
+    /// Calls executed with the complete sorted range walk.
+    ///
+    /// This is explicit so a future delta strategy can be compared without changing the metrics
+    /// shape or inferring the strategy from unrelated counters.
+    pub full_range_calls: u64,
+    /// Calls that consumed a verified sorted slice without cloning it.
+    pub presorted_inputs: u64,
+    /// Calls that requested sorted input but fell back because it was unordered.
+    pub sorted_input_fallbacks: u64,
+    /// Microseconds spent validating or cloning and sorting the input.
+    pub input_us: u64,
+    /// Microseconds spent walking nodes and matching retained prefixes.
+    pub traversal_us: u64,
+    /// Microseconds spent replacing revealed roots with parent hash stubs.
+    pub mutation_us: u64,
+    /// Microseconds spent removing descendants, values, masks, and emptied subtries.
+    pub finalization_us: u64,
+    /// Revealed nodes examined by the walk.
+    pub nodes_visited: u64,
+    /// Revealed branch edges examined by the walk.
+    pub edges_visited: u64,
+    /// Binary searches against the complete retained-path slice.
+    ///
+    /// The range walk keeps this at zero. It is retained as an explicit regression counter for
+    /// the legacy traversal that performed one such search per revealed edge.
+    pub global_prefix_lookups: u64,
+    /// Comparisons made while narrowing sorted retained-path ranges.
+    pub retained_path_comparisons: u64,
+    /// Whole branch-node clones performed by the walk.
+    pub branch_clones: u64,
+    /// Heap bytes copied by whole branch-node clones.
+    pub branch_clone_bytes: u64,
+    /// Prefix-free roots selected for pruning.
+    pub prune_roots: u64,
+    /// Selected roots actually converted to parent hash stubs.
+    pub nodes_converted: u64,
+    /// Upper-subtrie node entries visited by finalization map scans.
+    pub finalization_upper_nodes_scanned: u64,
+    /// Upper-subtrie value entries visited by finalization map scans.
+    pub finalization_upper_values_scanned: u64,
+    /// Branch-mask entries visited by finalization map scans.
+    pub finalization_branch_masks_scanned: u64,
+    /// Lower-subtrie slots or groups inspected by finalization.
+    pub finalization_lower_subtries_scanned: u64,
+    /// Nodes that could not be blinded because their RLP/hash had not been computed.
+    pub unprunable_dirty: u64,
+    /// Nodes represented inline in their parent rather than by a hash.
+    pub unprunable_inline: u64,
+}
+
+impl RetainWitnessPathsMetrics {
+    /// Adds another retention call's work to this aggregate.
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.full_range_calls = self.full_range_calls.saturating_add(other.full_range_calls);
+        self.presorted_inputs = self.presorted_inputs.saturating_add(other.presorted_inputs);
+        self.sorted_input_fallbacks =
+            self.sorted_input_fallbacks.saturating_add(other.sorted_input_fallbacks);
+        self.input_us = self.input_us.saturating_add(other.input_us);
+        self.traversal_us = self.traversal_us.saturating_add(other.traversal_us);
+        self.mutation_us = self.mutation_us.saturating_add(other.mutation_us);
+        self.finalization_us = self.finalization_us.saturating_add(other.finalization_us);
+        self.nodes_visited = self.nodes_visited.saturating_add(other.nodes_visited);
+        self.edges_visited = self.edges_visited.saturating_add(other.edges_visited);
+        self.global_prefix_lookups =
+            self.global_prefix_lookups.saturating_add(other.global_prefix_lookups);
+        self.retained_path_comparisons =
+            self.retained_path_comparisons.saturating_add(other.retained_path_comparisons);
+        self.branch_clones = self.branch_clones.saturating_add(other.branch_clones);
+        self.branch_clone_bytes = self.branch_clone_bytes.saturating_add(other.branch_clone_bytes);
+        self.prune_roots = self.prune_roots.saturating_add(other.prune_roots);
+        self.nodes_converted = self.nodes_converted.saturating_add(other.nodes_converted);
+        self.finalization_upper_nodes_scanned = self
+            .finalization_upper_nodes_scanned
+            .saturating_add(other.finalization_upper_nodes_scanned);
+        self.finalization_upper_values_scanned = self
+            .finalization_upper_values_scanned
+            .saturating_add(other.finalization_upper_values_scanned);
+        self.finalization_branch_masks_scanned = self
+            .finalization_branch_masks_scanned
+            .saturating_add(other.finalization_branch_masks_scanned);
+        self.finalization_lower_subtries_scanned = self
+            .finalization_lower_subtries_scanned
+            .saturating_add(other.finalization_lower_subtries_scanned);
+        self.unprunable_dirty = self.unprunable_dirty.saturating_add(other.unprunable_dirty);
+        self.unprunable_inline = self.unprunable_inline.saturating_add(other.unprunable_inline);
+    }
+}
+
+/// Result of retaining the requested witness paths.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainOutcome {
+    /// Revealed subtree roots converted back to hash stubs.
+    pub pruned: usize,
+    /// Phase timings and work counters for this call.
+    pub metrics: RetainWitnessPathsMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PruneAction {
+    path: Nibbles,
+    hash: B256,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FinalizationMetrics {
+    upper_nodes_scanned: u64,
+    upper_values_scanned: u64,
+    branch_masks_scanned: u64,
+    lower_subtries_scanned: u64,
 }
 
 /// A revealed sparse trie with subtries that can be updated in parallel.
@@ -839,118 +983,11 @@ impl SparseTrie for ParallelSparseTrie {
             }
         }
 
-        Self::finalize_pruned_roots(self, effective_pruned_roots)
+        self.finalize_pruned_roots(effective_pruned_roots).0
     }
 
     fn retain_witness_paths(&mut self, retained_paths: &[Nibbles]) -> usize {
-        #[cfg(feature = "trie-debug")]
-        self.debug_recorder.reset();
-
-        let mut retained_paths = retained_paths.to_vec();
-        retained_paths.sort_unstable();
-
-        let mut effective_pruned_roots = Vec::<Nibbles>::new();
-        let mut stack: SmallVec<[Nibbles; 32]> = SmallVec::new();
-        stack.push(Nibbles::default());
-
-        while let Some(path) = stack.pop() {
-            let Some(node) =
-                self.subtrie_for_path(&path).and_then(|subtrie| subtrie.nodes.get(&path).cloned())
-            else {
-                continue;
-            };
-
-            match node {
-                SparseNode::Empty | SparseNode::Leaf { .. } => {}
-                SparseNode::Extension { key, state, .. } => {
-                    let mut child = path;
-                    child.extend(&key);
-
-                    // A retained lookup can terminate at this extension by diverging inside its
-                    // compressed key. Keep the extension and its child root in that case: the
-                    // extension proves exclusion and its cached encoding commits to the child.
-                    if has_retained_descendant(&retained_paths, &path) {
-                        stack.push(child);
-                        continue;
-                    }
-
-                    // Root extension has no parent branch edge to blind; keep it as-is.
-                    if path.is_empty() {
-                        continue;
-                    }
-
-                    let Some(hash) = state.cached_hash() else { continue };
-                    self.subtrie_for_path_mut_untracked(&path)
-                        .expect("node subtrie exists")
-                        .nodes
-                        .remove(&path);
-
-                    let parent_path = path.slice(0..path.len() - 1);
-                    let SparseNode::Branch { blinded_mask, blinded_hashes, .. } = self
-                        .subtrie_for_path_mut_untracked(&parent_path)
-                        .expect("parent subtrie exists")
-                        .nodes
-                        .get_mut(&parent_path)
-                        .expect("expected parent branch node")
-                    else {
-                        panic!("expected branch node at path {parent_path:?}");
-                    };
-
-                    let nibble = path.last().unwrap();
-                    blinded_mask.set_bit(nibble);
-                    blinded_hashes[nibble as usize] = hash;
-                    effective_pruned_roots.push(path);
-                }
-                SparseNode::Branch { state_mask, blinded_mask, blinded_hashes, .. } => {
-                    let mut blinded_mask = blinded_mask;
-                    let mut blinded_hashes = blinded_hashes;
-                    for nibble in state_mask.iter() {
-                        if blinded_mask.is_bit_set(nibble) {
-                            continue;
-                        }
-
-                        let mut child = path;
-                        child.push_unchecked(nibble);
-                        if has_retained_descendant(&retained_paths, &child) {
-                            stack.push(child);
-                            continue;
-                        }
-
-                        let Entry::Occupied(entry) =
-                            self.subtrie_for_path_mut_untracked(&child).unwrap().nodes.entry(child)
-                        else {
-                            panic!("expected node at path {child:?}");
-                        };
-
-                        let Some(hash) = entry.get().cached_hash() else {
-                            continue;
-                        };
-                        entry.remove();
-                        blinded_mask.set_bit(nibble);
-                        blinded_hashes[nibble as usize] = hash;
-                        effective_pruned_roots.push(child);
-                    }
-
-                    let SparseNode::Branch {
-                        blinded_mask: old_blinded_mask,
-                        blinded_hashes: old_blinded_hashes,
-                        ..
-                    } = self
-                        .subtrie_for_path_mut_untracked(&path)
-                        .unwrap()
-                        .nodes
-                        .get_mut(&path)
-                        .unwrap()
-                    else {
-                        unreachable!("expected branch node at path {path:?}");
-                    };
-                    *old_blinded_mask = blinded_mask;
-                    *old_blinded_hashes = blinded_hashes;
-                }
-            }
-        }
-
-        Self::finalize_pruned_roots(self, effective_pruned_roots)
+        self.retain_witness_paths_with_options(retained_paths, RetentionOptions::default()).pruned
     }
 
     fn update_leaves(
@@ -1067,6 +1104,330 @@ impl ParallelSparseTrie {
     pub const fn with_parallelism_thresholds(mut self, thresholds: ParallelismThresholds) -> Self {
         self.parallelism_thresholds = thresholds;
         self
+    }
+
+    /// Retains only the decoded nodes required to prove `retained_paths`.
+    ///
+    /// This is the instrumented entry point behind [`SparseTrie::retain_witness_paths`]. The
+    /// default options accept paths in any order; [`RetentionOptions::sorted_input`] lets a
+    /// caller with an ordered index avoid cloning and sorting the full slice.
+    pub fn retain_witness_paths_with_options(
+        &mut self,
+        retained_paths: &[Nibbles],
+        options: RetentionOptions,
+    ) -> RetainOutcome {
+        #[cfg(feature = "trie-debug")]
+        self.debug_recorder.reset();
+
+        let mut metrics =
+            RetainWitnessPathsMetrics { calls: 1, full_range_calls: 1, ..Default::default() };
+
+        #[cfg(feature = "std")]
+        let input_start = StdInstant::now();
+        let sorted_input_verified = options.sorted_input && paths_are_sorted(retained_paths);
+        let retained_paths = if sorted_input_verified {
+            metrics.presorted_inputs = 1;
+            Cow::Borrowed(retained_paths)
+        } else {
+            if options.sorted_input {
+                metrics.sorted_input_fallbacks = 1;
+            }
+            let mut sorted = retained_paths.to_vec();
+            sorted.sort_unstable();
+            Cow::Owned(sorted)
+        };
+        #[cfg(feature = "std")]
+        {
+            metrics.input_us = input_start.elapsed().as_micros() as u64;
+        }
+        debug_assert!(matches!(&retained_paths, Cow::Owned(_)) || sorted_input_verified);
+
+        #[cfg(feature = "std")]
+        let traversal_start = StdInstant::now();
+        let mut actions = self.collect_witness_prune_actions(&retained_paths, &mut metrics);
+        #[cfg(feature = "std")]
+        {
+            metrics.traversal_us = traversal_start.elapsed().as_micros() as u64;
+        }
+
+        metrics.prune_roots = actions.len() as u64;
+        #[cfg(feature = "std")]
+        let mutation_start = StdInstant::now();
+        self.apply_witness_prune_actions(&mut actions);
+        #[cfg(feature = "std")]
+        {
+            metrics.mutation_us = mutation_start.elapsed().as_micros() as u64;
+        }
+
+        let pruned_roots = actions.iter().map(|action| action.path).collect();
+        #[cfg(feature = "std")]
+        let finalization_start = StdInstant::now();
+        let (pruned, finalization) = self.finalize_pruned_roots(pruned_roots);
+        #[cfg(feature = "std")]
+        {
+            metrics.finalization_us = finalization_start.elapsed().as_micros() as u64;
+        }
+        metrics.nodes_converted = pruned as u64;
+        metrics.finalization_upper_nodes_scanned = finalization.upper_nodes_scanned;
+        metrics.finalization_upper_values_scanned = finalization.upper_values_scanned;
+        metrics.finalization_branch_masks_scanned = finalization.branch_masks_scanned;
+        metrics.finalization_lower_subtries_scanned = finalization.lower_subtries_scanned;
+
+        RetainOutcome { pruned, metrics }
+    }
+
+    /// Collects a prefix-free set of revealed roots that can be blinded.
+    ///
+    /// Every stack entry carries only the retained-path subrange relevant to that node. Branch
+    /// children are visited in nibble order, so the cursor moves forward through that subrange
+    /// instead of binary-searching the complete retained set for every edge.
+    fn collect_witness_prune_actions(
+        &self,
+        retained_paths: &[Nibbles],
+        metrics: &mut RetainWitnessPathsMetrics,
+    ) -> Vec<PruneAction> {
+        let mut actions = Vec::new();
+        let mut stack: SmallVec<[(Nibbles, Range<usize>); 32]> = SmallVec::new();
+        stack.push((Nibbles::default(), 0..retained_paths.len()));
+
+        while let Some((path, retained_range)) = stack.pop() {
+            let Some(node) =
+                self.subtrie_for_path(&path).and_then(|subtrie| subtrie.nodes.get(&path))
+            else {
+                continue;
+            };
+            metrics.nodes_visited = metrics.nodes_visited.saturating_add(1);
+
+            match node {
+                SparseNode::Empty | SparseNode::Leaf { .. } => {}
+                SparseNode::Extension { key, .. } => {
+                    let mut child = path;
+                    child.extend(key);
+
+                    // Any retained lookup below `path`, including one that diverges inside the
+                    // compressed key, needs the extension and its child root as an exclusion
+                    // witness. Only paths that match the complete key are relevant below child.
+                    if !retained_range.is_empty() {
+                        let child_range = retained_prefix_range(
+                            retained_paths,
+                            retained_range,
+                            &child,
+                            &mut metrics.retained_path_comparisons,
+                        );
+                        stack.push((child, child_range));
+                        continue;
+                    }
+
+                    // Root extension has no parent branch edge to blind; keep it as-is.
+                    if path.is_empty() {
+                        continue;
+                    }
+                    self.collect_blind_action(path, node, &mut actions, metrics);
+                }
+                SparseNode::Branch { state_mask, blinded_mask, .. } => {
+                    // Both masks are Copy. Do not clone the branch: that would allocate and copy
+                    // its 16-element blinded-hash box merely to work around a borrow boundary.
+                    let state_mask = *state_mask;
+                    let blinded_mask = *blinded_mask;
+                    let mut retained_idx = retained_range.start;
+
+                    for nibble in state_mask.iter() {
+                        if blinded_mask.is_bit_set(nibble) {
+                            continue;
+                        }
+                        metrics.edges_visited = metrics.edges_visited.saturating_add(1);
+
+                        let mut child = path;
+                        child.push_unchecked(nibble);
+                        let child_range = next_retained_prefix_range(
+                            retained_paths,
+                            &mut retained_idx,
+                            retained_range.end,
+                            &child,
+                            &mut metrics.retained_path_comparisons,
+                        );
+                        if !child_range.is_empty() {
+                            stack.push((child, child_range));
+                            continue;
+                        }
+
+                        let Some(child_node) = self
+                            .subtrie_for_path(&child)
+                            .and_then(|subtrie| subtrie.nodes.get(&child))
+                        else {
+                            panic!("expected node at path {child:?}");
+                        };
+                        self.collect_blind_action(child, child_node, &mut actions, metrics);
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    fn collect_blind_action(
+        &self,
+        path: Nibbles,
+        node: &SparseNode,
+        actions: &mut Vec<PruneAction>,
+        metrics: &mut RetainWitnessPathsMetrics,
+    ) {
+        if let Some(hash) = node.cached_hash() {
+            actions.push(PruneAction { path, hash });
+        } else if node.cached_rlp_node().is_some() {
+            // An inline RLP cannot be represented by the parent's B256-only blinded-hash slot.
+            metrics.unprunable_inline = metrics.unprunable_inline.saturating_add(1);
+        } else {
+            // Retention is specified to run only after root hashing. Keep the node rather than
+            // manufacturing a hash, but expose the violated precondition in every benchmark.
+            metrics.unprunable_dirty = metrics.unprunable_dirty.saturating_add(1);
+        }
+    }
+
+    /// Applies prefix-free prune actions, updating each parent branch once.
+    fn apply_witness_prune_actions(&mut self, actions: &mut [PruneAction]) {
+        actions.sort_unstable_by(|a, b| {
+            prune_action_parent(a).cmp(&prune_action_parent(b)).then(a.path.cmp(&b.path))
+        });
+
+        let mut start = 0;
+        while start < actions.len() {
+            let parent_path = prune_action_parent(&actions[start]);
+            let mut end = start + 1;
+            while end < actions.len() && prune_action_parent(&actions[end]) == parent_path {
+                end += 1;
+            }
+
+            for action in &actions[start..end] {
+                let removed = self
+                    .subtrie_for_path_mut_untracked(&action.path)
+                    .expect("node subtrie exists")
+                    .nodes
+                    .remove(&action.path);
+                assert!(removed.is_some(), "expected node at path {:?}", action.path);
+            }
+
+            let SparseNode::Branch { blinded_mask, blinded_hashes, .. } = self
+                .subtrie_for_path_mut_untracked(&parent_path)
+                .expect("parent subtrie exists")
+                .nodes
+                .get_mut(&parent_path)
+                .expect("expected parent branch node")
+            else {
+                panic!("expected branch node at path {parent_path:?}");
+            };
+            for action in &actions[start..end] {
+                let nibble = action.path.last().expect("pruned root is never the trie root");
+                blinded_mask.set_bit(nibble);
+                blinded_hashes[nibble as usize] = action.hash;
+            }
+
+            start = end;
+        }
+    }
+
+    /// Pre-range-walk implementation retained only as a differential test oracle.
+    #[cfg(test)]
+    fn retain_witness_paths_legacy(&mut self, retained_paths: &[Nibbles]) -> usize {
+        let mut retained_paths = retained_paths.to_vec();
+        retained_paths.sort_unstable();
+
+        let mut effective_pruned_roots = Vec::<Nibbles>::new();
+        let mut stack: SmallVec<[Nibbles; 32]> = SmallVec::new();
+        stack.push(Nibbles::default());
+
+        while let Some(path) = stack.pop() {
+            let Some(node) =
+                self.subtrie_for_path(&path).and_then(|subtrie| subtrie.nodes.get(&path).cloned())
+            else {
+                continue;
+            };
+
+            match node {
+                SparseNode::Empty | SparseNode::Leaf { .. } => {}
+                SparseNode::Extension { key, state, .. } => {
+                    let mut child = path;
+                    child.extend(&key);
+                    if has_retained_descendant(&retained_paths, &path) {
+                        stack.push(child);
+                        continue;
+                    }
+                    if path.is_empty() {
+                        continue;
+                    }
+
+                    let Some(hash) = state.cached_hash() else { continue };
+                    self.subtrie_for_path_mut_untracked(&path)
+                        .expect("node subtrie exists")
+                        .nodes
+                        .remove(&path);
+
+                    let parent_path = path.slice(0..path.len() - 1);
+                    let SparseNode::Branch { blinded_mask, blinded_hashes, .. } = self
+                        .subtrie_for_path_mut_untracked(&parent_path)
+                        .expect("parent subtrie exists")
+                        .nodes
+                        .get_mut(&parent_path)
+                        .expect("expected parent branch node")
+                    else {
+                        panic!("expected branch node at path {parent_path:?}");
+                    };
+                    let nibble = path.last().expect("non-root extension");
+                    blinded_mask.set_bit(nibble);
+                    blinded_hashes[nibble as usize] = hash;
+                    effective_pruned_roots.push(path);
+                }
+                SparseNode::Branch { state_mask, blinded_mask, blinded_hashes, .. } => {
+                    let mut blinded_mask = blinded_mask;
+                    let mut blinded_hashes = blinded_hashes;
+                    for nibble in state_mask.iter() {
+                        if blinded_mask.is_bit_set(nibble) {
+                            continue;
+                        }
+
+                        let mut child = path;
+                        child.push_unchecked(nibble);
+                        if has_retained_descendant(&retained_paths, &child) {
+                            stack.push(child);
+                            continue;
+                        }
+
+                        let Entry::Occupied(entry) = self
+                            .subtrie_for_path_mut_untracked(&child)
+                            .expect("child subtrie exists")
+                            .nodes
+                            .entry(child)
+                        else {
+                            panic!("expected node at path {child:?}");
+                        };
+                        let Some(hash) = entry.get().cached_hash() else { continue };
+                        entry.remove();
+                        blinded_mask.set_bit(nibble);
+                        blinded_hashes[nibble as usize] = hash;
+                        effective_pruned_roots.push(child);
+                    }
+
+                    let SparseNode::Branch {
+                        blinded_mask: old_blinded_mask,
+                        blinded_hashes: old_blinded_hashes,
+                        ..
+                    } = self
+                        .subtrie_for_path_mut_untracked(&path)
+                        .expect("branch subtrie exists")
+                        .nodes
+                        .get_mut(&path)
+                        .expect("expected branch node")
+                    else {
+                        unreachable!("expected branch node at path {path:?}");
+                    };
+                    *old_blinded_mask = blinded_mask;
+                    *old_blinded_hashes = blinded_hashes;
+                }
+            }
+        }
+
+        self.finalize_pruned_roots(effective_pruned_roots).0
     }
 
     /// Returns true if retaining updates is enabled for the overall trie.
@@ -1506,12 +1867,21 @@ impl ParallelSparseTrie {
         Ok(())
     }
 
-    fn finalize_pruned_roots(&mut self, mut effective_pruned_roots: Vec<Nibbles>) -> usize {
+    fn finalize_pruned_roots(
+        &mut self,
+        mut effective_pruned_roots: Vec<Nibbles>,
+    ) -> (usize, FinalizationMetrics) {
         if effective_pruned_roots.is_empty() {
-            return 0;
+            return (0, FinalizationMetrics::default());
         }
 
         let nodes_converted = effective_pruned_roots.len();
+        let mut metrics = FinalizationMetrics {
+            upper_nodes_scanned: self.upper_subtrie.nodes.len() as u64,
+            upper_values_scanned: self.upper_subtrie.inner.values.len() as u64,
+            branch_masks_scanned: self.branch_node_masks.len() as u64,
+            ..Default::default()
+        };
 
         // Sort roots by subtrie type (upper first), then by path for efficient partitioning.
         effective_pruned_roots.sort_unstable_by(|path_a, path_b| {
@@ -1541,6 +1911,8 @@ impl ParallelSparseTrie {
         // Upper prune roots that are prefixes of lower subtrie root paths cause the entire
         // subtrie to be cleared (preserving allocations for reuse).
         if !roots_upper.is_empty() {
+            metrics.lower_subtries_scanned =
+                metrics.lower_subtries_scanned.saturating_add(self.lower_subtries.len() as u64);
             for subtrie in &mut *self.lower_subtries {
                 let should_clear = subtrie.as_revealed_ref().is_some_and(|s| {
                     let search_idx = roots_upper.partition_point(|root| root <= &s.path);
@@ -1562,6 +1934,7 @@ impl ParallelSparseTrie {
         for roots_group in roots_lower.chunk_by(|path_a, path_b| {
             SparseSubtrieType::from_path(path_a) == SparseSubtrieType::from_path(path_b)
         }) {
+            metrics.lower_subtries_scanned = metrics.lower_subtries_scanned.saturating_add(1);
             let subtrie_idx = path_subtrie_index_unchecked(&roots_group[0]);
 
             // Skip unrevealed/blinded subtries - nothing to prune.
@@ -1593,7 +1966,7 @@ impl ParallelSparseTrie {
             }
         });
 
-        nodes_converted
+        (nodes_converted, metrics)
     }
 
     /// Returns a reference to the lower `SparseSubtrie` for the given path, or None if the
@@ -3480,6 +3853,51 @@ fn is_strict_descendant_in(roots: &[Nibbles], path: &Nibbles) -> bool {
     false
 }
 
+fn paths_are_sorted(paths: &[Nibbles]) -> bool {
+    paths.windows(2).all(|window| window[0] <= window[1])
+}
+
+/// Returns the retained paths inside `range` which start with `prefix`.
+fn retained_prefix_range(
+    retained: &[Nibbles],
+    range: Range<usize>,
+    prefix: &Nibbles,
+    comparisons: &mut u64,
+) -> Range<usize> {
+    let mut cursor = range.start;
+    next_retained_prefix_range(retained, &mut cursor, range.end, prefix, comparisons)
+}
+
+/// Advances a monotonic cursor to the range of retained paths starting with `prefix`.
+fn next_retained_prefix_range(
+    retained: &[Nibbles],
+    cursor: &mut usize,
+    end: usize,
+    prefix: &Nibbles,
+    comparisons: &mut u64,
+) -> Range<usize> {
+    while *cursor < end {
+        *comparisons = comparisons.saturating_add(1);
+        if retained[*cursor] >= *prefix {
+            break;
+        }
+        *cursor += 1;
+    }
+    let begin = *cursor;
+    while *cursor < end {
+        *comparisons = comparisons.saturating_add(1);
+        if !retained[*cursor].starts_with(prefix) {
+            break;
+        }
+        *cursor += 1;
+    }
+    begin..*cursor
+}
+
+fn prune_action_parent(action: &PruneAction) -> Nibbles {
+    action.path.slice(0..action.path.len().saturating_sub(1))
+}
+
 /// Returns true if any retained leaf path has `prefix` as a prefix.
 ///
 /// The `retained` slice must be sorted.
@@ -3487,7 +3905,6 @@ fn has_retained_descendant(retained: &[Nibbles], prefix: &Nibbles) -> bool {
     if retained.is_empty() {
         return false;
     }
-    debug_assert!(retained.windows(2).all(|w| w[0] <= w[1]), "retained must be sorted by path");
     let idx = retained.partition_point(|path| path < prefix);
     idx < retained.len() && retained[idx].starts_with(prefix)
 }
@@ -3526,8 +3943,8 @@ enum SparseTrieUpdatesAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        path_subtrie_index_unchecked, LowerSparseSubtrie, ParallelSparseTrie, SparseSubtrie,
-        SparseSubtrieType,
+        path_subtrie_index_unchecked, LowerSparseSubtrie, ParallelSparseTrie, RetentionOptions,
+        SparseSubtrie, SparseSubtrieType,
     };
     use crate::{
         parallel::ChangedSubtrie, trie::SparseNodeState, LeafLookup, LeafLookupError, SparseNode,
@@ -7683,6 +8100,154 @@ mod tests {
         trie.prune(&[]);
         let root_after = trie.root();
         assert_eq!(root_before, root_after, "root hash must be preserved after prune");
+    }
+
+    #[test]
+    fn retain_witness_range_walk_matches_legacy() {
+        let mut trie = ParallelSparseTrie::default();
+        let value = large_account_value();
+        for i in 0..8u8 {
+            for j in 0..4u8 {
+                trie.update_leaf(
+                    pad_nibbles_right(Nibbles::from_nibbles([i, j, 0x3, 0x4, 0x5, 0x6])),
+                    value.clone(),
+                )
+                .unwrap();
+            }
+        }
+        let root_before = trie.root();
+
+        let mut retained_paths = vec![
+            pad_nibbles_right(Nibbles::from_nibbles([0x1, 0x1, 0x3, 0x4, 0x5, 0x6])),
+            pad_nibbles_right(Nibbles::from_nibbles([0x4, 0x2, 0x3, 0x4, 0x5, 0x6])),
+            // An absent child exercises exclusion through the revealed branch/extension shape.
+            pad_nibbles_right(Nibbles::from_nibbles([0x7, 0xa, 0xb, 0xc])),
+        ];
+        retained_paths.sort_unstable();
+
+        let mut legacy = trie.clone();
+        let legacy_pruned = legacy.retain_witness_paths_legacy(&retained_paths);
+        let mut range_walk = trie;
+        let outcome = range_walk
+            .retain_witness_paths_with_options(&retained_paths, RetentionOptions::sorted_input());
+
+        assert_eq!(outcome.pruned, legacy_pruned);
+        assert_eq!(range_walk, legacy);
+        assert_eq!(range_walk.root(), root_before);
+        assert_eq!(outcome.metrics.sorted_input_fallbacks, 0);
+        assert_eq!(outcome.metrics.branch_clones, 0);
+        assert_eq!(outcome.metrics.branch_clone_bytes, 0);
+        assert_eq!(outcome.metrics.global_prefix_lookups, 0);
+        assert!(outcome.metrics.nodes_visited > 0);
+        assert!(outcome.metrics.edges_visited > 0);
+    }
+
+    #[test]
+    fn retain_witness_sorted_hint_falls_back_for_unsorted_input() {
+        let mut trie = ParallelSparseTrie::default();
+        let value = large_account_value();
+        for i in 0..4u8 {
+            trie.update_leaf(
+                pad_nibbles_right(Nibbles::from_nibbles([i, 0x1, 0x2, 0x3])),
+                value.clone(),
+            )
+            .unwrap();
+        }
+        let _ = trie.root();
+
+        let unsorted = vec![
+            pad_nibbles_right(Nibbles::from_nibbles([0x3, 0x1, 0x2, 0x3])),
+            pad_nibbles_right(Nibbles::from_nibbles([0x0, 0x1, 0x2, 0x3])),
+        ];
+        let mut fallback = trie.clone();
+        let fallback_outcome =
+            fallback.retain_witness_paths_with_options(&unsorted, RetentionOptions::sorted_input());
+        let mut canonical = trie;
+        let canonical_outcome =
+            canonical.retain_witness_paths_with_options(&unsorted, RetentionOptions::default());
+
+        assert_eq!(fallback, canonical);
+        assert_eq!(fallback_outcome.pruned, canonical_outcome.pruned);
+        assert_eq!(fallback_outcome.metrics.sorted_input_fallbacks, 1);
+        assert_eq!(fallback_outcome.metrics.presorted_inputs, 0);
+    }
+
+    #[test]
+    fn retain_witness_classifies_dirty_and_inline_nodes() {
+        let mut leaf1 = [0u8; 64];
+        leaf1[63] = 1;
+        let mut leaf2 = [0u8; 64];
+        leaf2[63] = 2;
+        let leaf1 = Nibbles::from_nibbles(leaf1);
+        let leaf2 = Nibbles::from_nibbles(leaf2);
+        let divergent_lookup = Nibbles::from_nibbles([1u8; 64]);
+
+        let mut dirty = ParallelSparseTrie::default();
+        dirty.update_leaf(leaf1, vec![1]).unwrap();
+        dirty.update_leaf(leaf2, vec![2]).unwrap();
+        let dirty_outcome = dirty.retain_witness_paths_with_options(
+            &[divergent_lookup],
+            RetentionOptions::sorted_input(),
+        );
+        assert_eq!(dirty_outcome.metrics.unprunable_dirty, 2);
+        assert_eq!(dirty_outcome.metrics.unprunable_inline, 0);
+
+        let mut inline = ParallelSparseTrie::default();
+        inline.update_leaf(leaf1, vec![1]).unwrap();
+        inline.update_leaf(leaf2, vec![2]).unwrap();
+        let root_before = inline.root();
+        let inline_outcome = inline.retain_witness_paths_with_options(
+            &[divergent_lookup],
+            RetentionOptions::sorted_input(),
+        );
+        assert_eq!(inline_outcome.metrics.unprunable_dirty, 0);
+        assert_eq!(inline_outcome.metrics.unprunable_inline, 2);
+        assert_eq!(inline.root(), root_before);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn retain_witness_range_walk_matches_legacy_for_arbitrary_shapes(
+            leaf_keys in proptest::collection::btree_set(any::<[u8; 32]>(), 2..24),
+            lookup_keys in proptest::collection::vec(any::<[u8; 32]>(), 0..24),
+        ) {
+            let mut trie = ParallelSparseTrie::default();
+            let value = large_account_value();
+            let leaf_paths: Vec<_> = leaf_keys
+                .into_iter()
+                .map(|key| Nibbles::unpack(B256::from(key)))
+                .collect();
+            for path in &leaf_paths {
+                trie.update_leaf(*path, value.clone()).unwrap();
+            }
+            let root_before = trie.root();
+
+            let mut retained_paths: Vec<_> = lookup_keys
+                .into_iter()
+                .map(|key| Nibbles::unpack(B256::from(key)))
+                .collect();
+            // Guarantee inclusion as well as arbitrary exclusion lookups.
+            retained_paths.extend(leaf_paths.iter().step_by(3).copied());
+            retained_paths.sort_unstable();
+            retained_paths.dedup();
+
+            let mut legacy = trie.clone();
+            let legacy_pruned = legacy.retain_witness_paths_legacy(&retained_paths);
+            let mut range_walk = trie;
+            let outcome = range_walk.retain_witness_paths_with_options(
+                &retained_paths,
+                RetentionOptions::sorted_input(),
+            );
+
+            prop_assert_eq!(outcome.pruned, legacy_pruned);
+            prop_assert_eq!(&range_walk, &legacy);
+            prop_assert_eq!(range_walk.root(), root_before);
+            prop_assert_eq!(outcome.metrics.sorted_input_fallbacks, 0);
+            prop_assert_eq!(outcome.metrics.branch_clones, 0);
+            prop_assert_eq!(outcome.metrics.global_prefix_lookups, 0);
+        }
     }
 
     #[test]
