@@ -24,6 +24,17 @@ bincode = { workspace = true }
 # utilities
 tracing = { workspace = true }
 
+[features]
+# Not default, because this crate is a library and its consumers decide the build profile:
+# `partial-stateless-exex` turns both on by default to match `bin/reth`.
+#
+# They exist here so `cargo test -p partial-stateless` can profile the cache root on the keccak
+# implementation production actually runs. Building this package alone selects only its own
+# dependency graph, so without these the profile measures a keccak the node never uses — the
+# defect that invalidated every absolute benchmark number before 2026-08-06.
+asm-keccak = ["alloy-primitives/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+
 [dev-dependencies]
 reth-trie = { workspace = true }
 serde_json = { workspace = true }

@@ -344,6 +344,141 @@ def build_retention_split_section(accepted):
     return lines
 
 
+ANCHOR_SPLIT_GROUPS = [
+    ("Collect + sort", "ordered digest index", ["account", "storage", "code"], "collect_sort_us"),
+    ("Leaf preimage + hash", "leaf digest memo", ["account", "storage", "code"], "leaf_hash_us"),
+    ("Namespace hash", "irreducible at v2", ["account", "storage", "code"], "namespace_us"),
+]
+
+
+def build_anchor_split_section(accepted):
+    """Break the next cache anchor into the work each candidate optimization would remove.
+
+    Ordering the keys removes the sort, memoizing leaf digests removes the hashing for entries
+    that did not change, and neither touches the namespace hash. The three are disjoint, so
+    their sizes are what ranks them. Emitted only when the records carry the split.
+    """
+    details = [r["partial"].get("next_cache_anchor_detail") for r in accepted]
+    details = [d for d in details if d]
+    if not details:
+        return []
+
+    def avg(field):
+        return statistics.fmean(d.get(field, 0) for d in details) / 1000
+
+    total = statistics.fmean(r["partial"].get("next_cache_anchor_us", 0) for r in accepted) / 1000
+    lines = [
+        "", "### Next cache anchor split (Partial)", "",
+        "Measured inside `next_cache_anchor_us`; the rows are components of it, not additions to "
+        "it. The right column names the change that would remove the row.", "",
+        "| Component | Account | Storage | Code | Total | Share | Removed by |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for label, removed_by, namespaces, suffix in ANCHOR_SPLIT_GROUPS:
+        parts = [avg(f"{namespace}_{suffix}") for namespace in namespaces]
+        group = sum(parts)
+        share = f"{100 * group / total:.1f}%" if total else "n/a"
+        cells = " | ".join(f"{part:.2f} ms" for part in parts)
+        lines.append(f"| {label} | {cells} | **{group:.2f} ms** | {share} | {removed_by} |")
+    root = avg("root_us")
+    root_share = f"{100 * root / total:.1f}%" if total else "n/a"
+    lines.append(f"| Final root hash | — | — | — | {root:.2f} ms | {root_share} | nothing |")
+
+    accounts = statistics.fmean(d.get("accounts", 0) for d in details)
+    storage = statistics.fmean(d.get("storage", 0) for d in details)
+    codes = statistics.fmean(d.get("codes", 0) for d in details)
+    leaves = accounts + storage + codes
+    per_leaf = f"{1000 * total / leaves:.3f} µs" if leaves else "n/a"
+    lines.extend(["",
+        f"- Value-cache composition hashed: **{accounts:.0f} accounts, {storage:.0f} storage, "
+        f"{codes:.0f} codes** ({leaves:.0f} leaves)",
+        f"- Cost per leaf: **{per_leaf}**"])
+
+    # A memo hit is free, so averaging one into the phase mean understates it. The validator path
+    # invalidates the memo immediately before the anchor, so this should always be zero.
+    memo_hits = sum(d.get("memo_hits", 0) for d in details)
+    if memo_hits:
+        lines.append(
+            f"- **{memo_hits} samples answered from the cache-root memo** and cost nothing; the "
+            "phase mean above is diluted by them and should be recomputed without them")
+    return lines
+
+
+CLONE_SPLIT_FIELDS = [
+    ("Account trie deep copy", "account_trie_us", None),
+    ("Storage trie map (refcount bumps)", "storage_tries_us", "storage_tries"),
+    ("Warm membership sets", "warm_membership_us", "warm_accounts"),
+    ("Retained path indexes", "retained_paths_us", "retained_account_paths"),
+]
+
+
+def build_clone_split_section(accepted):
+    """Separate the account-trie copy from the three copies that scale with cache size.
+
+    Sharing the account trie means node-granular structural sharing inside reth's own trie crate.
+    The other three copies are ordinary data structures that an `Arc` would share, so their share
+    decides whether that much smaller change is worth making. Emitted only when the records carry
+    the split.
+    """
+    details = [r["partial"].get("trie_clone_detail") for r in accepted]
+    details = [d for d in details if d]
+    if not details:
+        return []
+
+    total = statistics.fmean(r["partial"].get("trie_clone_us", 0) for r in accepted) / 1000
+    lines = [
+        "", "### Transactional trie clone split (Partial)", "",
+        "Measured inside `trie_clone_us`; the rows are components of it, not additions to it.", "",
+        "| Component | Avg | Share of clone | Entries copied |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    size_proportional = 0.0
+    for label, field, count_field in CLONE_SPLIT_FIELDS:
+        avg = statistics.fmean(d.get(field, 0) for d in details) / 1000
+        if field != "account_trie_us":
+            size_proportional += avg
+        share = f"{100 * avg / total:.1f}%" if total else "n/a"
+        count = (
+            f"{statistics.fmean(d.get(count_field, 0) for d in details):.0f}"
+            if count_field else "—")
+        lines.append(f"| {label} | {avg:.2f} ms | {share} | {count} |")
+    prop_share = f"{100 * size_proportional / total:.1f}%" if total else "n/a"
+    lines.append(
+        f"| **Copies proportional to cache size** | **{size_proportional:.2f} ms** | "
+        f"**{prop_share}** | — |")
+    return lines
+
+
+def build_cache_composition_section(accepted):
+    """Report the two cache-wide phases per cached entry, not only per block.
+
+    Two runs cover different blocks, so an absolute phase mean confounds a workload difference
+    with an implementation difference. Both phases are functions of cache composition, so the
+    per-entry coefficients are the part the implementation controls and the part that survives a
+    comparison across ranges. Emitted only when the records carry the composition.
+    """
+    if not any("cache_accounts" in record for record in accepted):
+        return []
+
+    accounts = statistics.fmean(r.get("cache_accounts", 0) for r in accepted)
+    storage = statistics.fmean(r.get("cache_storage", 0) for r in accepted)
+    codes = statistics.fmean(r.get("cache_codes", 0) for r in accepted)
+    entries = accounts + storage
+
+    def per_entry(field):
+        avg = statistics.fmean(r["partial"].get(field, 0) for r in accepted)
+        return f"{avg / entries:.3f} µs" if entries else "n/a"
+
+    return ["", "## Cache composition and normalized phase cost", "",
+        "Compare these coefficients across runs, not the absolute means: two runs cover different "
+        "blocks, and both phases scale with the numbers in the first row.", "",
+        f"- Cached accounts / storage entries / codes: **{accounts:.0f} / {storage:.0f} / "
+        f"{codes:.0f}**",
+        f"- Next cache anchor per cached entry: **{per_entry('next_cache_anchor_us')}**",
+        f"- Trie retention per cached entry: **{per_entry('trie_retention_us')}**",
+        f"- Transactional trie clone per cached entry: **{per_entry('trie_clone_us')}**"]
+
+
 def retained_generation_lines(accepted):
     """Report what the K = 1 retained generation costs, or that this run kept none.
 
@@ -491,6 +626,10 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         lines.append(f"| {label} | {p_avg:.2f} ms | {w_avg:.2f} ms |")
 
     lines.extend(build_retention_split_section(accepted))
+    lines.extend(build_anchor_split_section(accepted))
+    lines.extend(build_clone_split_section(accepted))
+
+    lines.extend(build_cache_composition_section(accepted))
 
     orders = [r["verifier_order"] for r in accepted]
     tx_average = statistics.fmean(r["tx_count"] for r in accepted)

@@ -70,32 +70,70 @@ pub struct PartialTrieNodeCache {
 
 impl Clone for PartialTrieNodeCache {
     fn clone(&self) -> Self {
+        self.clone_timed().0
+    }
+}
+
+impl PartialTrieNodeCache {
+    /// [`Clone::clone`], reporting which of the snapshot's four copies the time went to.
+    ///
+    /// The account trie is the copy storage-trie sharing deliberately left in place, because
+    /// sharing it needs node-granular structural sharing inside the trie itself. But it is not the
+    /// only copy: warm membership is two hash sets holding every cached account and slot, and the
+    /// retained-path indexes hold one `Nibbles` per retained account plus an `Arc` per storage
+    /// trie. Those three are proportional to cache *size* rather than to the block's changes, and
+    /// an `Arc` would share them, so they are a much smaller change than sharing trie nodes.
+    /// Splitting the timer is what decides whether that change is worth making.
+    pub fn clone_timed(&self) -> (Self, TrieCloneTimings) {
+        let mut timings = TrieCloneTimings::default();
+
+        let start = Instant::now();
         let accounts = self
             .sparse
             .state_trie_ref()
             .map(|trie| RevealableSparseTrie::Revealed(Box::new(trie.clone())))
             .unwrap_or_else(RevealableSparseTrie::blind);
         let mut sparse = CacheSparseStateTrie::default().with_accounts_trie(accounts);
+        timings.account_trie_us = start.elapsed().as_micros() as u64;
 
         // Copying the map wholesale is both cheaper and more faithful than rebuilding it from
         // warm membership: each value is a refcount bump, and `retain_from_value_cache` has
         // already reduced the map to exactly the tries warm membership requires. Allocation-reuse
         // buffers and process-local LFU history are deliberately not copied.
+        let start = Instant::now();
         let storage = sparse.storage_tries_mut();
         storage.reserve(self.sparse.storage_tries_ref().len());
         for (hashed_address, trie) in self.sparse.storage_tries_ref() {
             storage.insert(*hashed_address, trie.clone());
         }
+        timings.storage_tries_us = start.elapsed().as_micros() as u64;
+        timings.storage_tries = self.sparse.storage_tries_ref().len() as u64;
 
-        Self {
-            sparse,
-            warm_accounts: self.warm_accounts.clone(),
-            warm_storage: self.warm_storage.clone(),
-            state_root: self.state_root,
-            retained_storage_paths: self.retained_storage_paths.clone(),
-            retained_account_paths: self.retained_account_paths.clone(),
-            synced_to_block: self.synced_to_block,
-        }
+        let start = Instant::now();
+        let warm_accounts = self.warm_accounts.clone();
+        let warm_storage = self.warm_storage.clone();
+        timings.warm_membership_us = start.elapsed().as_micros() as u64;
+        timings.warm_accounts = warm_accounts.len() as u64;
+        timings.warm_storage = warm_storage.len() as u64;
+
+        let start = Instant::now();
+        let retained_storage_paths = self.retained_storage_paths.clone();
+        let retained_account_paths = self.retained_account_paths.clone();
+        timings.retained_paths_us = start.elapsed().as_micros() as u64;
+        timings.retained_account_paths = retained_account_paths.len() as u64;
+
+        (
+            Self {
+                sparse,
+                warm_accounts,
+                warm_storage,
+                state_root: self.state_root,
+                retained_storage_paths,
+                retained_account_paths,
+                synced_to_block: self.synced_to_block,
+            },
+            timings,
+        )
     }
 }
 
@@ -927,6 +965,48 @@ impl RetentionTimings {
     }
 }
 
+/// What opening a transactional snapshot copied, split by component.
+///
+/// `trie_clone_us` was a single timer over [`PartialTrieNodeCache::clone`], which made it read as
+/// "the account-trie deep copy" even though three size-proportional copies ride along with it.
+/// The counters beside each time are the populations those copies scale with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrieCloneTimings {
+    /// Deep-copying the revealed account trie. The copy storage-trie sharing did not remove.
+    pub account_trie_us: u64,
+    /// Copying the storage-trie map. One refcount bump per entry, not a trie copy.
+    pub storage_tries_us: u64,
+    /// Copying the warm account and storage key sets.
+    pub warm_membership_us: u64,
+    /// Copying the retained account-path vector and the per-trie retained-slot map.
+    pub retained_paths_us: u64,
+    /// Storage tries whose `Arc` was bumped.
+    pub storage_tries: u64,
+    /// Warm accounts and slots copied, which is the whole value-cache key population.
+    pub warm_accounts: u64,
+    pub warm_storage: u64,
+    /// Retained account paths copied.
+    pub retained_account_paths: u64,
+}
+
+impl TrieCloneTimings {
+    /// The copies that scale with cache size rather than with the account trie's node count.
+    ///
+    /// Reported together because they share one possible fix — sharing these three behind an
+    /// `Arc` and copying on write — which is independent of, and far cheaper than, node-granular
+    /// sharing inside the account trie.
+    pub const fn membership_and_paths_us(&self) -> u64 {
+        self.storage_tries_us
+            .saturating_add(self.warm_membership_us)
+            .saturating_add(self.retained_paths_us)
+    }
+
+    /// Sum of the measured phases. Slightly below the caller's outer timer by the timer calls.
+    pub const fn total_us(&self) -> u64 {
+        self.account_trie_us.saturating_add(self.membership_and_paths_us())
+    }
+}
+
 /// Number of account-key prefix levels reported for comparison with the old depth-five pinned
 /// cache. The array covers depths zero through five, inclusive.
 pub const TRIE_SHAPE_PREFIX_LEVELS: usize = 6;
@@ -1298,6 +1378,34 @@ mod tests {
         assert!(!trie.contains_storage_path(&address, &slot));
         assert_eq!(trie.tracked_account_count(), 1);
         assert_eq!(trie.tracked_storage_slot_count(), 1);
+    }
+
+    /// Splitting the clone's timer must not change what the snapshot contains, and each counter
+    /// must describe the copy it sits beside — those counters are what a per-entry cost for the
+    /// size-proportional copies would be divided by.
+    #[test]
+    fn timed_clone_matches_the_plain_clone_and_counts_each_copy() {
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 3, balance: U256::from(7), code_hash: None });
+        accessed.storage.insert((address, slot), U256::from(1));
+
+        let mut values = value_cache();
+        values.on_block_executed(1, &accessed);
+        let mut trie = PartialTrieNodeCache::new();
+        trie.retain_from_value_cache(&values);
+        trie.set_state_root(B256::repeat_byte(0x44));
+
+        let (timed, timings) = trie.clone_timed();
+        assert_eq!(timed.cache_root(), trie.clone().cache_root());
+        assert_eq!(timings.warm_accounts, trie.tracked_account_count() as u64);
+        assert_eq!(timings.warm_storage, trie.tracked_storage_slot_count() as u64);
+        assert_eq!(timings.retained_account_paths, trie.retained_account_paths.len() as u64);
+        assert_eq!(timings.storage_tries, trie.sparse.storage_tries_ref().len() as u64);
+        assert_eq!(timings.total_us(), timings.account_trie_us + timings.membership_and_paths_us());
     }
 
     #[test]

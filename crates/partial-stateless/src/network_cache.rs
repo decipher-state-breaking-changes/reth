@@ -12,6 +12,7 @@ use alloy_primitives::{keccak256, Address, Bytes, Keccak256, B256, U256};
 use std::{
     collections::{HashMap, VecDeque},
     sync::OnceLock,
+    time::Instant,
 };
 use tracing::{debug, info};
 
@@ -95,6 +96,86 @@ fn hash_code_reference(code_hash: B256, entry: &CachedEntry<Bytes>) -> B256 {
     preimage.extend_from_slice(&entry.value);
     preimage.extend_from_slice(&entry.last_accessed_block.to_be_bytes());
     keccak256(preimage)
+}
+
+/// Where one `cache_root` recomputation spent its time, and over how many entries.
+///
+/// Computing this root is one of the two largest costs a validator pays outside execution, and it
+/// used to be a single opaque timer — so the three ways to make it cheaper (reusing the leaf
+/// preimage buffer, memoizing leaf digests, and keeping the keys ordered) could not be sized
+/// against each other. Each namespace is reported separately because their leaf shapes, key
+/// widths, and entry counts all differ. `accounts`/`storage`/`codes` are the populations these
+/// times are per-entry costs over; the cost scales with them, so two runs over different blocks
+/// are comparable only after dividing by them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheRootTimings {
+    /// Draining each namespace's `HashMap` into a `Vec` and sorting it by key.
+    pub account_collect_sort_us: u64,
+    pub storage_collect_sort_us: u64,
+    pub code_collect_sort_us: u64,
+    /// Building each leaf preimage and hashing it. Code leaves finish a memoized sponge.
+    pub account_leaf_hash_us: u64,
+    pub storage_leaf_hash_us: u64,
+    pub code_leaf_hash_us: u64,
+    /// Concatenating a namespace's leaf digests into one buffer and hashing it.
+    pub account_namespace_us: u64,
+    pub storage_namespace_us: u64,
+    pub code_namespace_us: u64,
+    /// Hashing the final preimage over the three namespace roots and counts.
+    pub root_us: u64,
+    /// Entries in each namespace at the moment the root was computed.
+    pub accounts: u64,
+    pub storage: u64,
+    pub codes: u64,
+    /// True when the memo answered and no work was done, so the zero times are not a measurement.
+    pub memo_hit: bool,
+}
+
+impl CacheRootTimings {
+    /// What a memoized answer costs: nothing, over the population it would have hashed.
+    fn memo_hit(cache: &NetworkStateCache) -> Self {
+        Self {
+            accounts: cache.accounts.len() as u64,
+            storage: cache.storage.len() as u64,
+            codes: cache.codes.len() as u64,
+            memo_hit: true,
+            ..Default::default()
+        }
+    }
+
+    /// Collecting entries out of the hash maps and sorting them, across all three namespaces.
+    pub const fn collect_sort_us(&self) -> u64 {
+        self.account_collect_sort_us
+            .saturating_add(self.storage_collect_sort_us)
+            .saturating_add(self.code_collect_sort_us)
+    }
+
+    /// Per-leaf preimage construction and hashing, across all three namespaces.
+    pub const fn leaf_hash_us(&self) -> u64 {
+        self.account_leaf_hash_us
+            .saturating_add(self.storage_leaf_hash_us)
+            .saturating_add(self.code_leaf_hash_us)
+    }
+
+    /// Namespace digest-stream hashing, across all three namespaces.
+    pub const fn namespace_hash_us(&self) -> u64 {
+        self.account_namespace_us
+            .saturating_add(self.storage_namespace_us)
+            .saturating_add(self.code_namespace_us)
+    }
+
+    /// Sum of the measured phases. Slightly below the caller's outer timer by the timer calls.
+    pub const fn total_us(&self) -> u64 {
+        self.collect_sort_us()
+            .saturating_add(self.leaf_hash_us())
+            .saturating_add(self.namespace_hash_us())
+            .saturating_add(self.root_us)
+    }
+
+    /// Leaves hashed, which is what every per-entry coefficient here divides by.
+    pub const fn leaves(&self) -> u64 {
+        self.accounts.saturating_add(self.storage).saturating_add(self.codes)
+    }
 }
 
 /// An entry in the network state cache, tracking access metadata.
@@ -525,11 +606,33 @@ impl NetworkStateCache {
     /// Local-only metadata such as `first_accessed_block` and `access_count` is
     /// excluded.
     pub fn cache_root(&self) -> B256 {
-        *self.memoized_cache_root.get_or_init(|| self.compute_cache_root_uncached())
+        self.cache_root_timed().0
+    }
+
+    /// [`Self::cache_root`], reporting where the computation spent its time.
+    ///
+    /// The timings describe one full recomputation. A memoized answer reports
+    /// [`CacheRootTimings::memo_hit`] with zero times and the current entry counts, so an average
+    /// over blocks stays honest instead of silently mixing hits into the phase cost.
+    pub fn cache_root_timed(&self) -> (B256, CacheRootTimings) {
+        if let Some(root) = self.memoized_cache_root.get() {
+            return (*root, CacheRootTimings::memo_hit(self));
+        }
+        let (root, timings) = self.compute_cache_root_uncached_timed();
+        (*self.memoized_cache_root.get_or_init(|| root), timings)
     }
 
     /// Compute the canonical root directly from the value maps, using the code leaf memo.
+    ///
+    /// The differential tests compare this against [`Self::compute_cache_root_reference`]; the
+    /// production path reaches the same computation through [`Self::cache_root_timed`].
+    #[cfg(test)]
     fn compute_cache_root_uncached(&self) -> B256 {
+        self.compute_cache_root_uncached_timed().0
+    }
+
+    /// [`Self::compute_cache_root_uncached`], reporting the internal split.
+    fn compute_cache_root_uncached_timed(&self) -> (B256, CacheRootTimings) {
         self.compute_cache_root_with(|code_hash, entry| {
             match self.code_leaf_hashers.get(&code_hash) {
                 Some(hasher) => finish_code_leaf(hasher.clone(), entry.last_accessed_block),
@@ -546,35 +649,70 @@ impl NetworkStateCache {
     /// The slow reference [`Self::compute_cache_root_uncached`] is differential-tested against, and
     /// the periodic diagnostic a run can use to prove the memo has not drifted.
     pub fn compute_cache_root_reference(&self) -> B256 {
-        self.compute_cache_root_with(hash_code_reference)
+        self.compute_cache_root_with(hash_code_reference).0
     }
 
+    /// The one root implementation, always timed.
+    ///
+    /// There is deliberately no untimed twin: ten `Instant::now()` calls are far below this
+    /// function's own timer resolution, and a second copy of the leaf ordering would be a place
+    /// for the commitment to drift.
     fn compute_cache_root_with(
         &self,
         hash_code: impl Fn(B256, &CachedEntry<Bytes>) -> B256,
-    ) -> B256 {
+    ) -> (B256, CacheRootTimings) {
+        let mut timings = CacheRootTimings {
+            accounts: self.accounts.len() as u64,
+            storage: self.storage.len() as u64,
+            codes: self.codes.len() as u64,
+            ..Default::default()
+        };
+
+        let start = Instant::now();
         let mut account_entries: Vec<_> = self.accounts.iter().collect();
         account_entries.sort_by_key(|(address, _)| **address);
+        timings.account_collect_sort_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let mut storage_entries: Vec<_> = self.storage.iter().collect();
         storage_entries.sort_by_key(|((address, slot), _)| (*address, *slot));
+        timings.storage_collect_sort_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let mut code_entries: Vec<_> = self.codes.iter().collect();
         code_entries.sort_by_key(|(code_hash, _)| **code_hash);
+        timings.code_collect_sort_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let account_leaves: Vec<_> =
             account_entries.iter().map(|(address, entry)| hash_account(**address, entry)).collect();
+        timings.account_leaf_hash_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
         let storage_leaves: Vec<_> = storage_entries
             .iter()
             .map(|((address, slot), entry)| hash_storage(*address, *slot, entry))
             .collect();
+        timings.storage_leaf_hash_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
         let code_leaves: Vec<_> =
             code_entries.iter().map(|(code_hash, entry)| hash_code(**code_hash, entry)).collect();
+        timings.code_leaf_hash_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
         let account_root = namespace_root(b"accounts", &account_leaves);
-        let storage_root = namespace_root(b"storage", &storage_leaves);
-        let code_root = namespace_root(b"codes", &code_leaves);
+        timings.account_namespace_us = start.elapsed().as_micros() as u64;
 
+        let start = Instant::now();
+        let storage_root = namespace_root(b"storage", &storage_leaves);
+        timings.storage_namespace_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
+        let code_root = namespace_root(b"codes", &code_leaves);
+        timings.code_namespace_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
         let mut preimage = Vec::new();
         preimage.extend_from_slice(b"NetworkStateCacheRoot/v2");
 
@@ -593,7 +731,9 @@ impl NetworkStateCache {
         preimage.extend_from_slice(b"code_count");
         preimage.extend_from_slice(&(code_entries.len() as u64).to_be_bytes());
 
-        keccak256(preimage)
+        let root = keccak256(preimage);
+        timings.root_us = start.elapsed().as_micros() as u64;
+        (root, timings)
     }
 
     /// Bind the current cache root to a specific canonical block and cache policy.
@@ -603,7 +743,18 @@ impl NetworkStateCache {
         block_hash: B256,
         cache_policy_id: B256,
     ) -> CacheAnchor {
-        CacheAnchor { block_number, block_hash, cache_policy_id, cache_root: self.cache_root() }
+        self.cache_anchor_timed(block_number, block_hash, cache_policy_id).0
+    }
+
+    /// [`Self::cache_anchor`], reporting the root computation's internal split.
+    pub fn cache_anchor_timed(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+        cache_policy_id: B256,
+    ) -> (CacheAnchor, CacheRootTimings) {
+        let (cache_root, timings) = self.cache_root_timed();
+        (CacheAnchor { block_number, block_hash, cache_policy_id, cache_root }, timings)
     }
 
     /// Estimated memory usage in bytes.
@@ -1075,6 +1226,76 @@ mod tests {
         cache.rollback_block(15).unwrap();
         assert!(cache.contains_code(&first_hash));
         assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+    }
+
+    /// Populate a cache with `accounts` accounts, `slots` slots each, and one shared code.
+    fn populated_cache(accounts: u8, slots: u8) -> NetworkStateCache {
+        let mut cache = make_cache(1000, 1000);
+        let (code_hash, bytes) = code(0x5a, 512);
+        let mut accessed = accessed_with_code(code_hash, bytes);
+        for account in 0..accounts {
+            let address = Address::repeat_byte(account);
+            accessed.accounts.insert(
+                address,
+                AccountData {
+                    nonce: u64::from(account),
+                    balance: U256::from(account),
+                    code_hash: Some(code_hash),
+                },
+            );
+            for slot in 0..slots {
+                accessed
+                    .storage
+                    .insert((address, B256::repeat_byte(slot)), U256::from(u16::from(slot) + 1));
+            }
+        }
+        cache.on_block_executed(10, &accessed);
+        cache
+    }
+
+    /// Instrumenting the root must not change it, and the counts must describe what it hashed.
+    ///
+    /// The split exists to size the candidate optimizations against each other, so a count that
+    /// disagrees with the maps would silently corrupt every per-entry coefficient derived from it.
+    #[test]
+    fn timed_cache_root_equals_the_untimed_root_and_counts_what_it_hashed() {
+        let cache = populated_cache(24, 5);
+        let (timed_root, timings) = cache.cache_root_timed();
+
+        assert_eq!(timed_root, cache.compute_cache_root_reference());
+        assert!(!timings.memo_hit);
+        assert_eq!(timings.accounts, cache.accounts.len() as u64);
+        assert_eq!(timings.storage, cache.storage.len() as u64);
+        assert_eq!(timings.codes, cache.codes.len() as u64);
+        assert_eq!(timings.leaves(), timings.accounts + timings.storage + timings.codes);
+        assert_eq!(
+            timings.total_us(),
+            timings.collect_sort_us() +
+                timings.leaf_hash_us() +
+                timings.namespace_hash_us() +
+                timings.root_us
+        );
+    }
+
+    /// A memo hit is free, and must say so rather than report a zero measurement.
+    ///
+    /// The validator path never takes this branch — the cache update immediately before the anchor
+    /// invalidates the memo — but averaging a hit into the phase mean as a real zero would
+    /// understate it, so the flag is what the analyzer excludes on.
+    #[test]
+    fn a_memoized_cache_root_reports_a_memo_hit_with_the_current_composition() {
+        let cache = populated_cache(8, 2);
+        let (first_root, first) = cache.cache_root_timed();
+        let (second_root, second) = cache.cache_root_timed();
+
+        assert_eq!(first_root, second_root);
+        assert!(!first.memo_hit);
+        assert!(second.memo_hit);
+        assert_eq!(second.total_us(), 0);
+        assert_eq!(
+            (second.accounts, second.storage, second.codes),
+            (first.accounts, first.storage, first.codes)
+        );
     }
 
     /// The memo is derived state, so discarding it may cost time but must not change the root.

@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use partial_stateless::{
-    PartialExecutionWitness, PartialStatelessSidecar, RetainWitnessPathsMetrics,
-    TrieMutationMetrics,
+    CacheRootTimings, PartialExecutionWitness, PartialStatelessSidecar, RetainWitnessPathsMetrics,
+    TrieCloneTimings, TrieMutationMetrics,
 };
 use serde::Serialize;
 use std::{
@@ -11,7 +11,11 @@ use std::{
 };
 
 /// Current on-disk schema for paired validation benchmark records.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 4;
+///
+/// V5 adds the next-anchor and trie-clone splits plus the value-cache composition the anchor was
+/// computed over. Analyzer reports emit those sections only when the fields are present, so a V4
+/// run still regenerates.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 5;
 
 /// Serializable trie-walk detail kept inside the enclosing retention total.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,6 +73,82 @@ impl From<&RetainWitnessPathsMetrics> for RetentionWalkMetrics {
     }
 }
 
+/// Serializable next-anchor detail kept inside `next_cache_anchor_us`.
+///
+/// The counts are the value-cache composition the root was computed over. This phase scales with
+/// them, so two runs covering different blocks are comparable only per entry, not per block.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CacheRootMetrics {
+    pub account_collect_sort_us: u64,
+    pub storage_collect_sort_us: u64,
+    pub code_collect_sort_us: u64,
+    pub account_leaf_hash_us: u64,
+    pub storage_leaf_hash_us: u64,
+    pub code_leaf_hash_us: u64,
+    pub account_namespace_us: u64,
+    pub storage_namespace_us: u64,
+    pub code_namespace_us: u64,
+    pub root_us: u64,
+    /// Entries each namespace hashed. Mirrored to the record's top-level `cache_*` fields, which
+    /// are assigned from these and so cannot disagree with them.
+    pub accounts: u64,
+    pub storage: u64,
+    pub codes: u64,
+    /// Nonzero only if the memo answered, which the validator path never lets happen: the cache
+    /// update immediately before invalidates it. A nonzero sum here means the phase mean is
+    /// diluted by free samples and the record should be excluded, not averaged.
+    pub memo_hits: u64,
+}
+
+impl From<&CacheRootTimings> for CacheRootMetrics {
+    fn from(timings: &CacheRootTimings) -> Self {
+        Self {
+            account_collect_sort_us: timings.account_collect_sort_us,
+            storage_collect_sort_us: timings.storage_collect_sort_us,
+            code_collect_sort_us: timings.code_collect_sort_us,
+            account_leaf_hash_us: timings.account_leaf_hash_us,
+            storage_leaf_hash_us: timings.storage_leaf_hash_us,
+            code_leaf_hash_us: timings.code_leaf_hash_us,
+            account_namespace_us: timings.account_namespace_us,
+            storage_namespace_us: timings.storage_namespace_us,
+            code_namespace_us: timings.code_namespace_us,
+            root_us: timings.root_us,
+            accounts: timings.accounts,
+            storage: timings.storage,
+            codes: timings.codes,
+            memo_hits: u64::from(timings.memo_hit),
+        }
+    }
+}
+
+/// Serializable transactional-snapshot detail kept inside `trie_clone_us`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TrieCloneMetrics {
+    pub account_trie_us: u64,
+    pub storage_tries_us: u64,
+    pub warm_membership_us: u64,
+    pub retained_paths_us: u64,
+    pub storage_tries: u64,
+    pub warm_accounts: u64,
+    pub warm_storage: u64,
+    pub retained_account_paths: u64,
+}
+
+impl From<&TrieCloneTimings> for TrieCloneMetrics {
+    fn from(timings: &TrieCloneTimings) -> Self {
+        Self {
+            account_trie_us: timings.account_trie_us,
+            storage_tries_us: timings.storage_tries_us,
+            warm_membership_us: timings.warm_membership_us,
+            retained_paths_us: timings.retained_paths_us,
+            storage_tries: timings.storage_tries,
+            warm_accounts: timings.warm_accounts,
+            warm_storage: timings.warm_storage,
+            retained_account_paths: timings.retained_account_paths,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ValidationPhaseTimings {
     pub deserialize_us: u64,
@@ -90,6 +170,8 @@ pub struct ValidationPhaseTimings {
     /// copies the block turns out to need are paid inside `state_root_us` and `trie_retention_us`
     /// instead, and counted by `trie_storage_tries_copied`.
     pub trie_clone_us: u64,
+    /// The clone's internal split; included in `trie_clone_us`, never summed into a total.
+    pub trie_clone_detail: TrieCloneMetrics,
     /// Copy-on-write copies of storage tries taken across the whole transaction.
     ///
     /// Counts copies, not survivors: a trie copied and then dropped by retention still counts, and
@@ -123,6 +205,8 @@ pub struct ValidationPhaseTimings {
     /// this measures how much of the optimization a run actually got.
     pub retention_full_rebuild: u64,
     pub next_cache_anchor_us: u64,
+    /// The anchor's internal split; included in `next_cache_anchor_us`, never summed into a total.
+    pub next_cache_anchor_detail: CacheRootMetrics,
     pub trie_commit_us: u64,
     /// Measured validator work outside the named phase boundaries (executor setup/fingerprints).
     pub unattributed_us: u64,
@@ -239,6 +323,13 @@ pub struct ValidationBenchmarkRecord {
     pub partial_sidecar_bytes: usize,
     pub weak_sidecar_bytes: usize,
     pub value_cache_bytes: usize,
+    /// Value-cache composition after this block's transition, read off the next-anchor
+    /// computation so it is exactly the population that phase hashed rather than a second count
+    /// taken elsewhere. The next anchor and trie retention are both functions of these three
+    /// numbers, so comparing two runs over different blocks requires normalizing by them.
+    pub cache_accounts: u64,
+    pub cache_storage: u64,
+    pub cache_codes: u64,
     pub trie_cache_bytes: usize,
     pub retained_generation: RetainedGenerationBytes,
     pub expected_state_root: B256,
@@ -471,7 +562,7 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 4);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 5);
         assert_eq!(value["schema_version"], 0);
         assert!(value.get("block_hash").is_some());
         assert!(value["partial"].get("state_access_execution_us").is_some());
@@ -485,6 +576,39 @@ mod tests {
         assert!(value.get("expected_requests_hash").is_some());
         assert!(value.get("value_cache_bytes").is_some());
         assert!(value.get("trie_cache_bytes").is_some());
+        for field in ["cache_accounts", "cache_storage", "cache_codes"] {
+            assert!(value.get(field).is_some(), "missing composition field {field}");
+        }
+        for field in [
+            "account_collect_sort_us",
+            "storage_collect_sort_us",
+            "account_leaf_hash_us",
+            "storage_leaf_hash_us",
+            "account_namespace_us",
+            "storage_namespace_us",
+            "root_us",
+            "accounts",
+            "storage",
+            "memo_hits",
+        ] {
+            assert!(
+                value["partial"]["next_cache_anchor_detail"].get(field).is_some(),
+                "missing anchor split field {field}"
+            );
+        }
+        for field in [
+            "account_trie_us",
+            "storage_tries_us",
+            "warm_membership_us",
+            "retained_paths_us",
+            "warm_accounts",
+            "retained_account_paths",
+        ] {
+            assert!(
+                value["partial"]["trie_clone_detail"].get(field).is_some(),
+                "missing clone split field {field}"
+            );
+        }
         assert!(value["retained_generation"].get("exclusive_bytes").is_some());
         assert!(value.get("partial_witness_build_us").is_some());
         assert!(value.get("partial_serialize_us").is_some());

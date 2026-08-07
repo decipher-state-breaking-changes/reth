@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analyze_validation_bench import build_retention_split_section
+from analyze_validation_bench import (
+    build_anchor_split_section,
+    build_cache_composition_section,
+    build_clone_split_section,
+    build_retention_split_section,
+)
 
 
 def partial_record(**updates):
@@ -46,6 +51,87 @@ class RetentionTelemetryCompatibilityTest(unittest.TestCase):
         self.assertIn("Retention walk internals", rendered)
         self.assertIn("sorted fallbacks **0**", rendered)
         self.assertIn("unprunable dirty / inline **0 / 0**", rendered)
+
+
+def anchor_record(**detail_updates):
+    detail = {
+        "account_collect_sort_us": 6_000,
+        "storage_collect_sort_us": 13_000,
+        "code_collect_sort_us": 300,
+        "account_leaf_hash_us": 25_000,
+        "storage_leaf_hash_us": 26_000,
+        "code_leaf_hash_us": 1_800,
+        "account_namespace_us": 3_700,
+        "storage_namespace_us": 4_200,
+        "code_namespace_us": 280,
+        "root_us": 2,
+        "accounts": 30_100,
+        "storage": 32_900,
+        "codes": 2_300,
+        "memo_hits": 0,
+    }
+    detail.update(detail_updates)
+    return {
+        "cache_accounts": detail["accounts"],
+        "cache_storage": detail["storage"],
+        "cache_codes": detail["codes"],
+        "partial": {
+            "next_cache_anchor_us": 102_000,
+            "trie_retention_us": 82_000,
+            "trie_clone_us": 100_000,
+            "next_cache_anchor_detail": detail,
+            "trie_clone_detail": {
+                "account_trie_us": 84_000,
+                "storage_tries_us": 5_000,
+                "warm_membership_us": 7_000,
+                "retained_paths_us": 4_000,
+                "storage_tries": 1_820,
+                "warm_accounts": 30_100,
+                "warm_storage": 32_900,
+                "retained_account_paths": 30_500,
+            },
+        },
+    }
+
+
+class SchemaFiveTelemetryTest(unittest.TestCase):
+    """The V5 sections must render, and a V4 record must not make them appear."""
+
+    def test_anchor_split_ranks_the_v2_candidates(self):
+        rendered = "\n".join(build_anchor_split_section([anchor_record()]))
+
+        self.assertIn("Next cache anchor split", rendered)
+        self.assertIn("leaf digest memo", rendered)
+        self.assertIn("ordered digest index", rendered)
+        # 25.0 + 26.0 + 1.8 = 52.8 ms of the 102 ms phase.
+        self.assertIn("**52.80 ms**", rendered)
+        self.assertIn("65300 leaves", rendered)
+
+    def test_anchor_split_flags_memo_hits_that_would_dilute_the_mean(self):
+        rendered = "\n".join(build_anchor_split_section([anchor_record(memo_hits=1)]))
+
+        self.assertIn("answered from the cache-root memo", rendered)
+
+    def test_clone_split_separates_size_proportional_copies(self):
+        rendered = "\n".join(build_clone_split_section([anchor_record()]))
+
+        self.assertIn("Transactional trie clone split", rendered)
+        # 5.0 + 7.0 + 4.0 = 16 ms that is not the account trie.
+        self.assertIn("**16.00 ms**", rendered)
+
+    def test_composition_section_reports_per_entry_coefficients(self):
+        rendered = "\n".join(build_cache_composition_section([anchor_record()]))
+
+        self.assertIn("30100 / 32900 / 2300", rendered)
+        # 102_000 us over 63_000 cached entries.
+        self.assertIn("1.619 µs", rendered)
+
+    def test_schema_four_records_emit_no_v5_sections(self):
+        legacy = [partial_record()]
+
+        self.assertEqual(build_anchor_split_section(legacy), [])
+        self.assertEqual(build_clone_split_section(legacy), [])
+        self.assertEqual(build_cache_composition_section(legacy), [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
-use crate::benchmark::{RetentionWalkMetrics, ValidationPhaseTimings};
+use crate::benchmark::{
+    CacheRootMetrics, RetentionWalkMetrics, TrieCloneMetrics, ValidationPhaseTimings,
+};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
 use partial_stateless::{
@@ -10,8 +12,8 @@ use partial_stateless::{
         check_sidecar_witness_prefilter, materialize_sidecar_witness_after_prefilter,
         root_witness_completeness_from_bundle_with_cache, SidecarWitnessCheckLimits,
     },
-    CacheAnchor, MaterializedStateProof, PartialStatelessSidecar, PartialTrieNodeCache,
-    RetentionTimings, RootWitnessCompletenessReport, StateTargetSet,
+    CacheAnchor, CacheRootTimings, MaterializedStateProof, PartialStatelessSidecar,
+    PartialTrieNodeCache, RetentionTimings, RootWitnessCompletenessReport, StateTargetSet,
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::{execute::Executor, ConfigureEvm};
@@ -217,7 +219,7 @@ where
     // because the ExEx applies one transition at a time.
     let cow_copies_before = cow_copies_taken();
     let clone_start = Instant::now();
-    let mut next_trie_cache = trie_cache.clone();
+    let (mut next_trie_cache, trie_clone_detail) = trie_cache.clone_timed();
     let trie_clone_us = clone_start.elapsed().as_micros() as u64;
     let transition_storage_targets = sidecar
         .cache_miss_targets
@@ -353,6 +355,7 @@ where
         evm_us,
         hash_post_state_us,
         trie_clone_us,
+        trie_clone_detail: TrieCloneMetrics::from(&trie_clone_detail),
         trie_storage_tries_copied,
         trie_storage_tries_total: cache_timings.storage_tries_total,
         state_root_us,
@@ -376,6 +379,7 @@ where
         retention_storage_tries_skipped: cache_timings.retention.storage_tries_skipped,
         retention_full_rebuild: u64::from(cache_timings.retention.full_rebuild),
         next_cache_anchor_us: cache_timings.anchor_us,
+        next_cache_anchor_detail: CacheRootMetrics::from(&cache_timings.anchor),
         trie_commit_us: cache_timings.commit_us,
         provider_root_us,
         ..Default::default()
@@ -410,6 +414,8 @@ struct CacheTransitionTimings {
     /// The retention phase's internal split. See [`RetentionTimings`].
     retention: RetentionTimings,
     anchor_us: u64,
+    /// The anchor phase's internal split. See [`CacheRootTimings`].
+    anchor: CacheRootTimings,
     commit_us: u64,
     /// Storage tries the snapshot held after retention.
     ///
@@ -439,8 +445,10 @@ fn apply_cache_transition_and_check(
     timings.retention_us = start.elapsed().as_micros() as u64;
     timings.storage_tries_total = next_trie_cache.storage_trie_count() as u64;
     let start = Instant::now();
-    let next_cache_anchor = cache.cache_anchor(block_number, block_hash, cache_policy_id);
+    let (next_cache_anchor, anchor_detail) =
+        cache.cache_anchor_timed(block_number, block_hash, cache_policy_id);
     timings.anchor_us = start.elapsed().as_micros() as u64;
+    timings.anchor = anchor_detail;
     if next_cache_anchor != expected_next_anchor {
         cache.rollback_block(block_number).map_err(|rollback_err| {
             eyre!("next cache anchor mismatch; cache rollback also failed: {rollback_err}")
