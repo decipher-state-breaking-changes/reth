@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_validation_bench import (
     build_anchor_split_section,
     build_cache_composition_section,
+    build_cache_delta_section,
     build_clone_split_section,
     build_retention_split_section,
 )
@@ -132,6 +133,29 @@ class SchemaFiveTelemetryTest(unittest.TestCase):
         self.assertEqual(build_anchor_split_section(legacy), [])
         self.assertEqual(build_clone_split_section(legacy), [])
         self.assertEqual(build_cache_composition_section(legacy), [])
+
+
+class SchemaSixCacheDeltaTest(unittest.TestCase):
+    """The delta section is what sizes a leaf digest memo, so its arithmetic is pinned."""
+
+    def test_reuse_share_counts_refreshes_and_excludes_evictions(self):
+        record = anchor_record()
+        record["partial"]["cache_delta"] = {
+            "accounts_added": 100, "accounts_refreshed": 1_400, "accounts_evicted": 90,
+            "storage_added": 300, "storage_refreshed": 3_000, "storage_evicted": 280,
+            "codes_added": 10, "codes_refreshed": 120, "codes_evicted": 8,
+        }
+        rendered = "\n".join(build_cache_delta_section([record]))
+
+        # Accounts: (100 + 1400) of 30_100 invalidated, so 95.0% reuse. Evictions are not in it.
+        self.assertIn("1500.0 (5.0%)", rendered)
+        self.assertIn("**95.0%**", rendered)
+        # Weighted: (1500 + 3300 + 130) of (30_100 + 32_900 + 2_300) = 4930 / 65_300.
+        self.assertIn("**92.5%**", rendered)
+        self.assertIn("4930 of 65300", rendered)
+
+    def test_schema_five_records_emit_no_delta_section(self):
+        self.assertEqual(build_cache_delta_section([anchor_record()]), [])
 
 
 if __name__ == "__main__":

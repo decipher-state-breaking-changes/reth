@@ -215,8 +215,29 @@ pub struct UpdateStats {
     pub storage_evicted: usize,
     /// Number of new code entries added.
     pub codes_added: usize,
+    /// Number of existing code entries refreshed (access time updated).
+    ///
+    /// Counted for the same reason as the account and storage refreshes: a code leaf preimage
+    /// ends in `last_accessed_block`, so touching a code changes its leaf digest even though the
+    /// bytecode and the map are unchanged.
+    pub codes_refreshed: usize,
     /// Number of code entries evicted.
     pub codes_evicted: usize,
+}
+
+impl UpdateStats {
+    /// Entries whose leaf digest this block invalidated, per namespace.
+    ///
+    /// Added and refreshed entries both need a new digest — the preimage commits
+    /// `last_accessed_block`, so a read that changes no value still changes the leaf. Evictions
+    /// are excluded: they remove a leaf rather than recompute one.
+    pub const fn leaf_digests_invalidated(&self) -> (usize, usize, usize) {
+        (
+            self.accounts_added + self.accounts_refreshed,
+            self.storage_added + self.storage_refreshed,
+            self.codes_added + self.codes_refreshed,
+        )
+    }
 }
 
 /// Which keys entered or left the cache when the newest undo record's block was applied.
@@ -438,6 +459,7 @@ impl NetworkStateCache {
             match self.codes.get_mut(code_hash) {
                 Some(entry) => {
                     entry.touch(block_number);
+                    stats.codes_refreshed += 1;
                 }
                 None => {
                     self.codes.insert(*code_hash, CachedEntry::new(bytecode.clone(), block_number));
@@ -984,6 +1006,66 @@ mod tests {
             Box::new(LastNBlocksPolicy::new(account_window)),
             Box::new(LastNBlocksPolicy::new(storage_window)),
         )
+    }
+
+    /// An unchanged re-read still moves the cache root, and `UpdateStats` still counts it.
+    ///
+    /// Nothing about the entry changes except `last_accessed_block`, which every leaf preimage
+    /// commits, so the populations are identical block to block while every touched leaf has a
+    /// new digest. Anything deriving per-entry state from this cache therefore has to invalidate
+    /// on the touch rather than on the value, and `MembershipDelta` is the wrong source for it —
+    /// it tracks membership, which a refresh does not move.
+    #[test]
+    fn an_unchanged_reread_still_invalidates_every_touched_leaf() {
+        let mut cache = make_cache(60, 60);
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let code = Bytes::from_static(b"runtime bytecode");
+        let code_hash = keccak256(&code);
+
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            address,
+            AccountData { nonce: 7, balance: U256::from(1234), code_hash: Some(code_hash) },
+        );
+        accessed.storage.insert((address, slot), U256::from(99));
+        accessed.codes.insert(code_hash, code);
+
+        cache.on_block_executed(100, &accessed);
+        let root_after_insert = cache.cache_root();
+        let population = (cache.accounts.len(), cache.storage.len(), cache.codes.len());
+
+        // Same block content, replayed at the next height: identical values, nothing added or
+        // evicted, so every population count is unmoved.
+        let stats = cache.on_block_executed(101, &accessed);
+        assert_eq!(
+            (cache.accounts.len(), cache.storage.len(), cache.codes.len()),
+            population,
+            "an unchanged re-read must not move any population count"
+        );
+        assert_eq!(
+            (stats.accounts_added, stats.storage_added, stats.codes_added),
+            (0, 0, 0),
+            "nothing was added"
+        );
+        assert_eq!(
+            (stats.accounts_refreshed, stats.storage_refreshed, stats.codes_refreshed),
+            (1, 1, 1),
+            "every namespace, code included, must count the refresh"
+        );
+        assert_eq!(stats.leaf_digests_invalidated(), (1, 1, 1));
+
+        assert_ne!(
+            cache.cache_root(),
+            root_after_insert,
+            "last_accessed_block is in every leaf preimage, so a pure re-read moves the root"
+        );
+
+        // And the undo record — the memo's invalidation source — names all three keys.
+        let undo = cache.undo_log.back().expect("the block left an undo record");
+        assert!(undo.accounts_before.contains_key(&address));
+        assert!(undo.storage_before.contains_key(&(address, slot)));
+        assert!(undo.codes_before.contains_key(&code_hash));
     }
 
     #[test]

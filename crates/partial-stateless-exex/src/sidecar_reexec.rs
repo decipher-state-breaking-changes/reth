@@ -1,5 +1,6 @@
 use crate::benchmark::{
-    CacheRootMetrics, RetentionWalkMetrics, TrieCloneMetrics, ValidationPhaseTimings,
+    CacheDeltaMetrics, CacheRootMetrics, RetentionWalkMetrics, TrieCloneMetrics,
+    ValidationPhaseTimings,
 };
 use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
@@ -362,6 +363,7 @@ where
         root_completeness_us,
         miss_policy_check_us,
         cache_update_us: cache_timings.update_us,
+        cache_delta: CacheDeltaMetrics::from(&cache_update),
         trie_retention_us: cache_timings.retention_us,
         retention_warm_membership_us: cache_timings.retention.warm_membership_us,
         retention_storage_paths_us: cache_timings.retention.storage_paths_us,

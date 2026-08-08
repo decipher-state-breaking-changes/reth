@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use partial_stateless::{
-    CacheRootTimings, PartialExecutionWitness, PartialStatelessSidecar, RetainWitnessPathsMetrics,
-    TrieCloneTimings, TrieMutationMetrics,
+    network_cache::UpdateStats, CacheRootTimings, PartialExecutionWitness, PartialStatelessSidecar,
+    RetainWitnessPathsMetrics, TrieCloneTimings, TrieMutationMetrics,
 };
 use serde::Serialize;
 use std::{
@@ -13,9 +13,10 @@ use std::{
 /// Current on-disk schema for paired validation benchmark records.
 ///
 /// V5 adds the next-anchor and trie-clone splits plus the value-cache composition the anchor was
-/// computed over. Analyzer reports emit those sections only when the fields are present, so a V4
-/// run still regenerates.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 5;
+/// computed over. V6 adds `cache_delta`, the per-namespace added/refreshed/evicted counts the
+/// transition moved. Analyzer reports emit those sections only when the fields are present, so a
+/// V4 or V5 run still regenerates.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 6;
 
 /// Serializable trie-walk detail kept inside the enclosing retention total.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -121,6 +122,42 @@ impl From<&CacheRootTimings> for CacheRootMetrics {
     }
 }
 
+/// What this block's transition moved in the value cache, per namespace.
+///
+/// Published because the *gross* movement is not recoverable from anything else a record carries.
+/// The `cache_*` populations only show net change, and a refresh moves no population at all while
+/// still changing that entry's leaf: `last_accessed_block` is part of every leaf preimage. So
+/// `added + refreshed`, the leaves whose digest this block invalidated, can be read here and
+/// nowhere else, while `evicted` counts the leaves it dropped instead.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CacheDeltaMetrics {
+    pub accounts_added: u64,
+    pub accounts_refreshed: u64,
+    pub accounts_evicted: u64,
+    pub storage_added: u64,
+    pub storage_refreshed: u64,
+    pub storage_evicted: u64,
+    pub codes_added: u64,
+    pub codes_refreshed: u64,
+    pub codes_evicted: u64,
+}
+
+impl From<&UpdateStats> for CacheDeltaMetrics {
+    fn from(stats: &UpdateStats) -> Self {
+        Self {
+            accounts_added: stats.accounts_added as u64,
+            accounts_refreshed: stats.accounts_refreshed as u64,
+            accounts_evicted: stats.accounts_evicted as u64,
+            storage_added: stats.storage_added as u64,
+            storage_refreshed: stats.storage_refreshed as u64,
+            storage_evicted: stats.storage_evicted as u64,
+            codes_added: stats.codes_added as u64,
+            codes_refreshed: stats.codes_refreshed as u64,
+            codes_evicted: stats.codes_evicted as u64,
+        }
+    }
+}
+
 /// Serializable transactional-snapshot detail kept inside `trie_clone_us`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TrieCloneMetrics {
@@ -183,6 +220,9 @@ pub struct ValidationPhaseTimings {
     pub root_completeness_us: u64,
     pub miss_policy_check_us: u64,
     pub cache_update_us: u64,
+    /// What the transition inside `cache_update_us` moved, per namespace. Counts, not times:
+    /// reported beside the phase rather than as a component of it.
+    pub cache_delta: CacheDeltaMetrics,
     pub trie_retention_us: u64,
     /// Retention's internal split. Reported beside `trie_retention_us`, never summed into a total:
     /// the phases below are measured inside it, so adding them would double-count.
@@ -562,7 +602,7 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 5);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 6);
         assert_eq!(value["schema_version"], 0);
         assert!(value.get("block_hash").is_some());
         assert!(value["partial"].get("state_access_execution_us").is_some());
@@ -578,6 +618,22 @@ mod tests {
         assert!(value.get("trie_cache_bytes").is_some());
         for field in ["cache_accounts", "cache_storage", "cache_codes"] {
             assert!(value.get(field).is_some(), "missing composition field {field}");
+        }
+        for field in [
+            "accounts_added",
+            "accounts_refreshed",
+            "accounts_evicted",
+            "storage_added",
+            "storage_refreshed",
+            "storage_evicted",
+            "codes_added",
+            "codes_refreshed",
+            "codes_evicted",
+        ] {
+            assert!(
+                value["partial"]["cache_delta"].get(field).is_some(),
+                "missing cache delta field {field}"
+            );
         }
         for field in [
             "account_collect_sort_us",

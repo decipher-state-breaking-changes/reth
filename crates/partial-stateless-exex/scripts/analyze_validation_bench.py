@@ -479,6 +479,55 @@ def build_cache_composition_section(accepted):
         f"- Transactional trie clone per cached entry: **{per_entry('trie_clone_us')}**"]
 
 
+def build_cache_delta_section(accepted):
+    """Report what share of each namespace's leaves a block actually invalidates.
+
+    Not recoverable from anything else a record carries: the `cache_*` populations show only net
+    movement, while a refresh moves no population at all and still changes that entry's leaf,
+    because `last_accessed_block` is part of every leaf preimage. Evictions are reported separately
+    since they drop a leaf rather than change one. Emitted only when the records carry the delta.
+    """
+    rows = [r["partial"]["cache_delta"] for r in accepted if "cache_delta" in r.get("partial", {})]
+    if not rows:
+        return []
+
+    def mean(field):
+        return statistics.fmean(row.get(field, 0) for row in rows)
+
+    lines = [
+        "", "## Per-block cache delta and leaf reuse", "",
+        "`added + refreshed` is the leaves whose digest this block changed, against the population "
+        "the root was computed over; reuse is the rest. Evictions drop a leaf rather than change "
+        "one, so they are listed but not counted as invalidated.", "",
+        "| Namespace | Population | Added | Refreshed | Evicted | Invalidated | Reuse |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    total_population = 0.0
+    total_invalidated = 0.0
+    for name, pop_field, prefix in (
+        ("Accounts", "cache_accounts", "accounts"),
+        ("Storage", "cache_storage", "storage"),
+        ("Codes", "cache_codes", "codes"),
+    ):
+        population = statistics.fmean(r.get(pop_field, 0) for r in accepted)
+        added, refreshed, evicted = (
+            mean(f"{prefix}_added"), mean(f"{prefix}_refreshed"), mean(f"{prefix}_evicted"))
+        invalidated = added + refreshed
+        share = f"{100 * (1 - invalidated / population):.1f}%" if population else "n/a"
+        lines.append(
+            f"| {name} | {population:.0f} | {added:.1f} | {refreshed:.1f} | {evicted:.1f} "
+            f"| {invalidated:.1f} ({100 * invalidated / population:.1f}%) | **{share}** |"
+            if population else f"| {name} | 0 | — | — | — | — | n/a |")
+        total_population += population
+        total_invalidated += invalidated
+
+    if total_population:
+        lines += ["", f"- Weighted leaf reuse across all three namespaces: "
+            f"**{100 * (1 - total_invalidated / total_population):.1f}%** "
+            f"({total_invalidated:.0f} of {total_population:.0f} leaves invalidated per block)"]
+    return lines
+
+
 def retained_generation_lines(accepted):
     """Report what the K = 1 retained generation costs, or that this run kept none.
 
@@ -630,6 +679,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines.extend(build_clone_split_section(accepted))
 
     lines.extend(build_cache_composition_section(accepted))
+    lines.extend(build_cache_delta_section(accepted))
 
     orders = [r["verifier_order"] for r in accepted]
     tx_average = statistics.fmean(r["tx_count"] for r in accepted)
