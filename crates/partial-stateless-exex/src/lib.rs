@@ -2260,6 +2260,21 @@ mod tests {
         pair.cache.on_block_executed(number, &accessed);
     }
 
+    /// The memo, the leaf digest index, and the value maps must all be telling the same story.
+    ///
+    /// [`CoordinatedPair::fingerprint`] reads `cache_root()`, which answers from the memo — and a
+    /// rollback restores that memo from the undo record rather than recomputing it. Two pairs can
+    /// therefore be fingerprint-equal while the digest index under one of them has drifted, and the
+    /// drift would first surface a block later, on the next root the memo does not answer. The slow
+    /// reference reads neither memo nor index, so it is what closes that gap.
+    fn assert_cache_root_is_independently_reproducible(pair: &CoordinatedPair, at: &str) {
+        assert_eq!(
+            pair.cache.cache_root(),
+            pair.cache.compute_cache_root_reference(),
+            "cache root disagrees with a from-scratch recomputation, {at}"
+        );
+    }
+
     /// The pair a depth-1 reorg finds, plus a reference pair that never saw the abandoned block.
     ///
     /// The abandoned block touches `ABANDONED` and nothing else does, so any residue the rollback
@@ -2323,6 +2338,7 @@ mod tests {
             reference.fingerprint(),
             "a recovered pair must equal one that never saw the abandoned block, on every field"
         );
+        assert_cache_root_is_independently_reproducible(&pair, "after recovery");
 
         // Equality at the anchor is necessary but not sufficient: `last_accessed_block` decides
         // what the *next* eviction does, and no state proof attests to it. Driving both pairs
@@ -2335,6 +2351,10 @@ mod tests {
             reference.fingerprint(),
             "and it must still agree after the winning branch is applied to both"
         );
+        // The winning block invalidated the memo, so this root was recomputed from the index
+        // rather than restored — which is the point at which a rollback that left the index
+        // stale would produce a wrong anchor and be rejected by peers.
+        assert_cache_root_is_independently_reproducible(&pair, "after the winning branch");
     }
 
     #[test]
@@ -2353,6 +2373,7 @@ mod tests {
         assert_eq!(ready.anchor.block_number, SNAP_BLOCK);
         assert_eq!(ready.anchor.block_hash, SNAP_HASH);
         assert_eq!(pair.fingerprint(), reference.fingerprint());
+        assert_cache_root_is_independently_reproducible(&pair, "after a pure revert");
         assert!(
             matches!(pair.readiness.state(), CacheReadiness::Ready(_)),
             "a reverted pair is Ready at the new tip, not left Recovering"

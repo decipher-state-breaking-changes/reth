@@ -14,9 +14,12 @@ use std::{
 ///
 /// V5 adds the next-anchor and trie-clone splits plus the value-cache composition the anchor was
 /// computed over. V6 adds `cache_delta`, the per-namespace added/refreshed/evicted counts the
-/// transition moved. Analyzer reports emit those sections only when the fields are present, so a
-/// V4 or V5 run still regenerates.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 6;
+/// transition moved. V7 adds `cache_root_index_maintenance_us`, without which the anchor cannot be
+/// compared across the leaf digest index — the index moves work out of the anchor and into the
+/// cache update, so a V6 record and a V7 record report the same phase over different scopes.
+/// Analyzer reports emit those sections only when the fields are present, so a V4, V5, or V6 run
+/// still regenerates.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 7;
 
 /// Serializable trie-walk detail kept inside the enclosing retention total.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -220,6 +223,14 @@ pub struct ValidationPhaseTimings {
     pub root_completeness_us: u64,
     pub miss_policy_check_us: u64,
     pub cache_update_us: u64,
+    /// Rehashing the leaf digests of the entries this block moved; measured inside
+    /// `cache_update_us`, never summed into a total.
+    ///
+    /// The cost the cache root stopped paying, charged to the block that caused it. It belongs
+    /// beside `next_cache_anchor_us` and not inside it, so comparing the anchor across the change
+    /// means comparing the sum of the two against the anchor a pre-index run reported — the anchor
+    /// alone would credit the change with work that merely moved.
+    pub cache_root_index_maintenance_us: u64,
     /// What the transition inside `cache_update_us` moved, per namespace. Counts, not times:
     /// reported beside the phase rather than as a component of it.
     pub cache_delta: CacheDeltaMetrics,
@@ -602,7 +613,10 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 6);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 7);
+        // Nested inside `cache_update_us`. Without it the anchor is not comparable across the
+        // index, so a record that omits it is a record the combined gate cannot be read off.
+        assert!(value["partial"].get("cache_root_index_maintenance_us").is_some());
         assert_eq!(value["schema_version"], 0);
         assert!(value.get("block_hash").is_some());
         assert!(value["partial"].get("state_access_execution_us").is_some());

@@ -22,6 +22,11 @@
 //! biases the collect-and-sort term *down* — it is the term most sensitive to layout — so treat
 //! its share as a lower bound and the leaf-hash share as an upper bound. The live schema-V5 split
 //! is the measurement; this is the thing that says which change is worth writing first.
+//!
+//! Since the leaf digest index landed, the first two of those terms read zero and the split above
+//! is a regression check rather than a ranking: a nonzero value in either means the root has gone
+//! back to reading the value maps. The layout bias does still apply, but to index *maintenance*,
+//! which [`profile_anchor_against_its_index_maintenance`] reports beside the anchor it pays for.
 
 use alloy_primitives::{keccak256, Address, Bytes, Keccak256, B256, U256};
 use partial_stateless::{
@@ -169,10 +174,14 @@ fn profile_next_cache_anchor_cost() {
     println!("{}", row("**Total**", total, total, leaves));
 
     println!("\nGrouped by the change that would remove it:\n");
+    // The first two read zero since the leaf digest index landed: both terms moved into
+    // `UpdateStats::index_maintenance_us`, where they are paid over the entries a block moved
+    // rather than over the whole cache. They stay in the table because a nonzero value here would
+    // mean the root had gone back to reading the value maps.
     println!(
         "{}",
         row(
-            "collect + sort  (ordered index)",
+            "collect + sort  (moved to the index)",
             mean(CacheRootTimings::collect_sort_us),
             total,
             leaves
@@ -180,7 +189,12 @@ fn profile_next_cache_anchor_cost() {
     );
     println!(
         "{}",
-        row("leaf hash       (digest memo)", mean(CacheRootTimings::leaf_hash_us), total, leaves)
+        row(
+            "leaf hash       (moved to the index)",
+            mean(CacheRootTimings::leaf_hash_us),
+            total,
+            leaves
+        )
     );
     println!(
         "{}",
@@ -194,6 +208,133 @@ fn profile_next_cache_anchor_cost() {
     println!();
 
     assert!(total > 0, "profile measured nothing");
+}
+
+/// Composition and per-block delta of the 2026-08-09 A.13 run, over its 300 accepted samples.
+///
+/// Different from the constants above, and deliberately not merged with them: the gate the leaf
+/// digest index is judged against is normalized on A.13, and the anchor split above is a different
+/// measurement on a different run. Averaging the two would leave neither reproducible.
+mod measured {
+    pub const ACCOUNTS: u32 = 18_657;
+    pub const STORAGE: u32 = 46_426;
+    pub const CODES: u32 = 2_476;
+    /// Entries a block invalidates: added + refreshed, which are the same cost to rehash.
+    pub const ACCOUNTS_TOUCHED: u32 = 658;
+    pub const STORAGE_TOUCHED: u32 = 2_157;
+    pub const CODES_TOUCHED: u32 = 288;
+}
+
+/// The gate arithmetic, offline: what the anchor costs now, and what maintaining the index costs.
+///
+/// Neither number alone says whether the index paid for itself — it makes the anchor cheaper by
+/// making the cache update more expensive — so the quantity to compare against a pre-index run is
+/// their sum. Running this before the live screen is what says the screen is worth an hour.
+///
+/// Read the ranking and the shape, not the absolutes. The cache here is built in one pass, so its
+/// layout is more compact than one that has lived through sixty blocks of insertion and eviction,
+/// which biases both terms down; the offline anchor profile ran about a fifth low against live for
+/// exactly this reason.
+#[test]
+#[ignore = "production-sized profile; run explicitly in release mode"]
+fn profile_anchor_against_its_index_maintenance() {
+    require_production_keccak();
+    let mut cache = NetworkStateCache::new(
+        Box::new(LastNBlocksPolicy::new(1_000)),
+        Box::new(LastNBlocksPolicy::new(1_000)),
+    );
+
+    let mut initial = BlockAccessedState::default();
+    for index in 0..measured::CODES {
+        let mut body = vec![0xefu8; CODE_BYTES];
+        body[..4].copy_from_slice(&index.to_be_bytes());
+        let bytes = Bytes::from(body);
+        initial.codes.insert(keccak256(&bytes), bytes);
+    }
+    let code_hashes: Vec<B256> = initial.codes.keys().copied().collect();
+    for index in 0..measured::ACCOUNTS {
+        initial.accounts.insert(
+            address_at(index),
+            AccountData {
+                nonce: u64::from(index),
+                balance: U256::from(index),
+                code_hash: (index % 13 == 0)
+                    .then(|| code_hashes[index as usize % code_hashes.len()]),
+            },
+        );
+    }
+    for index in 0..measured::STORAGE {
+        initial.storage.insert(
+            (address_at(index % measured::ACCOUNTS), keccak256(index.to_be_bytes())),
+            U256::from(index),
+        );
+    }
+    cache.on_block_executed(1, &initial);
+
+    // Every touched key already exists, so the populations hold still across rounds and the two
+    // terms stay comparable. An insertion costs the same rehash plus a `BTreeMap` node; at 3.5% of
+    // accounts being new that is a fraction of a fraction, and holding composition fixed is worth
+    // more here than modelling it.
+    let mut delta = BlockAccessedState::default();
+    for index in 0..measured::ACCOUNTS_TOUCHED {
+        let address = address_at(index * 7 % measured::ACCOUNTS);
+        delta.accounts.insert(
+            address,
+            AccountData { nonce: u64::from(index), balance: U256::from(index), code_hash: None },
+        );
+    }
+    for index in 0..measured::STORAGE_TOUCHED {
+        let slot = index * 11 % measured::STORAGE;
+        delta.storage.insert(
+            (address_at(slot % measured::ACCOUNTS), keccak256(slot.to_be_bytes())),
+            U256::from(index),
+        );
+    }
+    for index in 0..measured::CODES_TOUCHED {
+        let code_hash = code_hashes[(index * 5 % measured::CODES) as usize];
+        let bytes = cache.codes().get(&code_hash).expect("inserted above").value.clone();
+        delta.codes.insert(code_hash, bytes);
+    }
+
+    let mut maintenance = Vec::new();
+    let mut anchor = Vec::new();
+    for round in 0..5u64 {
+        let stats = cache.on_block_executed(2 + round, &delta);
+        let (_, timings) = cache.cache_root_timed();
+        assert!(!timings.memo_hit, "profiling a memo hit measures nothing");
+        maintenance.push(stats.index_maintenance_us);
+        anchor.push(timings.total_us());
+    }
+
+    let mean = |samples: &[u64]| samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    let anchor_us = mean(&anchor);
+    let maintenance_us = mean(&maintenance);
+    let entries = f64::from(measured::ACCOUNTS + measured::STORAGE);
+
+    println!("\n## Anchor against its index maintenance (offline, {} rounds)\n", anchor.len());
+    println!("| Term | Mean | Per cached entry |");
+    println!("| --- | ---: | ---: |");
+    println!(
+        "| Next cache anchor | {:.2} ms | {:.3} µs |",
+        anchor_us / 1000.0,
+        anchor_us / entries
+    );
+    println!(
+        "| Leaf digest index maintenance | {:.2} ms | {:.3} µs |",
+        maintenance_us / 1000.0,
+        maintenance_us / entries
+    );
+    println!(
+        "| **Combined** | **{:.2} ms** | **{:.3} µs** |",
+        (anchor_us + maintenance_us) / 1000.0,
+        (anchor_us + maintenance_us) / entries
+    );
+    println!(
+        "\nA.13 measured the pre-index anchor at 101.03 ms over the same composition, \
+         1.640 µs/entry.\n"
+    );
+
+    assert!(anchor_us > 0.0, "profile measured nothing");
 }
 
 /// Split the leaf-hash term into the allocator's share and keccak's share.

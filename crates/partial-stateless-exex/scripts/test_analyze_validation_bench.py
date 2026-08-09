@@ -78,6 +78,7 @@ def anchor_record(**detail_updates):
         "cache_codes": detail["codes"],
         "partial": {
             "next_cache_anchor_us": 102_000,
+            "cache_update_us": 30_000,
             "trie_retention_us": 82_000,
             "trie_clone_us": 100_000,
             "next_cache_anchor_detail": detail,
@@ -102,8 +103,8 @@ class SchemaFiveTelemetryTest(unittest.TestCase):
         rendered = "\n".join(build_anchor_split_section([anchor_record()]))
 
         self.assertIn("Next cache anchor split", rendered)
-        self.assertIn("leaf digest memo", rendered)
-        self.assertIn("ordered digest index", rendered)
+        self.assertIn("the digest index (moved)", rendered)
+        self.assertIn("nothing — measured irreducible", rendered)
         # 25.0 + 26.0 + 1.8 = 52.8 ms of the 102 ms phase.
         self.assertIn("**52.80 ms**", rendered)
         self.assertIn("65300 leaves", rendered)
@@ -126,6 +127,26 @@ class SchemaFiveTelemetryTest(unittest.TestCase):
         self.assertIn("30100 / 32900 / 2300", rendered)
         # 102_000 us over 63_000 cached entries.
         self.assertIn("1.619 µs", rendered)
+
+    def test_composition_section_combines_the_anchor_with_its_index_maintenance(self):
+        """The gate reads the sum, so the sum is what the report has to state.
+
+        Neither phase alone answers whether the index paid for itself: it makes the anchor cheaper
+        by making the cache update more expensive. A record predating the field must read as zero
+        maintenance rather than break, so an old run stays comparable against a new one.
+        """
+        record = anchor_record()
+        record["partial"]["cache_root_index_maintenance_us"] = 12_600
+        rendered = "\n".join(build_cache_composition_section([record]))
+
+        # 102_000 + 12_600 us over 63_000 cached entries.
+        self.assertIn("**114.60 ms**", rendered)
+        self.assertIn("1.819 µs", rendered)
+        # 30_000 us of cache update, less the 12_600 measured inside it.
+        self.assertIn("**17.40 ms**", rendered)
+
+        without = "\n".join(build_cache_composition_section([anchor_record()]))
+        self.assertIn("**102.00 ms**", without)
 
     def test_schema_four_records_emit_no_v5_sections(self):
         legacy = [partial_record()]

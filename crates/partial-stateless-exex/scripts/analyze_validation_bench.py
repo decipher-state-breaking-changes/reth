@@ -345,9 +345,12 @@ def build_retention_split_section(accepted):
 
 
 ANCHOR_SPLIT_GROUPS = [
-    ("Collect + sort", "ordered digest index", ["account", "storage", "code"], "collect_sort_us"),
-    ("Leaf preimage + hash", "leaf digest memo", ["account", "storage", "code"], "leaf_hash_us"),
-    ("Namespace hash", "irreducible at v2", ["account", "storage", "code"], "namespace_us"),
+    ("Collect + sort", "the digest index (moved)", ["account", "storage", "code"],
+     "collect_sort_us"),
+    ("Leaf preimage + hash", "the digest index (moved)", ["account", "storage", "code"],
+     "leaf_hash_us"),
+    ("Namespace hash", "nothing — measured irreducible", ["account", "storage", "code"],
+     "namespace_us"),
 ]
 
 
@@ -357,6 +360,11 @@ def build_anchor_split_section(accepted):
     Ordering the keys removes the sort, memoizing leaf digests removes the hashing for entries
     that did not change, and neither touches the namespace hash. The three are disjoint, so
     their sizes are what ranks them. Emitted only when the records carry the split.
+
+    The first two rows read zero once the leaf digest index is in place, and that is the
+    measurement rather than a gap: both terms moved into `cache_root_index_maintenance_us`, where
+    they are paid over the entries a block moved instead of over the whole cache. Reading the
+    anchor alone across that change would credit it with work that only relocated.
     """
     details = [r["partial"].get("next_cache_anchor_detail") for r in accepted]
     details = [d for d in details if d]
@@ -465,9 +473,20 @@ def build_cache_composition_section(accepted):
     codes = statistics.fmean(r.get("cache_codes", 0) for r in accepted)
     entries = accounts + storage
 
+    def mean_us(field):
+        return statistics.fmean(r["partial"].get(field, 0) for r in accepted)
+
     def per_entry(field):
-        avg = statistics.fmean(r["partial"].get(field, 0) for r in accepted)
-        return f"{avg / entries:.3f} µs" if entries else "n/a"
+        return f"{mean_us(field) / entries:.3f} µs" if entries else "n/a"
+
+    # What the leaf digest index costs and what it saves are two different phases, so neither
+    # alone says whether it paid. Their sum is the like-for-like comparison against the anchor a
+    # run that predates the index reported.
+    anchor_us = mean_us("next_cache_anchor_us")
+    maintenance_us = mean_us("cache_root_index_maintenance_us")
+    combined = anchor_us + maintenance_us
+    combined_per_entry = f"{combined / entries:.3f} µs" if entries else "n/a"
+    update_net_us = mean_us("cache_update_us") - maintenance_us
 
     return ["", "## Cache composition and normalized phase cost", "",
         "Compare these coefficients across runs, not the absolute means: two runs cover different "
@@ -475,6 +494,11 @@ def build_cache_composition_section(accepted):
         f"- Cached accounts / storage entries / codes: **{accounts:.0f} / {storage:.0f} / "
         f"{codes:.0f}**",
         f"- Next cache anchor per cached entry: **{per_entry('next_cache_anchor_us')}**",
+        f"- Leaf digest index maintenance per cached entry: "
+        f"**{per_entry('cache_root_index_maintenance_us')}**",
+        f"- Anchor + index maintenance: **{combined / 1000:.2f} ms**, "
+        f"**{combined_per_entry}** per cached entry",
+        f"- Cache update net of index maintenance: **{update_net_us / 1000:.2f} ms**",
         f"- Trie retention per cached entry: **{per_entry('trie_retention_us')}**",
         f"- Transactional trie clone per cached entry: **{per_entry('trie_clone_us')}**"]
 
@@ -663,6 +687,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         ("Sparse-trie root", "state_root_us"),
         ("Exact miss-only policy", "miss_policy_check_us"),
         ("Cache update", "cache_update_us"),
+        ("↳ leaf digest index maintenance", "cache_root_index_maintenance_us"),
         ("Trie retention", "trie_retention_us"),
         ("Next cache anchor", "next_cache_anchor_us"),
         ("Transactional trie clone", "trie_clone_us"),
@@ -673,6 +698,9 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         p_avg = statistics.fmean(r["partial"].get(field, 0) for r in accepted) / 1000
         w_avg = statistics.fmean(r["weak"].get(field, 0) for r in accepted) / 1000
         lines.append(f"| {label} | {p_avg:.2f} ms | {w_avg:.2f} ms |")
+    lines.extend(["",
+        "Rows marked ↳ are measured inside the row above them, so the column does not sum. Weak "
+        "carries no leaf digest index, which is why that row is zero for it rather than absent."])
 
     lines.extend(build_retention_split_section(accepted))
     lines.extend(build_anchor_split_section(accepted))

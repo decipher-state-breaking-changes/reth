@@ -363,6 +363,7 @@ where
         root_completeness_us,
         miss_policy_check_us,
         cache_update_us: cache_timings.update_us,
+        cache_root_index_maintenance_us: cache_update.index_maintenance_us,
         cache_delta: CacheDeltaMetrics::from(&cache_update),
         trie_retention_us: cache_timings.retention_us,
         retention_warm_membership_us: cache_timings.retention.warm_membership_us,

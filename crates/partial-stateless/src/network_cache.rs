@@ -10,7 +10,7 @@ use crate::{
 };
 use alloy_primitives::{keccak256, Address, Bytes, Keccak256, B256, U256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::OnceLock,
     time::Instant,
 };
@@ -36,6 +36,62 @@ fn namespace_root(label: &[u8], leaves: &[B256]) -> B256 {
     for leaf in leaves {
         preimage.extend_from_slice(leaf.as_slice());
     }
+    keccak256(preimage)
+}
+
+/// [`namespace_root`] over a borrowed stream of leaves instead of a slice.
+///
+/// The index holds its digests in a `BTreeMap`, whose values are ordered but not contiguous, and
+/// collecting them into a slice first would reintroduce the ~2 MiB per-block allocation the index
+/// exists to remove. Absorbing them one at a time is bit-identical — keccak is a sponge, and
+/// `absorb(a) ++ absorb(b)` is `absorb(a ++ b)` — and measures within 5% of the contiguous form,
+/// which is why the streaming form is worth having (`tests/digest_index_profile.rs`).
+fn namespace_root_streamed<'a>(
+    label: &[u8],
+    leaves: impl ExactSizeIterator<Item = &'a B256>,
+) -> B256 {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"NetworkStateCacheNamespaceRoot/v1");
+    hasher.update(label);
+    hasher.update((leaves.len() as u64).to_be_bytes());
+    for leaf in leaves {
+        hasher.update(leaf.as_slice());
+    }
+    hasher.finalize()
+}
+
+/// The v2 cache root over three namespace roots and their populations.
+///
+/// The two leaf-producing paths — the index-backed one and the slow reference — both end here, so
+/// the commitment's byte format has exactly one definition. What they deliberately do not share is
+/// how the leaves are produced and ordered: that is what the index changed, and what a differential
+/// test has to be free to disagree about.
+fn cache_root_v2(
+    account_root: B256,
+    account_count: usize,
+    storage_root: B256,
+    storage_count: usize,
+    code_root: B256,
+    code_count: usize,
+) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"NetworkStateCacheRoot/v2");
+
+    preimage.extend_from_slice(b"account_root");
+    preimage.extend_from_slice(account_root.as_slice());
+    preimage.extend_from_slice(b"account_count");
+    preimage.extend_from_slice(&(account_count as u64).to_be_bytes());
+
+    preimage.extend_from_slice(b"storage_root");
+    preimage.extend_from_slice(storage_root.as_slice());
+    preimage.extend_from_slice(b"storage_count");
+    preimage.extend_from_slice(&(storage_count as u64).to_be_bytes());
+
+    preimage.extend_from_slice(b"code_root");
+    preimage.extend_from_slice(code_root.as_slice());
+    preimage.extend_from_slice(b"code_count");
+    preimage.extend_from_slice(&(code_count as u64).to_be_bytes());
+
     keccak256(preimage)
 }
 
@@ -85,6 +141,22 @@ fn code_leaf_prefix_hasher(code_hash: B256, code: &Bytes) -> Keccak256 {
 fn finish_code_leaf(mut hasher: Keccak256, last_accessed_block: u64) -> B256 {
     hasher.update(last_accessed_block.to_be_bytes());
     hasher.finalize()
+}
+
+/// A code leaf digest, finishing the memoized sponge when one is present.
+///
+/// A memo miss is only reachable through a path that inserted a code without going through
+/// `on_block_executed`, `restore`, or `rollback_block`. Recompute rather than assume, so the
+/// digest never depends on the memo being populated.
+fn code_leaf_digest(
+    hashers: &HashMap<B256, Keccak256>,
+    code_hash: B256,
+    entry: &CachedEntry<Bytes>,
+) -> B256 {
+    match hashers.get(&code_hash) {
+        Some(hasher) => finish_code_leaf(hasher.clone(), entry.last_accessed_block),
+        None => hash_code_reference(code_hash, entry),
+    }
 }
 
 /// Hashes a code leaf without consulting any memo. The reference the memoized path must equal.
@@ -223,6 +295,13 @@ pub struct UpdateStats {
     pub codes_refreshed: usize,
     /// Number of code entries evicted.
     pub codes_evicted: usize,
+    /// Time spent bringing the leaf digest index back into agreement with the value maps.
+    ///
+    /// This is the cost the cache root no longer pays: rehashing the leaves a block moved, charged
+    /// to the block that moved them instead of to every later root. It is measured inside the
+    /// cache update, so a caller reporting both must report this one as a component and never
+    /// add it to a total.
+    pub index_maintenance_us: u64,
 }
 
 impl UpdateStats {
@@ -312,6 +391,12 @@ pub struct NetworkStateCache {
     /// [`Self::memoized_cache_root`], whose value depends on cache contents and therefore does
     /// need explicit invalidation.
     code_leaf_hashers: HashMap<B256, Keccak256>,
+    /// Every cache entry's leaf digest, in the key order the cache root hashes them in.
+    ///
+    /// Unlike [`Self::code_leaf_hashers`], losing an entry here is not merely slow: the root is
+    /// read straight out of this index, so a stale digest is a wrong answer. See
+    /// [`CacheDigestIndex`] for what keeps it in agreement with the value maps.
+    digest_index: CacheDigestIndex,
     /// Per-block undo records (oldest→newest) enabling rollback on reorg.
     /// Retained only for the unfinalized window; pruned below the finalized block.
     undo_log: VecDeque<BlockCacheUndo>,
@@ -329,6 +414,7 @@ impl NetworkStateCache {
             current_block: 0,
             memoized_cache_root: OnceLock::new(),
             code_leaf_hashers: HashMap::new(),
+            digest_index: CacheDigestIndex::default(),
             undo_log: VecDeque::new(),
         }
     }
@@ -357,7 +443,7 @@ impl NetworkStateCache {
                 (*code_hash, code_leaf_prefix_hasher(*code_hash, &entry.value))
             })
             .collect();
-        Self {
+        let mut cache = Self {
             accounts,
             storage,
             codes,
@@ -366,8 +452,14 @@ impl NetworkStateCache {
             current_block,
             memoized_cache_root: OnceLock::new(),
             code_leaf_hashers,
+            digest_index: CacheDigestIndex::default(),
             undo_log: VecDeque::new(),
-        }
+        };
+        // The index is not persisted either: it is a pure function of the value maps, so rebuilding
+        // it is a one-off full scan at restore rather than a format the snapshot has to carry and
+        // then be trusted about.
+        cache.rebuild_digest_index();
+        cache
     }
 
     /// Fork the current cache values with fresh policies and no undo history.
@@ -390,6 +482,10 @@ impl NetworkStateCache {
             current_block: self.current_block,
             memoized_cache_root: initialized_cache_root(self.memoized_cache_root.get().copied()),
             code_leaf_hashers: self.code_leaf_hashers.clone(),
+            // Cloned rather than rebuilt: the fork inherits the value maps exactly, so the digests
+            // over them are already the right answer, and rebuilding would cost a full rehash on
+            // the re-execution path this call exists to keep cheap.
+            digest_index: self.digest_index.clone(),
             undo_log: VecDeque::new(),
         }
     }
@@ -507,6 +603,18 @@ impl NetworkStateCache {
         if stats.codes_evicted > 0 {
             self.code_leaf_hashers.retain(|code_hash, _| self.codes.contains_key(code_hash));
         }
+
+        // The undo record names every key this block touched or evicted, and nothing else in the
+        // cache moved — an untouched entry keeps both its value and its `last_accessed_block`, so
+        // its digest is still correct. Patching from the record is therefore a pass over the ~5%
+        // of the cache the block moved rather than over all of it.
+        let maintenance = Instant::now();
+        self.resync_digest_index(
+            undo.accounts_before.keys().copied(),
+            undo.storage_before.keys().copied(),
+            undo.codes_before.keys().copied(),
+        );
+        stats.index_maintenance_us = maintenance.elapsed().as_micros() as u64;
 
         self.undo_log.push_back(undo);
 
@@ -644,7 +752,7 @@ impl NetworkStateCache {
         (*self.memoized_cache_root.get_or_init(|| root), timings)
     }
 
-    /// Compute the canonical root directly from the value maps, using the code leaf memo.
+    /// Compute the canonical root from the leaf digest index.
     ///
     /// The differential tests compare this against [`Self::compute_cache_root_reference`]; the
     /// production path reaches the same computation through [`Self::cache_root_timed`].
@@ -654,108 +762,159 @@ impl NetworkStateCache {
     }
 
     /// [`Self::compute_cache_root_uncached`], reporting the internal split.
+    ///
+    /// The collect-sort and leaf-hash timers stay zero here, and that is a measurement rather than
+    /// a gap: the index is already in key order and its digests were computed by the block that
+    /// last moved each entry. That work is now reported as
+    /// [`UpdateStats::index_maintenance_us`] inside the cache update, so a phase table that adds
+    /// the two is comparing like with like against a run that predates the index.
     fn compute_cache_root_uncached_timed(&self) -> (B256, CacheRootTimings) {
-        self.compute_cache_root_with(|code_hash, entry| {
-            match self.code_leaf_hashers.get(&code_hash) {
-                Some(hasher) => finish_code_leaf(hasher.clone(), entry.last_accessed_block),
-                // A memo miss is only reachable through a path that inserted a code without going
-                // through `on_block_executed`, `restore`, or `rollback_block`. Recompute rather
-                // than assume, so the root never depends on the memo being populated.
-                None => hash_code_reference(code_hash, entry),
-            }
-        })
-    }
-
-    /// Compute the canonical root without consulting the code leaf memo.
-    ///
-    /// The slow reference [`Self::compute_cache_root_uncached`] is differential-tested against, and
-    /// the periodic diagnostic a run can use to prove the memo has not drifted.
-    pub fn compute_cache_root_reference(&self) -> B256 {
-        self.compute_cache_root_with(hash_code_reference).0
-    }
-
-    /// The one root implementation, always timed.
-    ///
-    /// There is deliberately no untimed twin: ten `Instant::now()` calls are far below this
-    /// function's own timer resolution, and a second copy of the leaf ordering would be a place
-    /// for the commitment to drift.
-    fn compute_cache_root_with(
-        &self,
-        hash_code: impl Fn(B256, &CachedEntry<Bytes>) -> B256,
-    ) -> (B256, CacheRootTimings) {
+        let index = &self.digest_index;
+        debug_assert_eq!(
+            (index.accounts.len(), index.storage.len(), index.codes.len()),
+            (self.accounts.len(), self.storage.len(), self.codes.len()),
+            "digest index population disagrees with the value maps; the root would be wrong"
+        );
         let mut timings = CacheRootTimings {
-            accounts: self.accounts.len() as u64,
-            storage: self.storage.len() as u64,
-            codes: self.codes.len() as u64,
+            accounts: index.accounts.len() as u64,
+            storage: index.storage.len() as u64,
+            codes: index.codes.len() as u64,
             ..Default::default()
         };
 
         let start = Instant::now();
+        let account_root = namespace_root_streamed(b"accounts", index.accounts.values());
+        timings.account_namespace_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
+        let storage_root = namespace_root_streamed(b"storage", index.storage.values());
+        timings.storage_namespace_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
+        let code_root = namespace_root_streamed(b"codes", index.codes.values());
+        timings.code_namespace_us = start.elapsed().as_micros() as u64;
+
+        let start = Instant::now();
+        let root = cache_root_v2(
+            account_root,
+            index.accounts.len(),
+            storage_root,
+            index.storage.len(),
+            code_root,
+            index.codes.len(),
+        );
+        timings.root_us = start.elapsed().as_micros() as u64;
+        (root, timings)
+    }
+
+    /// Compute the canonical root from the value maps alone, consulting neither memo nor index.
+    ///
+    /// Deliberately a second implementation of the leaf ordering rather than a shared one. The
+    /// index is derived state whose failure mode is a digest that no longer matches its entry, and
+    /// an oracle that reads the index cannot see that — it would agree with the fast path by
+    /// construction. Only the byte format of the commitment is shared ([`cache_root_v2`] and the
+    /// `hash_*` leaf functions), because that is what must not drift between the two.
+    ///
+    /// Slow: it sorts the whole cache and rehashes every leaf, which is what the pre-index root
+    /// cost. Used by the differential tests and available as the periodic diagnostic a run can use
+    /// to prove the index has not drifted.
+    pub fn compute_cache_root_reference(&self) -> B256 {
         let mut account_entries: Vec<_> = self.accounts.iter().collect();
         account_entries.sort_by_key(|(address, _)| **address);
-        timings.account_collect_sort_us = start.elapsed().as_micros() as u64;
-
-        let start = Instant::now();
-        let mut storage_entries: Vec<_> = self.storage.iter().collect();
-        storage_entries.sort_by_key(|((address, slot), _)| (*address, *slot));
-        timings.storage_collect_sort_us = start.elapsed().as_micros() as u64;
-
-        let start = Instant::now();
-        let mut code_entries: Vec<_> = self.codes.iter().collect();
-        code_entries.sort_by_key(|(code_hash, _)| **code_hash);
-        timings.code_collect_sort_us = start.elapsed().as_micros() as u64;
-
-        let start = Instant::now();
         let account_leaves: Vec<_> =
             account_entries.iter().map(|(address, entry)| hash_account(**address, entry)).collect();
-        timings.account_leaf_hash_us = start.elapsed().as_micros() as u64;
 
-        let start = Instant::now();
+        let mut storage_entries: Vec<_> = self.storage.iter().collect();
+        storage_entries.sort_by_key(|((address, slot), _)| (*address, *slot));
         let storage_leaves: Vec<_> = storage_entries
             .iter()
             .map(|((address, slot), entry)| hash_storage(*address, *slot, entry))
             .collect();
-        timings.storage_leaf_hash_us = start.elapsed().as_micros() as u64;
 
-        let start = Instant::now();
-        let code_leaves: Vec<_> =
-            code_entries.iter().map(|(code_hash, entry)| hash_code(**code_hash, entry)).collect();
-        timings.code_leaf_hash_us = start.elapsed().as_micros() as u64;
+        let mut code_entries: Vec<_> = self.codes.iter().collect();
+        code_entries.sort_by_key(|(code_hash, _)| **code_hash);
+        let code_leaves: Vec<_> = code_entries
+            .iter()
+            .map(|(code_hash, entry)| hash_code_reference(**code_hash, entry))
+            .collect();
 
-        let start = Instant::now();
-        let account_root = namespace_root(b"accounts", &account_leaves);
-        timings.account_namespace_us = start.elapsed().as_micros() as u64;
+        cache_root_v2(
+            namespace_root(b"accounts", &account_leaves),
+            account_leaves.len(),
+            namespace_root(b"storage", &storage_leaves),
+            storage_leaves.len(),
+            namespace_root(b"codes", &code_leaves),
+            code_leaves.len(),
+        )
+    }
 
-        let start = Instant::now();
-        let storage_root = namespace_root(b"storage", &storage_leaves);
-        timings.storage_namespace_us = start.elapsed().as_micros() as u64;
+    /// Bring the leaf digest index back into agreement with the value maps, for exactly the keys
+    /// named.
+    ///
+    /// Symmetric by construction: it reads the current entry and writes what the entry says, so it
+    /// does not need to know whether the caller just applied a block or just undid one. A named key
+    /// that is present gets a fresh digest, a named key that is absent loses its digest, and a key
+    /// that is not named is not looked at.
+    ///
+    /// The caller owes the one thing this cannot check: that the names cover every key whose entry
+    /// changed. Both callers take them from the same undo record, which is built for exactly that
+    /// purpose.
+    fn resync_digest_index(
+        &mut self,
+        accounts: impl IntoIterator<Item = Address>,
+        storage: impl IntoIterator<Item = (Address, B256)>,
+        codes: impl IntoIterator<Item = B256>,
+    ) {
+        for address in accounts {
+            match self.accounts.get(&address) {
+                Some(entry) => {
+                    self.digest_index.accounts.insert(address, hash_account(address, entry))
+                }
+                None => self.digest_index.accounts.remove(&address),
+            };
+        }
+        for key in storage {
+            match self.storage.get(&key) {
+                Some(entry) => {
+                    self.digest_index.storage.insert(key, hash_storage(key.0, key.1, entry))
+                }
+                None => self.digest_index.storage.remove(&key),
+            };
+        }
+        for code_hash in codes {
+            match self.codes.get(&code_hash) {
+                Some(entry) => self
+                    .digest_index
+                    .codes
+                    .insert(code_hash, code_leaf_digest(&self.code_leaf_hashers, code_hash, entry)),
+                None => self.digest_index.codes.remove(&code_hash),
+            };
+        }
+    }
 
-        let start = Instant::now();
-        let code_root = namespace_root(b"codes", &code_leaves);
-        timings.code_namespace_us = start.elapsed().as_micros() as u64;
-
-        let start = Instant::now();
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(b"NetworkStateCacheRoot/v2");
-
-        preimage.extend_from_slice(b"account_root");
-        preimage.extend_from_slice(account_root.as_slice());
-        preimage.extend_from_slice(b"account_count");
-        preimage.extend_from_slice(&(account_entries.len() as u64).to_be_bytes());
-
-        preimage.extend_from_slice(b"storage_root");
-        preimage.extend_from_slice(storage_root.as_slice());
-        preimage.extend_from_slice(b"storage_count");
-        preimage.extend_from_slice(&(storage_entries.len() as u64).to_be_bytes());
-
-        preimage.extend_from_slice(b"code_root");
-        preimage.extend_from_slice(code_root.as_slice());
-        preimage.extend_from_slice(b"code_count");
-        preimage.extend_from_slice(&(code_entries.len() as u64).to_be_bytes());
-
-        let root = keccak256(preimage);
-        timings.root_us = start.elapsed().as_micros() as u64;
-        (root, timings)
+    /// Discard the leaf digest index and recompute it over the whole cache.
+    ///
+    /// The cost of the pre-index root, paid once. Only for entry points that did not arrive through
+    /// a block: construction from persisted maps, and the tests that check the incremental path
+    /// against a full rebuild.
+    fn rebuild_digest_index(&mut self) {
+        self.digest_index.accounts = self
+            .accounts
+            .iter()
+            .map(|(address, entry)| (*address, hash_account(*address, entry)))
+            .collect();
+        self.digest_index.storage = self
+            .storage
+            .iter()
+            .map(|(key, entry)| (*key, hash_storage(key.0, key.1, entry)))
+            .collect();
+        self.digest_index.codes = self
+            .codes
+            .iter()
+            .map(|(code_hash, entry)| {
+                (*code_hash, code_leaf_digest(&self.code_leaf_hashers, *code_hash, entry))
+            })
+            .collect();
     }
 
     /// Bind the current cache root to a specific canonical block and cache policy.
@@ -840,7 +999,14 @@ impl NetworkStateCache {
 
         let undo = self.undo_log.pop_back().expect("checked non-empty above");
         let previous_cache_root = undo.previous_cache_root;
+        // The same key set the forward direction patched the index with, kept as the undo record is
+        // consumed. Undoing a block changes exactly the entries applying it changed, so the index
+        // is resynced from the same names in both directions.
+        let mut touched_accounts = Vec::with_capacity(undo.accounts_before.len());
+        let mut touched_storage = Vec::with_capacity(undo.storage_before.len());
+        let mut touched_codes = Vec::with_capacity(undo.codes_before.len());
         for (address, before) in undo.accounts_before {
+            touched_accounts.push(address);
             match before {
                 Some(entry) => {
                     self.accounts.insert(address, entry);
@@ -851,6 +1017,7 @@ impl NetworkStateCache {
             }
         }
         for (key, before) in undo.storage_before {
+            touched_storage.push(key);
             match before {
                 Some(entry) => {
                     self.storage.insert(key, entry);
@@ -861,6 +1028,7 @@ impl NetworkStateCache {
             }
         }
         for (code_hash, before) in undo.codes_before {
+            touched_codes.push(code_hash);
             match before {
                 Some(entry) => {
                     // Restoring a code the block evicted also restores its memo, which eviction
@@ -877,6 +1045,7 @@ impl NetworkStateCache {
                 }
             }
         }
+        self.resync_digest_index(touched_accounts, touched_storage, touched_codes);
         self.current_block = undo.previous_block;
         self.memoized_cache_root = initialized_cache_root(previous_cache_root);
         Ok(())
@@ -903,6 +1072,7 @@ impl NetworkStateCache {
         self.storage.clear();
         self.codes.clear();
         self.code_leaf_hashers.clear();
+        self.digest_index = CacheDigestIndex::default();
         self.undo_log.clear();
         self.current_block = 0;
         self.memoized_cache_root = OnceLock::new();
@@ -972,6 +1142,29 @@ impl BlockCacheUndo {
             codes_before: HashMap::new(),
         }
     }
+}
+
+/// Every cache entry's leaf digest, held in the key order the cache root hashes them in.
+///
+/// The root used to sort the whole cache and rehash every leaf on every block, but a block moves
+/// about 4.6% of the entries (history A.13) — so all but that fraction of both terms was
+/// recomputing an answer that had not changed. Holding the digests in order turns the root into one
+/// pass over already-ordered bytes and charges the leaf hashing to the block that moved the entry.
+///
+/// `BTreeMap` rather than a sorted `Vec`: at this composition the three containers land within 2%
+/// of each other and all of them clear the budget, so the choice was made on correctness surface
+/// instead. Point mutation is the same eight lines forwards and backwards, which is what the
+/// rollback invariant needs, where a merge into a sorted `Vec` is a two-pointer walk with three
+/// tail cases that has to be exactly right in both directions. The measured price is a 39% memory
+/// overhead on the node pointers, about 6.7 MiB — 0.16% of the process.
+///
+/// This is not [`NetworkStateCache::code_leaf_hashers`]. That memo is a pure function of its key,
+/// so losing an entry costs a rehash; a stale entry here is a wrong root.
+#[derive(Debug, Clone, Default)]
+struct CacheDigestIndex {
+    accounts: BTreeMap<Address, B256>,
+    storage: BTreeMap<(Address, B256), B256>,
+    codes: BTreeMap<B256, B256>,
 }
 
 /// Errors returned by reorg-related cache operations.
@@ -1381,6 +1574,10 @@ mod tests {
     }
 
     /// The memo is derived state, so discarding it may cost time but must not change the root.
+    ///
+    /// The index has to be rebuilt alongside it for this to test anything: the root reads the code
+    /// digest out of the index, so an index left in place would answer without ever consulting the
+    /// memo and the assertion would hold no matter what the memo did.
     #[test]
     fn cache_root_is_unchanged_when_the_code_leaf_memo_is_absent() {
         let mut cache = make_cache(10, 10);
@@ -1389,6 +1586,7 @@ mod tests {
         let memoized_root = cache.cache_root();
 
         cache.code_leaf_hashers.clear();
+        cache.rebuild_digest_index();
         assert_eq!(cache.compute_cache_root_uncached(), memoized_root);
         assert_eq!(cache.compute_cache_root_reference(), memoized_root);
     }
@@ -1412,6 +1610,301 @@ mod tests {
         assert!(cache.contains_code(&code_hash));
         assert_eq!(cache.code_leaf_hashers.len(), 1);
         assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+    }
+
+    /// The index must equal a rebuild from the value maps, and the root it produces must equal the
+    /// reference. Checked at a named point so a failure says which operation broke it.
+    fn assert_digest_index_is_exact(cache: &NetworkStateCache, at: &str) {
+        let mut rebuilt = cache.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(1)),
+            Box::new(LastNBlocksPolicy::new(1)),
+        );
+        rebuilt.rebuild_digest_index();
+        assert_eq!(cache.digest_index.accounts, rebuilt.digest_index.accounts, "accounts, {at}");
+        assert_eq!(cache.digest_index.storage, rebuilt.digest_index.storage, "storage, {at}");
+        assert_eq!(cache.digest_index.codes, rebuilt.digest_index.codes, "codes, {at}");
+        assert_eq!(
+            cache.compute_cache_root_uncached(),
+            cache.compute_cache_root_reference(),
+            "root, {at}"
+        );
+    }
+
+    /// The index is patched from the undo record at every point that moves an entry, so this walks
+    /// an entry through all of them: insertion, refresh at a new height, eviction, rollback of that
+    /// eviction, and the touch-and-evict-in-the-same-block case where a key appears in the undo
+    /// record but not in the cache afterwards.
+    #[test]
+    fn digest_index_equals_a_full_rebuild_across_the_entry_lifecycle() {
+        let mut cache = make_cache(10, 3);
+        assert_digest_index_is_exact(&cache, "empty");
+
+        let address = Address::repeat_byte(0x41);
+        let slot = B256::repeat_byte(0x42);
+        let (code_hash, bytes) = code(0x43, 1024);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(address, account(1, 100));
+        accessed.storage.insert((address, slot), U256::from(7));
+        accessed.codes.insert(code_hash, bytes);
+
+        cache.on_block_executed(10, &accessed);
+        assert_digest_index_is_exact(&cache, "after insertion");
+
+        // A refresh moves only `last_accessed_block`, which every leaf preimage commits, so the
+        // digests must all change while the populations do not.
+        let before_refresh = cache.digest_index.clone();
+        cache.on_block_executed(11, &accessed);
+        assert_digest_index_is_exact(&cache, "after refresh");
+        assert_ne!(cache.digest_index.accounts, before_refresh.accounts, "a touch is a new digest");
+        assert_ne!(cache.digest_index.storage, before_refresh.storage);
+        assert_ne!(cache.digest_index.codes, before_refresh.codes);
+
+        // Storage window 3 evicts the slot and the code at block 15 (cutoff 12, last accessed 11);
+        // the account's window of 10 keeps it.
+        cache.on_block_executed(15, &BlockAccessedState::default());
+        assert!(!cache.contains_storage(&address, &slot));
+        assert!(!cache.contains_code(&code_hash));
+        assert!(cache.contains_account(&address));
+        assert_digest_index_is_exact(&cache, "after eviction");
+
+        cache.rollback_block(15).unwrap();
+        assert!(cache.contains_storage(&address, &slot));
+        assert_digest_index_is_exact(&cache, "after rolling the eviction back");
+
+        cache.reset();
+        assert!(cache.digest_index.accounts.is_empty());
+        assert!(cache.digest_index.storage.is_empty());
+        assert!(cache.digest_index.codes.is_empty());
+        assert_digest_index_is_exact(&cache, "after reset");
+    }
+
+    /// Evicts the whole cache on every block, whatever it was just accessed at.
+    ///
+    /// [`LastNBlocksPolicy`] keeps anything the current block touched, so under it a key can never
+    /// be named by the undo record and be absent from the cache at the same time. That is a
+    /// property of the policy rather than of the cache, and a size-capped policy would not have it,
+    /// so this exists to reach the branch anyway.
+    struct EvictEverything;
+
+    impl CachePolicy for EvictEverything {
+        fn evict_accounts(
+            &self,
+            accounts: &mut HashMap<Address, CachedEntry<AccountData>>,
+            _current_block: u64,
+        ) {
+            accounts.clear();
+        }
+
+        fn evict_storage(
+            &self,
+            storage: &mut HashMap<(Address, B256), CachedEntry<U256>>,
+            codes: &mut HashMap<B256, CachedEntry<Bytes>>,
+            _current_block: u64,
+        ) {
+            storage.clear();
+            codes.clear();
+        }
+
+        fn name(&self) -> &str {
+            "evict-everything"
+        }
+    }
+
+    /// A key the block touched and the same block evicted is named by the undo record but absent
+    /// from the cache when the index is patched, so the patch has to remove it rather than rehash
+    /// it. Getting this backwards would leave a digest behind for an entry that no longer exists.
+    #[test]
+    fn a_key_touched_and_evicted_by_the_same_block_leaves_no_digest() {
+        let mut cache =
+            NetworkStateCache::new(Box::new(EvictEverything), Box::new(EvictEverything));
+        let address = Address::repeat_byte(0x51);
+        let (code_hash, bytes) = code(0x52, 128);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(address, account(1, 100));
+        accessed.storage.insert((address, B256::repeat_byte(0x53)), U256::from(5));
+        accessed.codes.insert(code_hash, bytes);
+
+        let stats = cache.on_block_executed(10, &accessed);
+        assert_eq!((stats.accounts_added, stats.accounts_evicted), (1, 1), "added then evicted");
+        assert!(cache.accounts.is_empty() && cache.storage.is_empty() && cache.codes.is_empty());
+        assert!(cache.digest_index.accounts.is_empty(), "the digest must go with the entry");
+        assert!(cache.digest_index.storage.is_empty());
+        assert!(cache.digest_index.codes.is_empty());
+        assert_digest_index_is_exact(&cache, "after a touch the same block evicted");
+
+        // Rolling it back restores nothing, because nothing survived the block.
+        cache.rollback_block(10).unwrap();
+        assert_digest_index_is_exact(&cache, "after rolling that block back");
+    }
+
+    /// A restored cache rebuilds the index from the persisted maps; a fork inherits it.
+    #[test]
+    fn digest_index_survives_restore_and_fork() {
+        let cache = populated_cache(12, 3);
+        let root = cache.compute_cache_root_reference();
+
+        let fork = cache.fork_for_reexecution(
+            Box::new(LastNBlocksPolicy::new(1000)),
+            Box::new(LastNBlocksPolicy::new(1000)),
+        );
+        assert_eq!(fork.digest_index.accounts, cache.digest_index.accounts);
+        assert_eq!(fork.compute_cache_root_uncached(), root);
+        assert_digest_index_is_exact(&fork, "fork");
+
+        let restored = NetworkStateCache::restore(
+            cache.accounts.clone(),
+            cache.storage.clone(),
+            cache.codes.clone(),
+            cache.current_block,
+            Box::new(LastNBlocksPolicy::new(1000)),
+            Box::new(LastNBlocksPolicy::new(1000)),
+        );
+        assert_eq!(restored.digest_index.accounts, cache.digest_index.accounts);
+        assert_eq!(restored.compute_cache_root_uncached(), root);
+        assert_digest_index_is_exact(&restored, "restore");
+    }
+
+    /// Pruning drops the ability to roll a block back. It must not drop the digests of the entries
+    /// that block left behind, which are still part of the current cache.
+    #[test]
+    fn prune_undo_below_does_not_disturb_the_digest_index() {
+        let mut cache = populated_cache(8, 2);
+        cache.on_block_executed(11, &BlockAccessedState::default());
+        let before = cache.digest_index.clone();
+
+        cache.prune_undo_below(11);
+        assert!(cache.undo_log.is_empty());
+        assert_eq!(cache.digest_index.accounts, before.accounts);
+        assert_eq!(cache.digest_index.storage, before.storage);
+        assert_eq!(cache.digest_index.codes, before.codes);
+        assert_digest_index_is_exact(&cache, "after pruning the undo log");
+    }
+
+    /// Streaming a namespace's digests into the sponge must be bit-identical to hashing the
+    /// concatenation, which is what lets the index skip materializing the leaves into a slice.
+    #[test]
+    fn the_streamed_namespace_root_matches_the_buffered_form() {
+        for count in [0usize, 1, 5, 300] {
+            let leaves: Vec<B256> =
+                (0..count).map(|i| keccak256((i as u64).to_be_bytes())).collect();
+            assert_eq!(
+                namespace_root(b"accounts", &leaves),
+                namespace_root_streamed(b"accounts", leaves.iter()),
+                "{count} leaves"
+            );
+        }
+        // The label is part of the preimage in both forms, so two namespaces of the same leaves
+        // must not collide.
+        assert_ne!(
+            namespace_root_streamed(b"accounts", [].iter()),
+            namespace_root(b"storage", &[])
+        );
+    }
+
+    /// The slow reference has to be able to disagree with the index, or it is not an oracle.
+    ///
+    /// This is the reason [`NetworkStateCache::compute_cache_root_reference`] duplicates the leaf
+    /// ordering instead of sharing it: the index's failure mode is a digest that no longer matches
+    /// its entry, and a reference that read the index would agree by construction and see nothing.
+    #[test]
+    fn the_slow_reference_disagrees_when_the_index_is_wrong() {
+        let mut cache = populated_cache(6, 2);
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+
+        let address = *cache.digest_index.accounts.keys().next().expect("populated");
+        cache.digest_index.accounts.insert(address, B256::repeat_byte(0xff));
+        assert_ne!(
+            cache.compute_cache_root_uncached(),
+            cache.compute_cache_root_reference(),
+            "a corrupted digest must be visible to the reference"
+        );
+
+        cache.rebuild_digest_index();
+        assert_eq!(cache.compute_cache_root_uncached(), cache.compute_cache_root_reference());
+    }
+
+    /// A deterministic 32-bit xorshift. The sequence only has to shuffle which keys a block
+    /// touches and be identical on every machine; it is not used for anything statistical.
+    struct Xorshift(u32);
+
+    impl Xorshift {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+
+        fn below(&mut self, bound: u32) -> u32 {
+            self.next() % bound
+        }
+    }
+
+    /// The lifecycle test walks the transitions one at a time; this one interleaves them.
+    ///
+    /// Eviction windows are small enough that entries leave on their own, blocks overlap in the
+    /// keys they touch, and every few blocks a reorg rolls back a run of them and applies different
+    /// ones at the same heights. The index is checked against a full rebuild after every single
+    /// step, so the first block that breaks it is the one that fails.
+    #[test]
+    fn a_randomized_block_and_reorg_sequence_keeps_the_index_exact() {
+        let mut cache = make_cache(6, 4);
+        let mut rng = Xorshift(0x9e37_79b9);
+        let mut applied: Vec<u64> = Vec::new();
+        let mut block = 100u64;
+
+        for round in 0..60u32 {
+            let mut accessed = BlockAccessedState::default();
+            for _ in 0..rng.below(10) {
+                let address = Address::repeat_byte(rng.below(14) as u8);
+                accessed
+                    .accounts
+                    .insert(address, account(u64::from(rng.below(50)), u64::from(rng.below(1000))));
+                for _ in 0..rng.below(4) {
+                    accessed.storage.insert(
+                        (address, B256::repeat_byte(rng.below(6) as u8)),
+                        U256::from(rng.below(10_000)),
+                    );
+                }
+            }
+            for _ in 0..rng.below(3) {
+                let (code_hash, bytes) = code(rng.below(5) as u8, 32 + rng.below(200) as usize);
+                accessed.codes.insert(code_hash, bytes);
+            }
+
+            cache.on_block_executed(block, &accessed);
+            applied.push(block);
+            assert_digest_index_is_exact(&cache, &format!("round {round}, block {block}"));
+            block += 1;
+
+            // Reorg: unwind newest-first, then let the loop rebuild a different chain from here.
+            if round % 7 == 6 {
+                let depth = 1 + rng.below(3) as usize;
+                for _ in 0..depth.min(applied.len()) {
+                    let target = applied.pop().expect("non-empty");
+                    cache.rollback_block(target).expect("newest undo record");
+                    assert_digest_index_is_exact(
+                        &cache,
+                        &format!("round {round}, rolled back {target}"),
+                    );
+                    block = target;
+                }
+            }
+
+            // Finality moves behind the reorg window, which drops undo records without touching
+            // the entries they describe.
+            if round % 11 == 10 {
+                let finalized = block.saturating_sub(5);
+                cache.prune_undo_below(finalized);
+                applied.retain(|applied_block| *applied_block > finalized);
+                assert_digest_index_is_exact(&cache, &format!("round {round}, pruned {finalized}"));
+            }
+        }
+
+        assert!(
+            !cache.accounts.is_empty() && !cache.storage.is_empty(),
+            "the sequence must leave a populated cache, or it proved nothing"
+        );
     }
 
     /// Pins the v2 cache root against a value captured from the implementation that predates the
