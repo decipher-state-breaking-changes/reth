@@ -19,7 +19,11 @@ use std::{
 /// cache update, so a V6 record and a V7 record report the same phase over different scopes.
 /// Analyzer reports emit those sections only when the fields are present, so a V4, V5, or V6 run
 /// still regenerates.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 7;
+///
+/// V8 adds the storage-prune copy-on-write and drop split. Storage retention's total has always
+/// exceeded the sum of its walk phases; these fields name the difference rather than leaving it as
+/// an unattributed residual, which is what makes the storage half of retention a targetable number.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 8;
 
 /// Serializable trie-walk detail kept inside the enclosing retention total.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -250,6 +254,16 @@ pub struct ValidationPhaseTimings {
     pub retention_account_paths: u64,
     pub retention_storage_tries_pruned: u64,
     pub retention_storage_tries_skipped: u64,
+    /// Copy-on-write copies taken before the storage walks, and what they cost.
+    ///
+    /// Included in `retention_storage_tries_us` but outside `retention_storage_trie_detail`, whose
+    /// timers start after the copy. This is the term that makes the storage total exceed the sum
+    /// of its walk phases, and it is transactional-snapshot cost rather than retention work.
+    pub retention_storage_trie_cow_us: u64,
+    pub retention_storage_trie_cow_copies: u64,
+    /// Releasing storage tries whose address left the retained set, and how many were released.
+    pub retention_storage_trie_drop_us: u64,
+    pub retention_storage_tries_dropped: u64,
     /// 1 when the retained sets were rebuilt from the whole value cache instead of patched.
     ///
     /// Summed over a run this is the fallback count: the delta path is correct either way, so
@@ -613,7 +627,10 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 7);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 8);
+        // The storage walk's own timers start after the copy, so without this field the gap
+        // between storage retention's total and its phases has no name.
+        assert!(value["partial"].get("retention_storage_trie_cow_us").is_some());
         // Nested inside `cache_update_us`. Without it the anchor is not comparable across the
         // index, so a record that omits it is a record the combined gate cannot be read off.
         assert!(value["partial"].get("cache_root_index_maintenance_us").is_some());

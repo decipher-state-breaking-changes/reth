@@ -12,6 +12,7 @@ from analyze_validation_bench import (
     build_cache_delta_section,
     build_clone_split_section,
     build_retention_split_section,
+    build_storage_prune_split,
 )
 
 
@@ -178,6 +179,56 @@ class SchemaSixCacheDeltaTest(unittest.TestCase):
     def test_schema_five_records_emit_no_delta_section(self):
         self.assertEqual(build_cache_delta_section([anchor_record()]), [])
 
+
+
+class StoragePruneSplitTest(unittest.TestCase):
+    """The split is what names the storage time the walk phases never covered."""
+
+    def test_absent_when_the_records_predate_the_fields(self):
+        record = {"partial": {"retention_storage_tries_us": 40_000}}
+        self.assertEqual(build_storage_prune_split([record]), [])
+
+    def test_residual_is_the_total_less_the_walk_the_copy_and_the_drop(self):
+        record = {"partial": {
+            "retention_storage_tries_us": 40_000,
+            "retention_storage_trie_cow_us": 15_000,
+            "retention_storage_trie_cow_copies": 164,
+            "retention_storage_trie_drop_us": 3_000,
+            "retention_storage_tries_dropped": 12,
+            "retention_storage_trie_detail": {
+                "input_us": 200, "traversal_us": 15_000,
+                "mutation_us": 500, "finalization_us": 7_900,
+            },
+        }}
+        body = "\n".join(build_storage_prune_split([record]))
+        self.assertIn("| Copy-on-write copy before the walk | 15.00 ms |", body)
+        self.assertIn("| Witness-path walk | 23.60 ms |", body)
+        self.assertIn("| Releasing no-longer-retained tries | 3.00 ms |", body)
+        # 40.00 - 23.60 - 15.00 - 3.00, clamped at zero rather than reported negative.
+        self.assertIn("| Storage-trie map scan (residual) | 0.00 ms |", body)
+        self.assertIn("**164 / 12**", body)
+
+    def test_the_copy_outweighing_the_walk_is_called_out(self):
+        record = {"partial": {
+            "retention_storage_tries_us": 30_000,
+            "retention_storage_trie_cow_us": 20_000,
+            "retention_storage_trie_detail": {"traversal_us": 5_000},
+        }}
+        body = "\n".join(build_storage_prune_split([record]))
+        self.assertIn("costs more than the walk it precedes", body)
+
+
+class RetentionYieldTest(unittest.TestCase):
+    """The walk's cost-to-output ratio is the case for replacing it, and no timer shows it."""
+
+    def test_nodes_walked_per_node_blinded_is_reported(self):
+        record = partial_record(retention_account_trie_detail={
+            "nodes_visited": 100_000, "nodes_converted": 200,
+            "finalization_branch_masks_scanned": 68_000,
+        })
+        body = "\n".join(build_retention_split_section([record]))
+        self.assertIn("**100000** nodes walked to blind **200** (500:1)", body)
+        self.assertIn("scanned **68000** branch masks", body)
 
 if __name__ == "__main__":
     unittest.main()

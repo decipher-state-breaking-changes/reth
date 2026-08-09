@@ -9,7 +9,7 @@ use crate::{
     accessed_state::BlockAccessedState,
     network_cache::{MembershipDelta, MissResult, NetworkStateCache},
     participant::ParticipantCache,
-    shared_trie::SharedSparseTrie,
+    shared_trie::{self, SharedSparseTrie},
 };
 use alloy_primitives::{
     keccak256,
@@ -312,12 +312,7 @@ impl PartialTrieNodeCache {
         (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
         // Nothing is known to be unmoved after a full rebuild, so every trie is pruned. This is
         // the cost the incremental path exists to avoid, not a case it has to reproduce.
-        let (storage_us, pruned, skipped, storage_metrics) =
-            self.prune_storage_tries(&B256Map::default(), true);
-        timings.storage_tries_us = storage_us;
-        timings.storage_tries = storage_metrics;
-        timings.storage_tries_pruned = pruned;
-        timings.storage_tries_skipped = skipped;
+        timings.record_storage_prune(self.prune_storage_tries(&B256Map::default(), true));
         timings
     }
 
@@ -410,12 +405,7 @@ impl PartialTrieNodeCache {
         timings.account_paths_us = start.elapsed().as_micros() as u64;
 
         (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
-        let (storage_us, pruned, skipped, storage_metrics) =
-            self.prune_storage_tries(&moved, false);
-        timings.storage_tries_us = storage_us;
-        timings.storage_tries = storage_metrics;
-        timings.storage_tries_pruned = pruned;
-        timings.storage_tries_skipped = skipped;
+        timings.record_storage_prune(self.prune_storage_tries(&moved, false));
         timings
     }
 
@@ -467,32 +457,54 @@ impl PartialTrieNodeCache {
         &mut self,
         moved: &B256Map<StorageSlotDelta>,
         prune_everything: bool,
-    ) -> (u64, u64, u64, RetainWitnessPathsMetrics) {
+    ) -> StoragePruneOutcome {
         let start = Instant::now();
+        let copies_before = shared_trie::cow_copies_taken();
         let retained = std::mem::take(&mut self.retained_storage_paths);
-        let mut pruned = 0;
-        let mut skipped = 0;
-        let mut metrics = RetainWitnessPathsMetrics::default();
+        let mut outcome = StoragePruneOutcome::default();
+        // Tries whose address left the retained set are moved out here and freed together below,
+        // so the cost of releasing a whole storage trie is measured rather than folded into the
+        // map scan that discovered it.
+        let mut evicted_tries = Vec::new();
         self.sparse.storage_tries_mut().retain(|hashed_address, trie| {
-            let Some(slots) = retained.get(hashed_address) else { return false };
+            let Some(slots) = retained.get(hashed_address) else {
+                evicted_tries.push(std::mem::take(trie));
+                return false;
+            };
             // `as_revealed_ref` first: `as_revealed_mut` hands out a `&mut SharedSparseTrie`, which
             // is harmless on its own, but reaching for it before knowing whether the prune is
             // needed makes the skip easy to lose in a later edit.
             let untouched = trie.as_revealed_ref().is_some_and(SharedSparseTrie::is_untouched);
             let unchanged = !prune_everything && !moved.contains_key(hashed_address);
             if untouched && unchanged {
-                skipped += 1;
+                outcome.skipped += 1;
             } else if let Some(trie) = trie.as_revealed_mut() {
-                let outcome = trie
+                // `make_mut` is timed apart from the walk it precedes. A trie still shared with
+                // the retained generation is copied whole here, before the walk reads a single
+                // node — transactional-snapshot cost that lands inside retention's timer rather
+                // than the clone phase's, and that the walk's own phases cannot see.
+                let copy = Instant::now();
+                trie.make_mut();
+                outcome.cow_us += copy.elapsed().as_micros() as u64;
+
+                let walk = trie
                     .make_mut()
                     .retain_witness_paths_with_options(slots, RetentionOptions::sorted_input());
-                metrics.accumulate(&outcome.metrics);
-                pruned += 1;
+                outcome.metrics.accumulate(&walk.metrics);
+                outcome.pruned += 1;
             }
             true
         });
         self.retained_storage_paths = retained;
-        (start.elapsed().as_micros() as u64, pruned, skipped, metrics)
+
+        outcome.dropped = evicted_tries.len() as u64;
+        let release = Instant::now();
+        drop(evicted_tries);
+        outcome.drop_us = release.elapsed().as_micros() as u64;
+
+        outcome.cow_copies = shared_trie::cow_copies_taken().saturating_sub(copies_before);
+        outcome.total_us = start.elapsed().as_micros() as u64;
+        outcome
     }
 
     /// Storage tries this snapshot still shares with the generation it was cloned from.
@@ -939,6 +951,19 @@ pub struct RetentionTimings {
     pub storage_tries_pruned: u64,
     /// Storage tries skipped because they were untouched and their slot set had not moved.
     pub storage_tries_skipped: u64,
+    /// Copy-on-write copies taken before the storage walks, and what they cost.
+    ///
+    /// A trie still shared with the retained generation is copied whole by `make_mut` before the
+    /// walk reads a node. That is transactional-snapshot cost charged to retention's timer rather
+    /// than the clone phase's, and the walk's own input/traversal/mutation/finalization phases
+    /// cannot see it — which is why `storage_tries_us` exceeds their sum.
+    pub storage_trie_cow_us: u64,
+    /// Storage tries the prune actually copied, as opposed to already owning outright.
+    pub storage_trie_cow_copies: u64,
+    /// Releasing storage tries whose address left the retained set.
+    pub storage_trie_drop_us: u64,
+    /// Storage tries dropped because their address is no longer retained.
+    pub storage_tries_dropped: u64,
     /// True when the retained sets were rebuilt from the whole value cache rather than patched.
     ///
     /// The delta path needs the value cache to be exactly one block ahead of the state the trie
@@ -949,7 +974,54 @@ pub struct RetentionTimings {
     pub full_rebuild: bool,
 }
 
+/// One storage-prune pass, split into the parts that scale differently.
+///
+/// The walk metrics scale with the tries actually pruned, the copies with how many of those were
+/// still shared with the retained generation, and the scan with the size of the storage-trie map.
+/// Kept as one value so the two callers cannot record a partial set of them.
+#[derive(Debug, Default)]
+struct StoragePruneOutcome {
+    total_us: u64,
+    cow_us: u64,
+    cow_copies: u64,
+    drop_us: u64,
+    pruned: u64,
+    skipped: u64,
+    dropped: u64,
+    metrics: RetainWitnessPathsMetrics,
+}
+
 impl RetentionTimings {
+    /// Folds one storage-prune pass into this block's retention timings.
+    fn record_storage_prune(&mut self, outcome: StoragePruneOutcome) {
+        self.storage_tries_us = outcome.total_us;
+        self.storage_tries = outcome.metrics;
+        self.storage_tries_pruned = outcome.pruned;
+        self.storage_tries_skipped = outcome.skipped;
+        self.storage_trie_cow_us = outcome.cow_us;
+        self.storage_trie_cow_copies = outcome.cow_copies;
+        self.storage_trie_drop_us = outcome.drop_us;
+        self.storage_tries_dropped = outcome.dropped;
+    }
+
+    /// Storage-prune time the measured walk phases and the copies do not account for.
+    ///
+    /// What is left is the pass over the storage-trie map itself and the skip decisions it makes.
+    /// Reported as a residual rather than timed directly because bracketing the closure body would
+    /// cost a timer call per trie against a per-trie body of a hash lookup and two flag reads.
+    pub const fn storage_trie_scan_us(&self) -> u64 {
+        let walk = self
+            .storage_tries
+            .input_us
+            .saturating_add(self.storage_tries.traversal_us)
+            .saturating_add(self.storage_tries.mutation_us)
+            .saturating_add(self.storage_tries.finalization_us);
+        self.storage_tries_us
+            .saturating_sub(walk)
+            .saturating_sub(self.storage_trie_cow_us)
+            .saturating_sub(self.storage_trie_drop_us)
+    }
+
     /// Time attributable to preparing key sets, as opposed to walking either trie.
     pub const fn preparation_us(&self) -> u64 {
         self.warm_membership_us

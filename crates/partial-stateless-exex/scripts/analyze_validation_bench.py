@@ -341,6 +341,74 @@ def build_retention_split_section(accepted):
                 f"**{global_lookups}**, branch clones **{branch_clones}**, "
                 f"unprunable dirty / inline **{dirty} / {inline}**"
             )
+
+        # What the walk returns for what it costs. The walk is a full pass over the revealed trie
+        # whose output is a prefix-free set of roots to blind, so this ratio is the case for or
+        # against replacing it with an incremental one -- and it is not readable from the phase
+        # timers, which show only that the pass is expensive.
+        lines.append("")
+        for label, key in walk_details:
+            details = [record["partial"].get(key, {}) for record in accepted]
+            visited = statistics.fmean(detail.get("nodes_visited", 0) for detail in details)
+            converted = statistics.fmean(detail.get("nodes_converted", 0) for detail in details)
+            masks = statistics.fmean(
+                detail.get("finalization_branch_masks_scanned", 0) for detail in details)
+            yield_ratio = f"{visited / converted:.0f}:1" if converted else "n/a"
+            lines.append(
+                f"- {label}: **{visited:.0f}** nodes walked to blind **{converted:.0f}** "
+                f"({yield_ratio}); finalization scanned **{masks:.0f}** branch masks to clean up "
+                f"after them"
+            )
+
+    lines.extend(build_storage_prune_split(accepted))
+    return lines
+
+
+def build_storage_prune_split(accepted):
+    """Name the storage-prune time that the walk phases do not cover.
+
+    `retention_storage_tries_us` brackets the whole pass over the storage-trie map, while the walk
+    detail's timers start only once a trie has been copied and handed over. The difference is a
+    copy-on-write copy per pruned-and-still-shared trie, the release of tries whose address left
+    the retained set, and the map scan itself -- and until these fields existed it was reported as
+    nothing at all.
+    """
+    if not any("retention_storage_trie_cow_us" in record["partial"] for record in accepted):
+        return []
+
+    def avg(field):
+        return statistics.fmean(r["partial"].get(field, 0) for r in accepted)
+
+    total = avg("retention_storage_tries_us") / 1000
+    detail = [r["partial"].get("retention_storage_trie_detail", {}) for r in accepted]
+    walk = sum(
+        statistics.fmean(d.get(field, 0) for d in detail) / 1000
+        for field in ("input_us", "traversal_us", "mutation_us", "finalization_us")
+    )
+    cow = avg("retention_storage_trie_cow_us") / 1000
+    drop = avg("retention_storage_trie_drop_us") / 1000
+    scan = max(0.0, total - walk - cow - drop)
+
+    def share(value):
+        return f"{100 * value / total:.1f}%" if total else "n/a"
+
+    lines = [
+        "", "#### Storage prune split (Partial)", "",
+        "Components of `retention_storage_tries_us`. The walk row is the four phases of the table "
+        "above; the rest is what happens around them.", "",
+        "| Component | Avg | Share of storage prune |", "| --- | ---: | ---: |",
+        f"| Copy-on-write copy before the walk | {cow:.2f} ms | {share(cow)} |",
+        f"| Witness-path walk | {walk:.2f} ms | {share(walk)} |",
+        f"| Releasing no-longer-retained tries | {drop:.2f} ms | {share(drop)} |",
+        f"| Storage-trie map scan (residual) | {scan:.2f} ms | {share(scan)} |",
+        "",
+        f"- Tries copied / released per block: **{avg('retention_storage_trie_cow_copies'):.0f} / "
+        f"{avg('retention_storage_tries_dropped'):.0f}**",
+    ]
+    if cow > walk:
+        lines.append(
+            "- The copy costs more than the walk it precedes, which makes this transactional-"
+            "snapshot cost booked to retention rather than retention work.")
     return lines
 
 
