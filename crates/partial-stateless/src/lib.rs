@@ -38,7 +38,7 @@ pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtu
 pub use network_cache::{CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache};
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
-pub use policy::{CachePolicy, LastNBlocksPolicy};
+pub use policy::{CachePolicy, EvictedStorage, LastNBlocksPolicy};
 pub use readiness::{
     BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
     ReadinessError, ReadyParent, TrustedCheckpoint,

@@ -251,7 +251,7 @@ impl CacheRootTimings {
 }
 
 /// An entry in the network state cache, tracking access metadata.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CachedEntry<T> {
     pub value: T,
     pub first_accessed_block: u64,
@@ -568,40 +568,34 @@ impl NetworkStateCache {
         }
 
         // --- Apply eviction policies ---
-        // Snapshot the maps before eviction so we can record exactly which entries
-        // the policy removes (their values are gone afterwards). The snapshot is
-        // transient — only the removed entries are kept, in the undo record.
-        let accounts_pre_evict = self.accounts.clone();
-        let storage_pre_evict = self.storage.clone();
-        let codes_pre_evict = self.codes.clone();
+        // The policy hands back what it removed, which is the whole record of the eviction: the
+        // values are gone from the maps by the time it returns. Recovering the same set by
+        // cloning all three maps first and diffing them afterwards costs three full-map copies,
+        // three full scans, and three drops per block, to learn a set proportional to the ~1% of
+        // the cache that actually expired.
+        let evicted_accounts = self.account_policy.evict_accounts(&mut self.accounts, block_number);
+        let evicted_storage =
+            self.storage_policy.evict_storage(&mut self.storage, &mut self.codes, block_number);
 
-        self.account_policy.evict_accounts(&mut self.accounts, block_number);
-        self.storage_policy.evict_storage(&mut self.storage, &mut self.codes, block_number);
+        stats.accounts_evicted = evicted_accounts.len();
+        stats.storage_evicted = evicted_storage.storage.len();
+        stats.codes_evicted = evicted_storage.codes.len();
 
-        for (address, entry) in &accounts_pre_evict {
-            if !self.accounts.contains_key(address) {
-                undo.accounts_before.entry(*address).or_insert_with(|| Some(entry.clone()));
-            }
+        // A key this block also touched is already recorded above with its pre-touch value, which
+        // is the state a rollback has to restore. `or_insert` keeps that record rather than
+        // overwriting it with the post-touch entry the policy just evicted.
+        for (address, entry) in evicted_accounts {
+            undo.accounts_before.entry(address).or_insert(Some(entry));
         }
-        for (key, entry) in &storage_pre_evict {
-            if !self.storage.contains_key(key) {
-                undo.storage_before.entry(*key).or_insert_with(|| Some(entry.clone()));
-            }
+        for (key, entry) in evicted_storage.storage {
+            undo.storage_before.entry(key).or_insert(Some(entry));
         }
-        for (code_hash, entry) in &codes_pre_evict {
-            if !self.codes.contains_key(code_hash) {
-                undo.codes_before.entry(*code_hash).or_insert_with(|| Some(entry.clone()));
-            }
-        }
-
-        stats.accounts_evicted = accounts_pre_evict.len().saturating_sub(self.accounts.len());
-        stats.storage_evicted = storage_pre_evict.len().saturating_sub(self.storage.len());
-        stats.codes_evicted = codes_pre_evict.len().saturating_sub(self.codes.len());
-
-        // Bound the memo to live codes. It is a few thousand entries, so this scan is far cheaper
-        // than the ~200 bytes per stale sponge it would otherwise accumulate for the run's life.
-        if stats.codes_evicted > 0 {
-            self.code_leaf_hashers.retain(|code_hash, _| self.codes.contains_key(code_hash));
+        for (code_hash, entry) in evicted_storage.codes {
+            // Bound the memo to live codes. Eviction is the only path that drops a code without
+            // going through rollback, which maintains the memo itself, so removing exactly the
+            // evicted keys here replaces a scan over the whole memo.
+            self.code_leaf_hashers.remove(&code_hash);
+            undo.codes_before.entry(code_hash).or_insert(Some(entry));
         }
 
         // The undo record names every key this block touched or evicted, and nothing else in the
@@ -1191,7 +1185,10 @@ impl std::error::Error for CacheError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{policy::LastNBlocksPolicy, sidecar::last_n_blocks_cache_policy_id};
+    use crate::{
+        policy::{EvictedStorage, LastNBlocksPolicy},
+        sidecar::last_n_blocks_cache_policy_id,
+    };
     use alloy_primitives::b256;
 
     fn make_cache(account_window: u64, storage_window: u64) -> NetworkStateCache {
@@ -1691,8 +1688,8 @@ mod tests {
             &self,
             accounts: &mut HashMap<Address, CachedEntry<AccountData>>,
             _current_block: u64,
-        ) {
-            accounts.clear();
+        ) -> Vec<(Address, CachedEntry<AccountData>)> {
+            accounts.drain().collect()
         }
 
         fn evict_storage(
@@ -1700,9 +1697,8 @@ mod tests {
             storage: &mut HashMap<(Address, B256), CachedEntry<U256>>,
             codes: &mut HashMap<B256, CachedEntry<Bytes>>,
             _current_block: u64,
-        ) {
-            storage.clear();
-            codes.clear();
+        ) -> EvictedStorage {
+            EvictedStorage { storage: storage.drain().collect(), codes: codes.drain().collect() }
         }
 
         fn name(&self) -> &str {
@@ -1838,6 +1834,70 @@ mod tests {
         fn below(&mut self, bound: u32) -> u32 {
             self.next() % bound
         }
+    }
+
+    /// The eviction policy is the sole record of what it removed, and the undo record is the sole
+    /// record of the values, so a policy that drops an entry without reporting it makes the block
+    /// unrollbackable. Apply a block, roll it straight back, and require the whole cache to return.
+    #[test]
+    fn rollback_restores_every_entry_eviction_removed() {
+        // Windows this narrow expire entries within a handful of rounds, which is the point:
+        // eviction is the only path that removes an entry the block never touched.
+        let mut cache = make_cache(3, 2);
+        let mut rng = Xorshift(0x5eed_1234);
+        let mut evictions_seen = 0usize;
+
+        for round in 0..40u64 {
+            let block = 100 + round;
+            let mut accessed = BlockAccessedState::default();
+            for _ in 0..(1 + rng.below(8)) {
+                let address = Address::repeat_byte(rng.below(20) as u8);
+                accessed
+                    .accounts
+                    .insert(address, account(u64::from(rng.below(50)), u64::from(rng.below(1000))));
+                for _ in 0..rng.below(4) {
+                    accessed.storage.insert(
+                        (address, B256::repeat_byte(rng.below(8) as u8)),
+                        U256::from(rng.below(10_000)),
+                    );
+                }
+            }
+            for _ in 0..(1 + rng.below(3)) {
+                let (code_hash, bytes) = code(rng.below(7) as u8, 32 + rng.below(200) as usize);
+                accessed.codes.insert(code_hash, bytes);
+            }
+
+            let accounts_before = cache.accounts.clone();
+            let storage_before = cache.storage.clone();
+            let codes_before = cache.codes.clone();
+            let root_before = cache.compute_cache_root_reference();
+
+            let stats = cache.on_block_executed(block, &accessed);
+            evictions_seen += stats.accounts_evicted + stats.storage_evicted + stats.codes_evicted;
+
+            cache.rollback_block(block).expect("newest undo record");
+
+            // Whole-map equality rather than a digest-index check: an eviction the undo record
+            // failed to name leaves the cache self-consistent but short one entry, and the index
+            // assertions cannot see that because the map and the index would both lack it.
+            assert_eq!(cache.accounts, accounts_before, "round {round}: accounts after rollback");
+            assert_eq!(cache.storage, storage_before, "round {round}: storage after rollback");
+            assert_eq!(cache.codes, codes_before, "round {round}: codes after rollback");
+            assert_eq!(
+                cache.compute_cache_root_reference(),
+                root_before,
+                "round {round}: root recomputed from the restored maps"
+            );
+
+            // Re-apply so the next round starts from a cache that has actually moved.
+            cache.on_block_executed(block, &accessed);
+            assert_digest_index_is_exact(&cache, &format!("round {round}, reapplied {block}"));
+        }
+
+        assert!(
+            evictions_seen > 0,
+            "the windows must be narrow enough to exercise eviction at all"
+        );
     }
 
     /// The lifecycle test walks the transitions one at a time; this one interleaves them.
