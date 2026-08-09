@@ -700,7 +700,9 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         lines.append(f"| {label} | {p_avg:.2f} ms | {w_avg:.2f} ms |")
     lines.extend(["",
         "Rows marked ↳ are measured inside the row above them, so the column does not sum. Weak "
-        "carries no leaf digest index, which is why that row is zero for it rather than absent."])
+        "maintains a leaf digest index too, but over a cache built fresh for each block rather "
+        "than a sixty-block window, so its cache-update columns are not a control for Partial's "
+        "and must not be normalized against the Partial composition reported below."])
 
     lines.extend(build_retention_split_section(accepted))
     lines.extend(build_anchor_split_section(accepted))
