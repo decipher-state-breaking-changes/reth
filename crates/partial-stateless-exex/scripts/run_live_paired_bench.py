@@ -86,6 +86,18 @@ def parse_args():
             "rebuild and the run must not be read for recovery timings"
         ),
     )
+    parser.add_argument(
+        "--engine-access",
+        choices=("off", "shadow"),
+        default="off",
+        help=(
+            "set PS_ENGINE_ACCESS (default: off, which is the baseline every measured run must "
+            "use). 'shadow' makes the Engine capture its access set and the builder compare it "
+            "against its own re-execution, writing access_shadow.jsonl; the builder still "
+            "re-executes, so builder timings stay comparable but carry the capture's cost on the "
+            "Engine side. 'on' is stage 4 and is deliberately not offered here"
+        ),
+    )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.warmup is None:
@@ -263,10 +275,12 @@ def benchmark_environment(
     paired_path,
     engine_path,
     builder_path,
+    shadow_path,
     sidecar_dir,
     parallel_initial_proof,
     canonical_rebuild,
     retain_generation,
+    engine_access,
 ):
     env = os.environ.copy()
     env.update(
@@ -281,6 +295,8 @@ def benchmark_environment(
             "PS_PARALLEL_INITIAL_PROOF": "1" if parallel_initial_proof == "on" else "0",
             "PS_CANONICAL_REBUILD": "1" if canonical_rebuild == "on" else "0",
             "PS_RETAIN_GENERATION": "1" if retain_generation == "on" else "0",
+            "PS_ENGINE_ACCESS": engine_access,
+            "PS_SHADOW_OUTPUT": str(shadow_path),
         }
     )
     for name in DISABLED_DIAGNOSTICS:
@@ -319,23 +335,26 @@ def main():
     overlap_report_path = args.output / "results-overlap.md"
     builder_report_path = args.output / "results-builder.md"
     resource_path = args.output / "resources.jsonl"
+    shadow_path = args.output / "access_shadow.jsonl"
     sidecar_dir = args.output / "sidecars"
 
     env = benchmark_environment(
         paired_path,
         engine_path,
         builder_path,
+        shadow_path,
         sidecar_dir,
         args.parallel_initial_proof,
         args.canonical_rebuild,
         args.retain_generation,
+        args.engine_access,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
     print(
         "Waiting for cache readiness, then collecting "
         f"{args.warmup} sample-warm-up plus {args.samples} accepted same-block samples "
-        f"(canonical_rebuild={args.canonical_rebuild})",
+        f"(canonical_rebuild={args.canonical_rebuild}, engine_access={args.engine_access})",
         flush=True,
     )
 

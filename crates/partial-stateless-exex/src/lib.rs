@@ -14,6 +14,7 @@
 //! admission paths can be tested from `tests/`: every one of those tests needs a state provider
 //! and an EVM, which the `partial-stateless` library deliberately does not depend on.
 
+pub mod access_shadow;
 pub mod bootstrap_io;
 pub mod cold_eoa;
 pub mod rebuild;

@@ -1,4 +1,5 @@
 use crate::{
+    access_shadow::{record_shadow_comparison, take_engine_access},
     benchmark::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
         serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, RetainedGenerationBytes,
@@ -1113,6 +1114,10 @@ where
     let builder_total_start = Instant::now();
     let parent_block_number = block_number.saturating_sub(1);
 
+    // Taken before the re-execution below, not after, so the recorded residence is the wait a
+    // consumer that skipped re-execution would actually see. `None` unless capture is enabled.
+    let engine_access = take_engine_access(block.hash());
+
     // Shared with the canonical rebuild, which has to replay exactly what this applies: the cache
     // is a function of *accessed* state, so an execution diff would miss read-only accounts, code
     // reads, and reads made by calls that later reverted.
@@ -1122,6 +1127,20 @@ where
         output: execution_output,
         elapsed_us: historical_full_db_evm_us,
     } = simulate_block(evm_config, state_provider, block)?;
+
+    // Shadow only: the comparison decides whether the artifact may later replace the execution
+    // above, and changes nothing about what this block produces in the meantime.
+    if let Some(take) = engine_access {
+        record_shadow_comparison(
+            block_number,
+            block.hash(),
+            block.parent_hash,
+            take,
+            &accessed,
+            lowest_block_number,
+            historical_full_db_evm_us,
+        );
+    }
     let historical_gas_used = execution_output.result.gas_used;
     let historical_receipts_root =
         calculate_receipt_root_no_memo(&execution_output.result.receipts);
