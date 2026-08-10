@@ -360,7 +360,94 @@ def build_retention_split_section(accepted):
                 f"after them"
             )
 
+        lines.extend(build_walk_frontier_section(accepted, walk_details))
+
     lines.extend(build_storage_prune_split(accepted))
+    return lines
+
+
+def build_walk_frontier_section(accepted, walk_details):
+    """Say how much of the walk was obligatory and which finalization mechanisms are open.
+
+    The yield ratio is a reason to open the walk, not a budget: a retention walk also proves
+    exclusion and confirms retained paths survive, so an unknown share of the non-blinding visits
+    is obligatory. `visits_on_productive_path` measures the part that is obligatory in the
+    strongest available sense -- the descent the walk cannot skip and still find what it found --
+    which turns the ceiling on a traversal frontier from an argument into a number.
+
+    Finalization gets the same treatment. Its cost is split by map, and two counts decide which of
+    the two candidate mechanisms is admissible: masks removed with no node behind them, which a
+    node-driven enumeration would leave in place, and the subtree sizes that enumeration would
+    have to walk. Emitted only when the records carry the fields.
+    """
+    if not any(record["partial"].get(key, {}).get("visits_on_productive_path")
+               for _, key in walk_details for record in accepted):
+        return []
+
+    lines = ["", "#### Obligatory share and the finalization scan", ""]
+    for label, key in walk_details:
+        details = [record["partial"].get(key, {}) for record in accepted]
+
+        def avg(field, details=details):
+            return statistics.fmean(detail.get(field, 0) for detail in details)
+
+        visited = avg("nodes_visited")
+        productive = avg("visits_on_productive_path")
+        share = f"{100 * productive / visited:.1f}%" if visited else "n/a"
+        lines.append(
+            f"- {label} traversal: **{productive:.0f}** of **{visited:.0f}** visits were on the "
+            f"descent to a node this walk blinded ({share}). The other "
+            f"**{visited - productive:.0f}** are the ceiling on what a narrower frontier could "
+            "remove — a ceiling, since those visits also prove exclusion"
+        )
+
+        masks_us = avg("finalization_masks_us")
+        maps_us = avg("finalization_maps_us")
+        subtries_us = avg("finalization_subtries_us")
+        lines.append(
+            f"- {label} finalization: **{masks_us / 1000:.2f} ms** branch-mask scan, "
+            f"**{maps_us / 1000:.2f} ms** node and value maps, "
+            f"**{subtries_us / 1000:.2f} ms** subtrie slots, of "
+            f"**{avg('finalization_us') / 1000:.2f} ms**"
+        )
+
+        orphans = avg("finalization_masks_removed_without_node")
+        removed = avg("finalization_masks_removed")
+        nodes_removed = avg("finalization_nodes_removed")
+        mechanism = (
+            "descendant enumeration would leave them behind, so replacing the scan needs a mask "
+            "map with a prefix range rather than a walk"
+            if orphans else
+            "no mask outlived its node, so descendant enumeration is admissible on this traffic"
+        )
+        lines.append(
+            f"- {label} mechanism: **{orphans:.1f}** of **{removed:.0f}** removed masks had no "
+            f"node — {mechanism}. Enumerating instead would walk the "
+            f"**{nodes_removed:.0f}** nodes finalization removed, against the "
+            f"**{avg('finalization_branch_masks_scanned'):.0f}** masks it scans now"
+        )
+        # Per call, not per block: the storage row aggregates every trie pruned in the block, and
+        # against a 256-slot denominator a per-block sum reads as more than the whole map.
+        calls = avg("calls") or 1
+        subtries_per_call = avg("finalization_lower_subtries_with_roots") / calls
+        lines.append(
+            f"- {label} partitioning: **{avg('finalization_upper_roots') / calls:.2f}** prune roots "
+            f"in the upper subtrie per call, **{subtries_per_call:.1f}** of 256 lower subtries "
+            f"holding one ({100 * subtries_per_call / 256:.0f}% of a per-subtrie mask map a "
+            "targeted scan would still touch)"
+        )
+
+    instrumentation = sum(
+        statistics.fmean(record["partial"].get(key, {}).get("productive_path_us", 0)
+                         for record in accepted)
+        for _, key in walk_details)
+    if instrumentation:
+        lines.extend([
+            "",
+            f"Obligatory-share instrumentation, outside every walk phase: "
+            f"**{instrumentation / 1000:.2f} ms** per block. Subtract it before comparing this "
+            "run's retention totals against a run without it.",
+        ])
     return lines
 
 
@@ -522,6 +609,119 @@ def build_clone_split_section(accepted):
     lines.append(
         f"| **Copies proportional to cache size** | **{size_proportional:.2f} ms** | "
         f"**{prop_share}** | — |")
+    return lines
+
+
+ACCOUNT_COPY_COMPONENTS = [
+    ("Node maps", "nodes_us", "nodes_bytes", "nodes_allocs"),
+    ("Leaf values", "values_us", "values_bytes", "values_allocs"),
+    ("Branch masks", "masks_us", "masks_bytes", None),
+    ("Reusable buffers", "buffers_us", "buffers_bytes", None),
+    ("Prefix set, updates, boxes", "rest_us", "rest_bytes", None),
+]
+
+
+def build_account_copy_section(accepted):
+    """Decompose the account-trie copy, the largest single validator phase.
+
+    One timer over the copy cannot distinguish a cost spread evenly across everything the trie
+    holds from one concentrated in a single field, and the two imply different fixes: the first
+    needs structural sharing, the second needs a narrower node. The one narrow candidate is the
+    512-byte box every branch node carries whether or not a child is blinded, so its bytes,
+    allocations, and — when the probe ran — its own microseconds are reported apart from the node
+    maps that contain it. Emitted only when the records carry the split.
+    """
+    details = [r["partial"].get("trie_clone_detail", {}).get("account_trie_detail")
+               for r in accepted]
+    details = [d for d in details if d]
+    if not details:
+        return []
+
+    def avg(field):
+        return statistics.fmean(d.get(field, 0) for d in details)
+
+    total_us = avg("nodes_us") + avg("values_us") + avg("masks_us") + avg("buffers_us") + \
+        avg("rest_us")
+    total_bytes = avg("total_bytes")
+    total_allocs = avg("total_allocs")
+
+    # The timers always run; the census does not, and printing its zeroes as though it had would
+    # read as a trie holding no bytes rather than as a run that did not ask.
+    counted = total_bytes > 0
+
+    lines = [
+        "", "### Account-trie copy decomposition (Partial)", "",
+        "Measured inside `account_trie_us` by copying field by field, so the rows are the copy "
+        "rather than a model of it." + (
+            " Bytes and allocations are structural counts and stay meaningful when a row's timer "
+            "rounds to zero." if counted else
+            " Bytes and allocations are omitted: this run did not request the census, which walks "
+            "every node and value entry. Set `PS_TRIE_SHAPE_DIAGNOSTICS=probe` to collect them."
+        ), "",
+    ]
+    if counted:
+        lines.extend(["| Component | Avg | Share | Bytes | Allocations |",
+                      "| --- | ---: | ---: | ---: | ---: |"])
+    else:
+        lines.extend(["| Component | Avg | Share |", "| --- | ---: | ---: |"])
+    for label, us_field, bytes_field, allocs_field in ACCOUNT_COPY_COMPONENTS:
+        component_us = avg(us_field) / 1000
+        share = f"{100 * avg(us_field) / total_us:.1f}%" if total_us else "n/a"
+        if not counted:
+            lines.append(f"| {label} | {component_us:.2f} ms | {share} |")
+            continue
+        component_bytes = f"{avg(bytes_field) / 1_048_576:.2f} MiB"
+        allocs = f"{avg(allocs_field):,.0f}" if allocs_field else "—"
+        lines.append(
+            f"| {label} | {component_us:.2f} ms | {share} | {component_bytes} | {allocs} |")
+    if counted:
+        lines.append(
+            f"| **Total** | **{total_us / 1000:.2f} ms** | **100.0%** | "
+            f"**{total_bytes / 1_048_576:.2f} MiB** | **{total_allocs:,.0f}** |")
+    else:
+        lines.append(f"| **Total** | **{total_us / 1000:.2f} ms** | **100.0%** |")
+        return lines
+
+    branch_nodes = avg("branch_nodes")
+    branch_bytes = avg("branch_hash_bytes")
+    probe_us = avg("branch_hash_probe_us")
+    byte_share = f"{100 * branch_bytes / total_bytes:.1f}%" if total_bytes else "n/a"
+    alloc_share = (f"{100 * avg('branch_hash_allocs') / total_allocs:.1f}%"
+                   if total_allocs else "n/a")
+    lines.extend([
+        "",
+        "The branch-hash box is a subset of the node-map row above, not a sixth component:",
+        "",
+        f"- Branch nodes copied per block: **{branch_nodes:,.0f}** of "
+        f"**{avg('node_entries'):,.0f}** node entries, across **{avg('subtries'):,.0f}** lower "
+        "subtries",
+        f"- Branch-hash boxes: **{branch_bytes / 1_048_576:.2f} MiB** ({byte_share} of the copy's "
+        f"bytes) in **{avg('branch_hash_allocs'):,.0f}** allocations ({alloc_share} of the copy's "
+        "allocations)",
+    ])
+    if probe_us:
+        probe_share = f"{100 * probe_us / total_us:.1f}%" if total_us else "n/a"
+        lines.append(
+            f"- Priced by the probe at **{probe_us / 1000:.2f} ms** per block ({probe_share} of "
+            "the copy) to allocate, copy, and free — measured, not inferred from the byte share")
+    else:
+        lines.append(
+            "- Not priced in this run: the probe was off, so the box has a size but no cost")
+    lines.append(
+        f"- Node census: **{avg('leaf_nodes'):,.0f}** leaves, **{avg('extension_nodes'):,.0f}** "
+        f"extensions, **{avg('value_entries'):,.0f}** leaf values, "
+        f"**{avg('mask_entries'):,.0f}** mask entries")
+
+    instrumentation = avg("accounting_us") + probe_us
+    if instrumentation:
+        lines.extend([
+            "",
+            f"Instrumentation cost, outside `account_trie_us` and inside the block's wall time: "
+            f"**{instrumentation / 1000:.2f} ms** per block "
+            f"({avg('accounting_us') / 1000:.2f} ms accounting + {probe_us / 1000:.2f} ms probe). "
+            "Subtract it before comparing this run's totals or per-entry coefficients against a "
+            "run without the decomposition.",
+        ])
     return lines
 
 
@@ -775,6 +975,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines.extend(build_retention_split_section(accepted))
     lines.extend(build_anchor_split_section(accepted))
     lines.extend(build_clone_split_section(accepted))
+    lines.extend(build_account_copy_section(accepted))
 
     lines.extend(build_cache_composition_section(accepted))
     lines.extend(build_cache_delta_section(accepted))

@@ -139,6 +139,27 @@ impl LowerSparseSubtrie {
         }
     }
 
+    /// Returns the underlying [`SparseSubtrie`] whether it is revealed or a retained allocation.
+    ///
+    /// Distinct from [`Self::as_revealed_ref`], which answers whether the subtrie participates in
+    /// the trie. This answers what a copy of this slot would have to carry, which a blinded slot
+    /// holding a cleared subtrie still does.
+    pub(crate) fn allocated_ref(&self) -> Option<&SparseSubtrie> {
+        match self {
+            Self::Revealed(subtrie) | Self::Blind(Some(subtrie)) => Some(subtrie.as_ref()),
+            Self::Blind(None) => None,
+        }
+    }
+
+    /// Rebuilds this slot with `f` applied to the subtrie it holds, preserving the variant.
+    pub(crate) fn map_allocated(&self, f: impl FnOnce(&SparseSubtrie) -> SparseSubtrie) -> Self {
+        match self {
+            Self::Revealed(subtrie) => Self::Revealed(Box::new(f(subtrie))),
+            Self::Blind(Some(subtrie)) => Self::Blind(Some(Box::new(f(subtrie)))),
+            Self::Blind(None) => Self::Blind(None),
+        }
+    }
+
     pub(crate) fn wipe(&mut self) {
         *self = Self::default();
     }

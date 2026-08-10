@@ -7,12 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_validation_bench import (
+    build_account_copy_section,
     build_anchor_split_section,
     build_cache_composition_section,
     build_cache_delta_section,
     build_clone_split_section,
     build_retention_split_section,
     build_storage_prune_split,
+    build_walk_frontier_section,
 )
 
 
@@ -229,6 +231,155 @@ class RetentionYieldTest(unittest.TestCase):
         body = "\n".join(build_retention_split_section([record]))
         self.assertIn("**100000** nodes walked to blind **200** (500:1)", body)
         self.assertIn("scanned **68000** branch masks", body)
+
+
+class WalkFrontierTest(unittest.TestCase):
+    """The frontier's ceiling and the finalization mechanism are both decided by these counts."""
+
+    WALK_DETAILS = [("Account", "retention_account_trie_detail")]
+
+    @staticmethod
+    def detail(**updates):
+        base = {
+            "nodes_visited": 160_000, "nodes_converted": 365,
+            "visits_on_productive_path": 2_400, "productive_path_us": 900,
+            "finalization_us": 21_710, "finalization_masks_us": 14_000,
+            "finalization_maps_us": 7_500, "finalization_subtries_us": 210,
+            "finalization_branch_masks_scanned": 100_735,
+            "finalization_masks_removed": 400,
+            "finalization_masks_removed_without_node": 0,
+            "finalization_nodes_removed": 1_200,
+            "finalization_upper_roots": 0,
+            "finalization_lower_subtries_with_roots": 180,
+            "calls": 1,
+        }
+        base.update(updates)
+        return {"partial": {"retention_account_trie_detail": base}}
+
+    def test_partitioning_is_normalized_per_call(self):
+        """The storage row aggregates every trie pruned in the block, so a per-block sum lies.
+
+        Against a 256-slot denominator, summing 175 pruned tries reads as more subtries than the
+        map has. Per call is the figure that answers what a per-subtrie mask partition would skip.
+        """
+        one = "\n".join(build_walk_frontier_section([self.detail()], self.WALK_DETAILS))
+        self.assertIn("**180.0** of 256 lower subtries", one)
+        self.assertIn("(70% of a per-subtrie mask map", one)
+
+        many = "\n".join(build_walk_frontier_section(
+            [self.detail(calls=175, finalization_lower_subtries_with_roots=420)],
+            self.WALK_DETAILS))
+        # 420 across 175 calls is 2.4 subtries per trie, not 420 of 256.
+        self.assertIn("**2.4** of 256 lower subtries", many)
+        self.assertIn("(1% of a per-subtrie mask map", many)
+
+    def test_the_obligatory_share_is_reported_as_a_ceiling(self):
+        body = "\n".join(build_walk_frontier_section([self.detail()], self.WALK_DETAILS))
+
+        # 2,400 of 160,000 visits reached something, leaving 157,600 as the ceiling.
+        self.assertIn("**2400** of **160000** visits", body)
+        self.assertIn("(1.5%)", body)
+        self.assertIn("**157600** are the ceiling", body)
+        self.assertIn("those visits also prove exclusion", body)
+
+    def test_finalization_is_split_by_map(self):
+        body = "\n".join(build_walk_frontier_section([self.detail()], self.WALK_DETAILS))
+
+        self.assertIn("**14.00 ms** branch-mask scan", body)
+        self.assertIn("**7.50 ms** node and value maps", body)
+        self.assertIn("of **21.71 ms**", body)
+
+    def test_an_orphaned_mask_rules_out_descendant_enumeration(self):
+        clean = "\n".join(build_walk_frontier_section([self.detail()], self.WALK_DETAILS))
+        self.assertIn("descendant enumeration is admissible", clean)
+
+        orphaned = "\n".join(build_walk_frontier_section(
+            [self.detail(finalization_masks_removed_without_node=12)], self.WALK_DETAILS))
+        self.assertIn("would leave them behind", orphaned)
+        self.assertIn("needs a mask map with a prefix range", orphaned)
+
+    def test_instrumentation_is_called_out_for_subtraction(self):
+        body = "\n".join(build_walk_frontier_section([self.detail()], self.WALK_DETAILS))
+        self.assertIn("**0.90 ms** per block", body)
+
+    def test_pre_v9_records_emit_nothing(self):
+        self.assertEqual(
+            build_walk_frontier_section([self.detail(visits_on_productive_path=0)],
+                                        self.WALK_DETAILS),
+            [])
+
+
+class AccountCopyDecompositionTest(unittest.TestCase):
+    """The copy is the largest phase, and the report has to say which field it is in."""
+
+    @staticmethod
+    def record(**detail):
+        base = {
+            "nodes_us": 80_000, "values_us": 20_000, "masks_us": 6_000,
+            "buffers_us": 1_000, "rest_us": 3_000,
+            "accounting_us": 1_500, "branch_hash_probe_us": 24_000,
+            "total_bytes": 419_430_400, "nodes_bytes": 314_572_800,
+            "values_bytes": 83_886_080, "masks_bytes": 10_485_760,
+            "buffers_bytes": 1_048_576, "rest_bytes": 9_437_184,
+            "branch_hash_bytes": 209_715_200, "branch_hash_allocs": 409_600,
+            "total_allocs": 500_000, "nodes_allocs": 409_665, "values_allocs": 90_335,
+            "subtries": 256, "node_entries": 600_000, "branch_nodes": 409_600,
+            "extension_nodes": 90_400, "leaf_nodes": 100_000,
+            "value_entries": 90_334, "mask_entries": 68_000,
+        }
+        base.update(detail)
+        return {"partial": {"trie_clone_detail": {"account_trie_detail": base}}}
+
+    def test_components_are_ranked_with_bytes_and_allocations(self):
+        body = "\n".join(build_account_copy_section([self.record()]))
+
+        self.assertIn("Account-trie copy decomposition", body)
+        # 80 + 20 + 6 + 1 + 3 = 110 ms, of which the node maps are 72.7%.
+        self.assertIn("| Node maps | 80.00 ms | 72.7%", body)
+        self.assertIn("**110.00 ms**", body)
+        self.assertIn("409,600", body)
+
+    def test_the_branch_hash_box_is_priced_when_the_probe_ran(self):
+        body = "\n".join(build_account_copy_section([self.record()]))
+
+        # 200 MiB of the 400 MiB copy, in 409,600 of its 500,000 allocations.
+        self.assertIn("200.00 MiB** (50.0% of the copy's bytes)", body)
+        self.assertIn("(81.9% of the copy's allocations)", body)
+        self.assertIn("**24.00 ms** per block (21.8% of the copy)", body)
+        # 1.5 ms accounting + 24 ms probe, which a cross-run comparison has to remove.
+        self.assertIn("**25.50 ms** per block", body)
+
+    def test_a_run_without_the_probe_reports_size_without_cost(self):
+        body = "\n".join(build_account_copy_section([self.record(branch_hash_probe_us=0)]))
+
+        self.assertIn("the box has a size but no cost", body)
+        self.assertIn("200.00 MiB** (50.0% of the copy's bytes)", body)
+
+    def test_a_run_without_the_census_reports_times_and_says_so(self):
+        """The timers are free and always run; the census walks the copy and is opt-in.
+
+        Printing its zeroes in the byte column would read as a trie that holds no bytes rather
+        than as a run that did not ask for the walk.
+        """
+        bare = {field: 0 for field in (
+            "total_bytes", "nodes_bytes", "values_bytes", "masks_bytes", "buffers_bytes",
+            "rest_bytes", "branch_hash_bytes", "total_allocs", "nodes_allocs", "values_allocs",
+            "branch_hash_allocs", "accounting_us", "branch_hash_probe_us", "subtries",
+            "node_entries", "branch_nodes", "extension_nodes", "leaf_nodes", "value_entries",
+            "mask_entries")}
+        body = "\n".join(build_account_copy_section([self.record(**bare)]))
+
+        self.assertIn("| Node maps | 80.00 ms | 72.7% |", body)
+        self.assertIn("**110.00 ms**", body)
+        self.assertIn("did not request the census", body)
+        self.assertIn("PS_TRIE_SHAPE_DIAGNOSTICS=probe", body)
+        self.assertNotIn("MiB", body)
+        self.assertNotIn("branch-hash box", body)
+
+    def test_pre_v9_records_emit_nothing(self):
+        self.assertEqual(build_account_copy_section([anchor_record()]), [])
+        self.assertEqual(build_account_copy_section([partial_record()]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

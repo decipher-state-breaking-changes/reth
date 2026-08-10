@@ -18,10 +18,73 @@ use alloy_primitives::{
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
 use reth_trie_sparse::{
-    ParallelSparseTrie, RetainWitnessPathsMetrics, RetentionOptions, RevealableSparseTrie,
-    SparseStateTrie, SparseTrie,
+    CloneBreakdown, CloneMeasureOptions, ParallelSparseTrie, RetainWitnessPathsMetrics,
+    RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
 };
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
+
+/// How much the account trie measures about its own shape, from `PS_TRIE_SHAPE_DIAGNOSTICS`.
+///
+/// Phase timers are always on: they ride along with work the block already does, and the splits
+/// they give are the reason those phases are legible at all. Everything selected here is extra
+/// work, so it is off unless a run asks:
+///
+/// - `1`, `on`: the copy's byte, allocation, and structural census, which walks every node and
+///   value entry — something the copy itself never does, since a hash-map copy is a bulk operation
+///   — plus the retention walk's obligatory-visit share and orphaned-mask count.
+/// - `probe`: the above, plus the price of the unconditional branch-hash box, which means
+///   allocating, copying, and freeing one per branch node.
+///
+/// All of them answer structural questions that move with cache size rather than with the block.
+/// A.16 measured the census at 8.94 ms, the probe at 9.11 ms, and the walk's descents at 0.49 ms —
+/// together 4.7% of raw validation, enough to make a default-on run incomparable to one without
+/// them and to distort the phase this workstream is trying to reduce.
+fn shape_diagnostics() -> ShapeDiagnostics {
+    static LEVEL: OnceLock<ShapeDiagnostics> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("PS_TRIE_SHAPE_DIAGNOSTICS").as_deref() {
+        Ok("probe") => ShapeDiagnostics::Probe,
+        Ok("1" | "on" | "true" | "TRUE" | "yes") => ShapeDiagnostics::Census,
+        _ => ShapeDiagnostics::Off,
+    })
+}
+
+/// What the trie cache collects beyond the phase timers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeDiagnostics {
+    /// Phase timers only, which is what a production block and a timing benchmark want.
+    Off,
+    /// Byte, allocation, and structural counts for the copy and the walks.
+    Census,
+    /// The census plus the measured price of the branch-hash box.
+    Probe,
+}
+
+impl ShapeDiagnostics {
+    const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    const fn clone_options(self) -> CloneMeasureOptions {
+        match self {
+            Self::Off => CloneMeasureOptions::timers_only(),
+            Self::Census => CloneMeasureOptions::accounting(),
+            Self::Probe => CloneMeasureOptions::accounting().with_branch_hash_probe(),
+        }
+    }
+
+    fn retention_options(self) -> RetentionOptions {
+        let options = RetentionOptions::sorted_input();
+        if self.is_on() {
+            options.with_diagnostics()
+        } else {
+            options
+        }
+    }
+}
 
 /// The sparse state trie this cache runs on.
 ///
@@ -87,14 +150,19 @@ impl PartialTrieNodeCache {
     pub fn clone_timed(&self) -> (Self, TrieCloneTimings) {
         let mut timings = TrieCloneTimings::default();
 
-        let start = Instant::now();
+        // Timed from inside the copy rather than around it, so the instrumentation the breakdown
+        // costs stays out of the phase number this run reports for the phase.
         let accounts = self
             .sparse
             .state_trie_ref()
-            .map(|trie| RevealableSparseTrie::Revealed(Box::new(trie.clone())))
+            .map(|trie| {
+                let (copy, breakdown) = trie.clone_measured(shape_diagnostics().clone_options());
+                timings.account_trie_breakdown = breakdown;
+                RevealableSparseTrie::Revealed(Box::new(copy))
+            })
             .unwrap_or_else(RevealableSparseTrie::blind);
         let mut sparse = CacheSparseStateTrie::default().with_accounts_trie(accounts);
-        timings.account_trie_us = start.elapsed().as_micros() as u64;
+        timings.account_trie_us = timings.account_trie_breakdown.total_us;
 
         // Copying the map wholesale is both cheaper and more faithful than rebuilding it from
         // warm membership: each value is a refcount bump, and `retain_from_value_cache` has
@@ -439,7 +507,7 @@ impl PartialTrieNodeCache {
             .map(|trie| {
                 trie.retain_witness_paths_with_options(
                     &self.retained_account_paths,
-                    RetentionOptions::sorted_input(),
+                    shape_diagnostics().retention_options(),
                 )
                 .metrics
             })
@@ -487,9 +555,10 @@ impl PartialTrieNodeCache {
                 trie.make_mut();
                 outcome.cow_us += copy.elapsed().as_micros() as u64;
 
-                let walk = trie
-                    .make_mut()
-                    .retain_witness_paths_with_options(slots, RetentionOptions::sorted_input());
+                let walk = trie.make_mut().retain_witness_paths_with_options(
+                    slots,
+                    shape_diagnostics().retention_options(),
+                );
                 outcome.metrics.accumulate(&walk.metrics);
                 outcome.pruned += 1;
             }
@@ -1046,6 +1115,14 @@ impl RetentionTimings {
 pub struct TrieCloneTimings {
     /// Deep-copying the revealed account trie. The copy storage-trie sharing did not remove.
     pub account_trie_us: u64,
+    /// Where that copy's time, bytes, and allocations went. Included in `account_trie_us`.
+    ///
+    /// The phase has been the largest single one since V2 landed, and one timer over it cannot say
+    /// whether a narrower node representation would help or whether the cost is spread evenly
+    /// across everything the trie holds. Its own instrumentation terms — `accounting_us` and
+    /// `branch_hash_probe_us` — are outside `account_trie_us` and reported so a run carrying them
+    /// stays comparable to one that does not.
+    pub account_trie_breakdown: CloneBreakdown,
     /// Copying the storage-trie map. One refcount bump per entry, not a trie copy.
     pub storage_tries_us: u64,
     /// Copying the warm account and storage key sets.

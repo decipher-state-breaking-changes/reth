@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use partial_stateless::{
-    network_cache::UpdateStats, CacheRootTimings, PartialExecutionWitness, PartialStatelessSidecar,
-    RetainWitnessPathsMetrics, TrieCloneTimings, TrieMutationMetrics,
+    network_cache::UpdateStats, CacheRootTimings, CloneBreakdown, PartialExecutionWitness,
+    PartialStatelessSidecar, RetainWitnessPathsMetrics, TrieCloneTimings, TrieMutationMetrics,
 };
 use serde::Serialize;
 use std::{
@@ -23,7 +23,31 @@ use std::{
 /// V8 adds the storage-prune copy-on-write and drop split. Storage retention's total has always
 /// exceeded the sum of its walk phases; these fields name the difference rather than leaving it as
 /// an unattributed residual, which is what makes the storage half of retention a targetable number.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 8;
+///
+/// V9 opens the two halves of the account trie, which are the two largest phases left.
+///
+/// `trie_clone_detail.account_trie_detail` splits the copy by component in time, bytes, and
+/// allocations. One timer over it cannot distinguish a cost spread evenly across everything the
+/// trie holds from one concentrated in a single field, and the two imply different fixes.
+///
+/// The retention walk gains `visits_on_productive_path`, which bounds what a narrower traversal
+/// frontier could remove, and a finalization split by map plus the counts that decide whether
+/// enumerating descendants can replace the branch-mask scan at all.
+///
+/// Both splits' phase timers are free and always present, because they ride along with work the
+/// block already does. The counts that describe shape rather than cost are not free — the copy's
+/// census walks every node and value entry, which a hash-map copy never does; the box probe
+/// allocates one box per branch node; the walk re-descends to every prune root — so they are
+/// collected only when `PS_TRIE_SHAPE_DIAGNOSTICS` asks: `1` for the census and the walk counts,
+/// `probe` to also price the branch-hash box. A.16 measured them at 8.94, 0.49, and 9.11 ms per
+/// block, so a default run leaves them off and reports zeroes rather than paying 4.7% of raw
+/// validation for numbers that move with cache size rather than with the block.
+///
+/// Three fields therefore measure the instrumentation rather than the work and sit outside their
+/// phase: `account_trie_detail.accounting_us`, `account_trie_detail.branch_hash_probe_us`, and
+/// each walk's `productive_path_us`. All three are zero unless requested. Subtract whichever are
+/// nonzero before comparing a V9 run's totals or per-entry coefficients against a V8 one.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 9;
 
 /// Serializable trie-walk detail kept inside the enclosing retention total.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -50,6 +74,31 @@ pub struct RetentionWalkMetrics {
     pub finalization_lower_subtries_scanned: u64,
     pub unprunable_dirty: u64,
     pub unprunable_inline: u64,
+    /// Visited nodes on the descent to a node the walk actually blinded.
+    ///
+    /// `nodes_visited` minus this is the walk's unproductive share for this block, which is the
+    /// ceiling on what any narrower traversal frontier could remove — a ceiling, not a target,
+    /// since the same visits also prove exclusion.
+    pub visits_on_productive_path: u64,
+    /// What computing the field above cost. Outside every walk phase; subtract to compare runs.
+    pub productive_path_us: u64,
+    /// Prune roots in the upper subtrie, which force finalization to touch every lower slot.
+    pub finalization_upper_roots: u64,
+    /// Distinct lower subtries holding a prune root, against 256 slots.
+    pub finalization_lower_subtries_with_roots: u64,
+    /// Node and value entries finalization removed: the size of the subtrees the walk stops at.
+    pub finalization_nodes_removed: u64,
+    pub finalization_values_removed: u64,
+    pub finalization_masks_removed: u64,
+    /// Removed masks whose node was already gone.
+    ///
+    /// Nonzero means a finalization driven by enumerating descendants through the node maps would
+    /// diverge from the full scan rather than merely be faster than it.
+    pub finalization_masks_removed_without_node: u64,
+    /// `finalization_us` split by which map the scan was over.
+    pub finalization_masks_us: u64,
+    pub finalization_maps_us: u64,
+    pub finalization_subtries_us: u64,
 }
 
 impl From<&RetainWitnessPathsMetrics> for RetentionWalkMetrics {
@@ -77,6 +126,18 @@ impl From<&RetainWitnessPathsMetrics> for RetentionWalkMetrics {
             finalization_lower_subtries_scanned: metrics.finalization_lower_subtries_scanned,
             unprunable_dirty: metrics.unprunable_dirty,
             unprunable_inline: metrics.unprunable_inline,
+            visits_on_productive_path: metrics.visits_on_productive_path,
+            productive_path_us: metrics.productive_path_us,
+            finalization_upper_roots: metrics.finalization_upper_roots,
+            finalization_lower_subtries_with_roots: metrics.finalization_lower_subtries_with_roots,
+            finalization_nodes_removed: metrics.finalization_nodes_removed,
+            finalization_values_removed: metrics.finalization_values_removed,
+            finalization_masks_removed: metrics.finalization_masks_removed,
+            finalization_masks_removed_without_node: metrics
+                .finalization_masks_removed_without_node,
+            finalization_masks_us: metrics.finalization_masks_us,
+            finalization_maps_us: metrics.finalization_maps_us,
+            finalization_subtries_us: metrics.finalization_subtries_us,
         }
     }
 }
@@ -169,6 +230,8 @@ impl From<&UpdateStats> for CacheDeltaMetrics {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TrieCloneMetrics {
     pub account_trie_us: u64,
+    /// The account copy's own split; included in `account_trie_us`, never summed into a total.
+    pub account_trie_detail: CloneBreakdownMetrics,
     pub storage_tries_us: u64,
     pub warm_membership_us: u64,
     pub retained_paths_us: u64,
@@ -182,6 +245,7 @@ impl From<&TrieCloneTimings> for TrieCloneMetrics {
     fn from(timings: &TrieCloneTimings) -> Self {
         Self {
             account_trie_us: timings.account_trie_us,
+            account_trie_detail: CloneBreakdownMetrics::from(&timings.account_trie_breakdown),
             storage_tries_us: timings.storage_tries_us,
             warm_membership_us: timings.warm_membership_us,
             retained_paths_us: timings.retained_paths_us,
@@ -189,6 +253,80 @@ impl From<&TrieCloneTimings> for TrieCloneMetrics {
             warm_accounts: timings.warm_accounts,
             warm_storage: timings.warm_storage,
             retained_account_paths: timings.retained_account_paths,
+        }
+    }
+}
+
+/// Where the account-trie copy's time, bytes, and allocations went.
+///
+/// The five `_us` components sum to `account_trie_us`; the two beside them do not, because they are
+/// what the measurement itself costs. `branch_hash_*` are a subset of `nodes_*`, being the
+/// unconditional 512-byte box every branch node carries whether or not a child is blinded — the one
+/// narrow representation candidate this phase has, and the reason the split is worth taking.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CloneBreakdownMetrics {
+    pub nodes_us: u64,
+    pub values_us: u64,
+    pub masks_us: u64,
+    pub buffers_us: u64,
+    pub rest_us: u64,
+    /// The accounting walk's own cost. Outside `account_trie_us`; subtract to compare runs.
+    pub accounting_us: u64,
+    /// Allocating, copying, and freeing one branch-hash box per branch node.
+    ///
+    /// Outside `account_trie_us` for the same reason, and zero when the probe is off. This is the
+    /// box priced rather than inferred from its byte share, which is what the candidate must beat.
+    pub branch_hash_probe_us: u64,
+    pub total_bytes: u64,
+    pub nodes_bytes: u64,
+    pub values_bytes: u64,
+    pub masks_bytes: u64,
+    pub buffers_bytes: u64,
+    pub rest_bytes: u64,
+    /// Bytes in branch-hash boxes. A subset of `nodes_bytes`.
+    pub branch_hash_bytes: u64,
+    pub total_allocs: u64,
+    pub nodes_allocs: u64,
+    pub values_allocs: u64,
+    /// Separate allocations for branch-hash boxes. A subset of `nodes_allocs`.
+    pub branch_hash_allocs: u64,
+    pub subtries: u64,
+    pub node_entries: u64,
+    pub branch_nodes: u64,
+    pub extension_nodes: u64,
+    pub leaf_nodes: u64,
+    pub value_entries: u64,
+    pub mask_entries: u64,
+}
+
+impl From<&CloneBreakdown> for CloneBreakdownMetrics {
+    fn from(breakdown: &CloneBreakdown) -> Self {
+        Self {
+            nodes_us: breakdown.nodes_us,
+            values_us: breakdown.values_us,
+            masks_us: breakdown.masks_us,
+            buffers_us: breakdown.buffers_us,
+            rest_us: breakdown.rest_us,
+            accounting_us: breakdown.accounting_us,
+            branch_hash_probe_us: breakdown.branch_hash_probe_us,
+            total_bytes: breakdown.total_bytes,
+            nodes_bytes: breakdown.nodes_bytes,
+            values_bytes: breakdown.values_bytes,
+            masks_bytes: breakdown.masks_bytes,
+            buffers_bytes: breakdown.buffers_bytes,
+            rest_bytes: breakdown.rest_bytes,
+            branch_hash_bytes: breakdown.branch_hash_bytes,
+            total_allocs: breakdown.total_allocs,
+            nodes_allocs: breakdown.nodes_allocs,
+            values_allocs: breakdown.values_allocs,
+            branch_hash_allocs: breakdown.branch_hash_allocs,
+            subtries: breakdown.subtries,
+            node_entries: breakdown.node_entries,
+            branch_nodes: breakdown.branch_nodes,
+            extension_nodes: breakdown.extension_nodes,
+            leaf_nodes: breakdown.leaf_nodes,
+            value_entries: breakdown.value_entries,
+            mask_entries: breakdown.mask_entries,
         }
     }
 }
@@ -627,7 +765,7 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 8);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 9);
         // The storage walk's own timers start after the copy, so without this field the gap
         // between storage retention's total and its phases has no name.
         assert!(value["partial"].get("retention_storage_trie_cow_us").is_some());
@@ -694,6 +832,46 @@ mod tests {
             assert!(
                 value["partial"]["trie_clone_detail"].get(field).is_some(),
                 "missing clone split field {field}"
+            );
+        }
+        for field in [
+            "nodes_us",
+            "values_us",
+            "masks_us",
+            "buffers_us",
+            "rest_us",
+            "accounting_us",
+            "branch_hash_probe_us",
+            "total_bytes",
+            "nodes_bytes",
+            "branch_hash_bytes",
+            "total_allocs",
+            "nodes_allocs",
+            "branch_hash_allocs",
+            "branch_nodes",
+            "node_entries",
+            "value_entries",
+        ] {
+            assert!(
+                value["partial"]["trie_clone_detail"]["account_trie_detail"].get(field).is_some(),
+                "missing account copy decomposition field {field}"
+            );
+        }
+        for field in [
+            "visits_on_productive_path",
+            "productive_path_us",
+            "finalization_upper_roots",
+            "finalization_lower_subtries_with_roots",
+            "finalization_nodes_removed",
+            "finalization_masks_removed",
+            "finalization_masks_removed_without_node",
+            "finalization_masks_us",
+            "finalization_maps_us",
+            "finalization_subtries_us",
+        ] {
+            assert!(
+                value["partial"]["retention_account_trie_detail"].get(field).is_some(),
+                "missing walk frontier field {field}"
             );
         }
         assert!(value["retained_generation"].get("exclusive_bytes").is_some());

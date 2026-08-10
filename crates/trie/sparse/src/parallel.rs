@@ -56,13 +56,26 @@ pub struct ParallelismThresholds {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionOptions {
     sorted_input: bool,
+    diagnostics: bool,
 }
 
 impl RetentionOptions {
     /// Uses `retained_paths` directly when it is sorted, otherwise falls back to copying and
     /// sorting it.
     pub const fn sorted_input() -> Self {
-        Self { sorted_input: true }
+        Self { sorted_input: true, diagnostics: false }
+    }
+
+    /// Collects the counters that describe the walk's shape rather than its cost.
+    ///
+    /// The phase and work counters are free — they ride along with work the walk already does.
+    /// These are not: the obligatory-visit share re-descends to every prune root, and the
+    /// orphaned-mask count holds the removed mask paths so each can be checked against the node
+    /// it belonged to. Both answer structural questions for a design decision, not questions a
+    /// production block or a timing benchmark needs answered, so a caller asks for them.
+    pub const fn with_diagnostics(mut self) -> Self {
+        self.diagnostics = true;
+        self
     }
 }
 
@@ -122,6 +135,55 @@ pub struct RetainWitnessPathsMetrics {
     pub unprunable_dirty: u64,
     /// Nodes represented inline in their parent rather than by a hash.
     pub unprunable_inline: u64,
+    /// Visited nodes that lie on the descent to a node this walk actually blinded.
+    ///
+    /// The walk cannot reach a prunable subtree root without descending to its parent, so these
+    /// visits are obligatory in the strongest sense available: no traversal producing the same
+    /// output can skip them. `nodes_visited` minus this is what the walk spent proving that
+    /// nothing below a node was prunable — an upper bound on what a narrower frontier could
+    /// remove, not a promise, since the same visits are what prove exclusion and a different
+    /// retained set makes a different subset of them productive.
+    pub visits_on_productive_path: u64,
+    /// Microseconds spent computing `visits_on_productive_path`.
+    ///
+    /// Instrumentation, not walk work: excluded from `traversal_us` and from the enclosing
+    /// retention total's phases, and reported so a run carrying it stays comparable.
+    pub productive_path_us: u64,
+    /// Prune roots that landed in the upper subtrie.
+    ///
+    /// An upper root covers descendants in many lower subtries, which is what forces finalization
+    /// to touch every slot. A block with none of them is one where a per-subtrie mask partition
+    /// would scan only the subtries that contain a root.
+    pub finalization_upper_roots: u64,
+    /// Distinct lower subtries containing at least one prune root.
+    ///
+    /// The denominator for that partition: against 256 slots, this says what share of the mask map
+    /// a partitioned finalization would still have to scan.
+    pub finalization_lower_subtries_with_roots: u64,
+    /// Node entries finalization actually removed, across all subtries.
+    ///
+    /// The size of the pruned subtrees, which the traversal never sees because it stops at each
+    /// prune root. Enumerating descendants during the walk instead of scanning the maps costs
+    /// roughly this many steps, so this is what says whether that alternative is affordable.
+    pub finalization_nodes_removed: u64,
+    /// Leaf-value entries finalization actually removed.
+    pub finalization_values_removed: u64,
+    /// Branch-mask entries finalization actually removed.
+    pub finalization_masks_removed: u64,
+    /// Removed mask entries that had no node at their path when finalization began.
+    ///
+    /// Decides whether descendant enumeration can replace the mask scan at all. Masks are inserted
+    /// on reveal and on commit, and only `commit_updates` removes them, so a mask can outlive its
+    /// node. Every such entry is one a node-driven enumeration would leave behind, which is a
+    /// divergence from the full scan rather than a saving. Zero across a run is the evidence that
+    /// enumeration is admissible; anything else says the mask map needs a different shape.
+    pub finalization_masks_removed_without_node: u64,
+    /// Microseconds inside `finalization_us` spent on the branch-mask scan alone.
+    pub finalization_masks_us: u64,
+    /// Microseconds inside `finalization_us` spent on the node and value map scans.
+    pub finalization_maps_us: u64,
+    /// Microseconds inside `finalization_us` spent scanning lower-subtrie slots to clear.
+    pub finalization_subtries_us: u64,
 }
 
 impl RetainWitnessPathsMetrics {
@@ -160,6 +222,29 @@ impl RetainWitnessPathsMetrics {
             .saturating_add(other.finalization_lower_subtries_scanned);
         self.unprunable_dirty = self.unprunable_dirty.saturating_add(other.unprunable_dirty);
         self.unprunable_inline = self.unprunable_inline.saturating_add(other.unprunable_inline);
+        self.visits_on_productive_path =
+            self.visits_on_productive_path.saturating_add(other.visits_on_productive_path);
+        self.productive_path_us = self.productive_path_us.saturating_add(other.productive_path_us);
+        self.finalization_upper_roots =
+            self.finalization_upper_roots.saturating_add(other.finalization_upper_roots);
+        self.finalization_lower_subtries_with_roots = self
+            .finalization_lower_subtries_with_roots
+            .saturating_add(other.finalization_lower_subtries_with_roots);
+        self.finalization_nodes_removed =
+            self.finalization_nodes_removed.saturating_add(other.finalization_nodes_removed);
+        self.finalization_values_removed =
+            self.finalization_values_removed.saturating_add(other.finalization_values_removed);
+        self.finalization_masks_removed =
+            self.finalization_masks_removed.saturating_add(other.finalization_masks_removed);
+        self.finalization_masks_removed_without_node = self
+            .finalization_masks_removed_without_node
+            .saturating_add(other.finalization_masks_removed_without_node);
+        self.finalization_masks_us =
+            self.finalization_masks_us.saturating_add(other.finalization_masks_us);
+        self.finalization_maps_us =
+            self.finalization_maps_us.saturating_add(other.finalization_maps_us);
+        self.finalization_subtries_us =
+            self.finalization_subtries_us.saturating_add(other.finalization_subtries_us);
     }
 }
 
@@ -170,6 +255,156 @@ pub struct RetainOutcome {
     pub pruned: usize,
     /// Phase timings and work counters for this call.
     pub metrics: RetainWitnessPathsMetrics,
+}
+
+/// What a measured copy reports beyond its per-component timers.
+///
+/// The timers are free — a handful of clock reads around field copies — so they are never
+/// optional. Everything else costs the block real work it would not otherwise do: the byte and
+/// allocation census walks every node and value entry, which a hash-map copy never does, and the
+/// branch-hash probe allocates one box per branch node. Both answer structural questions that move
+/// slowly, so they belong to a run that asks for them rather than to every run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloneMeasureOptions {
+    accounting: bool,
+    branch_hash_probe: bool,
+}
+
+impl CloneMeasureOptions {
+    /// Per-component timers and nothing else, which is what a copy on the hot path wants.
+    pub const fn timers_only() -> Self {
+        Self { accounting: false, branch_hash_probe: false }
+    }
+
+    /// Adds the byte, allocation, and structural counts, at the cost of a full walk of the copy.
+    pub const fn accounting() -> Self {
+        Self { accounting: true, branch_hash_probe: false }
+    }
+
+    /// Also prices the unconditional branch-hash box, at the cost of one allocation per branch.
+    ///
+    /// Implies [`Self::accounting`], since a price without the count it belongs to says nothing.
+    pub const fn with_branch_hash_probe(mut self) -> Self {
+        self.accounting = true;
+        self.branch_hash_probe = true;
+        self
+    }
+}
+
+/// Where one whole-trie deep copy spent its time, bytes, and allocations.
+///
+/// Durations are microseconds and are zero in `no_std` builds. The five component durations are
+/// measured by copying field by field rather than by sampling, so they sum to `total_us` up to
+/// timer resolution and describe the real copy rather than a model of it. The byte and allocation
+/// counters are structural and independent of the timers, so a component stays sized even when its
+/// timer rounds to zero.
+///
+/// `branch_hash_bytes` and `branch_hash_allocs` are a *subset* of `nodes_bytes` and `nodes_allocs`,
+/// not a sixth component: every revealed branch node carries a [`Box<[B256; 16]>`] whether or not
+/// any child is blinded, and subtracting them says what the node maps would cost without it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CloneBreakdown {
+    /// Microseconds the copy itself took, excluding the instrumentation below.
+    pub total_us: u64,
+    /// Microseconds spent copying the upper and lower node maps.
+    pub nodes_us: u64,
+    /// Microseconds spent copying the leaf-value maps.
+    pub values_us: u64,
+    /// Microseconds spent copying `branch_node_masks`.
+    pub masks_us: u64,
+    /// Microseconds spent copying the reusable hashing and update-action buffers.
+    pub buffers_us: u64,
+    /// Microseconds spent copying the prefix set, retained updates, and the subtrie boxes.
+    pub rest_us: u64,
+    /// Microseconds the byte and allocation accounting walk added on top of the copy.
+    ///
+    /// Excluded from `total_us` and reported so a run carrying this instrumentation stays
+    /// comparable to one that does not.
+    pub accounting_us: u64,
+    /// Microseconds to allocate, copy, and free one branch-hash box per branch node.
+    ///
+    /// Zero unless the probe is requested. This is the marginal cost the box adds to a copy,
+    /// measured rather than inferred from its share of the bytes, and it is what a narrower
+    /// representation has to beat. Excluded from `total_us`: it is a second pass over the copy,
+    /// not part of it.
+    pub branch_hash_probe_us: u64,
+    /// Heap bytes the copy allocated, summed over the five components.
+    pub total_bytes: u64,
+    /// Heap bytes in the node maps, including the branch-hash boxes.
+    pub nodes_bytes: u64,
+    /// Heap bytes in the leaf-value maps, including each value's own buffer.
+    pub values_bytes: u64,
+    /// Heap bytes in `branch_node_masks`.
+    pub masks_bytes: u64,
+    /// Heap bytes in the reusable buffers.
+    pub buffers_bytes: u64,
+    /// Heap bytes in the prefix set, retained updates, and the subtrie boxes.
+    pub rest_bytes: u64,
+    /// Heap bytes in branch-hash boxes. A subset of `nodes_bytes`.
+    pub branch_hash_bytes: u64,
+    /// Separate heap allocations the copy made, summed over the five components.
+    pub total_allocs: u64,
+    /// Separate heap allocations made for the node maps, including the branch-hash boxes.
+    pub nodes_allocs: u64,
+    /// Separate heap allocations made for the leaf-value maps, one per value plus one per table.
+    pub values_allocs: u64,
+    /// Separate heap allocations made for branch-hash boxes. A subset of `nodes_allocs`.
+    pub branch_hash_allocs: u64,
+    /// Lower subtries the copy had to walk, revealed or holding a retained allocation.
+    pub subtries: u64,
+    /// Node entries copied across all subtries.
+    pub node_entries: u64,
+    /// Branch nodes among them, each carrying one branch-hash box.
+    pub branch_nodes: u64,
+    /// Extension nodes among them.
+    pub extension_nodes: u64,
+    /// Leaf nodes among them.
+    pub leaf_nodes: u64,
+    /// Leaf-value entries copied across all subtries.
+    pub value_entries: u64,
+    /// Branch-mask entries copied.
+    pub mask_entries: u64,
+}
+
+/// Heap bytes a hashbrown table of this capacity occupies, before any per-entry heap.
+///
+/// The table is sized to the next power of two that keeps the load factor under 7/8, and carries
+/// one control byte per bucket alongside each slot. Reported as the table rather than as a bound
+/// on it, since the per-entry heap it excludes is counted separately.
+const fn map_table_bytes<K, V>(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0
+    }
+    let buckets = (capacity * 8 / 7 + 1).next_power_of_two();
+    (buckets * (core::mem::size_of::<K>() + core::mem::size_of::<V>() + 1)) as u64
+}
+
+/// Per-component nanoseconds accumulated across the upper subtrie and every lower subtrie.
+///
+/// Nanoseconds rather than microseconds because these are summed over up to 257 subtries, and
+/// truncating each subtrie's share to microseconds would round the smaller components away.
+#[derive(Debug, Clone, Copy, Default)]
+struct CloneNanos {
+    nodes: u128,
+    values: u128,
+    buffers: u128,
+}
+
+/// Runs `f`, returning its value and the nanoseconds it took. Nanoseconds are zero in `no_std`.
+///
+/// Nanoseconds rather than microseconds because the per-subtrie components are accumulated over 257
+/// calls, and truncating each one to microseconds would round the smaller components away.
+fn timed<T>(f: impl FnOnce() -> T) -> (T, u128) {
+    #[cfg(feature = "std")]
+    {
+        let start = StdInstant::now();
+        let value = f();
+        (value, start.elapsed().as_nanos())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        (f(), 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +419,15 @@ struct FinalizationMetrics {
     upper_values_scanned: u64,
     branch_masks_scanned: u64,
     lower_subtries_scanned: u64,
+    upper_roots: u64,
+    lower_subtries_with_roots: u64,
+    nodes_removed: u64,
+    values_removed: u64,
+    masks_removed: u64,
+    masks_removed_without_node: u64,
+    masks_us: u64,
+    maps_us: u64,
+    subtries_us: u64,
 }
 
 /// A revealed sparse trie with subtries that can be updated in parallel.
@@ -983,7 +1227,7 @@ impl SparseTrie for ParallelSparseTrie {
             }
         }
 
-        self.finalize_pruned_roots(effective_pruned_roots).0
+        self.finalize_pruned_roots(effective_pruned_roots, false).0
     }
 
     fn retain_witness_paths(&mut self, retained_paths: &[Nibbles]) -> usize {
@@ -1151,6 +1395,15 @@ impl ParallelSparseTrie {
         }
 
         metrics.prune_roots = actions.len() as u64;
+
+        // Before the mutation, which removes the nodes the descent would follow. Timed apart from
+        // every walk phase because it is instrumentation, not retention work.
+        if options.diagnostics {
+            let (productive, productive_ns) = timed(|| self.count_productive_path_visits(&actions));
+            metrics.visits_on_productive_path = productive;
+            metrics.productive_path_us = (productive_ns / 1_000) as u64;
+        }
+
         #[cfg(feature = "std")]
         let mutation_start = StdInstant::now();
         self.apply_witness_prune_actions(&mut actions);
@@ -1162,7 +1415,7 @@ impl ParallelSparseTrie {
         let pruned_roots = actions.iter().map(|action| action.path).collect();
         #[cfg(feature = "std")]
         let finalization_start = StdInstant::now();
-        let (pruned, finalization) = self.finalize_pruned_roots(pruned_roots);
+        let (pruned, finalization) = self.finalize_pruned_roots(pruned_roots, options.diagnostics);
         #[cfg(feature = "std")]
         {
             metrics.finalization_us = finalization_start.elapsed().as_micros() as u64;
@@ -1172,8 +1425,50 @@ impl ParallelSparseTrie {
         metrics.finalization_upper_values_scanned = finalization.upper_values_scanned;
         metrics.finalization_branch_masks_scanned = finalization.branch_masks_scanned;
         metrics.finalization_lower_subtries_scanned = finalization.lower_subtries_scanned;
+        metrics.finalization_upper_roots = finalization.upper_roots;
+        metrics.finalization_lower_subtries_with_roots = finalization.lower_subtries_with_roots;
+        metrics.finalization_nodes_removed = finalization.nodes_removed;
+        metrics.finalization_values_removed = finalization.values_removed;
+        metrics.finalization_masks_removed = finalization.masks_removed;
+        metrics.finalization_masks_removed_without_node = finalization.masks_removed_without_node;
+        metrics.finalization_masks_us = finalization.masks_us;
+        metrics.finalization_maps_us = finalization.maps_us;
+        metrics.finalization_subtries_us = finalization.subtries_us;
 
         RetainOutcome { pruned, metrics }
+    }
+
+    /// Visited nodes that lie on the descent to a node this walk blinded.
+    ///
+    /// Descends from the root to each prune action rather than recording the walk's own visits: the
+    /// walk sees 159,743 nodes on a live account trie and holding that many paths to answer a
+    /// counting question would cost more than the phase being measured. The descent touches one
+    /// node per level per action instead, and the answer is the same set — the walk reaches a prune
+    /// candidate only by descending to its parent, so every node on that descent was visited.
+    ///
+    /// Must run before [`Self::apply_witness_prune_actions`], which removes the nodes it follows.
+    fn count_productive_path_visits(&self, actions: &[PruneAction]) -> u64 {
+        let mut marked: HashSet<Nibbles> = HashSet::default();
+        for action in actions {
+            let mut path = Nibbles::default();
+            while path != action.path {
+                let Some(node) =
+                    self.subtrie_for_path(&path).and_then(|subtrie| subtrie.nodes.get(&path))
+                else {
+                    break
+                };
+                marked.insert(path);
+                match node {
+                    SparseNode::Extension { key, .. } => path.extend(key),
+                    SparseNode::Branch { .. } => {
+                        let Some(nibble) = action.path.get(path.len()) else { break };
+                        path.push_unchecked(nibble);
+                    }
+                    SparseNode::Empty | SparseNode::Leaf { .. } => break,
+                }
+            }
+        }
+        marked.len() as u64
     }
 
     /// Collects a prefix-free set of revealed roots that can be blinded.
@@ -1427,7 +1722,7 @@ impl ParallelSparseTrie {
             }
         }
 
-        self.finalize_pruned_roots(effective_pruned_roots).0
+        self.finalize_pruned_roots(effective_pruned_roots, false).0
     }
 
     /// Returns true if retaining updates is enabled for the overall trie.
@@ -1870,6 +2165,7 @@ impl ParallelSparseTrie {
     fn finalize_pruned_roots(
         &mut self,
         mut effective_pruned_roots: Vec<Nibbles>,
+        diagnostics: bool,
     ) -> (usize, FinalizationMetrics) {
         if effective_pruned_roots.is_empty() {
             return (0, FinalizationMetrics::default());
@@ -1908,63 +2204,128 @@ impl ParallelSparseTrie {
             "prune roots must be prefix-free"
         );
 
+        if diagnostics {
+            metrics.upper_roots = roots_upper.len() as u64;
+            metrics.lower_subtries_with_roots = roots_lower
+                .chunk_by(|path_a, path_b| {
+                    SparseSubtrieType::from_path(path_a) == SparseSubtrieType::from_path(path_b)
+                })
+                .count() as u64;
+        }
+
+        // Branch node masks pruning, ahead of the node maps so that a removed mask can still be
+        // checked against the node it belonged to. Nothing here reads the nodes and nothing below
+        // reads the masks, so the order is free; what it buys is the one measurement that decides
+        // whether enumerating descendants could replace this scan.
+        let mut removed_masks = Vec::new();
+        let mut masks_removed = 0u64;
+        let (_, masks_ns) = timed(|| {
+            self.branch_node_masks.retain(|p, _| {
+                let keep = if SparseSubtrieType::path_len_is_upper(p.len()) {
+                    !starts_with_pruned_in(roots_upper, p)
+                } else {
+                    !starts_with_pruned_in(roots_lower, p) && !starts_with_pruned_in(roots_upper, p)
+                };
+                if !keep {
+                    masks_removed += 1;
+                    if diagnostics {
+                        removed_masks.push(*p);
+                    }
+                }
+                keep
+            });
+        });
+        metrics.masks_us = (masks_ns / 1_000) as u64;
+        metrics.masks_removed = masks_removed;
+        if diagnostics {
+            metrics.masks_removed_without_node = removed_masks
+                .iter()
+                .filter(|path| {
+                    self.subtrie_for_path(path)
+                        .is_none_or(|subtrie| !subtrie.nodes.contains_key(path))
+                })
+                .count() as u64;
+        }
+
         // Upper prune roots that are prefixes of lower subtrie root paths cause the entire
         // subtrie to be cleared (preserving allocations for reuse).
-        if !roots_upper.is_empty() {
-            metrics.lower_subtries_scanned =
-                metrics.lower_subtries_scanned.saturating_add(self.lower_subtries.len() as u64);
-            for subtrie in &mut *self.lower_subtries {
-                let should_clear = subtrie.as_revealed_ref().is_some_and(|s| {
-                    let search_idx = roots_upper.partition_point(|root| root <= &s.path);
-                    search_idx > 0 && s.path.starts_with(&roots_upper[search_idx - 1])
-                });
-                if should_clear {
-                    subtrie.clear();
+        let (_, subtries_ns) = timed(|| {
+            if !roots_upper.is_empty() {
+                metrics.lower_subtries_scanned =
+                    metrics.lower_subtries_scanned.saturating_add(self.lower_subtries.len() as u64);
+                for subtrie in &mut *self.lower_subtries {
+                    let should_clear = subtrie.as_revealed_ref().is_some_and(|s| {
+                        let search_idx = roots_upper.partition_point(|root| root <= &s.path);
+                        search_idx > 0 && s.path.starts_with(&roots_upper[search_idx - 1])
+                    });
+                    if should_clear {
+                        if let Some(revealed) = subtrie.as_revealed_ref() {
+                            metrics.nodes_removed =
+                                metrics.nodes_removed.saturating_add(revealed.nodes.len() as u64);
+                            metrics.values_removed = metrics
+                                .values_removed
+                                .saturating_add(revealed.inner.values.len() as u64);
+                        }
+                        subtrie.clear();
+                    }
                 }
             }
-        }
-
-        // Upper subtrie: prune nodes and values
-        self.upper_subtrie.nodes.retain(|p, _| !is_strict_descendant_in(roots_upper, p));
-        self.upper_subtrie.inner.values.retain(|p, _| {
-            !starts_with_pruned_in(roots_upper, p) && !starts_with_pruned_in(roots_lower, p)
         });
+        metrics.subtries_us = (subtries_ns / 1_000) as u64;
 
-        // Process lower subtries using chunk_by to group roots by subtrie
-        for roots_group in roots_lower.chunk_by(|path_a, path_b| {
-            SparseSubtrieType::from_path(path_a) == SparseSubtrieType::from_path(path_b)
-        }) {
-            metrics.lower_subtries_scanned = metrics.lower_subtries_scanned.saturating_add(1);
-            let subtrie_idx = path_subtrie_index_unchecked(&roots_group[0]);
+        let (_, maps_ns) = timed(|| {
+            // Upper subtrie: prune nodes and values
+            let before_nodes = self.upper_subtrie.nodes.len();
+            let before_values = self.upper_subtrie.inner.values.len();
+            self.upper_subtrie.nodes.retain(|p, _| !is_strict_descendant_in(roots_upper, p));
+            self.upper_subtrie.inner.values.retain(|p, _| {
+                !starts_with_pruned_in(roots_upper, p) && !starts_with_pruned_in(roots_lower, p)
+            });
+            metrics.nodes_removed = metrics
+                .nodes_removed
+                .saturating_add((before_nodes - self.upper_subtrie.nodes.len()) as u64);
+            metrics.values_removed = metrics
+                .values_removed
+                .saturating_add((before_values - self.upper_subtrie.inner.values.len()) as u64);
 
-            // Skip unrevealed/blinded subtries - nothing to prune.
-            let should_clear = {
-                let Some(subtrie) = self.lower_subtries[subtrie_idx].as_revealed_mut() else {
-                    continue;
+            // Process lower subtries using chunk_by to group roots by subtrie
+            for roots_group in roots_lower.chunk_by(|path_a, path_b| {
+                SparseSubtrieType::from_path(path_a) == SparseSubtrieType::from_path(path_b)
+            }) {
+                metrics.lower_subtries_scanned = metrics.lower_subtries_scanned.saturating_add(1);
+                let subtrie_idx = path_subtrie_index_unchecked(&roots_group[0]);
+
+                // Skip unrevealed/blinded subtries - nothing to prune.
+                let should_clear = {
+                    let Some(subtrie) = self.lower_subtries[subtrie_idx].as_revealed_mut() else {
+                        continue;
+                    };
+
+                    let before_nodes = subtrie.nodes.len();
+                    let before_values = subtrie.inner.values.len();
+
+                    // Retain only nodes/values not descended from any pruned root.
+                    subtrie.nodes.retain(|p, _| !is_strict_descendant_in(roots_group, p));
+                    subtrie.inner.values.retain(|p, _| !starts_with_pruned_in(roots_group, p));
+
+                    metrics.nodes_removed = metrics
+                        .nodes_removed
+                        .saturating_add((before_nodes - subtrie.nodes.len()) as u64);
+                    metrics.values_removed = metrics
+                        .values_removed
+                        .saturating_add((before_values - subtrie.inner.values.len()) as u64);
+
+                    // If prune removed the node at `subtrie.path`, the subtrie can no longer be
+                    // represented as revealed and must be blinded.
+                    !subtrie.nodes.contains_key(&subtrie.path)
                 };
 
-                // Retain only nodes/values not descended from any pruned root.
-                subtrie.nodes.retain(|p, _| !is_strict_descendant_in(roots_group, p));
-                subtrie.inner.values.retain(|p, _| !starts_with_pruned_in(roots_group, p));
-
-                // If prune removed the node at `subtrie.path`, the subtrie can no longer be
-                // represented as revealed and must be blinded.
-                !subtrie.nodes.contains_key(&subtrie.path)
-            };
-
-            if should_clear {
-                self.lower_subtries[subtrie_idx].clear();
-            }
-        }
-
-        // Branch node masks pruning
-        self.branch_node_masks.retain(|p, _| {
-            if SparseSubtrieType::path_len_is_upper(p.len()) {
-                !starts_with_pruned_in(roots_upper, p)
-            } else {
-                !starts_with_pruned_in(roots_lower, p) && !starts_with_pruned_in(roots_upper, p)
+                if should_clear {
+                    self.lower_subtries[subtrie_idx].clear();
+                }
             }
         });
+        metrics.maps_us = (maps_ns / 1_000) as u64;
 
         (nodes_converted, metrics)
     }
@@ -2593,6 +2954,152 @@ impl ParallelSparseTrie {
 
             self.lower_subtries[index] = LowerSparseSubtrie::Revealed(subtrie);
         }
+    }
+
+    /// [`Clone::clone`], reporting where the copy's time, bytes, and allocations went.
+    ///
+    /// The value returned is what `Clone::clone` returns; the split comes from copying field by
+    /// field with a timer around each, so the components describe the copy that actually happened.
+    /// A caller that deep-copies this trie per block and wants to know whether a narrower node
+    /// representation would pay for itself needs this rather than [`Self::memory_size`], because
+    /// the question is which component the milliseconds are in, not how large the trie is.
+    ///
+    /// The component timers always run and cost a handful of clock reads. What `options` adds
+    /// costs the block real work — see [`CloneMeasureOptions`] — and lands in `accounting_us` and
+    /// `branch_hash_probe_us`, both outside `total_us` so the phase number stays the phase.
+    pub fn clone_measured(&self, options: CloneMeasureOptions) -> (Self, CloneBreakdown) {
+        let mut breakdown = CloneBreakdown::default();
+        let mut inner_ns = CloneNanos::default();
+
+        let (subtries, subtries_ns) = timed(|| {
+            let upper = Box::new(self.upper_subtrie.clone_measured(&mut inner_ns));
+            let lower: Box<[LowerSparseSubtrie; NUM_LOWER_SUBTRIES]> =
+                Box::new(core::array::from_fn(|i| {
+                    self.lower_subtries[i].map_allocated(|s| s.clone_measured(&mut inner_ns))
+                }));
+            (upper, lower)
+        });
+        let (upper_subtrie, lower_subtries) = subtries;
+
+        let (branch_node_masks, masks_ns) = timed(|| self.branch_node_masks.clone());
+        let (update_actions_buffers, action_buffers_ns) =
+            timed(|| self.update_actions_buffers.clone());
+        let (rest, rest_own_ns) =
+            timed(|| (self.prefix_set.clone(), self.updates.clone(), self.parallelism_thresholds));
+        let (prefix_set, updates, parallelism_thresholds) = rest;
+
+        // The subtrie pass is wall-clocked as a whole and attributed by the timers inside it, so
+        // what it cost beyond nodes, values, and buffers — the boxes, the 256-slot array, the
+        // struct moves — lands in `rest` rather than silently leaving the total.
+        let attributed_ns = inner_ns.nodes + inner_ns.values + inner_ns.buffers;
+        let rest_ns = rest_own_ns + subtries_ns.saturating_sub(attributed_ns);
+
+        breakdown.nodes_us = (inner_ns.nodes / 1_000) as u64;
+        breakdown.values_us = (inner_ns.values / 1_000) as u64;
+        breakdown.masks_us = (masks_ns / 1_000) as u64;
+        breakdown.buffers_us = ((inner_ns.buffers + action_buffers_ns) / 1_000) as u64;
+        breakdown.rest_us = (rest_ns / 1_000) as u64;
+        breakdown.total_us =
+            ((subtries_ns + masks_ns + action_buffers_ns + rest_own_ns) / 1_000) as u64;
+
+        let clone = Self {
+            upper_subtrie,
+            lower_subtries,
+            prefix_set,
+            updates,
+            branch_node_masks,
+            update_actions_buffers,
+            parallelism_thresholds,
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.clone(),
+            #[cfg(feature = "trie-debug")]
+            debug_recorder: self.debug_recorder.clone(),
+        };
+
+        if options.accounting {
+            let (_, accounting_ns) = timed(|| clone.account_copy(&mut breakdown));
+            breakdown.accounting_us = (accounting_ns / 1_000) as u64;
+        }
+
+        if options.branch_hash_probe {
+            breakdown.branch_hash_probe_us = clone.probe_branch_hash_boxes();
+        }
+
+        (clone, breakdown)
+    }
+
+    /// Fills the byte, allocation, and structural counters of `breakdown` from this trie.
+    ///
+    /// Separate from the timers because it is a full walk of every node and value entry, which the
+    /// copy itself never performs: hash-map cloning is a bulk operation. Keeping it apart is what
+    /// lets `accounting_us` be subtracted from a run carrying this instrumentation.
+    fn account_copy(&self, breakdown: &mut CloneBreakdown) {
+        self.upper_subtrie.account_copy(breakdown);
+        breakdown.rest_bytes += core::mem::size_of::<SparseSubtrie>() as u64;
+
+        for subtrie in &*self.lower_subtries {
+            if let Some(subtrie) = subtrie.allocated_ref() {
+                breakdown.subtries += 1;
+                subtrie.account_copy(breakdown);
+                breakdown.rest_bytes += core::mem::size_of::<SparseSubtrie>() as u64;
+            }
+        }
+        breakdown.rest_bytes +=
+            (core::mem::size_of::<LowerSparseSubtrie>() * NUM_LOWER_SUBTRIES) as u64;
+
+        breakdown.mask_entries = self.branch_node_masks.len() as u64;
+        breakdown.masks_bytes =
+            map_table_bytes::<Nibbles, BranchNodeMasks>(self.branch_node_masks.capacity());
+
+        breakdown.rest_bytes += (self.prefix_set.len() * core::mem::size_of::<Nibbles>()) as u64;
+        if let Some(updates) = &self.updates {
+            breakdown.rest_bytes +=
+                map_table_bytes::<Nibbles, BranchNodeCompact>(updates.updated_nodes.capacity()) +
+                    map_table_bytes::<Nibbles, ()>(updates.removed_nodes.capacity());
+        }
+
+        for buf in &self.update_actions_buffers {
+            breakdown.buffers_bytes +=
+                (buf.capacity() * core::mem::size_of::<SparseTrieUpdatesAction>()) as u64;
+        }
+
+        // Every branch node carries one box, so the box counts fall out of the node census rather
+        // than needing their own walk. They are folded into the node maps because that is where
+        // the copy pays them; keeping them addressable separately is what sizes the candidate.
+        breakdown.branch_hash_allocs = breakdown.branch_nodes;
+        breakdown.branch_hash_bytes =
+            breakdown.branch_nodes * core::mem::size_of::<[B256; 16]>() as u64;
+        breakdown.nodes_bytes += breakdown.branch_hash_bytes;
+        breakdown.nodes_allocs += breakdown.branch_hash_allocs;
+
+        breakdown.total_bytes = breakdown.nodes_bytes +
+            breakdown.values_bytes +
+            breakdown.masks_bytes +
+            breakdown.buffers_bytes +
+            breakdown.rest_bytes;
+        breakdown.total_allocs = breakdown.nodes_allocs + breakdown.values_allocs;
+    }
+
+    /// Microseconds to allocate, copy, and free one branch-hash box per branch node.
+    ///
+    /// The copy pays the allocation and the copy, and the generation that eventually drops pays the
+    /// free, so all three belong in the price of carrying the box.
+    fn probe_branch_hash_boxes(&self) -> u64 {
+        let mut sink = 0u8;
+        let (_, ns) = timed(|| {
+            for subtrie in core::iter::once(self.upper_subtrie.as_ref())
+                .chain(self.lower_subtries.iter().filter_map(LowerSparseSubtrie::allocated_ref))
+            {
+                for node in subtrie.nodes.values() {
+                    if let SparseNode::Branch { blinded_hashes, .. } = node {
+                        let copy = blinded_hashes.clone();
+                        sink ^= copy[0].0[0];
+                    }
+                }
+            }
+        });
+        core::hint::black_box(sink);
+        (ns / 1_000) as u64
     }
 
     /// Returns a heuristic for the in-memory size of this trie in bytes.
@@ -3281,6 +3788,46 @@ impl SparseSubtrie {
         self.inner.values.shrink_to(size);
     }
 
+    /// [`Clone::clone`], accumulating each component's nanoseconds into `ns`.
+    ///
+    /// Field by field rather than derived so that the node map, the value map, and the reusable
+    /// buffers are timed apart. The result is what the derived clone produces.
+    fn clone_measured(&self, ns: &mut CloneNanos) -> Self {
+        let (nodes, nodes_ns) = timed(|| self.nodes.clone());
+        let (values, values_ns) = timed(|| self.inner.values.clone());
+        let (buffers, buffers_ns) = timed(|| self.inner.buffers.clone());
+        ns.nodes += nodes_ns;
+        ns.values += values_ns;
+        ns.buffers += buffers_ns;
+        Self { path: self.path, nodes, inner: SparseSubtrieInner { values, buffers } }
+    }
+
+    /// Adds this subtrie's byte, allocation, and structural counts to `breakdown`.
+    fn account_copy(&self, breakdown: &mut CloneBreakdown) {
+        breakdown.node_entries += self.nodes.len() as u64;
+        breakdown.nodes_bytes += map_table_bytes::<Nibbles, SparseNode>(self.nodes.capacity());
+        breakdown.nodes_allocs += u64::from(!self.nodes.is_empty());
+        for node in self.nodes.values() {
+            match node {
+                SparseNode::Branch { .. } => breakdown.branch_nodes += 1,
+                SparseNode::Extension { .. } => breakdown.extension_nodes += 1,
+                SparseNode::Leaf { .. } => breakdown.leaf_nodes += 1,
+                SparseNode::Empty => {}
+            }
+        }
+
+        breakdown.value_entries += self.inner.values.len() as u64;
+        breakdown.values_bytes += map_table_bytes::<Nibbles, Vec<u8>>(self.inner.values.capacity());
+        breakdown.values_allocs += u64::from(!self.inner.values.is_empty());
+        for value in self.inner.values.values() {
+            breakdown.values_bytes += value.capacity() as u64;
+            breakdown.values_allocs += u64::from(value.capacity() > 0);
+        }
+
+        breakdown.buffers_bytes += (self.inner.buffers.memory_size() -
+            core::mem::size_of::<SparseSubtrieBuffers>()) as u64;
+    }
+
     /// Returns a heuristic for the in-memory size of this subtrie in bytes.
     pub(crate) fn memory_size(&self) -> usize {
         let mut size = core::mem::size_of::<Self>();
@@ -3943,8 +4490,8 @@ enum SparseTrieUpdatesAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        path_subtrie_index_unchecked, LowerSparseSubtrie, ParallelSparseTrie, RetentionOptions,
-        SparseSubtrie, SparseSubtrieType,
+        path_subtrie_index_unchecked, CloneMeasureOptions, LowerSparseSubtrie, ParallelSparseTrie,
+        RetentionOptions, SparseSubtrie, SparseSubtrieType,
     };
     use crate::{
         parallel::ChangedSubtrie, trie::SparseNodeState, LeafLookup, LeafLookupError, SparseNode,
@@ -8142,6 +8689,144 @@ mod tests {
         assert!(outcome.metrics.edges_visited > 0);
     }
 
+    /// Builds a trie whose retained set leaves several subtrees prunable.
+    fn retention_fixture() -> (ParallelSparseTrie, Vec<Nibbles>) {
+        let mut trie = ParallelSparseTrie::default();
+        let value = large_account_value();
+        for i in 0..8u8 {
+            for j in 0..4u8 {
+                trie.update_leaf(
+                    pad_nibbles_right(Nibbles::from_nibbles([i, j, 0x3, 0x4, 0x5, 0x6])),
+                    value.clone(),
+                )
+                .unwrap();
+            }
+        }
+        trie.root();
+
+        let mut retained_paths = vec![
+            pad_nibbles_right(Nibbles::from_nibbles([0x1, 0x1, 0x3, 0x4, 0x5, 0x6])),
+            pad_nibbles_right(Nibbles::from_nibbles([0x4, 0x2, 0x3, 0x4, 0x5, 0x6])),
+        ];
+        retained_paths.sort_unstable();
+        (trie, retained_paths)
+    }
+
+    /// The productive share is what says whether a narrower frontier has anything to remove.
+    #[test]
+    fn retain_witness_counts_visits_on_the_descent_to_a_blinded_node() {
+        let (mut trie, retained_paths) = retention_fixture();
+        let outcome = trie.retain_witness_paths_with_options(
+            &retained_paths,
+            RetentionOptions::sorted_input().with_diagnostics(),
+        );
+
+        assert!(
+            outcome.pruned > 0,
+            "the fixture must blind something for the count to mean anything"
+        );
+        assert!(outcome.metrics.visits_on_productive_path > 0);
+        assert!(
+            outcome.metrics.visits_on_productive_path <= outcome.metrics.nodes_visited,
+            "a node on the descent to a prune root was necessarily visited by the walk, so the \
+             count cannot exceed the walk's own"
+        );
+    }
+
+    /// A walk that blinds nothing has no descent to count, and must not report one.
+    #[test]
+    fn retain_witness_reports_no_productive_visits_when_nothing_is_blinded() {
+        let mut trie = ParallelSparseTrie::default();
+        let value = large_account_value();
+        let mut retained_paths = Vec::new();
+        for i in 0..4u8 {
+            let path = pad_nibbles_right(Nibbles::from_nibbles([i, 0x1, 0x2, 0x3]));
+            trie.update_leaf(path, value.clone()).unwrap();
+            retained_paths.push(path);
+        }
+        trie.root();
+        retained_paths.sort_unstable();
+
+        let outcome = trie.retain_witness_paths_with_options(
+            &retained_paths,
+            RetentionOptions::sorted_input().with_diagnostics(),
+        );
+
+        assert_eq!(outcome.pruned, 0);
+        assert_eq!(outcome.metrics.visits_on_productive_path, 0);
+        assert!(outcome.metrics.nodes_visited > 0);
+    }
+
+    /// The default walk collects nothing it does not already pay for.
+    ///
+    /// The phase and work counters ride along with work the walk does anyway. The two below do
+    /// not — one re-descends to every prune root, the other holds the removed mask paths — and a
+    /// production block has no use for either, so they must stay off until asked for.
+    #[test]
+    fn retain_witness_default_options_collect_no_shape_diagnostics() {
+        let (mut trie, retained_paths) = retention_fixture();
+
+        // A mask under a prunable subtree, so the removal count has something to count. It is an
+        // orphan as well, which makes the classification's absence below visible rather than
+        // vacuous.
+        let orphan = Nibbles::from_nibbles([0x6, 0x0, 0xf, 0xf]);
+        trie.branch_node_masks
+            .insert(orphan, BranchNodeMasks { hash_mask: 0b1.into(), tree_mask: 0b1.into() });
+
+        let outcome = trie
+            .retain_witness_paths_with_options(&retained_paths, RetentionOptions::sorted_input());
+
+        assert!(outcome.pruned > 0, "the walk still did its work");
+        assert!(outcome.metrics.nodes_visited > 0, "the free counters are still free");
+        assert_eq!(
+            outcome.metrics.finalization_masks_removed, 1,
+            "a plain count rides along with the scan and needs no extra pass"
+        );
+
+        assert_eq!(
+            outcome.metrics.finalization_masks_removed_without_node, 0,
+            "the orphan was removed, but classifying it needs the pass this run did not request"
+        );
+        assert_eq!(outcome.metrics.visits_on_productive_path, 0);
+        assert_eq!(outcome.metrics.productive_path_us, 0);
+        assert_eq!(outcome.metrics.finalization_upper_roots, 0);
+        assert_eq!(outcome.metrics.finalization_lower_subtries_with_roots, 0);
+    }
+
+    /// Masks outlive their nodes, and a node-driven finalization would leave exactly these behind.
+    ///
+    /// Masks are written on reveal and on commit and removed only by `commit_updates`, so a mask
+    /// whose node was removed by a leaf update is still in the map when retention runs. The full
+    /// scan removes it because it scans by path; enumerating descendants of a prune root through
+    /// the node maps never reaches it. The counter is what turns that from an argument into a
+    /// measurement on real traffic.
+    #[test]
+    fn retain_witness_counts_removed_masks_that_had_no_node() {
+        let (mut trie, retained_paths) = retention_fixture();
+
+        // A path under a prunable subtree that no node occupies. `[0x6, ..]` is outside both
+        // retained paths, so finalization removes everything below it.
+        let orphan = Nibbles::from_nibbles([0x6, 0x0, 0xf, 0xf]);
+        assert!(
+            trie.subtrie_for_path(&orphan).is_none_or(|s| !s.nodes.contains_key(&orphan)),
+            "the fixture must not have a node here, or the test proves nothing"
+        );
+        trie.branch_node_masks
+            .insert(orphan, BranchNodeMasks { hash_mask: 0b1.into(), tree_mask: 0b1.into() });
+
+        let outcome = trie.retain_witness_paths_with_options(
+            &retained_paths,
+            RetentionOptions::sorted_input().with_diagnostics(),
+        );
+
+        assert!(!trie.branch_node_masks.contains_key(&orphan), "the full scan removes it by path");
+        assert_eq!(outcome.metrics.finalization_masks_removed_without_node, 1);
+        assert!(
+            outcome.metrics.finalization_masks_removed >=
+                outcome.metrics.finalization_masks_removed_without_node
+        );
+    }
+
     #[test]
     fn retain_witness_sorted_hint_falls_back_for_unsorted_input() {
         let mut trie = ParallelSparseTrie::default();
@@ -9199,5 +9884,120 @@ mod tests {
 
         // Call root() to compute the trie root hash
         let _root = trie.root();
+    }
+
+    /// The measured copy has to be the copy, or its decomposition describes something else.
+    #[test]
+    fn test_clone_measured_matches_derived_clone() {
+        let mut trie = new_test_trie(
+            [
+                (Nibbles::default(), SparseNode::new_ext(Nibbles::from_nibbles([0x0]))),
+                (Nibbles::from_nibbles([0x0]), SparseNode::new_branch(0b11.into(), &[])),
+                (
+                    Nibbles::from_nibbles([0x0, 0x0]),
+                    SparseNode::new_branch(0b11.into(), &[(0, B256::repeat_byte(0xaa))]),
+                ),
+                (
+                    Nibbles::from_nibbles([0x0, 0x0, 0x0]),
+                    SparseNode::new_leaf(Nibbles::from_nibbles([0x1, 0x2])),
+                ),
+                (
+                    Nibbles::from_nibbles([0x0, 0x0, 0x1]),
+                    SparseNode::new_leaf(Nibbles::from_nibbles([0x3, 0x4])),
+                ),
+                (
+                    Nibbles::from_nibbles([0x0, 0x1]),
+                    SparseNode::new_leaf(Nibbles::from_nibbles([0x5, 0x6])),
+                ),
+            ]
+            .into_iter(),
+        );
+        trie.branch_node_masks.insert(
+            Nibbles::from_nibbles([0x0, 0x0]),
+            BranchNodeMasks { hash_mask: 0b11.into(), tree_mask: 0b01.into() },
+        );
+
+        let (measured, breakdown) =
+            trie.clone_measured(CloneMeasureOptions::default().with_branch_hash_probe());
+        assert_eq!(measured, trie.clone());
+
+        // Three of the six nodes above are branches, and each carries one 512-byte box whether or
+        // not any of its children is blinded — which is the whole point of counting them apart.
+        assert_eq!(breakdown.branch_nodes, 2);
+        assert_eq!(breakdown.leaf_nodes, 3);
+        assert_eq!(breakdown.extension_nodes, 1);
+        assert_eq!(breakdown.node_entries, 6);
+        assert_eq!(breakdown.value_entries, 3);
+        assert_eq!(breakdown.mask_entries, 1);
+        assert_eq!(breakdown.branch_hash_allocs, breakdown.branch_nodes);
+        assert_eq!(breakdown.branch_hash_bytes, breakdown.branch_nodes * 512);
+        assert!(breakdown.branch_hash_bytes < breakdown.nodes_bytes);
+        assert_eq!(
+            breakdown.total_bytes,
+            breakdown.nodes_bytes +
+                breakdown.values_bytes +
+                breakdown.masks_bytes +
+                breakdown.buffers_bytes +
+                breakdown.rest_bytes
+        );
+    }
+
+    /// The default asks for the timers only, and must not walk the copy to answer.
+    ///
+    /// The census and the probe each cost the block work a plain copy never does, and both answer
+    /// structural questions that move slowly. A run that did not ask for them has to pay nothing.
+    #[test]
+    fn test_clone_measured_default_skips_the_accounting_walk_and_the_probe() {
+        let mut trie = new_test_trie(
+            [
+                (Nibbles::default(), SparseNode::new_branch(0b11.into(), &[])),
+                (
+                    Nibbles::from_nibbles([0x0]),
+                    SparseNode::new_leaf(Nibbles::from_nibbles([0x1, 0x2])),
+                ),
+                (
+                    Nibbles::from_nibbles([0x1]),
+                    SparseNode::new_leaf(Nibbles::from_nibbles([0x3, 0x4])),
+                ),
+            ]
+            .into_iter(),
+        );
+        trie.branch_node_masks.insert(
+            Nibbles::default(),
+            BranchNodeMasks { hash_mask: 0b11.into(), tree_mask: 0b01.into() },
+        );
+
+        let (measured, breakdown) = trie.clone_measured(CloneMeasureOptions::default());
+        assert_eq!(measured, trie);
+
+        assert_eq!(breakdown.accounting_us, 0);
+        assert_eq!(breakdown.branch_hash_probe_us, 0);
+        assert_eq!(breakdown.total_bytes, 0, "the census did not run, so it reports no bytes");
+        assert_eq!(breakdown.total_allocs, 0);
+        assert_eq!(breakdown.node_entries, 0);
+        assert_eq!(breakdown.branch_nodes, 0);
+
+        // The timers are free, so they are never optional.
+        let (_, accounted) = trie.clone_measured(CloneMeasureOptions::accounting());
+        assert_eq!(accounted.node_entries, 3);
+        assert_eq!(accounted.branch_nodes, 1);
+        assert!(accounted.total_bytes > 0);
+        assert_eq!(accounted.branch_hash_probe_us, 0, "accounting alone does not price the box");
+    }
+
+    /// An empty trie still has an upper subtrie with a root node, and nothing else.
+    #[test]
+    fn test_clone_measured_empty_trie() {
+        let trie = ParallelSparseTrie::default();
+        let (measured, breakdown) =
+            trie.clone_measured(CloneMeasureOptions::default().with_branch_hash_probe());
+        assert_eq!(measured, trie);
+        assert_eq!(breakdown.branch_nodes, 0);
+        assert_eq!(breakdown.branch_hash_bytes, 0);
+        assert_eq!(breakdown.branch_hash_allocs, 0);
+        assert_eq!(breakdown.subtries, 0);
+        assert_eq!(breakdown.value_entries, 0);
+        // The root placeholder is a node entry that is neither branch, extension, nor leaf.
+        assert_eq!(breakdown.node_entries, 1);
     }
 }
