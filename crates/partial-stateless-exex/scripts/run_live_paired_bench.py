@@ -87,15 +87,28 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--shadow-sample",
+        type=int,
+        default=None,
+        help=(
+            "with --engine-access on, re-execute one block in this many purely to compare against "
+            "the artifact, keeping the correctness oracle live (default 50). 0 disables sampling "
+            "entirely; use it only for a pure timing run, where the sampled blocks' re-execution "
+            "would otherwise sit in the builder distribution being measured"
+        ),
+    )
+    parser.add_argument(
         "--engine-access",
-        choices=("off", "shadow"),
+        choices=("off", "shadow", "on"),
         default="off",
         help=(
             "set PS_ENGINE_ACCESS (default: off, which is the baseline every measured run must "
             "use). 'shadow' makes the Engine capture its access set and the builder compare it "
             "against its own re-execution, writing access_shadow.jsonl; the builder still "
             "re-executes, so builder timings stay comparable but carry the capture's cost on the "
-            "Engine side. 'on' is stage 4 and is deliberately not offered here"
+            "Engine side. 'on' makes the builder use the artifact instead of re-executing, which "
+            "is what the item exists to do -- read builder timings from an 'on' run, never a "
+            "'shadow' one, which by construction cannot show the improvement"
         ),
     )
     parser.add_argument("node_args", nargs=argparse.REMAINDER)
@@ -281,6 +294,7 @@ def benchmark_environment(
     canonical_rebuild,
     retain_generation,
     engine_access,
+    shadow_sample,
 ):
     env = os.environ.copy()
     env.update(
@@ -299,6 +313,8 @@ def benchmark_environment(
             "PS_SHADOW_OUTPUT": str(shadow_path),
         }
     )
+    if shadow_sample is not None:
+        env["PS_SHADOW_SAMPLE"] = str(shadow_sample)
     for name in DISABLED_DIAGNOSTICS:
         env.pop(name, None)
     return env
@@ -348,13 +364,15 @@ def main():
         args.canonical_rebuild,
         args.retain_generation,
         args.engine_access,
+        args.shadow_sample,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
     print(
         "Waiting for cache readiness, then collecting "
         f"{args.warmup} sample-warm-up plus {args.samples} accepted same-block samples "
-        f"(canonical_rebuild={args.canonical_rebuild}, engine_access={args.engine_access})",
+        f"(canonical_rebuild={args.canonical_rebuild}, engine_access={args.engine_access}, "
+        f"shadow_sample={args.shadow_sample if args.shadow_sample is not None else 'default'})",
         flush=True,
     )
 

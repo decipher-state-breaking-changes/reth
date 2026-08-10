@@ -573,6 +573,11 @@ pub struct BuilderBenchmarkRecord {
     pub block_number: u64,
     pub block_hash: B256,
     pub historical_full_db_evm_us: u64,
+    /// Whether the Engine's access artifact replaced this block's re-execution (B3 stage 4).
+    ///
+    /// When true `historical_full_db_evm_us` is zero because no EVM ran here, so the two fields
+    /// must be read together: a median over blocks that mixes both paths measures neither.
+    pub artifact_reused: bool,
     pub builder_total_us: u64,
     pub transition_witness_build_us: u64,
     pub snapshot_created: bool,

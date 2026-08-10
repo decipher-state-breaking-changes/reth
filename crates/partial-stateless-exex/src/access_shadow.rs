@@ -1,9 +1,14 @@
-//! Shadow comparison of the Engine's captured access set against the builder's re-execution.
+//! Consumption of the Engine's captured access set, and its comparison against re-execution.
 //!
-//! Stage 3 of B3. The builder keeps re-executing every block and additionally consumes the
-//! artifact the Engine published for it, then compares the two access sets key by key. Nothing
-//! here changes what the builder produces: it exists only to decide whether the artifact may be
-//! *relied* on, which is stage 4's question.
+//! Stages 3 and 4 of B3. In `shadow` mode the builder re-executes every block and additionally
+//! consumes the artifact the Engine published for it, comparing the two access sets key by key;
+//! nothing it produces changes, because the comparison exists only to decide whether the artifact
+//! may be *relied* on. In `on` mode it is relied on: [`simulation_from_artifact`] replaces the
+//! re-execution outright, and only a sampled fraction of blocks still executes both ways.
+//!
+//! That sampling is not leftover scaffolding. The comparison needs a second opinion, and `on` mode
+//! deletes the very re-execution that provides it, so an unsampled `on` run would run with no
+//! oracle at all. Sampling keeps one alive permanently for a proportional share of the win.
 //!
 //! Both sides run the same extraction function, so this is not testing the extractor. What it
 //! tests is whether the two execution paths built the same `State` to extract from — prewarming
@@ -15,20 +20,30 @@
 //! back to its own execution in every one of those cases. The gate is that among the blocks that
 //! *did* hit, divergence is zero.
 
+use crate::rebuild::HistoricalSimulation;
 use alloy_primitives::B256;
 use partial_stateless::accessed_state::BlockAccessedState;
+use reth_ethereum::EthPrimitives;
+use reth_evm::execute::BlockExecutionOutput;
 use reth_execution_access::{global_handoff, BlockAccessArtifact, HandoffStats};
+use reth_primitives_traits::NodePrimitives;
 use std::{
     fmt::Write as _,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 use tracing::{error, info, warn};
 
 /// Divergence samples carried on a single block's report.
 const MAX_SAMPLES: usize = 8;
+
+/// Selects the stage-4 shadow sampling rate.
+const SHADOW_SAMPLE_VAR: &str = "PS_SHADOW_SAMPLE";
+
+/// One block in fifty, costing about 2% of the item's win to keep the oracle permanently live.
+const DEFAULT_SHADOW_SAMPLE: u64 = 50;
 
 /// Removes the Engine's artifact for `block_hash`, if capture is enabled at all.
 ///
@@ -72,12 +87,12 @@ pub fn record_shadow_comparison(
             dropped_capacity = stats.dropped_capacity,
             "No Engine access artifact for this block; the builder re-executed it"
         );
-        let outcome = ShadowOutcome { hit: false, divergence: None, capture_us: 0 };
+        let outcome = ShadowOutcome { hit: false, divergence: None, coverage: None, capture_us: 0 };
         append_shadow_record(block_number, block_hash, &outcome, simulation_us, &stats);
         return outcome
     };
 
-    let divergence = compare(parent_hash, simulated, simulated_lowest_block, &artifact);
+    let (divergence, coverage) = compare(parent_hash, simulated, simulated_lowest_block, &artifact);
     let blocks = totals.blocks.fetch_add(1, Ordering::Relaxed) + 1;
     let hits = totals.hits.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -111,10 +126,73 @@ pub fn record_shadow_comparison(
         );
     }
 
-    let outcome =
-        ShadowOutcome { hit: true, divergence: Some(divergence), capture_us: artifact.capture_us };
+    let outcome = ShadowOutcome {
+        hit: true,
+        divergence: Some(divergence),
+        coverage: Some(coverage),
+        capture_us: artifact.capture_us,
+    };
     append_shadow_record(block_number, block_hash, &outcome, simulation_us, &stats);
     outcome
+}
+
+/// Rebuilds a block's simulation result from a captured artifact, without re-executing it.
+///
+/// This is the whole point of B3: the Engine already produced every field below, and the only
+/// work left is moving them. Returns `None` if the artifact's execution output is missing or of
+/// an unexpected type, which the caller must treat as a miss and re-execute -- never as an empty
+/// result, since a silently empty output would produce a wrong sidecar rather than a slow one.
+///
+/// `elapsed_us` is reported as zero because no EVM ran; the artifact's own `capture_us` is what
+/// this path cost, and it was paid on the Engine's thread.
+pub fn simulation_from_artifact(artifact: BlockAccessArtifact) -> Option<HistoricalSimulation> {
+    let output =
+        artifact.output::<BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>>()?;
+    let lowest_block_number = artifact.access.lowest_block_hash_number;
+    Some(HistoricalSimulation {
+        accessed: artifact.access.into(),
+        lowest_block_number,
+        // The Engine keeps its own reference for the canonical commit, so this normally clones the
+        // bundle rather than taking it. That clone is the artifact path's real cost and is the
+        // figure to watch: it must stay far below the re-execution it replaces.
+        output: Arc::try_unwrap(output).unwrap_or_else(|shared| (*shared).clone()),
+        elapsed_us: 0,
+    })
+}
+
+/// Whether stage 4 re-executes this block anyway, purely to keep the differential oracle alive.
+///
+/// In `on` mode the artifact replaces the re-execution that shadow comparison needs as its second
+/// opinion, so an unsampled `on` run has nothing to compare and accrues no evidence. Sampling a
+/// fraction of blocks buys a permanent oracle for a proportional share of the win, and it is the
+/// only arrangement under which a reorg or a post-restart replay is ever actually compared.
+pub fn shadow_sample_selects(block_number: u64) -> bool {
+    sample_selects(shadow_sample_interval(), block_number)
+}
+
+const fn sample_selects(interval: u64, block_number: u64) -> bool {
+    match interval {
+        0 => false,
+        interval => block_number % interval == 0,
+    }
+}
+
+/// `PS_SHADOW_SAMPLE`: one block in this many is re-executed for comparison. 0 disables sampling.
+fn shadow_sample_interval() -> u64 {
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let Some(raw) = std::env::var_os(SHADOW_SAMPLE_VAR) else {
+            return DEFAULT_SHADOW_SAMPLE;
+        };
+        raw.to_str().and_then(|value| value.trim().parse().ok()).unwrap_or_else(|| {
+            warn!(
+                target: "partial_stateless_shadow",
+                var = SHADOW_SAMPLE_VAR,
+                "unparsable shadow sample interval; using the default"
+            );
+            DEFAULT_SHADOW_SAMPLE
+        })
+    })
 }
 
 /// What a take from the handoff produced, plus the store telemetry at that moment.
@@ -133,6 +211,8 @@ pub struct ShadowOutcome {
     pub hit: bool,
     /// The comparison, present only on a hit.
     pub divergence: Option<AccessDivergence>,
+    /// How much that comparison examined, present only on a hit.
+    pub coverage: Option<AccessCoverage>,
     /// What the Engine-side capture cost for this block.
     pub capture_us: u64,
 }
@@ -198,6 +278,32 @@ impl AccessDivergence {
     }
 }
 
+/// How much the comparison actually examined, for one block.
+///
+/// A divergence count is only as strong as its denominator. Zero mismatches across a million
+/// key comparisons and zero across none are the same number in the record but not the same
+/// evidence, and `lowest_block_mismatched` in particular is `false` when *neither* side read
+/// BLOCKHASH -- a vacuous pass that no amount of extra blocks converts into coverage. These
+/// fields make the gate report what was tested rather than only what failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccessCoverage {
+    /// Distinct accounts examined, counting each side's keys once.
+    pub accounts: usize,
+    /// Distinct storage slots examined.
+    pub storage: usize,
+    /// Distinct bytecodes examined.
+    pub codes: usize,
+    /// Whether either side observed a BLOCKHASH read, making the range comparison non-vacuous.
+    pub blockhash_observed: bool,
+}
+
+impl AccessCoverage {
+    /// Total key comparisons this block contributed to the gate.
+    pub fn total(&self) -> usize {
+        self.accounts + self.storage + self.codes
+    }
+}
+
 impl std::fmt::Display for AccessDivergence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -224,7 +330,7 @@ fn compare(
     simulated: &BlockAccessedState,
     simulated_lowest_block: Option<u64>,
     artifact: &BlockAccessArtifact,
-) -> AccessDivergence {
+) -> (AccessDivergence, AccessCoverage) {
     let captured = &artifact.access;
     let mut divergence = AccessDivergence {
         lowest_block_mismatched: simulated_lowest_block != captured.lowest_block_hash_number,
@@ -311,8 +417,17 @@ fn compare(
         }
     }
 
+    // Each side's keys counted once: everything the simulation saw, plus what only the capture did.
+    let coverage = AccessCoverage {
+        accounts: simulated.accounts.len() + divergence.accounts_only_captured,
+        storage: simulated.storage.len() + divergence.storage_only_captured,
+        codes: simulated.codes.len() + divergence.codes_only_captured,
+        blockhash_observed: simulated_lowest_block.is_some() ||
+            captured.lowest_block_hash_number.is_some(),
+    };
+
     divergence.samples = samples.into_inner();
-    divergence
+    (divergence, coverage)
 }
 
 fn append_shadow_record(
@@ -338,8 +453,9 @@ fn append_shadow_record(
     }
 
     let divergence = outcome.divergence.as_ref();
+    let coverage = outcome.coverage.as_ref();
     let record = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "engine_access_shadow",
         "block_number": block_number,
         "block_hash": block_hash,
@@ -357,6 +473,11 @@ fn append_shadow_record(
         "codes_mismatched": divergence.map(|d| d.codes_mismatched),
         "lowest_block_mismatched": divergence.map(|d| d.lowest_block_mismatched),
         "parent_mismatched": divergence.map(|d| d.parent_mismatched),
+        "compared_keys": coverage.map(AccessCoverage::total),
+        "accounts_compared": coverage.map(|c| c.accounts),
+        "storage_compared": coverage.map(|c| c.storage),
+        "codes_compared": coverage.map(|c| c.codes),
+        "blockhash_observed": coverage.map(|c| c.blockhash_observed),
         "samples": divergence.map(|d| d.samples.clone()),
         "engine_capture_us": outcome.capture_us,
         "builder_simulation_us": simulation_us,
@@ -448,14 +569,76 @@ mod tests {
     }
 
     #[test]
+    fn sampling_reserves_a_fraction_of_blocks_for_comparison() {
+        assert!(sample_selects(50, 100));
+        assert!(!sample_selects(50, 101));
+        let selected = (0..500u64).filter(|block| sample_selects(50, *block)).count();
+        assert_eq!(selected, 10, "one block in fifty");
+
+        // Zero is the escape hatch for a pure timing run, where any re-execution would pollute
+        // the builder median that stage 5 reads.
+        assert!(!sample_selects(0, 0), "interval 0 must disable sampling, not select every block");
+        assert!(!sample_selects(0, 100));
+    }
+
+    #[test]
+    fn an_artifact_whose_output_is_not_an_execution_output_is_a_miss_not_an_empty_result() {
+        // `artifact_of` files an `Arc<u8>` as the output. Downcasting it to a BlockExecutionOutput
+        // must fail into `None` so the caller re-executes. Returning a default here would publish
+        // a sidecar built from an empty bundle: a wrong result rather than a slow one.
+        let artifact = artifact_of(populated(), parent());
+        assert!(simulation_from_artifact(artifact).is_none());
+    }
+
+    #[test]
+    fn a_reused_artifact_carries_the_access_set_and_blockhash_range_across() {
+        let access = populated();
+        let expected_lowest = access.lowest_block_hash_number;
+        let artifact = BlockAccessArtifact::new(
+            10,
+            B256::with_last_byte(10),
+            parent(),
+            access.clone(),
+            Arc::new(BlockExecutionOutput::<<EthPrimitives as NodePrimitives>::Receipt>::default()),
+            0,
+        );
+
+        let simulation = simulation_from_artifact(artifact).expect("output downcasts");
+        assert_eq!(simulation.lowest_block_number, expected_lowest);
+        let expected = BlockAccessedState::from(access);
+        assert_eq!(simulation.accessed.accounts, expected.accounts);
+        assert_eq!(simulation.accessed.storage, expected.storage);
+        assert_eq!(simulation.accessed.codes, expected.codes);
+        assert_eq!(simulation.elapsed_us, 0, "no EVM ran on this path");
+    }
+
+    #[test]
     fn identical_sets_do_not_diverge() {
         let simulated = BlockAccessedState::from(populated());
-        let divergence =
+        let (divergence, coverage) =
             compare(parent(), &simulated, Some(7), &artifact_of(populated(), parent()));
 
         assert!(divergence.is_empty(), "{divergence}");
         assert_eq!(divergence.total(), 0);
         assert!(divergence.samples.is_empty());
+        assert_eq!(coverage.total(), 3, "a clean block must still report what it compared");
+        assert!(coverage.blockhash_observed);
+    }
+
+    #[test]
+    fn a_block_that_never_read_blockhash_reports_the_range_check_as_uncovered() {
+        // `lowest_block_mismatched` is false when neither side read BLOCKHASH, so a run made
+        // entirely of such blocks would report a clean range check it never actually exercised.
+        // Coverage is what separates that from a real pass; more blocks would not.
+        let mut without_blockhash = populated();
+        without_blockhash.lowest_block_hash_number = None;
+        let simulated = BlockAccessedState::from(without_blockhash.clone());
+
+        let (divergence, coverage) =
+            compare(parent(), &simulated, None, &artifact_of(without_blockhash, parent()));
+        assert!(divergence.is_empty());
+        assert!(!divergence.lowest_block_mismatched);
+        assert!(!coverage.blockhash_observed, "a vacuous pass must be visible in the record");
     }
 
     #[test]
@@ -466,7 +649,8 @@ mod tests {
         captured.accounts.clear();
         let simulated = BlockAccessedState::from(populated());
 
-        let divergence = compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
+        let (divergence, _) =
+            compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
         assert_eq!(divergence.accounts_only_simulated, 1);
         assert_eq!(divergence.accounts_only_captured, 0);
         assert!(!divergence.is_empty());
@@ -479,7 +663,8 @@ mod tests {
         captured.accounts.insert(Address::with_last_byte(2), account(2));
         let simulated = BlockAccessedState::from(populated());
 
-        let divergence = compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
+        let (divergence, _) =
+            compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
         assert_eq!(divergence.accounts_only_captured, 1);
         assert_eq!(divergence.accounts_only_simulated, 0);
         assert_eq!(divergence.accounts_mismatched, 0);
@@ -493,7 +678,8 @@ mod tests {
         captured.codes.insert(B256::with_last_byte(4), Bytes::from_static(&[0]));
         let simulated = BlockAccessedState::from(populated());
 
-        let divergence = compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
+        let (divergence, _) =
+            compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
         assert_eq!(divergence.accounts_mismatched, 1);
         assert_eq!(divergence.storage_mismatched, 1);
         assert_eq!(divergence.codes_mismatched, 1);
@@ -504,13 +690,13 @@ mod tests {
     fn the_blockhash_range_and_the_parent_are_part_of_the_comparison() {
         let simulated = BlockAccessedState::from(populated());
 
-        let wrong_range =
+        let (wrong_range, _) =
             compare(parent(), &simulated, Some(6), &artifact_of(populated(), parent()));
         assert!(wrong_range.lowest_block_mismatched);
         assert!(!wrong_range.is_empty(), "a BLOCKHASH disagreement is a divergence on its own");
         assert_eq!(wrong_range.total(), 0, "but it is not a key count");
 
-        let wrong_parent = compare(
+        let (wrong_parent, _) = compare(
             parent(),
             &simulated,
             Some(7),
@@ -530,7 +716,8 @@ mod tests {
         }
         let simulated = BlockAccessedState::from(simulated);
 
-        let divergence = compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
+        let (divergence, _) =
+            compare(parent(), &simulated, Some(7), &artifact_of(captured, parent()));
         assert_eq!(divergence.accounts_only_simulated, 100);
         assert_eq!(divergence.samples.len(), MAX_SAMPLES);
     }

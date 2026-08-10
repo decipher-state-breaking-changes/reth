@@ -4,13 +4,25 @@
 The gate is not "no misses". Artifacts cannot exist for backfilled blocks, for notifications
 replayed from the WAL after a restart, or for a sibling already evicted, and the builder falls
 back to its own execution in each case. The gate is that among the blocks that *did* hit,
-divergence is zero, over at least the required sample count.
+divergence is zero, with enough evidence behind that zero.
 
-A sustained miss rate is still reported, because it means the handoff is not actually delivering
-and stage 4 would fall back on every block.
+"Enough" is about coverage, not block count. The divergence classes this stage exists to close --
+prewarming and the cross-block cache, read-only and reverted access survival, system calls,
+payload-versus-historical settings -- are systematic: they are exercised by every mainnet block
+and would show up in the first tens of them, not the six-thousandth. What block count buys is
+only a tighter bound on a hypothetical rare divergence (0 in N bounds the rate at about 3/N),
+and what it does *not* buy at any realistic N is a reorg or a restart, which are time-conditional.
+So the threshold here is modest, and two coverage facts are reported alongside it:
+
+  - compared keys, the denominator a zero mismatch count is a zero *of*;
+  - whether any block observed BLOCKHASH, because `lowest_block_mismatched` is false when
+    neither side read it, and a run of such blocks passes that check vacuously.
+
+A sustained miss rate is reported separately. It does not fail the gate -- drop-and-fallback is
+the design -- but it bounds how much of the stage 5 win stage 4 can actually collect.
 
 Usage:
-    python3 analyze_access_shadow.py <run-dir-or-jsonl> [--required 6000]
+    python3 analyze_access_shadow.py <run-dir-or-jsonl> [--required 1000]
 """
 
 from __future__ import annotations
@@ -37,7 +49,7 @@ KEY_FIELDS = (
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("path", type=pathlib.Path, help="access_shadow.jsonl, or a run directory containing it")
-    parser.add_argument("--required", type=int, default=6000, help="hits required to close the gate")
+    parser.add_argument("--required", type=int, default=1000, help="hits required to close the gate")
     parser.add_argument("--show-samples", type=int, default=5, help="diverging blocks to print in full")
     return parser.parse_args()
 
@@ -105,6 +117,19 @@ def main():
         f"mean={last.get('handoff_mean_residence_us')}us depth={last.get('handoff_mean_depth_at_take')} "
         f"queue={last.get('handoff_queue_depth')} resident_bytes={last.get('handoff_resident_bytes')}"
     )
+    compared = [r["compared_keys"] for r in hits if r.get("compared_keys") is not None]
+    blockhash_blocks = [r for r in hits if r.get("blockhash_observed")]
+    if compared:
+        print(
+            "compared keys       "
+            f"{sum(compared):,} total, median {percentile(compared, 0.5):,}/block"
+        )
+        print(
+            "blockhash coverage  "
+            f"{len(blockhash_blocks)} of {len(hits)} blocks read BLOCKHASH"
+        )
+    else:
+        print("compared keys       not recorded (schema 1 run; no denominator for the zero)")
     if capture:
         print(
             "engine capture      "
@@ -141,9 +166,25 @@ def main():
     if len(hits) < args.required:
         print(f"GATE OPEN: 0 divergences, but {len(hits)} hits < {args.required} required")
         return 2
-    print(f"GATE PASSED: {len(hits)} hits, zero divergence")
+    if not compared:
+        print(f"GATE OPEN: {len(hits)} hits, zero divergence, but this run recorded no denominator")
+        print("           re-run on schema 2 to record compared keys and BLOCKHASH coverage")
+        return 2
+    if not blockhash_blocks:
+        print(f"GATE OPEN: {len(hits)} hits, zero divergence, but no block read BLOCKHASH")
+        print("           the range check passed vacuously; it is unproven, not proven")
+        return 2
+    print(
+        f"GATE PASSED: {len(hits)} hits, {sum(compared):,} keys compared, zero divergence, "
+        f"BLOCKHASH exercised on {len(blockhash_blocks)} blocks"
+    )
     if misses:
-        print(f"note: {len(misses)} misses fell back to re-execution; stage 4 requires that to be 0")
+        share = len(misses) / len(records)
+        print(
+            f"note: {len(misses)} misses ({share:.1%}) fell back to re-execution. That is the "
+            "design working, not failing; it only means stage 4 collects the win on "
+            f"{1 - share:.1%} of blocks."
+        )
     return 0
 
 

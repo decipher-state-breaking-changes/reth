@@ -1,5 +1,8 @@
 use crate::{
-    access_shadow::{record_shadow_comparison, take_engine_access},
+    access_shadow::{
+        record_shadow_comparison, shadow_sample_selects, simulation_from_artifact,
+        take_engine_access, EngineAccessTake,
+    },
     benchmark::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
         serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, RetainedGenerationBytes,
@@ -38,6 +41,7 @@ use partial_stateless::{
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::ConfigureEvm;
+use reth_execution_access::AccessCaptureMode;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::{ProviderResult, StateProvider};
 use reth_trie_common::{
@@ -1118,6 +1122,28 @@ where
     // consumer that skipped re-execution would actually see. `None` unless capture is enabled.
     let engine_access = take_engine_access(block.hash());
 
+    // Stage 4: in `on` mode the Engine's artifact replaces the re-execution entirely, except on
+    // sampled blocks, which re-execute deliberately so the differential oracle outlives stage 3.
+    // Anything else -- shadow mode, a miss, an artifact whose output will not downcast -- falls
+    // back to executing the block here, which is always correct and merely slower.
+    let sampled = shadow_sample_selects(block_number);
+    let reuse_artifact = AccessCaptureMode::current().is_authoritative() && !sampled;
+
+    let (reused, engine_access) = match engine_access {
+        Some(EngineAccessTake { artifact, stats }) if reuse_artifact => {
+            match artifact.and_then(simulation_from_artifact) {
+                Some(simulation) => (Some(simulation), None),
+                // Absent or unusable. Fall back to re-execution, but keep the take so the miss
+                // still reaches the record: stage 4's gate is a hit rate, and a miss that writes
+                // nothing would be indistinguishable from a block that never ran.
+                None => (None, Some(EngineAccessTake { artifact: None, stats })),
+            }
+        }
+        // Shadow mode, or a sampled block: keep the take for the comparison below.
+        other => (None, other),
+    };
+    let artifact_reused = reused.is_some();
+
     // Shared with the canonical rebuild, which has to replay exactly what this applies: the cache
     // is a function of *accessed* state, so an execution diff would miss read-only accounts, code
     // reads, and reads made by calls that later reverted.
@@ -1126,10 +1152,13 @@ where
         lowest_block_number,
         output: execution_output,
         elapsed_us: historical_full_db_evm_us,
-    } = simulate_block(evm_config, state_provider, block)?;
+    } = match reused {
+        Some(simulation) => simulation,
+        None => simulate_block(evm_config, state_provider, block)?,
+    };
 
-    // Shadow only: the comparison decides whether the artifact may later replace the execution
-    // above, and changes nothing about what this block produces in the meantime.
+    // Only reached when this block re-executed: in shadow mode always, in `on` mode on the
+    // sampled fraction. The comparison changes nothing about what this block produces.
     if let Some(take) = engine_access {
         record_shadow_comparison(
             block_number,
@@ -1876,10 +1905,11 @@ where
     let builder_total_us = builder_total_start.elapsed().as_micros() as u64;
     if let Some(path) = options.builder_bench_output {
         let record = BuilderBenchmarkRecord {
-            schema_version: 2,
+            schema_version: 3,
             block_number,
             block_hash,
             historical_full_db_evm_us,
+            artifact_reused,
             builder_total_us,
             transition_witness_build_us: builder_transition_witness_build_us,
             snapshot_created,
@@ -1938,6 +1968,7 @@ where
         block = block_number,
         block_hash = ?block_hash,
         historical_full_db_evm_us,
+        artifact_reused,
         builder_total_us,
         snapshot_created,
         snapshot_us,
