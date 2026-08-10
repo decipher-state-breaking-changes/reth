@@ -12,6 +12,7 @@ alloy-rlp = { workspace = true }
 revm-database = { workspace = true, features = ["std"] }
 revm-state = { workspace = true, features = ["std"] }
 revm-primitives = { workspace = true, features = ["std"] }
+reth-execution-access = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-trie-common = { workspace = true }
 reth-trie-sparse = { workspace = true }

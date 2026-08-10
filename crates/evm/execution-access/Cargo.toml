@@ -1,0 +1,24 @@
+[package]
+name = "reth-execution-access"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Neutral block-execution access artifacts and a bounded Engine-to-consumer handoff"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["std", "map-foldhash", "serde"] }
+revm-database = { workspace = true, features = ["std"] }
+revm-primitives = { workspace = true, features = ["std"] }
+
+serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+
+[dev-dependencies]
+revm-database-interface = { workspace = true, features = ["std"] }
+revm-state.workspace = true

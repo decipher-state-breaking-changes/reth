@@ -19,6 +19,7 @@ reth-db.workspace = true
 reth-engine-primitives = { workspace = true, features = ["std"] }
 reth-execution-cache.workspace = true
 reth-errors.workspace = true
+reth-execution-access.workspace = true
 reth-execution-types.workspace = true
 reth-evm = { workspace = true, features = ["metrics"] }
 reth-network-p2p.workspace = true

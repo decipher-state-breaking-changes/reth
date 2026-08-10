@@ -40,6 +40,7 @@ reth-trie-common = { workspace = true }
 reth-trie-parallel.workspace = true
 reth-provider = { workspace = true, features = ["jemalloc"] }
 reth-evm = { workspace = true }
+reth-execution-access = { workspace = true }
 reth-revm = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-cli-util = { workspace = true, features = ["jemalloc"] }

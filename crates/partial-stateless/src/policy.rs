@@ -45,12 +45,12 @@ pub struct EvictedStorage {
 }
 
 /// Account data stored in the cache.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AccountData {
-    pub nonce: u64,
-    pub balance: U256,
-    pub code_hash: Option<B256>,
-}
+///
+/// This is the neutral account-access record, re-exported under the name the cache has always
+/// used for it. Sharing the type with `reth-execution-access` is what lets an access set
+/// captured by the node's own execution move into the cache without being rebuilt entry by
+/// entry.
+pub use reth_execution_access::AccountAccess as AccountData;
 
 /// Simplest policy: retain only state accessed within the last N blocks.
 ///

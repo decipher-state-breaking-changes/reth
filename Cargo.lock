@@ -6465,6 +6465,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "reth-execution-access",
  "reth-primitives-traits",
  "reth-trie",
  "reth-trie-common",
@@ -6493,6 +6494,7 @@ dependencies = [
  "reth-cli-util",
  "reth-ethereum",
  "reth-evm",
+ "reth-execution-access",
  "reth-primitives-traits",
  "reth-provider",
  "reth-revm",
@@ -8254,6 +8256,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
+ "reth-execution-access",
  "reth-execution-cache",
  "reth-execution-types",
  "reth-exex-types",
@@ -8668,6 +8671,19 @@ dependencies = [
  "reth-testing-utils",
  "revm",
  "secp256k1 0.30.0",
+]
+
+[[package]]
+name = "reth-execution-access"
+version = "2.2.0"
+dependencies = [
+ "alloy-primitives",
+ "revm-database",
+ "revm-database-interface",
+ "revm-primitives",
+ "revm-state",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

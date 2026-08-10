@@ -32,6 +32,7 @@ use reth_evm::{
     execute::{BlockExecutionOutput, Executor},
     ConfigureEvm,
 };
+use reth_execution_access::ExecutedBlockAccess;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, NodePrimitives, RecoveredBlock};
 use reth_provider::{BlockReader, StateProvider, StateProviderFactory, TransactionVariant};
 use reth_revm::database::StateProviderDatabase;
@@ -216,8 +217,12 @@ where
     let mut lowest_block_number = None;
     let output = block_executor
         .execute_with_state_closure(block, |statedb: &State<_>| {
-            accessed = BlockAccessedState::from_simulated_state(statedb);
-            lowest_block_number = statedb.block_hashes.lowest().map(|(num, _)| num);
+            // One extraction produces both the access set and the BLOCKHASH range, and it is the
+            // same extraction the node's own execution uses. Reading the two separately is what
+            // would let a captured artifact and this simulation drift apart.
+            let access = ExecutedBlockAccess::from_state(statedb);
+            lowest_block_number = access.lowest_block_hash_number;
+            accessed = access.into();
         })
         .map_err(|err| eyre::eyre!("simulation failed for block {}: {err}", block.number()))?;
 

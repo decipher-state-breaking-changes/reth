@@ -71,6 +71,9 @@ use reth_evm::{
     block::BlockExecutor, execute::ExecutableTxFor, ConfigureEvm, EvmEnvFor, ExecutionCtxFor,
     OnStateHook, SpecFor,
 };
+use reth_execution_access::{
+    global_handoff, AccessCaptureMode, BlockAccessArtifact, ExecutedBlockAccess,
+};
 use reth_execution_cache::{CacheStats, SavedCache};
 use reth_payload_primitives::{
     BuiltPayload, InvalidPayloadAttributesError, NewPayloadError, PayloadTypes,
@@ -177,6 +180,7 @@ fn append_engine_benchmark_record(
     state_root_wait_us: u64,
     validation_us: u64,
     contaminated: bool,
+    access_capture_us: u64,
     strategy: &str,
 ) {
     let path = std::env::var_os("PS_ENGINE_BENCH_OUTPUT")
@@ -194,7 +198,10 @@ fn append_engine_benchmark_record(
         }
     }
     let record = serde_json::json!({
-        "schema_version": 2,
+        // 3 adds `access_capture_us`, which is already excluded from `execution_us` and
+        // `state_access_execution_us`. It is published so the un-subtracted figures remain
+        // recoverable rather than being silently absorbed.
+        "schema_version": 3,
         "benchmark": "vanilla_engine_v2",
         "block_number": block_number,
         "block_hash": block_hash,
@@ -205,6 +212,7 @@ fn append_engine_benchmark_record(
         "state_root_wait_us": state_root_wait_us,
         "validation_us": validation_us,
         "contaminated": contaminated,
+        "access_capture_us": access_capture_us,
         "state_root_strategy": strategy,
     });
     let result = (|| -> std::io::Result<()> {
@@ -217,6 +225,16 @@ fn append_engine_benchmark_record(
     if let Err(error) = result {
         warn!(target: "partial_stateless_bench", %error, path = %path.display(), "failed to append engine benchmark record");
     }
+}
+
+/// A block's access set together with what capturing it cost.
+///
+/// The cost travels with the set because the capture happens inside a timed region that predates
+/// it. Every caller that reports a duration covering the capture subtracts this first.
+#[derive(Debug)]
+struct CapturedBlockAccess {
+    access: ExecutedBlockAccess,
+    capture_us: u64,
 }
 
 /// Context providing access to tree state during validation.
@@ -685,14 +703,20 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx) =
+        let (output, senders, receipt_root_rx, captured_access) =
             match self.execute_block(state_provider, env, &input, &mut handle) {
                 Ok(output) => output,
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
             };
-        let execution_duration = execute_block_start.elapsed();
+        let access_capture_us = captured_access.as_ref().map_or(0, |access| access.capture_us);
+        let execution_duration =
+            execute_block_start.elapsed().saturating_sub(Duration::from_micros(access_capture_us));
+        // Subtract the capture rather than stopping the timer before it. This boundary has
+        // included `take_bundle` and the execution metrics in every run recorded so far; moving
+        // the stop instant would shift the baseline by an amount that has nothing to do with the
+        // capture, and the whole point of measuring here is to stay comparable across runs.
         let state_access_execution_us = state_access_execution_start
-            .map(|start| start.elapsed().as_micros() as u64)
+            .map(|start| (start.elapsed().as_micros() as u64).saturating_sub(access_capture_us))
             .unwrap_or_default();
 
         // After executing the block we can stop prewarming transactions
@@ -952,6 +976,7 @@ where
                 state_root_wait_us,
                 validation_us,
                 contaminated,
+                access_capture_us,
                 strategy = %strategy_name,
                 "Vanilla Reth Engine V2 validation benchmark"
             );
@@ -966,8 +991,26 @@ where
                 state_root_wait_us,
                 validation_us,
                 contaminated,
+                access_capture_us,
                 &strategy_name,
             );
+        }
+
+        // Published only once the state root has matched, and after every measured phase has
+        // ended, so a consumer never sees a block this node rejected and the insert lands in no
+        // benchmark boundary. The `Arc` is the one already shared with the chain state, so while
+        // this block stays in memory the artifact costs no additional resident bytes.
+        if let Some(handoff) = global_handoff() &&
+            let Some(captured) = captured_access
+        {
+            handoff.insert(BlockAccessArtifact::new(
+                block.number(),
+                block.hash(),
+                block.parent_hash(),
+                captured.access,
+                output.clone(),
+                captured.capture_us,
+            ));
         }
 
         let timing_stats = state_provider_stats.map(|stats| {
@@ -1062,6 +1105,7 @@ where
             BlockExecutionOutput<N::Receipt>,
             Vec<Address>,
             tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+            Option<CapturedBlockAccess>,
         ),
         InsertBlockErrorKind,
     >
@@ -1150,14 +1194,28 @@ where
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
+        // Capture the access set here and nowhere else: contracts created by this block are only
+        // in the bundle after `merge_transitions`, and the bundle is gone after `take_bundle`.
+        // This is the same point at which `Executor::execute_with_state_closure` runs its closure,
+        // so a re-execution of this block observes the identical `State`.
+        let access = AccessCaptureMode::current().is_enabled().then(|| {
+            let started = Instant::now();
+            let access = ExecutedBlockAccess::from_state(&db);
+            CapturedBlockAccess { access, capture_us: started.elapsed().as_micros() as u64 }
+        });
+
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
-        let execution_duration = execution_start.elapsed();
+        // The node's own execution metrics describe execution, so the capture comes back out of
+        // them for the same reason it comes out of the caller's boundary.
+        let execution_duration = execution_start
+            .elapsed()
+            .saturating_sub(Duration::from_micros(access.as_ref().map_or(0, |a| a.capture_us)));
         self.metrics.record_block_execution(&output, execution_duration);
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
 
-        Ok((output, senders, result_rx))
+        Ok((output, senders, result_rx, access))
     }
 
     /// Executes transactions and collects senders, streaming receipts to a background task.
