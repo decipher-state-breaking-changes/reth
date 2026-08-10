@@ -1,7 +1,7 @@
 use crate::{
     access_shadow::{
         record_shadow_comparison, shadow_sample_selects, simulation_from_artifact,
-        take_engine_access, EngineAccessTake,
+        take_engine_access, ArtifactDisposition, EngineAccessTake,
     },
     benchmark::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
@@ -41,7 +41,7 @@ use partial_stateless::{
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::ConfigureEvm;
-use reth_execution_access::AccessCaptureMode;
+use reth_execution_access::{AccessCaptureMode, MissReason};
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
 use reth_provider::{ProviderResult, StateProvider};
 use reth_trie_common::{
@@ -1127,22 +1127,39 @@ where
     // Anything else -- shadow mode, a miss, an artifact whose output will not downcast -- falls
     // back to executing the block here, which is always correct and merely slower.
     let sampled = shadow_sample_selects(block_number);
-    let reuse_artifact = AccessCaptureMode::current().is_authoritative() && !sampled;
+    let authoritative = AccessCaptureMode::current().is_authoritative();
+    let reuse_artifact = authoritative && !sampled;
 
-    let (reused, engine_access) = match engine_access {
-        Some(EngineAccessTake { artifact, stats }) if reuse_artifact => {
-            match artifact.and_then(simulation_from_artifact) {
-                Some(simulation) => (Some(simulation), None),
-                // Absent or unusable. Fall back to re-execution, but keep the take so the miss
-                // still reaches the record: stage 4's gate is a hit rate, and a miss that writes
-                // nothing would be indistinguishable from a block that never ran.
-                None => (None, Some(EngineAccessTake { artifact: None, stats })),
+    let (reused, engine_access, disposition) = match engine_access {
+        None => (None, None, ArtifactDisposition::CaptureOff),
+        Some(EngineAccessTake { artifact, miss_reason, stats }) if reuse_artifact => {
+            match artifact {
+                None => (
+                    None,
+                    // Keep the take so the miss still reaches the record: stage 4's gate is stated
+                    // per miss, and one that wrote nothing would be indistinguishable from a block
+                    // that never ran.
+                    Some(EngineAccessTake { artifact: None, miss_reason, stats }),
+                    ArtifactDisposition::Missed(miss_reason.unwrap_or(MissReason::NotPublished)),
+                ),
+                Some(artifact) => match simulation_from_artifact(artifact) {
+                    Some(simulation) => (Some(simulation), None, ArtifactDisposition::Reused),
+                    None => (None, None, ArtifactDisposition::TypeMismatch),
+                },
             }
         }
         // Shadow mode, or a sampled block: keep the take for the comparison below.
-        other => (None, other),
+        Some(take) => {
+            let disposition = match (&take.artifact, take.miss_reason) {
+                (Some(_), _) if sampled && authoritative => ArtifactDisposition::Sampled,
+                (Some(_), _) => ArtifactDisposition::Shadowed,
+                (None, reason) => {
+                    ArtifactDisposition::Missed(reason.unwrap_or(MissReason::NotPublished))
+                }
+            };
+            (None, Some(take), disposition)
+        }
     };
-    let artifact_reused = reused.is_some();
 
     // Shared with the canonical rebuild, which has to replay exactly what this applies: the cache
     // is a function of *accessed* state, so an execution diff would miss read-only accounts, code
@@ -1909,7 +1926,10 @@ where
             block_number,
             block_hash,
             historical_full_db_evm_us,
-            artifact_reused,
+            artifact_available: disposition.artifact_available(),
+            artifact_reused: disposition.artifact_reused(),
+            shadow_sampled: disposition.shadow_sampled(),
+            fallback_reason: disposition.fallback_reason(),
             builder_total_us,
             transition_witness_build_us: builder_transition_witness_build_us,
             snapshot_created,
@@ -1968,7 +1988,8 @@ where
         block = block_number,
         block_hash = ?block_hash,
         historical_full_db_evm_us,
-        artifact_reused,
+        artifact_reused = disposition.artifact_reused(),
+        fallback_reason = disposition.fallback_reason(),
         builder_total_us,
         snapshot_created,
         snapshot_us,

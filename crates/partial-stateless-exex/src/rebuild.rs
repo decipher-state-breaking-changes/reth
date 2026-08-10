@@ -38,7 +38,7 @@ use reth_provider::{BlockReader, StateProvider, StateProviderFactory, Transactio
 use reth_revm::database::StateProviderDatabase;
 use reth_trie_common::TrieInput;
 use revm::database::State;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 /// Rebuilds an exact coordinated pair at the canonical block `tip_hash`.
@@ -229,7 +229,7 @@ where
     Ok(HistoricalSimulation {
         accessed,
         lowest_block_number,
-        output,
+        output: Arc::new(output),
         elapsed_us: started.elapsed().as_micros() as u64,
     })
 }
@@ -242,7 +242,11 @@ pub struct HistoricalSimulation {
     /// Lowest ancestor height the block asked for via `BLOCKHASH`, if any.
     pub lowest_block_number: Option<u64>,
     /// Receipts, requests, gas, and the resulting bundle state.
-    pub output: BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>,
+    ///
+    /// Shared rather than owned so that B3's artifact path can hand the Engine's own output
+    /// through without copying the bundle. Every consumer reads through it, so the `Arc` costs
+    /// nothing here and saves a full `BundleState` clone on the reuse path.
+    pub output: Arc<BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>>,
     /// Wall time of the re-execution.
     pub elapsed_us: u64,
 }

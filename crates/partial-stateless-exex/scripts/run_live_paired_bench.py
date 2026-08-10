@@ -87,6 +87,17 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--handoff-capacity",
+        type=int,
+        default=None,
+        help=(
+            "set PS_HANDOFF_CAPACITY, the number of artifacts the handoff retains before evicting "
+            "the oldest (default 4). Raising it trades resident memory for a lower miss rate when "
+            "the builder falls briefly behind; read it together with resources.jsonl, since the "
+            "byte budget bounds access sets only, not the execution outputs a deeper queue holds"
+        ),
+    )
+    parser.add_argument(
         "--shadow-sample",
         type=int,
         default=None,
@@ -295,6 +306,7 @@ def benchmark_environment(
     retain_generation,
     engine_access,
     shadow_sample,
+    handoff_capacity,
 ):
     env = os.environ.copy()
     env.update(
@@ -315,6 +327,8 @@ def benchmark_environment(
     )
     if shadow_sample is not None:
         env["PS_SHADOW_SAMPLE"] = str(shadow_sample)
+    if handoff_capacity is not None:
+        env["PS_HANDOFF_CAPACITY"] = str(handoff_capacity)
     for name in DISABLED_DIAGNOSTICS:
         env.pop(name, None)
     return env
@@ -365,6 +379,7 @@ def main():
         args.retain_generation,
         args.engine_access,
         args.shadow_sample,
+        args.handoff_capacity,
     )
     command = build_command(reth_bin, args.datadir, args.jwtsecret, args.node_args)
     print("Starting:", " ".join(command), flush=True)
@@ -372,7 +387,8 @@ def main():
         "Waiting for cache readiness, then collecting "
         f"{args.warmup} sample-warm-up plus {args.samples} accepted same-block samples "
         f"(canonical_rebuild={args.canonical_rebuild}, engine_access={args.engine_access}, "
-        f"shadow_sample={args.shadow_sample if args.shadow_sample is not None else 'default'})",
+        f"shadow_sample={args.shadow_sample if args.shadow_sample is not None else 'default'}, "
+        f"handoff_capacity={args.handoff_capacity if args.handoff_capacity is not None else 'default'})",
         flush=True,
     )
 

@@ -11,7 +11,7 @@ use std::{
     },
     time::Instant,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Blocks retained by the global handoff before the oldest insert is evicted.
 ///
@@ -22,10 +22,30 @@ use tracing::debug;
 pub const DEFAULT_HANDOFF_CAPACITY: usize = 4;
 
 /// Access-set bytes retained by the global handoff before the oldest insert is evicted.
+///
+/// This is a budget over *access-set* bytes, not a hard cap on artifact residency, and the
+/// difference matters when reading RSS. Two things sit outside it. The execution output is held
+/// behind an `Arc` whose bytes [`ExecutedBlockAccess::approx_heap_bytes`] does not count, so a
+/// resident artifact keeps a `BundleState` alive that this number never mentions -- and if the
+/// Engine has already dropped its own reference, the handoff is what is extending that bundle's
+/// life. And a single artifact larger than the budget is still inserted, because evicting
+/// everything and then refusing the only one left would turn a memory bound into a total loss of
+/// delivery. What is actually guaranteed is [`DEFAULT_HANDOFF_CAPACITY`] artifacts, whatever they
+/// weigh. Treat the byte budget as what keeps the common case near a bound, and the count as the
+/// bound.
 pub const DEFAULT_HANDOFF_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Evicted hashes remembered so a later miss can name its cause. Holds hashes, never artifacts.
+const TOMBSTONE_CAPACITY: usize = 64;
 
 /// Environment variable selecting the capture mode.
 const CAPTURE_MODE_VAR: &str = "PS_ENGINE_ACCESS";
+
+/// Overrides [`DEFAULT_HANDOFF_CAPACITY`], so tuning the bound does not require a rebuild.
+const CAPACITY_VAR: &str = "PS_HANDOFF_CAPACITY";
+
+/// Overrides [`DEFAULT_HANDOFF_MAX_BYTES`], in bytes.
+const MAX_BYTES_VAR: &str = "PS_HANDOFF_MAX_BYTES";
 
 /// Returns the global handoff, or `None` when capture is off.
 ///
@@ -38,8 +58,19 @@ pub fn global_handoff() -> Option<&'static BlockAccessHandoff> {
     }
     static HANDOFF: OnceLock<BlockAccessHandoff> = OnceLock::new();
     Some(HANDOFF.get_or_init(|| {
-        BlockAccessHandoff::new(DEFAULT_HANDOFF_CAPACITY, DEFAULT_HANDOFF_MAX_BYTES)
+        BlockAccessHandoff::new(
+            env_override(CAPACITY_VAR, DEFAULT_HANDOFF_CAPACITY),
+            env_override(MAX_BYTES_VAR, DEFAULT_HANDOFF_MAX_BYTES),
+        )
     }))
+}
+
+fn env_override(var: &str, default: usize) -> usize {
+    let Some(raw) = std::env::var_os(var) else { return default };
+    raw.to_str().and_then(|value| value.trim().parse().ok()).unwrap_or_else(|| {
+        warn!(target: "execution_access", var, "unparsable handoff bound; using the default");
+        default
+    })
 }
 
 /// How the node should treat execution-access capture.
@@ -203,7 +234,14 @@ impl BlockAccessHandoff {
             (!inner.entries.is_empty() && inner.bytes + artifact.approx_bytes > self.max_bytes)
         {
             let Some(oldest) = inner.order.front().copied() else { break };
+            // Which bound forced this out, recorded before the removal changes either measure.
+            let reason = if inner.entries.len() >= self.capacity {
+                MissReason::EvictedCapacity
+            } else {
+                MissReason::EvictedBytes
+            };
             inner.remove(&oldest);
+            inner.entomb(oldest, reason);
             self.metrics.dropped_capacity.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -219,6 +257,17 @@ impl BlockAccessHandoff {
     /// Lookup is by exact hash and never by height, so a consumer can never be handed a sibling's
     /// execution by accident.
     pub fn take(&self, block_hash: &B256) -> Option<BlockAccessArtifact> {
+        self.take_outcome(block_hash).artifact()
+    }
+
+    /// Like [`take`](Self::take), but names the cause when the artifact is absent.
+    ///
+    /// Cumulative counters cannot do this. Observing that `missed` and `dropped_capacity` rose by
+    /// the same amount over a run is consistent with each miss being an eviction, but it is not
+    /// evidence for any *particular* miss, and it silently conflates a sibling that was never
+    /// published with one that was published and evicted. Since the stage 4 gate is stated per
+    /// miss, the attribution has to be per miss.
+    pub fn take_outcome(&self, block_hash: &B256) -> TakeOutcome {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
@@ -226,22 +275,27 @@ impl BlockAccessHandoff {
         let depth = inner.entries.len();
         let artifact = inner.remove(block_hash);
 
-        match &artifact {
+        let outcome = match artifact {
             Some(artifact) => {
                 self.metrics.taken.fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .residence_us_total
                     .fetch_add(artifact.residence().as_micros() as u64, Ordering::Relaxed);
                 self.metrics.depth_at_take_total.fetch_add(depth as u64, Ordering::Relaxed);
+                TakeOutcome::Hit(artifact)
             }
             None => {
                 self.metrics.missed.fetch_add(1, Ordering::Relaxed);
+                // Absent from the tombstones means this hash was never evicted here. It may never
+                // have been published at all -- a backfilled block, a WAL replay after restart --
+                // which this store cannot distinguish from the outside and does not claim to.
+                TakeOutcome::Miss(inner.tombstone(block_hash).unwrap_or(MissReason::NotPublished))
             }
-        }
+        };
 
         self.metrics.resident_bytes.store(inner.bytes, Ordering::Relaxed);
         self.metrics.queue_depth.store(inner.entries.len(), Ordering::Relaxed);
-        artifact
+        outcome
     }
 
     /// Current telemetry snapshot.
@@ -261,6 +315,63 @@ impl BlockAccessHandoff {
             mean_depth_at_take: (taken > 0).then(|| {
                 self.metrics.depth_at_take_total.load(Ordering::Relaxed) as f64 / taken as f64
             }),
+        }
+    }
+}
+
+/// What a take found, and when it found nothing, why.
+///
+/// The variants differ in size by the width of an artifact, which clippy would rather see boxed.
+/// Boxing it would add an allocation to every successful take in exchange for shrinking a value
+/// that is constructed once per block and consumed immediately, so the lint is declined here.
+#[expect(clippy::large_enum_variant, reason = "boxing costs an allocation per take")]
+#[derive(Debug)]
+pub enum TakeOutcome {
+    /// The artifact for the requested hash.
+    Hit(BlockAccessArtifact),
+    /// No artifact, with the cause as far as this store can attest to it.
+    Miss(MissReason),
+}
+
+impl TakeOutcome {
+    /// The artifact, discarding the miss reason.
+    pub fn artifact(self) -> Option<BlockAccessArtifact> {
+        match self {
+            Self::Hit(artifact) => Some(artifact),
+            Self::Miss(_) => None,
+        }
+    }
+
+    /// The miss reason, or `None` on a hit.
+    pub const fn miss_reason(&self) -> Option<MissReason> {
+        match self {
+            Self::Hit(_) => None,
+            Self::Miss(reason) => Some(*reason),
+        }
+    }
+}
+
+/// Why a take found nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissReason {
+    /// This store never held the hash, or held it too long ago to still have the tombstone.
+    ///
+    /// Structural for backfilled blocks and for notifications replayed from the ExEx WAL after a
+    /// restart, neither of which the engine tree ever executed in this process.
+    NotPublished,
+    /// Evicted to stay within the artifact count.
+    EvictedCapacity,
+    /// Evicted to stay within the access-set byte budget.
+    EvictedBytes,
+}
+
+impl MissReason {
+    /// Stable name for telemetry.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotPublished => "not_published",
+            Self::EvictedCapacity => "evicted_capacity",
+            Self::EvictedBytes => "evicted_bytes",
         }
     }
 }
@@ -299,6 +410,12 @@ struct HandoffInner {
     order: VecDeque<B256>,
     entries: HashMap<B256, BlockAccessArtifact>,
     bytes: usize,
+    /// Hashes this store evicted, newest last, so a later miss on one can name its cause.
+    ///
+    /// Bounded and lossy on purpose: it holds hashes and a one-byte reason, never artifacts, so
+    /// remembering more of them costs nothing that matters. Falling off the end degrades an
+    /// attributed miss to `NotPublished`, which is the honest answer once the evidence is gone.
+    tombstones: VecDeque<(B256, MissReason)>,
 }
 
 impl HandoffInner {
@@ -315,6 +432,20 @@ impl HandoffInner {
             self.order.remove(position);
         }
         Some(artifact)
+    }
+
+    fn entomb(&mut self, block_hash: B256, reason: MissReason) {
+        if self.tombstones.len() >= TOMBSTONE_CAPACITY {
+            self.tombstones.pop_front();
+        }
+        self.tombstones.push_back((block_hash, reason));
+    }
+
+    fn tombstone(&self, block_hash: &B256) -> Option<MissReason> {
+        self.tombstones
+            .iter()
+            .rev()
+            .find_map(|(hash, reason)| (hash == block_hash).then_some(*reason))
     }
 }
 
@@ -402,6 +533,51 @@ mod tests {
         assert!(handoff.take(&hash(2)).is_some());
         assert!(handoff.take(&hash(3)).is_some());
         assert_eq!(handoff.stats().dropped_capacity, 1);
+    }
+
+    #[test]
+    fn an_evicted_hash_can_still_name_why_it_is_missing() {
+        // Cumulative counters cannot separate these two cases: both are one miss, and only one of
+        // them is this store's doing. The stage 4 gate is stated per miss, so the store has to be
+        // able to answer per miss.
+        let handoff = BlockAccessHandoff::new(2, usize::MAX);
+        handoff.insert(artifact(50, 1));
+        handoff.insert(artifact(10, 2));
+        handoff.insert(artifact(11, 3));
+
+        assert_eq!(
+            handoff.take_outcome(&hash(1)).miss_reason(),
+            Some(MissReason::EvictedCapacity),
+            "hash 1 was published here and then evicted"
+        );
+        assert_eq!(
+            handoff.take_outcome(&hash(99)).miss_reason(),
+            Some(MissReason::NotPublished),
+            "hash 99 was never seen at all"
+        );
+    }
+
+    #[test]
+    fn tombstones_are_bounded_and_degrade_to_not_published() {
+        // The tombstone ring must not become an unbounded log of every block the node ever saw.
+        // Losing the oldest entries costs attribution, never memory, and the honest answer once
+        // the evidence is gone is that this store cannot say.
+        let handoff = BlockAccessHandoff::new(1, usize::MAX);
+        for index in 0..(TOMBSTONE_CAPACITY as u8 + 10) {
+            handoff.insert(artifact(index.into(), index));
+        }
+
+        assert_eq!(
+            handoff.take_outcome(&hash(0)).miss_reason(),
+            Some(MissReason::NotPublished),
+            "the oldest tombstone has aged out"
+        );
+        let recent = TOMBSTONE_CAPACITY as u8 + 5;
+        assert_eq!(
+            handoff.take_outcome(&hash(recent)).miss_reason(),
+            Some(MissReason::EvictedCapacity),
+            "a recent eviction is still attributable"
+        );
     }
 
     #[test]

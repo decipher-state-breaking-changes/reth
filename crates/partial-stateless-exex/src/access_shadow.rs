@@ -25,13 +25,13 @@ use alloy_primitives::B256;
 use partial_stateless::accessed_state::BlockAccessedState;
 use reth_ethereum::EthPrimitives;
 use reth_evm::execute::BlockExecutionOutput;
-use reth_execution_access::{global_handoff, BlockAccessArtifact, HandoffStats};
+use reth_execution_access::{global_handoff, BlockAccessArtifact, HandoffStats, MissReason};
 use reth_primitives_traits::NodePrimitives;
 use std::{
     fmt::Write as _,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Mutex, OnceLock,
     },
 };
 use tracing::{error, info, warn};
@@ -53,8 +53,9 @@ const DEFAULT_SHADOW_SAMPLE: u64 = 50;
 /// simulation this stage still performs.
 pub fn take_engine_access(block_hash: B256) -> Option<EngineAccessTake> {
     let handoff = global_handoff()?;
-    let artifact = handoff.take(&block_hash);
-    Some(EngineAccessTake { artifact, stats: handoff.stats() })
+    let outcome = handoff.take_outcome(&block_hash);
+    let miss_reason = outcome.miss_reason();
+    Some(EngineAccessTake { artifact: outcome.artifact(), miss_reason, stats: handoff.stats() })
 }
 
 /// Compares a captured artifact against this block's re-execution and records the outcome.
@@ -72,7 +73,7 @@ pub fn record_shadow_comparison(
     simulation_us: u64,
 ) -> ShadowOutcome {
     let totals = ShadowTotals::get();
-    let EngineAccessTake { artifact, stats } = take;
+    let EngineAccessTake { artifact, miss_reason, stats } = take;
 
     let Some(artifact) = artifact else {
         let blocks = totals.blocks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -85,9 +86,16 @@ pub fn record_shadow_comparison(
             missed,
             queue_depth = stats.queue_depth,
             dropped_capacity = stats.dropped_capacity,
+            reason = miss_reason.as_ref().map(MissReason::as_str),
             "No Engine access artifact for this block; the builder re-executed it"
         );
-        let outcome = ShadowOutcome { hit: false, divergence: None, coverage: None, capture_us: 0 };
+        let outcome = ShadowOutcome {
+            hit: false,
+            divergence: None,
+            coverage: None,
+            capture_us: 0,
+            miss_reason,
+        };
         append_shadow_record(block_number, block_hash, &outcome, simulation_us, &stats);
         return outcome
     };
@@ -131,6 +139,7 @@ pub fn record_shadow_comparison(
         divergence: Some(divergence),
         coverage: Some(coverage),
         capture_us: artifact.capture_us,
+        miss_reason: None,
     };
     append_shadow_record(block_number, block_hash, &outcome, simulation_us, &stats);
     outcome
@@ -152,12 +161,66 @@ pub fn simulation_from_artifact(artifact: BlockAccessArtifact) -> Option<Histori
     Some(HistoricalSimulation {
         accessed: artifact.access.into(),
         lowest_block_number,
-        // The Engine keeps its own reference for the canonical commit, so this normally clones the
-        // bundle rather than taking it. That clone is the artifact path's real cost and is the
-        // figure to watch: it must stay far below the re-execution it replaces.
-        output: Arc::try_unwrap(output).unwrap_or_else(|shared| (*shared).clone()),
+        // Shared, not cloned. The Engine keeps its own reference for the canonical commit, so an
+        // owned value here would mean copying the whole `BundleState` on every reused block --
+        // the largest remaining cost on a path whose entire purpose is to not pay for the block
+        // twice. Every downstream consumer reads through the reference.
+        output,
         elapsed_us: 0,
     })
+}
+
+/// What became of the Engine's artifact for one block.
+///
+/// One total value rather than a set of booleans, because the interesting question -- "did the
+/// handoff deliver?" -- is not the same as "did the builder skip re-execution?", and independent
+/// flags let those two drift into contradiction. A sampled block is a *delivery success* and a
+/// *reuse refusal* at the same time, which is exactly the case that makes a single
+/// `artifact_reused` field misleading: at the default 1-in-50 sampling, perfect delivery still
+/// reads as 98% reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactDisposition {
+    /// Capture is off; no artifact was expected.
+    CaptureOff,
+    /// The artifact replaced this block's re-execution.
+    Reused,
+    /// Shadow mode: the artifact arrived and was compared, and the block re-executed anyway.
+    Shadowed,
+    /// `on` mode, sampled block: the artifact arrived and was compared, deliberately not reused.
+    Sampled,
+    /// No artifact, for the stated reason.
+    Missed(MissReason),
+    /// An artifact arrived but its output was not the expected type, so the block re-executed.
+    TypeMismatch,
+}
+
+impl ArtifactDisposition {
+    /// Whether the handoff delivered an artifact. This, not reuse, is the delivery rate.
+    pub const fn artifact_available(&self) -> bool {
+        matches!(self, Self::Reused | Self::Shadowed | Self::Sampled)
+    }
+
+    /// Whether the artifact replaced re-execution. This is the share of blocks that got the win.
+    pub const fn artifact_reused(&self) -> bool {
+        matches!(self, Self::Reused)
+    }
+
+    /// Whether this block re-executed on purpose to feed the comparison.
+    pub const fn shadow_sampled(&self) -> bool {
+        matches!(self, Self::Shadowed | Self::Sampled)
+    }
+
+    /// Why the artifact was not reused, or `None` when it was.
+    pub const fn fallback_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Reused => None,
+            Self::CaptureOff => Some("capture_off"),
+            Self::Shadowed => Some("shadow_mode"),
+            Self::Sampled => Some("shadow_sampled"),
+            Self::TypeMismatch => Some("type_mismatch"),
+            Self::Missed(reason) => Some(reason.as_str()),
+        }
+    }
 }
 
 /// Whether stage 4 re-executes this block anyway, purely to keep the differential oracle alive.
@@ -200,6 +263,8 @@ fn shadow_sample_interval() -> u64 {
 pub struct EngineAccessTake {
     /// The artifact, or `None` on a miss.
     pub artifact: Option<BlockAccessArtifact>,
+    /// Why the artifact was absent, or `None` on a hit.
+    pub miss_reason: Option<MissReason>,
     /// Handoff counters read immediately after the take.
     pub stats: HandoffStats,
 }
@@ -215,6 +280,8 @@ pub struct ShadowOutcome {
     pub coverage: Option<AccessCoverage>,
     /// What the Engine-side capture cost for this block.
     pub capture_us: u64,
+    /// Why the artifact was absent, or `None` on a hit.
+    pub miss_reason: Option<MissReason>,
 }
 
 impl ShadowOutcome {
@@ -479,6 +546,7 @@ fn append_shadow_record(
         "codes_compared": coverage.map(|c| c.codes),
         "blockhash_observed": coverage.map(|c| c.blockhash_observed),
         "samples": divergence.map(|d| d.samples.clone()),
+        "miss_reason": outcome.miss_reason.as_ref().map(MissReason::as_str),
         "engine_capture_us": outcome.capture_us,
         "builder_simulation_us": simulation_us,
         "handoff_queue_depth": stats.queue_depth,

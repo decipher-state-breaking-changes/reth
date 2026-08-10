@@ -118,18 +118,34 @@ def main():
         f"queue={last.get('handoff_queue_depth')} resident_bytes={last.get('handoff_resident_bytes')}"
     )
     compared = [r["compared_keys"] for r in hits if r.get("compared_keys") is not None]
+    uncovered = [r for r in hits if r.get("compared_keys") is None]
     blockhash_blocks = [r for r in hits if r.get("blockhash_observed")]
+    per_category = {
+        name: sum(r.get(f"{name}_compared") or 0 for r in hits)
+        for name in ("accounts", "storage", "codes")
+    }
     if compared:
         print(
             "compared keys       "
-            f"{sum(compared):,} total, median {percentile(compared, 0.5):,}/block"
+            f"{sum(compared):,} total, median {percentile(compared, 0.5):,}/block  "
+            f"(accounts {per_category['accounts']:,} / storage {per_category['storage']:,} / "
+            f"codes {per_category['codes']:,})"
         )
         print(
             "blockhash coverage  "
             f"{len(blockhash_blocks)} of {len(hits)} blocks read BLOCKHASH"
         )
+        if uncovered:
+            print(f"coverage gaps       {len(uncovered)} hits carry no denominator")
     else:
         print("compared keys       not recorded (schema 1 run; no denominator for the zero)")
+
+    if misses:
+        reasons = Counter(r.get("miss_reason") or "unattributed" for r in misses)
+        print(
+            "miss attribution    "
+            + ", ".join(f"{reason}={count}" for reason, count in reasons.most_common())
+        )
     if capture:
         print(
             "engine capture      "
@@ -169,6 +185,22 @@ def main():
     if not compared:
         print(f"GATE OPEN: {len(hits)} hits, zero divergence, but this run recorded no denominator")
         print("           re-run on schema 2 to record compared keys and BLOCKHASH coverage")
+        return 2
+    if uncovered:
+        # One covered hit is not evidence that the rest were covered. A mixed-schema file, or a
+        # bug that skipped the coverage path on some blocks, would otherwise pass on the strength
+        # of whichever records happened to carry the field.
+        print(f"GATE OPEN: {len(uncovered)} of {len(hits)} hits carry no coverage denominator")
+        return 2
+    if sum(compared) == 0:
+        print(f"GATE OPEN: {len(hits)} hits compared zero keys; the zero divergence is vacuous")
+        return 2
+    empty_categories = [name for name, total in per_category.items() if total == 0]
+    if empty_categories:
+        print(
+            f"GATE OPEN: no {', '.join(empty_categories)} keys were compared at all; "
+            "those categories are unproven, not proven"
+        )
         return 2
     if not blockhash_blocks:
         print(f"GATE OPEN: {len(hits)} hits, zero divergence, but no block read BLOCKHASH")

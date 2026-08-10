@@ -33,5 +33,5 @@ pub use access::{AccountAccess, ExecutedBlockAccess};
 mod handoff;
 pub use handoff::{
     global_handoff, AccessCaptureMode, BlockAccessArtifact, BlockAccessHandoff, HandoffStats,
-    DEFAULT_HANDOFF_CAPACITY, DEFAULT_HANDOFF_MAX_BYTES,
+    MissReason, TakeOutcome, DEFAULT_HANDOFF_CAPACITY, DEFAULT_HANDOFF_MAX_BYTES,
 };
