@@ -7,7 +7,7 @@ use crate::{
         append_builder_record, append_record, deserialize_sidecar_for_benchmark,
         serialize_sidecar_for_benchmark, BuilderBenchmarkRecord, RetainedGenerationBytes,
         TrieMutationSummary, ValidationBenchmarkRecord, WitnessSizeBreakdown,
-        VALIDATION_BENCHMARK_SCHEMA_VERSION,
+        BUILDER_BENCHMARK_SCHEMA_VERSION, VALIDATION_BENCHMARK_SCHEMA_VERSION,
     },
     format_bytes, process_rss_bytes, process_rusage,
     rebuild::{simulate_block, HistoricalSimulation},
@@ -1922,7 +1922,7 @@ where
     let builder_total_us = builder_total_start.elapsed().as_micros() as u64;
     if let Some(path) = options.builder_bench_output {
         let record = BuilderBenchmarkRecord {
-            schema_version: 3,
+            schema_version: BUILDER_BENCHMARK_SCHEMA_VERSION,
             block_number,
             block_hash,
             historical_full_db_evm_us,

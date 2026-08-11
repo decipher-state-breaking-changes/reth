@@ -13,8 +13,13 @@ does not depend on.
 
 ## What it does per committed block
 
-1. Re-executes the block against its parent state (`history_by_block_number`) and
-   captures the `BlockAccessedState` (accounts, storage, bytecodes touched).
+1. Obtains the block's `BlockAccessedState` (accounts, storage, bytecodes
+   touched). With `PS_ENGINE_ACCESS=on` this is the artifact the consensus engine
+   already produced when it validated the block, handed over by block hash, and
+   no EVM runs here; otherwise — capture off, a handoff miss, or one of the
+   sampled blocks kept for the differential comparison — the ExEx re-executes the
+   block against its parent state (`history_by_block_number`) itself. Both paths
+   produce the same value, and every later step is identical.
 2. Computes the **cache miss** *before* updating the cache — this is what a
    validator joining at this block would have to be sent.
 3. Applies the tentative `NetworkStateCache` transition (including `LastNBlocksPolicy` eviction),
@@ -173,6 +178,10 @@ variables, so the core sidecar generation path stays lean:
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
 | `PS_PARALLEL_INITIAL_PROOF=1` | use Reth's proof workers for eligible initial V2 multiproofs; low-width target sets and later structural deltas stay serial |
 | `PS_RESOURCE_METRICS=1` | capture process CPU time + page faults around transition-witness construction, including parallel proof workers (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) |
+| `PS_ENGINE_ACCESS=off\|shadow\|on` | reuse the engine's own execution instead of re-executing each block: `shadow` captures and compares while still re-executing, `on` consumes the artifact (default: `off`) |
+| `PS_SHADOW_SAMPLE=<n>` | in `on` mode, re-execute one block in `n` anyway and compare it against the artifact, keeping the differential oracle alive; `0` disables sampling (default: `50`) |
+| `PS_HANDOFF_CAPACITY=<n>` | artifacts the handoff retains before evicting the oldest insert (default: `4`) |
+| `PS_HANDOFF_MAX_BYTES=<bytes>` | access-set byte budget for resident artifacts; excludes the shared execution outputs, so it is not an RSS cap (default: 256 MiB) |
 | `PS_ENGINE_BENCH=1` | enable the lightweight Vanilla Engine V2 timing collector; usable by a standard Reth node without the ExEx |
 | `PS_ENGINE_BENCH_OUTPUT=<file>` | JSONL destination for Vanilla Engine V2 timing records (default: `./engine_bench.jsonl`) |
 | `PS_VALIDATION_BENCH=1` | enable in-memory DB-free Partial/Weak validation paired with same-block Vanilla Engine timing; requires `builder-verifier` |
@@ -190,6 +199,17 @@ The initial parallel-proof gate currently requires at least two distinct storage
 total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
 of storage workers; smaller calls and all later structural/context proof deltas stay on the serial
 provider.
+
+`PS_ENGINE_ACCESS` shares one execution between the node and the ExEx. The engine
+captures the access set at the same point of the same lifecycle the ExEx would,
+after its own validation succeeds, and publishes it into a bounded store keyed by
+block hash; the builder takes it by exact hash. Nothing waits: a contended publish
+drops, a full store evicts its oldest insert, and any absence falls back to
+re-executing the block, which is always correct and merely slower. Lookup is never
+by height, so a reorg sibling can only ever be served its own artifact. In `on`
+mode `PS_SHADOW_SAMPLE` keeps re-executing a fraction of blocks and comparing the
+two access sets, so the equality that justifies the reuse stays under test instead
+of being assumed after the initial `shadow` run.
 
 `PS_SIDECAR_ROLE=builder-verifier` is a single-process test mode: it keeps the
 normal builder output path, but forces the same provider-assisted client preflight

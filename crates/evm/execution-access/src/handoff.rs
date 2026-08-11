@@ -196,6 +196,13 @@ pub struct BlockAccessHandoff {
     capacity: usize,
     max_bytes: usize,
     inner: Mutex<HandoffInner>,
+    /// Hashes dropped because [`Self::insert`] could not take `inner`.
+    ///
+    /// It cannot live inside `HandoffInner`, because the drop happens exactly when that lock is
+    /// unavailable. Its own lock is touched only by a producer that already lost the race and by
+    /// a consumer that is about to report a miss, so it is normally uncontended -- and `insert`
+    /// still refuses to wait on it, so a contention drop never becomes a second place to block.
+    contended: Mutex<VecDeque<B256>>,
     metrics: HandoffMetrics,
 }
 
@@ -206,6 +213,7 @@ impl BlockAccessHandoff {
             capacity: capacity.max(1),
             max_bytes,
             inner: Mutex::new(HandoffInner::default()),
+            contended: Mutex::new(VecDeque::new()),
             metrics: HandoffMetrics::default(),
         }
     }
@@ -221,6 +229,7 @@ impl BlockAccessHandoff {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => {
                 self.metrics.dropped_contended.fetch_add(1, Ordering::Relaxed);
+                self.entomb_contended(artifact.block_hash);
                 return false
             }
         };
@@ -286,16 +295,49 @@ impl BlockAccessHandoff {
             }
             None => {
                 self.metrics.missed.fetch_add(1, Ordering::Relaxed);
-                // Absent from the tombstones means this hash was never evicted here. It may never
-                // have been published at all -- a backfilled block, a WAL replay after restart --
-                // which this store cannot distinguish from the outside and does not claim to.
-                TakeOutcome::Miss(inner.tombstone(block_hash).unwrap_or(MissReason::NotPublished))
+                // Absent from both tombstone rings means this hash was neither evicted nor
+                // dropped here. It may never have been published at all -- a backfilled block, a
+                // WAL replay after restart -- which this store cannot distinguish from the
+                // outside and does not claim to.
+                let reason = inner
+                    .tombstone(block_hash)
+                    .or_else(|| {
+                        self.contended_tombstone(block_hash).then_some(MissReason::DroppedContended)
+                    })
+                    .unwrap_or(MissReason::NotPublished);
+                TakeOutcome::Miss(reason)
             }
         };
 
         self.metrics.resident_bytes.store(inner.bytes, Ordering::Relaxed);
         self.metrics.queue_depth.store(inner.entries.len(), Ordering::Relaxed);
         outcome
+    }
+
+    /// Remembers a hash that lost the insert race, so the consumer's later miss can name it.
+    ///
+    /// Best-effort in the same way the drop itself is: this never waits either, so a hash lost
+    /// while a second producer holds the ring degrades to [`MissReason::NotPublished`] rather
+    /// than delaying the producer that is trying to record it.
+    fn entomb_contended(&self, block_hash: B256) {
+        let mut contended = match self.contended.try_lock() {
+            Ok(contended) => contended,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        if contended.len() >= TOMBSTONE_CAPACITY {
+            contended.pop_front();
+        }
+        contended.push_back(block_hash);
+    }
+
+    /// Whether this hash was dropped on a contended insert, as far as the bounded ring recalls.
+    fn contended_tombstone(&self, block_hash: &B256) -> bool {
+        let contended = match self.contended.lock() {
+            Ok(contended) => contended,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        contended.contains(block_hash)
     }
 
     /// Current telemetry snapshot.
@@ -354,15 +396,23 @@ impl TakeOutcome {
 /// Why a take found nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissReason {
-    /// This store never held the hash, or held it too long ago to still have the tombstone.
+    /// This store never held the hash, or held it too long ago to still have a tombstone.
     ///
     /// Structural for backfilled blocks and for notifications replayed from the ExEx WAL after a
-    /// restart, neither of which the engine tree ever executed in this process.
+    /// restart, neither of which the engine tree ever executed in this process. It remains the
+    /// residual bucket: both tombstone rings are bounded and lossy, and the contended one is
+    /// itself written best-effort, so an attributable cause can still age or race out of reach.
+    /// Read it as "this store cannot say", never as "the producer never published it".
     NotPublished,
     /// Evicted to stay within the artifact count.
     EvictedCapacity,
     /// Evicted to stay within the access-set byte budget.
     EvictedBytes,
+    /// Dropped at publish time because the store was locked, so the artifact never entered it.
+    ///
+    /// This is the store's own doing rather than a structural absence, which is why it is not
+    /// left to fall into [`Self::NotPublished`]: the two demand opposite responses.
+    DroppedContended,
 }
 
 impl MissReason {
@@ -372,6 +422,7 @@ impl MissReason {
             Self::NotPublished => "not_published",
             Self::EvictedCapacity => "evicted_capacity",
             Self::EvictedBytes => "evicted_bytes",
+            Self::DroppedContended => "dropped_contended",
         }
     }
 }
@@ -554,6 +605,28 @@ mod tests {
             handoff.take_outcome(&hash(99)).miss_reason(),
             Some(MissReason::NotPublished),
             "hash 99 was never seen at all"
+        );
+    }
+
+    #[test]
+    fn a_contended_drop_is_attributed_to_the_hash_it_dropped() {
+        // Standing in for a consumer holding the store while the producer publishes. The counter
+        // alone cannot answer the per-miss question: without the hash, this miss would be
+        // indistinguishable from a block the Engine never executed in this process.
+        let handoff = BlockAccessHandoff::new(4, usize::MAX);
+        let held = handoff.inner.lock().expect("uncontended in this test");
+        assert!(!handoff.insert(artifact(10, 1)), "a contended insert drops rather than waits");
+        drop(held);
+
+        assert_eq!(handoff.stats().dropped_contended, 1);
+        assert_eq!(
+            handoff.take_outcome(&hash(1)).miss_reason(),
+            Some(MissReason::DroppedContended),
+        );
+        assert_eq!(
+            handoff.take_outcome(&hash(99)).miss_reason(),
+            Some(MissReason::NotPublished),
+            "an unrelated hash is still unattributed"
         );
     }
 

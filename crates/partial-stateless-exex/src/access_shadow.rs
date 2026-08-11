@@ -196,8 +196,14 @@ pub enum ArtifactDisposition {
 
 impl ArtifactDisposition {
     /// Whether the handoff delivered an artifact. This, not reuse, is the delivery rate.
+    ///
+    /// [`Self::TypeMismatch`] counts as delivered. The artifact arrived; what failed was the
+    /// consumer's downcast, and scoring that as a delivery failure would charge the handoff for
+    /// a defect on the other side of it. Delivery and usability are separate questions, and the
+    /// second one is answered by [`Self::fallback_reason`], which names `type_mismatch`
+    /// explicitly rather than leaving it among the misses.
     pub const fn artifact_available(&self) -> bool {
-        matches!(self, Self::Reused | Self::Shadowed | Self::Sampled)
+        matches!(self, Self::Reused | Self::Shadowed | Self::Sampled | Self::TypeMismatch)
     }
 
     /// Whether the artifact replaced re-execution. This is the share of blocks that got the win.
@@ -228,7 +234,9 @@ impl ArtifactDisposition {
 /// In `on` mode the artifact replaces the re-execution that shadow comparison needs as its second
 /// opinion, so an unsampled `on` run has nothing to compare and accrues no evidence. Sampling a
 /// fraction of blocks buys a permanent oracle for a proportional share of the win, and it is the
-/// only arrangement under which a reorg or a post-restart replay is ever actually compared.
+/// only arrangement under which a reorg sibling is ever actually compared in `on` mode. It buys
+/// nothing for a post-restart WAL replay: the handoff starts empty, so a replayed notification
+/// misses and there is no artifact for any sampling rate to compare against.
 pub fn shadow_sample_selects(block_number: u64) -> bool {
     sample_selects(shadow_sample_interval(), block_number)
 }

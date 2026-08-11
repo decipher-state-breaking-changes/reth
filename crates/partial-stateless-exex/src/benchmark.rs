@@ -566,6 +566,20 @@ pub struct RetainedGenerationBytes {
     pub exclusive_bytes: usize,
 }
 
+/// Schema of [`BuilderBenchmarkRecord`].
+///
+/// 4 declares the fields that make a B3 run readable: `artifact_available`, `shadow_sampled`,
+/// and `fallback_reason`. Schema 3 as specified carried only `artifact_reused`, which cannot
+/// answer what these files are read for -- a reused block looks the same either way, but a
+/// delivered-and-not-reused block is indistinguishable from a miss, and a delivery rate computed
+/// over 3 is not a low delivery rate, it is an absent field printed as zero.
+///
+/// The three fields were added without raising this constant, so files exist that declare 3 and
+/// carry all of 4 (B3 stages 3--5, history A.17). They are correct; only the label is stale.
+/// `analyze_builder_bench.py` therefore keys on field presence and reports the declared version
+/// rather than trusting it, and this bump only fixes files written from here on.
+pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 4;
+
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BuilderBenchmarkRecord {
@@ -578,6 +592,9 @@ pub struct BuilderBenchmarkRecord {
     /// Distinct from `artifact_reused`, and the distinction is not pedantic: a sampled block is
     /// delivered and deliberately not reused, so at the default 1-in-50 sampling a perfectly
     /// healthy handoff still reports only ~98% reuse. Read delivery here and the win there.
+    ///
+    /// Delivery, not usability: a `type_mismatch` block sets this and still re-executes. Since
+    /// schema 4 (never in 3, which has no such field).
     pub artifact_available: bool,
     /// Whether the artifact actually replaced this block's re-execution (B3 stage 4).
     ///
@@ -589,7 +606,10 @@ pub struct BuilderBenchmarkRecord {
     /// Why the artifact was not reused, or `None` when it was.
     ///
     /// `capture_off`, `shadow_mode`, `shadow_sampled`, `type_mismatch`, `not_published`,
-    /// `evicted_capacity`, `evicted_bytes`.
+    /// `evicted_capacity`, `evicted_bytes`, `dropped_contended`.
+    ///
+    /// `not_published` is the residual, not a claim about the producer: the handoff's tombstone
+    /// rings are bounded, so a cause that aged out arrives here. Since schema 4.
     pub fallback_reason: Option<&'static str>,
     pub builder_total_us: u64,
     pub transition_witness_build_us: u64,
@@ -912,6 +932,20 @@ mod tests {
         assert!(value.get("parallel_account_workers").is_some());
         assert!(value.get("witness_commitment").is_some());
         assert!(value["retained_generation"].get("exclusive_bytes").is_some());
+    }
+
+    #[test]
+    fn the_builder_schema_version_covers_every_artifact_field_an_analyzer_needs() {
+        // These four fields arrived together and are read together. A file that carries some of
+        // them under a version that promises none is the failure this guards: the analyzer would
+        // find `artifact_available` absent and report 0% delivery rather than "not recorded".
+        let value = serde_json::to_value(BuilderBenchmarkRecord::default()).unwrap();
+
+        assert_eq!(BUILDER_BENCHMARK_SCHEMA_VERSION, 4);
+        for field in ["artifact_available", "artifact_reused", "shadow_sampled", "fallback_reason"]
+        {
+            assert!(value.get(field).is_some(), "schema 4 must carry {field}");
+        }
     }
 
     #[test]
