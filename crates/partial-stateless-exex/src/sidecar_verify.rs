@@ -1,14 +1,13 @@
 use crate::{
     sidecar_io::{read_sidecar, sidecar_path},
-    sidecar_reexec::{
-        verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits, TrieCacheDisposition,
-    },
+    sidecar_reexec::{verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits},
     CacheConfig,
 };
 use partial_stateless::{
     last_n_blocks_cache_policy_id, network_cache::NetworkStateCache, PartialTrieNodeCache,
     ReadyParent,
 };
+use partial_stateless_validator::TrieCacheDisposition;
 use reth_ethereum::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
@@ -78,51 +77,46 @@ where
         TrieCacheDisposition::Commit,
     )?;
 
-    if !report.root_witness_completeness.trustless_root_ready {
+    if !report.outcome.root_witness_completeness.trustless_root_ready {
         warn!(
             target: "partial_stateless",
             block = block_number,
             partial_state_trustless_verification_ready = false,
-            missing_account_paths = report.root_witness_completeness.missing_account_paths.len(),
-            missing_storage_paths = report.root_witness_completeness.missing_storage_paths.len(),
+            missing_account_paths = report.outcome.root_witness_completeness.missing_account_paths.len(),
+            missing_storage_paths = report.outcome.root_witness_completeness.missing_storage_paths.len(),
             "Partial-state node trustless verification is not ready; current state_root check is provider-assisted"
         );
     }
 
-    match report.trustless_state_root {
-        Some(root) => info!(
-            target: "partial_stateless",
-            block = block_number,
-            accepted_as_partial = ready_parent.is_some(),
-            trustless_state_root = ?root,
-            "Trustless state root VERIFIED (trie node cache + witness only)"
-        ),
-        None => info!(
-            target: "partial_stateless",
-            block = block_number,
-            trie_warm_nodes = trie_cache.warm_node_count(),
-            tracked_accounts = trie_cache.tracked_account_count(),
-            "Trustless state root unavailable — trie node cache not warm enough this block (blind path)"
-        ),
-    }
+    // Unconditional: the core checks this root against the header before it returns, so reaching
+    // here at all means the trustless path produced it. The old "blind path" arm was already
+    // unreachable — the field it matched on was always `Some` — and the extraction removed the
+    // `Option` rather than preserving a branch nothing could take.
+    info!(
+        target: "partial_stateless",
+        block = block_number,
+        accepted_as_partial = ready_parent.is_some(),
+        trustless_state_root = ?report.outcome.state_root,
+        "Trustless state root VERIFIED (trie node cache + witness only)"
+    );
 
-    let stats = &report.cache_update;
+    let stats = &report.outcome.cache_update;
     info!(
         target: "partial_stateless",
         block = block_number,
         path = %path.display(),
         sidecar_bytes = bytes.len(),
         partial_state_trustless_verification_ready = report
-            .root_witness_completeness
+            .outcome.root_witness_completeness
             .trustless_root_ready,
-        computed_state_root = ?report.computed_state_root,
-        reexec_accounts = report.actual_accessed.accounts.len(),
-        reexec_storage = report.actual_accessed.storage.len(),
-        reexec_codes = report.actual_accessed.codes.len(),
-        expected_miss_accounts = report.expected_miss.accounts.len(),
-        expected_miss_storage = report.expected_miss.storage.len(),
-        expected_miss_codes = report.expected_miss.code_hashes.len(),
-        next_cache_root = ?report.next_cache_anchor.cache_root,
+        computed_state_root = ?report.outcome.state_root,
+        reexec_accounts = report.outcome.actual_accessed.accounts.len(),
+        reexec_storage = report.outcome.actual_accessed.storage.len(),
+        reexec_codes = report.outcome.actual_accessed.codes.len(),
+        expected_miss_accounts = report.outcome.expected_miss.accounts.len(),
+        expected_miss_storage = report.outcome.expected_miss.storage.len(),
+        expected_miss_codes = report.outcome.expected_miss.code_hashes.len(),
+        next_cache_root = ?report.outcome.next_cache_anchor.cache_root,
         accounts_added = stats.accounts_added,
         accounts_refreshed = stats.accounts_refreshed,
         accounts_evicted = stats.accounts_evicted,
@@ -132,7 +126,7 @@ where
         "Live sidecar verification succeeded"
     );
 
-    Ok(report.displaced_trie_cache)
+    Ok(report.outcome.displaced_trie_cache)
 }
 
 /// Rejects a sidecar whose previous anchor disagrees with the tracker-authenticated Ready parent.

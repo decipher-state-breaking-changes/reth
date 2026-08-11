@@ -1,0 +1,50 @@
+[package]
+name = "partial-stateless-validator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Database-free partial-stateless block validator core"
+
+[lib]
+name = "partial_stateless_validator"
+path = "src/lib.rs"
+
+[features]
+# Mirrors `partial-stateless-exex`, and for a reason this package makes sharper rather than
+# inherits. Features unify per package, so `cargo build -p partial-stateless-validator` — which is
+# exactly how the standalone binary is built — selects only this package's dependency graph and
+# would otherwise reach `alloy-primitives` with neither keccak feature. That is the defect of plan
+# section 1, which invalidated every absolute benchmark number in the archive before 2026-08-06.
+# `scripts/check_validator_isolation.sh` fails the build profile if these stop arriving.
+default = ["asm-keccak", "keccak-cache-global", "min-debug-logs"]
+
+asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+min-debug-logs = ["tracing/release_max_level_debug"]
+
+[dependencies]
+# reth — implementation crates only where they carry no state database.
+#
+# Nothing here may reach `reth-provider`, `reth-db`, `reth-libmdbx`, `reth-mdbx-sys`, `reth-exex`,
+# or `reth-node-builder`: "database-free" is a dependency-graph property of this package, not a
+# convention its callers observe. `reth-storage-errors` is the one storage crate present, and it
+# carries error types only. The `reth-ethereum` `full,cli` facade is deliberately absent — it is
+# what drags the node builder and MDBX in.
+reth-ethereum-primitives = { workspace = true, features = ["std"] }
+reth-evm = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std"] }
+reth-revm = { workspace = true, features = ["std"] }
+reth-storage-errors = { workspace = true, features = ["std"] }
+reth-trie-common = { workspace = true, features = ["std"] }
+revm = { workspace = true }
+
+# our cache crate
+partial-stateless = { path = "../partial-stateless" }
+
+# alloy
+alloy-primitives.workspace = true
+
+# utilities
+eyre.workspace = true
+serde.workspace = true
+tracing.workspace = true

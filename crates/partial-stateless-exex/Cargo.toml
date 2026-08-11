@@ -46,8 +46,9 @@ reth-primitives-traits = { workspace = true }
 reth-cli-util = { workspace = true, features = ["jemalloc"] }
 revm = { workspace = true }
 
-# our cache crate
+# our cache crate and the database-free validator core it drives
 partial-stateless = { path = "../partial-stateless" }
+partial-stateless-validator = { path = "../partial-stateless-validator" }
 
 # alloy
 alloy-eips.workspace = true

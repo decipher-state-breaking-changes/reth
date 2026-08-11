@@ -28,7 +28,6 @@ mod sidecar_verify;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
-use benchmark::RetainedGenerationBytes;
 use futures::TryStreamExt;
 use partial_stateless::{
     network_cache::NetworkStateCache,
@@ -36,10 +35,14 @@ use partial_stateless::{
     policy::{CachePolicy, LastNBlocksPolicy},
     readiness::{
         BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
-        ReadyParent, TrustedCheckpoint,
+        ReadyParent,
     },
     sidecar::last_n_blocks_cache_policy_id,
     PartialStatelessSidecar, PartialTrieNodeCache,
+};
+use partial_stateless_validator::{
+    admit_block, block_context, inject_recovery, BlockAdmission, CanonicalStateRoots,
+    CoordinatedPair, RetainedGenerationBytes,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -61,10 +64,11 @@ use sidecar_create::{
 use sidecar_reexec::SidecarReexecLimits;
 use sidecar_verify::verify_live_sidecar;
 use std::{
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Configuration for the partial statelessness cache.
 #[derive(Debug, Clone, Copy)]
@@ -454,11 +458,16 @@ impl RunOptions {
     }
 }
 
-/// The one coordinated generation this ExEx maintains, plus what it is authenticated against.
-struct CoordinatedPair {
-    cache: NetworkStateCache,
-    trie_cache: PartialTrieNodeCache,
-    readiness: CacheReadinessTracker,
+/// The coordinated pair as this ExEx carries it: protocol state plus what the run log needs.
+///
+/// `CoordinatedPair` lives in `partial-stateless-validator` and holds protocol state only, so the
+/// label below — which exists purely so the run checklist can read "exactly one transition to
+/// ready" — stays on this side rather than travelling into a validator that has no run log.
+///
+/// `Deref` is here so the hundred-odd `pair.cache` / `pair.readiness` sites read the same after
+/// the extraction as before it. This is a private newtype over one field, not a base class.
+struct LivePair {
+    coordinated: CoordinatedPair,
     /// Last classification that was *reported*, which is never the transient `Applying`.
     ///
     /// Reading the tracker's own label instead would report a change on every block: admitting a
@@ -466,193 +475,28 @@ struct CoordinatedPair {
     /// `Applying -> Ready` would be logged once per block and the run checklist's "exactly one
     /// transition to ready" would be unreadable.
     last_readiness_label: &'static str,
-    /// The single previous trie generation, kept so a depth-1 reorg does not need a full rebuild.
-    ///
-    /// K is 1 because that is the depth at which retention is free: the transition already copies
-    /// the parent trie and then overwrites it, so keeping the displaced copy costs no extra work.
-    /// Any K beyond 1 would need genuinely extra copies, and a deeper reorg falls back to
-    /// `rebuild_coordinated_pair` instead.
-    previous_generation: Option<RetainedGeneration>,
 }
 
-impl CoordinatedPair {
-    fn fingerprint(&self) -> CoordinatedFingerprint {
-        CoordinatedFingerprint {
-            cache_block: self.cache.current_block(),
-            cache_root: self.cache.cache_root(),
-            trie_cache_root: self.trie_cache.cache_root(),
-            trie_state_root: self.trie_cache.state_root(),
-        }
-    }
-
-    /// Record the trie generation a committed block displaced, so the block can be undone.
-    ///
-    /// `None` means the transition did not commit, in which case the current trie cache is still
-    /// the parent and there is nothing new to keep. The old retention is dropped either way: it
-    /// described a generation two blocks back, which K = 1 does not promise to reach.
-    fn retain_generation(
-        &mut self,
-        displaced: Option<PartialTrieNodeCache>,
-        block_hash: B256,
-        block_number: u64,
-        enabled: bool,
-    ) {
-        // Dropping `displaced` here rather than declining to produce it is deliberate: the
-        // transition still copies the parent trie and still hands the copy back, so the control
-        // arm pays exactly the work the production arm pays and differs only in what it keeps.
-        // A control that also skipped the copy would be measuring two changes at once.
-        self.previous_generation = enabled
-            .then_some(displaced)
-            .flatten()
-            .map(|trie_cache| RetainedGeneration { trie_cache, block_hash, block_number });
-    }
-
-    /// What the retained generation costs right now, for the K = 1 memory control.
-    ///
-    /// Read before a block is built, so it describes the generation the *previous* block
-    /// displaced — the steady state a run spends every block in, rather than the instant after a
-    /// transition when the live cache has not yet diverged from it.
-    fn retained_generation_bytes(&self, enabled: bool) -> RetainedGenerationBytes {
-        let Some(retained) = &self.previous_generation else {
-            return RetainedGenerationBytes { enabled, ..Default::default() }
-        };
-        RetainedGenerationBytes {
-            enabled,
-            present: true,
-            total_bytes: retained.trie_cache.estimated_memory_bytes(),
-            exclusive_bytes: retained.trie_cache.exclusive_memory_bytes(),
-        }
-    }
-
-    /// Drop the retained generation because the pair no longer descends from it.
-    ///
-    /// Called wherever the pair is replaced wholesale — cold reset, snapshot restore, canonical
-    /// rebuild. The arithmetic and hash checks in `restore_retained_generation` would reject a
-    /// stale retention anyway; clearing it is the cheaper, more obvious guard.
-    fn forget_retained_generation(&mut self) {
-        self.previous_generation = None;
-    }
-
-    /// Undo exactly one committed block, returning the pair to `target_hash`.
-    ///
-    /// This is the fast path for a depth-1 reorg. It is fail-closed by construction: every
-    /// precondition is checked before anything is mutated, and any rejection returns `None` so the
-    /// caller rebuilds instead. A rebuild is safe even over a half-restored pair, because
-    /// `rebuild_coordinated_pair` never consults the previous generation.
-    ///
-    /// `target_state_root` must come from the canonical header for `target_hash`. Comparing the
-    /// retained trie's own root against it is what makes this an authentication rather than a
-    /// tautology — the same reason `install_rebuilt_pair` leans on the header's state root rather
-    /// than on the self-derived cache root.
-    fn restore_retained_generation(
-        &mut self,
-        target_hash: B256,
-        target_state_root: B256,
-        cache_policy_id: B256,
-    ) -> Option<ReadyParent> {
-        let retained = self.previous_generation.take()?;
-        // Checked before anything is mutated, and before the cheap hash checks are even worth
-        // running: a pair that is still warming has no `Ready` to return to, so undoing into it
-        // would trade a rebuild that genuinely fills the window for a claim nothing backs. The
-        // tracker refuses this too, but only after the caches have already been rolled back.
-        if !self.readiness.stays_warm_after_one_undo() {
-            debug!(
-                target: "partial_stateless",
-                replay_depth = self.readiness.replay_depth(),
-                required = self.readiness.required_replay_depth(),
-                "Pair is still warming, so undoing one block cannot restore Ready; rebuilding"
-            );
-            return None
-        }
-        if retained.block_hash != target_hash {
-            debug!(
-                target: "partial_stateless",
-                retained_block = retained.block_number,
-                retained_hash = ?retained.block_hash,
-                ?target_hash,
-                "Retained generation belongs to a different block; falling back to a rebuild"
-            );
-            return None
-        }
-        // Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has
-        // to move as one generation.
-        if self.cache.current_block() != retained.block_number + 1 {
-            return None
-        }
-        if retained.trie_cache.state_root() != Some(target_state_root) {
-            warn!(
-                target: "partial_stateless",
-                block = retained.block_number,
-                retained_state_root = ?retained.trie_cache.state_root(),
-                canonical_state_root = ?target_state_root,
-                "Retained generation does not match the canonical state root at its own block; \
-                 falling back to a rebuild"
-            );
-            return None
-        }
-
-        let undone = self.cache.current_block();
-        if let Err(err) = self.cache.rollback_block(undone) {
-            warn!(
-                target: "partial_stateless",
-                block = undone,
-                ?err,
-                "Flat rollback refused the block the retained generation undoes"
-            );
-            return None
-        }
-        self.trie_cache = retained.trie_cache;
-
-        let checkpoint = TrustedCheckpoint {
-            block_number: retained.block_number,
-            block_hash: retained.block_hash,
-            state_root: target_state_root,
-            cache_root: self.cache.cache_root(),
-            cache_policy_id,
-        };
-        let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
-        match self.readiness.restore_from_undone_block(&checkpoint, &observation) {
-            Ok(ready) => {
-                let ready = ready.clone();
-                self.last_readiness_label = self.readiness.state().label();
-                Some(ready)
-            }
-            Err(err) => {
-                warn!(
-                    target: "partial_stateless",
-                    block = retained.block_number,
-                    ?err,
-                    "Readiness rejected the restored generation; falling back to a rebuild"
-                );
-                None
-            }
-        }
+impl LivePair {
+    /// Wraps a freshly built or restored pair, reporting whatever it is already classified as.
+    fn new(coordinated: CoordinatedPair) -> Self {
+        let last_readiness_label = coordinated.readiness.state().label();
+        Self { coordinated, last_readiness_label }
     }
 }
 
-/// What two coordinated pairs must agree on to be the same generation.
-///
-/// `trie_cache_root` commits the trie's state root together with its retained-path membership, so
-/// comparing it covers "retained paths" without walking them. `cache_root` hashes every flat
-/// value *and* its `last_accessed_block`, which is the only complete check on the replay metadata
-/// a state proof cannot attest to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CoordinatedFingerprint {
-    cache_block: u64,
-    cache_root: B256,
-    trie_cache_root: B256,
-    trie_state_root: Option<B256>,
+impl Deref for LivePair {
+    type Target = CoordinatedPair;
+
+    fn deref(&self) -> &Self::Target {
+        &self.coordinated
+    }
 }
 
-/// One previous trie generation, tagged with the block it is the state *after*.
-///
-/// The tag is a hash rather than a number on purpose: mid-reorg a height names whichever block the
-/// database currently calls canonical, which is the failure the whole recovery path exists to
-/// avoid. `NetworkStateCache` needs no counterpart here — its undo log already reaches finality.
-struct RetainedGeneration {
-    trie_cache: PartialTrieNodeCache,
-    block_hash: B256,
-    block_number: u64,
+impl DerefMut for LivePair {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.coordinated
+    }
 }
 
 /// State of the in-process bootstrap gate: export once, then carry a second pair for a few blocks.
@@ -683,7 +527,7 @@ impl BootstrapGate {
 /// run would restore at H and receive H + k — bridging that drift with a canonical rebuild would
 /// mean the snapshot did no work and the gate never closed.
 struct ShadowPair {
-    pair: CoordinatedPair,
+    pair: LivePair,
     remaining_blocks: u32,
     restored_at: u64,
 }
@@ -882,7 +726,7 @@ where
 /// persisting would let a restart reload exactly that.
 fn persist_cache(
     options: &RunOptions,
-    pair: &CoordinatedPair,
+    pair: &LivePair,
     cache_path: &Path,
     block: u64,
     canonical: bool,
@@ -905,7 +749,7 @@ fn persist_cache(
 /// A snapshot import takes precedence over the persisted flat cache, which loads values and then
 /// discards them for want of a matching trie snapshot — restoring both halves together is the
 /// whole point of the package.
-fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -> CoordinatedPair {
+fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -> LivePair {
     let config = &options.config;
     if options.bootstrap_import {
         match bootstrap_io::load_snapshot(&options.bootstrap_dir) {
@@ -913,13 +757,12 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                 match bootstrap_io::restore_snapshot(package, &checkpoint, config) {
                     Ok(restored) => {
                         bootstrap_io::warn_on_head_drift(&checkpoint, head_block + 1);
-                        return CoordinatedPair {
+                        return LivePair::new(CoordinatedPair {
                             cache: restored.cache,
                             trie_cache: restored.trie_cache,
-                            last_readiness_label: restored.readiness.state().label(),
                             previous_generation: None,
                             readiness: restored.readiness,
-                        }
+                        })
                     }
                     Err(err) => error!(
                         target: "partial_stateless",
@@ -1003,13 +846,12 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
 
     // Tracks whether the two caches together still describe the parent of the block being
     // processed. Both start cold here, and the tracker starts cold with them.
-    CoordinatedPair {
+    LivePair::new(CoordinatedPair {
         cache,
         trie_cache: PartialTrieNodeCache::new(),
         readiness: config.new_readiness_tracker(),
-        last_readiness_label: CacheReadiness::Cold.label(),
         previous_generation: None,
-    }
+    })
 }
 
 /// Rebuilds the coordinated pair at `parent_hash` when it is cold and a rebuild is available.
@@ -1022,7 +864,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
 fn maybe_rebuild_before_applying<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     parent_hash: B256,
     failures: &mut u32,
 ) where
@@ -1044,7 +886,7 @@ fn maybe_rebuild_before_applying<Node>(
 fn recover_at<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     unwound_from: u64,
     target_hash: Option<B256>,
     failures: &mut u32,
@@ -1081,18 +923,6 @@ where
     rebuild_pair_at(ctx, options, pair, target_hash, failures)
 }
 
-/// The canonical state root for a block hash — the only thing depth-1 recovery asks of the node.
-///
-/// This is a trait rather than a direct `ctx.provider()` call so the fast path can be driven
-/// without a database. The retained generation is only usable when it *is* the recovery target,
-/// and that is checked against the canonical header rather than against anything the pair derived
-/// itself; a fake chain that answers this one question is therefore enough to exercise the whole
-/// path, which is what [`inject_recovery`] and the equivalence gate rely on.
-trait CanonicalStateRoots {
-    /// `None` means there is no canonical header for `hash`, which is a rejection, not an error.
-    fn state_root_of(&self, hash: B256) -> ProviderResult<Option<B256>>;
-}
-
 /// Adapts a node provider to [`CanonicalStateRoots`].
 struct CanonicalChain<P>(P);
 
@@ -1102,76 +932,10 @@ impl<P: HeaderProvider<Header: AlloyBlockHeader>> CanonicalStateRoots for Canoni
     }
 }
 
-/// Drives the recovery half of a `ChainReorged` or `ChainReverted` notification.
-///
-/// This is the notification-injection hook. Both handlers do exactly this — mark the tracker
-/// `Recovering` at the first unwound height, then attempt the depth-1 undo — and everything after
-/// it differs only in whether a new branch follows. Mainnet produces the notification that reaches
-/// this code roughly once a day and never at a depth the test chooses, so the gate on recovery
-/// *equivalence* cannot be a live observation; injecting the notification against a chain the test
-/// controls is what makes it a gate.
-///
-/// The rebuild fallback is deliberately on the caller's side. It needs a database, and a stateless
-/// verifier does not have one, so a verifier's only recovery is the path this function covers.
-fn inject_recovery(
-    pair: &mut CoordinatedPair,
-    chain: &impl CanonicalStateRoots,
-    unwound_from: u64,
-    target_hash: B256,
-    cache_policy_id: B256,
-) -> Option<ReadyParent> {
-    pair.readiness.begin_recovery(unwound_from);
-    try_depth_one_recovery(pair, chain, target_hash, cache_policy_id)
-}
-
-/// Undoes exactly one block to return the pair to `target_hash`, or `None` to fall back.
-///
-/// Split out of [`recover_at`] so that everything between a notification and the restored pair can
-/// run against a fake chain. Nothing here touches the database, and the rebuild — which does — is
-/// deliberately left on the caller's side of the seam.
-fn try_depth_one_recovery(
-    pair: &mut CoordinatedPair,
-    chain: &impl CanonicalStateRoots,
-    target_hash: B256,
-    cache_policy_id: B256,
-) -> Option<ReadyParent> {
-    let state_root = match chain.state_root_of(target_hash) {
-        Ok(Some(state_root)) => state_root,
-        Ok(None) => {
-            debug!(
-                target: "partial_stateless",
-                ?target_hash,
-                "No canonical header for the recovery target; rebuilding"
-            );
-            return None
-        }
-        Err(err) => {
-            debug!(
-                target: "partial_stateless",
-                ?target_hash,
-                %err,
-                "Could not read the recovery target's header; rebuilding"
-            );
-            return None
-        }
-    };
-
-    let started = Instant::now();
-    let ready = pair.restore_retained_generation(target_hash, state_root, cache_policy_id)?;
-    info!(
-        target: "partial_stateless",
-        block = ready.anchor.block_number,
-        block_hash = ?ready.anchor.block_hash,
-        restore_us = started.elapsed().as_micros() as u64,
-        "Recovered by undoing one block from the retained generation instead of rebuilding"
-    );
-    Some(ready)
-}
-
 fn rebuild_pair_at<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     target_hash: B256,
     failures: &mut u32,
 ) -> bool
@@ -1198,9 +962,9 @@ where
     .and_then(|rebuilt| {
         rebuild::install_rebuilt_pair(
             rebuilt,
-            &mut pair.cache,
-            &mut pair.trie_cache,
-            &mut pair.readiness,
+            &mut pair.coordinated.cache,
+            &mut pair.coordinated.trie_cache,
+            &mut pair.coordinated.readiness,
         )
     });
 
@@ -1240,7 +1004,7 @@ where
 fn process_canonical_block<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     gate: &mut BootstrapGate,
     rebuild_failures: &mut u32,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
@@ -1303,8 +1067,8 @@ where
             ctx.evm_config(),
             state_provider.as_ref(),
             block,
-            &mut pair.cache,
-            &mut pair.trie_cache,
+            &mut pair.coordinated.cache,
+            &mut pair.coordinated.trie_cache,
             &options.config,
             &options.sidecar_dir,
             &options.reexec_limits,
@@ -1367,8 +1131,8 @@ where
         ctx.evm_config(),
         state_provider.as_ref(),
         block,
-        &mut pair.cache,
-        &mut pair.trie_cache,
+        &mut pair.coordinated.cache,
+        &mut pair.coordinated.trie_cache,
         &options.config,
         options.builder_options(
             options
@@ -1401,7 +1165,7 @@ where
 /// sidecar creation, while the verifier gets it from committed reexecution. Keeping the sequence
 /// shared prevents either arm from becoming unable to service the same depth-1 recovery hook.
 fn finish_committed_transition(
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     displaced_trie_cache: Option<PartialTrieNodeCache>,
     block: &BlockContext,
     retain_generation: bool,
@@ -1425,7 +1189,7 @@ fn finish_committed_transition(
 fn advance_bootstrap_gate<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     gate: &mut BootstrapGate,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     sidecar: Option<PartialStatelessSidecar>,
@@ -1452,24 +1216,24 @@ where
         }
         // Deliberately the provider-free path: a bootstrapped verifier is the case that has no
         // database to fall back on, so validating it with provider help would prove nothing.
-        let report = sidecar_reexec::verify_and_apply_trustless_sidecar_for_benchmark(
+        let report = partial_stateless_validator::verify_and_apply_sidecar(
             ctx.evm_config(),
             block,
-            &mut shadow.pair.cache,
+            &mut shadow.pair.coordinated.cache,
             &sidecar,
             options.config.cache_policy_id(),
             &options.reexec_limits,
-            &mut shadow.pair.trie_cache,
-            sidecar_reexec::TrieCacheDisposition::Commit,
+            &mut shadow.pair.coordinated.trie_cache,
+            partial_stateless_validator::TrieCacheDisposition::Commit,
         )
         .map_err(|err| {
             eyre::eyre!("the bootstrapped pair failed to verify block {block_number}: {err:#}")
         })?;
-        if report.trustless_state_root != Some(block.state_root()) {
+        if report.outcome.state_root != block.state_root() {
             eyre::bail!(
                 "the bootstrapped pair computed state root {:?} for block {block_number}, \
                  expected {:?}",
-                report.trustless_state_root,
+                report.outcome.state_root,
                 block.state_root()
             );
         }
@@ -1548,13 +1312,12 @@ where
             &options.config,
         )?;
         let shadow = ShadowPair {
-            pair: CoordinatedPair {
+            pair: LivePair::new(CoordinatedPair {
                 cache: restored.cache,
                 trie_cache: restored.trie_cache,
-                last_readiness_label: restored.readiness.state().label(),
                 previous_generation: None,
                 readiness: restored.readiness,
-            },
+            }),
             remaining_blocks: gate.self_test_blocks,
             restored_at: ready.anchor.block_number,
         };
@@ -1589,7 +1352,7 @@ where
 /// leaves the tracker `Recovering`, and repairing that with the same silent reset-and-retry as a
 /// plain gap would make a failed recovery indistinguishable from a clean cold start.
 fn admit_after_cold_reset(
-    pair: &mut CoordinatedPair,
+    pair: &mut LivePair,
     block: &BlockContext,
 ) -> eyre::Result<Option<ReadyParent>> {
     warn!(
@@ -1611,32 +1374,11 @@ fn admit_after_cold_reset(
     }
 }
 
-/// Reports whether a block may be applied, without repairing anything.
-fn admit_block(readiness: &mut CacheReadinessTracker, block: &BlockContext) -> BlockAdmission {
-    // Captured before admission: applying a block moves the tracker to `Applying`, and the token
-    // describes the parent this block builds on, not the block itself.
-    let ready_parent = readiness.ready_parent().cloned();
-    match readiness.begin_block(block) {
-        Ok(()) => BlockAdmission::Admitted(ready_parent),
-        Err(reason) => BlockAdmission::Rejected(reason),
-    }
-}
-
-/// Whether a block may be applied, and what the caches were authenticated against beforehand.
-#[derive(Debug)]
-enum BlockAdmission {
-    /// The block may be applied. `Some` carries the parent that partial output may be published
-    /// against; `None` means the caches are not Ready and may only produce local measurements.
-    Admitted(Option<ReadyParent>),
-    /// The block must not be applied, and why.
-    Rejected(BlockedReason),
-}
-
 /// Reclassifies the caches after `block` was applied, logging only genuine changes.
 ///
 /// Readiness is advisory here: nothing yet refuses to build or verify a sidecar because the caches
 /// are still warming. Gating on it would change what the benchmark measures.
-fn observe_readiness(pair: &mut CoordinatedPair, block: &BlockContext) {
+fn observe_readiness(pair: &mut LivePair, block: &BlockContext) {
     let before = pair.last_readiness_label;
     let observation = CacheObservation::capture(&pair.cache, &pair.trie_cache);
     let after = pair.readiness.finish_block(block, &observation).label();
@@ -1650,16 +1392,6 @@ fn observe_readiness(pair: &mut CoordinatedPair, block: &BlockContext) {
             replay_depth = pair.readiness.replay_depth(),
             "Cache readiness changed"
         );
-    }
-}
-
-/// Describes a canonical block for the readiness tracker.
-fn block_context(block: &RecoveredBlock<BlockTy<EthPrimitives>>) -> BlockContext {
-    BlockContext {
-        number: block.number(),
-        hash: block.hash(),
-        parent_hash: block.parent_hash,
-        state_root: block.state_root(),
     }
 }
 
@@ -1739,7 +1471,8 @@ mod tests {
     use super::{
         admit_after_cold_reset, admit_block, block_context, finish_committed_transition,
         inject_recovery, observe_readiness, BlockAdmission, BlockContext, CacheConfig,
-        CanonicalStateRoots, CoordinatedPair, PartialTrieNodeCache, ProviderResult, SidecarRole,
+        CanonicalStateRoots, CoordinatedPair, LivePair, PartialTrieNodeCache, ProviderResult,
+        SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -1755,15 +1488,14 @@ mod tests {
 
     const TOUCHED: Address = Address::repeat_byte(0x11);
 
-    fn cold_pair() -> CoordinatedPair {
+    fn cold_pair() -> LivePair {
         let config = CacheConfig::default();
-        CoordinatedPair {
+        LivePair::new(CoordinatedPair {
             cache: config.new_cache(),
             trie_cache: PartialTrieNodeCache::new(),
             readiness: config.new_readiness_tracker(),
-            last_readiness_label: CacheReadiness::Cold.label(),
             previous_generation: None,
-        }
+        })
     }
 
     /// Synthesizes a chain whose hashes and state roots derive from block numbers, so a test can
@@ -1785,7 +1517,7 @@ mod tests {
     }
 
     /// Stands in for a block application: advances the cache height and leaves one entry behind.
-    fn apply(pair: &mut CoordinatedPair, number: u64) {
+    fn apply(pair: &mut LivePair, number: u64) {
         let mut accessed = BlockAccessedState::default();
         accessed.accounts.insert(
             TOUCHED,
@@ -1795,7 +1527,7 @@ mod tests {
     }
 
     /// Admits a block the way the handler does when no canonical rebuild is available.
-    fn admit(pair: &mut CoordinatedPair, block: &BlockContext) -> Option<super::ReadyParent> {
+    fn admit(pair: &mut LivePair, block: &BlockContext) -> Option<super::ReadyParent> {
         match admit_block(&mut pair.readiness, block) {
             BlockAdmission::Admitted(ready) => ready,
             BlockAdmission::Rejected(_) => {
@@ -1805,7 +1537,7 @@ mod tests {
     }
 
     /// Runs one block end to end the way the notification handler does.
-    fn process(pair: &mut CoordinatedPair, number: u64) -> Option<super::ReadyParent> {
+    fn process(pair: &mut LivePair, number: u64) -> Option<super::ReadyParent> {
         let block = ctx(number);
         let ready = admit(pair, &block);
         apply(pair, number);
@@ -2036,7 +1768,7 @@ mod tests {
 
     /// A pair sitting at `SNAP_BLOCK + 1` with the generation at `SNAP_BLOCK` retained, which is
     /// exactly the state a depth-1 reorg has to undo.
-    fn pair_one_block_past_a_snapshot() -> (CoordinatedPair, CacheConfig, B256) {
+    fn pair_one_block_past_a_snapshot() -> (LivePair, CacheConfig, B256) {
         pair_one_block_past_a_snapshot_with(true)
     }
 
@@ -2044,7 +1776,7 @@ mod tests {
     ///
     /// `retain` false is the K = 1 memory control, which reaches the identical block by the
     /// identical route and differs only in whether the displaced generation is kept.
-    fn pair_one_block_past_a_snapshot_with(retain: bool) -> (CoordinatedPair, CacheConfig, B256) {
+    fn pair_one_block_past_a_snapshot_with(retain: bool) -> (LivePair, CacheConfig, B256) {
         let config = CacheConfig::default();
         let (package, checkpoint, state_root) = warm_snapshot(&config);
         let retained = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
@@ -2052,13 +1784,12 @@ mod tests {
         let current = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
             .expect("an honest snapshot restores");
 
-        let mut pair = CoordinatedPair {
+        let mut pair = LivePair::new(CoordinatedPair {
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
-            last_readiness_label: CacheReadiness::Cold.label(),
             previous_generation: None,
-        };
+        });
         // Advance the flat cache one block, which is what leaves the undo record the rollback
         // consumes, and retain the generation that block displaced.
         apply(&mut pair, SNAP_BLOCK + 1);
@@ -2252,7 +1983,7 @@ mod tests {
 
     /// Advances the flat cache by a block that touches `address`, so two branches can be made to
     /// leave different residue behind.
-    fn apply_touching(pair: &mut CoordinatedPair, number: u64, address: Address) {
+    fn apply_touching(pair: &mut LivePair, number: u64, address: Address) {
         let mut accessed = BlockAccessedState::default();
         accessed.accounts.insert(
             address,
@@ -2268,7 +1999,7 @@ mod tests {
     /// therefore be fingerprint-equal while the digest index under one of them has drifted, and the
     /// drift would first surface a block later, on the next root the memo does not answer. The slow
     /// reference reads neither memo nor index, so it is what closes that gap.
-    fn assert_cache_root_is_independently_reproducible(pair: &CoordinatedPair, at: &str) {
+    fn assert_cache_root_is_independently_reproducible(pair: &LivePair, at: &str) {
         assert_eq!(
             pair.cache.cache_root(),
             pair.cache.compute_cache_root_reference(),
@@ -2280,8 +2011,7 @@ mod tests {
     ///
     /// The abandoned block touches `ABANDONED` and nothing else does, so any residue the rollback
     /// fails to remove shows up as a `cache_root` divergence rather than having to be looked for.
-    fn pair_and_reference_before_a_reorg() -> (CoordinatedPair, CoordinatedPair, CacheConfig, B256)
-    {
+    fn pair_and_reference_before_a_reorg() -> (LivePair, LivePair, CacheConfig, B256) {
         const ABANDONED: Address = Address::repeat_byte(0xa1);
         let config = CacheConfig::default();
         let (package, checkpoint, state_root) = warm_snapshot(&config);
@@ -2292,20 +2022,18 @@ mod tests {
         let reference = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
             .expect("an honest snapshot restores");
 
-        let mut pair = CoordinatedPair {
+        let mut pair = LivePair::new(CoordinatedPair {
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
-            last_readiness_label: CacheReadiness::Cold.label(),
             previous_generation: None,
-        };
-        let reference = CoordinatedPair {
+        });
+        let reference = LivePair::new(CoordinatedPair {
             cache: reference.cache,
             trie_cache: reference.trie_cache,
             readiness: reference.readiness,
-            last_readiness_label: CacheReadiness::Cold.label(),
             previous_generation: None,
-        };
+        });
 
         apply_touching(&mut pair, SNAP_BLOCK + 1, ABANDONED);
         let applied = BlockContext {

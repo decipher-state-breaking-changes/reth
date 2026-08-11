@@ -12,11 +12,7 @@ use crate::{
     format_bytes, process_rss_bytes, process_rusage,
     rebuild::{simulate_block, HistoricalSimulation},
     sidecar_io::sidecar_path,
-    sidecar_reexec::{
-        verify_and_apply_provider_assisted_sidecar,
-        verify_and_apply_trustless_sidecar_for_benchmark, SidecarReexecLimits,
-        TrieCacheDisposition,
-    },
+    sidecar_reexec::{verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits},
     CacheConfig,
 };
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
@@ -38,6 +34,9 @@ use partial_stateless::{
     PartialExecutionWitness, PartialExecutionWitnessState, PartialStatelessSidecar,
     PartialTrieNodeCache, RootWitnessCompletenessSummary, SidecarBenchmarkManifest, StateTargetSet,
     StateTargetStats, TrieChangeSet, TrieProofTargetV2, WitnessReductionStats,
+};
+use partial_stateless_validator::{
+    verify_and_apply_sidecar, TimedValidation, TrieCacheDisposition,
 };
 use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
 use reth_evm::ConfigureEvm;
@@ -855,12 +854,12 @@ fn benchmark_one_sidecar_validation<Evm>(
     sidecar_bytes: &[u8],
     expected_cache_policy_id: B256,
     limits: &SidecarReexecLimits,
-) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
+) -> eyre::Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
 {
     let (sidecar, deserialize_us) = deserialize_sidecar_for_benchmark(sidecar_bytes)?;
-    let mut report = verify_and_apply_trustless_sidecar_for_benchmark(
+    let mut report = verify_and_apply_sidecar(
         evm_config,
         block,
         cache,
@@ -916,7 +915,7 @@ fn benchmark_sidecar_validation<Evm>(
     historical_requests_empty: bool,
     value_cache_bytes: usize,
     retained_generation: RetainedGenerationBytes,
-) -> eyre::Result<crate::sidecar_reexec::SidecarReexecReport>
+) -> eyre::Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
 {
@@ -1004,31 +1003,31 @@ where
         "Paired Partial/Weak timed validation complete"
     );
     let expected_root = block.state_root();
-    let partial_root = partial_report.trustless_state_root.unwrap_or_default();
-    let weak_root = weak_report.trustless_state_root.unwrap_or_default();
+    let partial_root = partial_report.outcome.state_root;
+    let weak_root = weak_report.outcome.state_root;
     let expected_gas_used = block.header().gas_used();
     let expected_receipts_root = block.header().receipts_root();
     let expected_requests_hash = block.header().requests_hash();
     let requests_valid = expected_requests_hash.map_or_else(
         || {
             historical_requests_empty &&
-                partial_report.execution_requests_empty &&
-                weak_report.execution_requests_empty
+                partial_report.outcome.execution_requests_empty &&
+                weak_report.outcome.execution_requests_empty
         },
         |expected| {
             historical_requests_hash == expected &&
-                partial_report.execution_requests_hash == expected &&
-                weak_report.execution_requests_hash == expected
+                partial_report.outcome.execution_requests_hash == expected &&
+                weak_report.outcome.execution_requests_hash == expected
         },
     );
     let valid = partial_root == expected_root &&
         weak_root == expected_root &&
         historical_gas_used == expected_gas_used &&
-        partial_report.execution_gas_used == expected_gas_used &&
-        weak_report.execution_gas_used == expected_gas_used &&
+        partial_report.outcome.execution_gas_used == expected_gas_used &&
+        weak_report.outcome.execution_gas_used == expected_gas_used &&
         historical_receipts_root == expected_receipts_root &&
-        partial_report.execution_receipts_root == expected_receipts_root &&
-        weak_report.execution_receipts_root == expected_receipts_root &&
+        partial_report.outcome.execution_receipts_root == expected_receipts_root &&
+        weak_report.outcome.execution_receipts_root == expected_receipts_root &&
         requests_valid;
     let record = ValidationBenchmarkRecord {
         schema_version: VALIDATION_BENCHMARK_SCHEMA_VERSION,
@@ -1061,12 +1060,12 @@ where
         weak_state_root: weak_root,
         expected_receipts_root,
         historical_receipts_root,
-        partial_receipts_root: partial_report.execution_receipts_root,
-        weak_receipts_root: weak_report.execution_receipts_root,
+        partial_receipts_root: partial_report.outcome.execution_receipts_root,
+        weak_receipts_root: weak_report.outcome.execution_receipts_root,
         expected_requests_hash,
         historical_requests_hash,
-        partial_requests_hash: partial_report.execution_requests_hash,
-        weak_requests_hash: weak_report.execution_requests_hash,
+        partial_requests_hash: partial_report.outcome.execution_requests_hash,
+        weak_requests_hash: weak_report.outcome.execution_requests_hash,
         valid,
     };
     append_record(output_path, &record)?;
@@ -1091,8 +1090,8 @@ where
     if !valid {
         return Err(eyre::eyre!(
             "paired validation mismatch: expected_root={expected_root:?}, partial_root={partial_root:?}, weak_root={weak_root:?}, expected_gas={expected_gas_used}, partial_gas={}, weak_gas={}",
-            partial_report.execution_gas_used,
-            weak_report.execution_gas_used,
+            partial_report.outcome.execution_gas_used,
+            weak_report.outcome.execution_gas_used,
         ));
     }
 
@@ -1683,18 +1682,18 @@ where
                 };
 
                 if options.validation_bench_output.is_none() &&
-                    !reexec_report.root_witness_completeness.trustless_root_ready
+                    !reexec_report.outcome.root_witness_completeness.trustless_root_ready
                 {
                     warn!(
                         target: "partial_stateless",
                         block = block_number,
                         partial_state_trustless_verification_ready = false,
                         missing_account_paths = reexec_report
-                            .root_witness_completeness
+                            .outcome.root_witness_completeness
                             .missing_account_paths
                             .len(),
                         missing_storage_paths = reexec_report
-                            .root_witness_completeness
+                            .outcome.root_witness_completeness
                             .missing_storage_paths
                             .len(),
                         "Partial-state node trustless verification is not ready; current state_root check is provider-assisted"
@@ -1704,42 +1703,29 @@ where
                     target: "partial_stateless",
                     block = block_number,
                     partial_state_trustless_verification_ready = reexec_report
-                        .root_witness_completeness
+                        .outcome.root_witness_completeness
                         .trustless_root_ready,
-                    computed_state_root = ?reexec_report.computed_state_root,
-                    reexec_accounts = reexec_report.actual_accessed.accounts.len(),
-                    reexec_storage = reexec_report.actual_accessed.storage.len(),
-                    reexec_codes = reexec_report.actual_accessed.codes.len(),
-                    expected_miss_accounts = reexec_report.expected_miss.accounts.len(),
-                    expected_miss_storage = reexec_report.expected_miss.storage.len(),
-                    expected_miss_codes = reexec_report.expected_miss.code_hashes.len(),
-                    next_cache_root = ?reexec_report.next_cache_anchor.cache_root,
+                    computed_state_root = ?reexec_report.outcome.state_root,
+                    reexec_accounts = reexec_report.outcome.actual_accessed.accounts.len(),
+                    reexec_storage = reexec_report.outcome.actual_accessed.storage.len(),
+                    reexec_codes = reexec_report.outcome.actual_accessed.codes.len(),
+                    expected_miss_accounts = reexec_report.outcome.expected_miss.accounts.len(),
+                    expected_miss_storage = reexec_report.outcome.expected_miss.storage.len(),
+                    expected_miss_codes = reexec_report.outcome.expected_miss.code_hashes.len(),
+                    next_cache_root = ?reexec_report.outcome.next_cache_anchor.cache_root,
                     "Sidecar preflight succeeded"
                 );
-                match reexec_report.trustless_state_root {
-                    Some(root) if root == block.state_root() => info!(
-                        target: "partial_stateless",
-                        block = block_number,
-                        trustless_state_root = ?root,
-                        "Trustless state root VERIFIED (trie node cache + witness only)"
-                    ),
-                    Some(root) => warn!(
-                        target: "partial_stateless",
-                        block = block_number,
-                        trustless_state_root = ?root,
-                        expected = ?block.state_root(),
-                        "Trustless state root MISMATCH — trie cache/witness stale or insufficient"
-                    ),
-                    None => info!(
-                        target: "partial_stateless",
-                        block = block_number,
-                        trie_warm_nodes = trie_cache.warm_node_count(),
-                        tracked_accounts = trie_cache.tracked_account_count(),
-                        "Trustless state root unavailable — trie node cache not warm enough this block (blind path)"
-                    ),
-                }
+                // Unconditional for the same reason as in the live verifier: the core compares
+                // this root against the header and bails before returning, so the mismatch and
+                // blind-path arms this used to carry were both unreachable.
+                info!(
+                    target: "partial_stateless",
+                    block = block_number,
+                    trustless_state_root = ?reexec_report.outcome.state_root,
+                    "Trustless state root VERIFIED (trie node cache + witness only)"
+                );
                 RootWitnessCompletenessSummary::from_report(
-                    &reexec_report.root_witness_completeness,
+                    &reexec_report.outcome.root_witness_completeness,
                 )
             } else {
                 RootWitnessCompletenessSummary::default()

@@ -6491,6 +6491,7 @@ dependencies = [
  "futures",
  "libc",
  "partial-stateless",
+ "partial-stateless-validator",
  "reth-cli-util",
  "reth-ethereum",
  "reth-evm",
@@ -6504,6 +6505,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "partial-stateless-validator"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "eyre",
+ "partial-stateless",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-revm",
+ "reth-storage-errors",
+ "reth-trie-common",
+ "revm",
+ "serde",
  "tracing",
 ]
 
