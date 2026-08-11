@@ -25,6 +25,68 @@ def select_builder_samples(records, warmup, limit=None, require_published=False)
     return selected[:limit] if limit is not None else selected
 
 
+def build_artifact_section(selected):
+    """B3 artifact reuse, on records that carry it (schema 3 and later).
+
+    Reports delivery and reuse as separate rates. They differ by the sampled blocks, which are
+    delivered and deliberately re-executed to keep the differential oracle alive, so reading
+    reuse as the delivery rate understates a healthy handoff by exactly the sampling fraction.
+
+    The timing split is by `artifact_reused`, because `historical_full_db_evm_us` is zero on the
+    reused blocks: a median over the mixed population describes neither path. Note that the
+    comparison groups here are not equally trustworthy -- blocks that missed did so because the
+    builder was behind, which correlates with heavy blocks, while sampled blocks are chosen by
+    height and are unbiased. Only the sampled group is a fair contrast.
+    """
+    carrying = [r for r in selected if r.get("fallback_reason") is not None or r.get("artifact_reused")]
+    if not carrying:
+        return []
+
+    available = sum(1 for r in carrying if r.get("artifact_available"))
+    reused = [r for r in carrying if r.get("artifact_reused")]
+    sampled = [r for r in carrying if r.get("fallback_reason") == "shadow_sampled"]
+    reasons = collections.Counter(
+        r["fallback_reason"] for r in carrying if r.get("fallback_reason")
+    )
+
+    lines = [
+        "## Engine access artifact (B3)", "",
+        f"- Artifact delivered: **{available}/{len(carrying)}** ({available / len(carrying):.2%})",
+        f"- Artifact reused: **{len(reused)}/{len(carrying)}** ({len(reused) / len(carrying):.2%})",
+    ]
+    for reason, count in sorted(reasons.items()):
+        lines.append(f"- Not reused, `{reason}`: **{count}**")
+    if reused:
+        evm_removed = sum(r["historical_full_db_evm_us"] for r in sampled) / len(sampled) if sampled else 0
+        lines.extend([
+            "",
+            f"- Re-execution removed per reused block: **{evm_removed / 1000:.1f} ms** "
+            "(mean over the sampled blocks, which still pay it)",
+            f"- Total re-execution avoided: **{evm_removed * len(reused) / 1e6:.1f} s** "
+            f"over {len(reused)} blocks",
+        ])
+    if reused and sampled:
+        lines.extend([
+            "", "| Path | n | p50 | p95 |", "| --- | ---: | ---: | ---: |",
+            format_summary_short("Reused (artifact)", [r["builder_total_us"] for r in reused]),
+            format_summary_short("Sampled (re-executed)", [r["builder_total_us"] for r in sampled]),
+            "",
+            "Read the two rows as a sanity check, not as the win. The removed re-execution is a "
+            "few percent of builder end-to-end and an order of magnitude below its block-to-block "
+            "spread, so it does not surface as a median difference at any sample count.",
+        ])
+    return lines + [""]
+
+
+def format_summary_short(label, values):
+    ordered = sorted(values)
+
+    def pct(fraction):
+        return ordered[min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))] / 1000
+
+    return f"| {label} | {len(ordered)} | {pct(0.5):.1f} | {pct(0.95):.1f} ms |"
+
+
 def build_builder_report(
     records,
     warmup,
@@ -70,8 +132,11 @@ def build_builder_report(
         ),
         format_summary("Initial provider", [r["initial_provider_us"] for r in selected]),
         format_summary("Previous-cache snapshot", [r["snapshot_us"] for r in selected]), "",
-        "## Initial proof selection", "",
     ]
+    lines.extend(build_artifact_section(selected))
+    lines.extend([
+        "## Initial proof selection", "",
+    ])
     for source, count in sorted(proof_sources.items()):
         lines.append(f"- `{source}`: **{count}**")
     lines.extend([
