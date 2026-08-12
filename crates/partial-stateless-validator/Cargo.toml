@@ -30,9 +30,20 @@ min-debug-logs = ["tracing/release_max_level_debug"]
 # convention its callers observe. `reth-storage-errors` is the one storage crate present, and it
 # carries error types only. The `reth-ethereum` `full,cli` facade is deliberately absent — it is
 # what drags the node builder and MDBX in.
+reth-chainspec = { workspace = true, features = ["std"] }
+reth-consensus = { workspace = true, features = ["std"] }
+reth-ethereum-consensus = { workspace = true, features = ["std"] }
 reth-ethereum-primitives = { workspace = true, features = ["std"] }
 reth-evm = { workspace = true, features = ["std"] }
-reth-primitives-traits = { workspace = true, features = ["std"] }
+reth-execution-types = { workspace = true, features = ["std"] }
+reth-payload-validator = { workspace = true }
+# `secp256k1` and `rayon` are named here for the same reason the keccak features are, and they were
+# missing until S1. Sender recovery is this package's own work once it admits untrusted input, and
+# without `secp256k1` the recovery falls back to the pure-Rust k256 path — silently, and only in a
+# standalone build, because `partial-stateless-exex` pulls both features in through the node graph
+# and hides the difference. `check_validator_isolation.sh` fails the build profile if they stop
+# arriving.
+reth-primitives-traits = { workspace = true, features = ["std", "secp256k1", "rayon"] }
 reth-revm = { workspace = true, features = ["std"] }
 reth-storage-errors = { workspace = true, features = ["std"] }
 reth-trie-common = { workspace = true, features = ["std"] }
@@ -42,9 +53,15 @@ revm = { workspace = true }
 partial-stateless = { path = "../partial-stateless" }
 
 # alloy
+alloy-consensus.workspace = true
 alloy-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
 
 # utilities
 eyre.workspace = true
 serde.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+alloy-evm.workspace = true
+reth-chainspec = { workspace = true, features = ["std"] }

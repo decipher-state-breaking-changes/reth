@@ -19,18 +19,20 @@
 //! prose above claims — the forbidden dependency set, and the keccak build profile that makes any
 //! timing taken from this package describe the binary production runs.
 
+pub mod admission;
 pub mod coordination;
 pub mod reexec;
 pub mod timings;
 
+pub use admission::{AdmissionError, AdmittedBlock, UntrustedAdmission};
 pub use coordination::{
     admit_block, block_context, inject_recovery, try_depth_one_recovery, BlockAdmission,
-    CanonicalStateRoots, CoordinatedFingerprint, CoordinatedPair, RetainedGeneration,
-    RetainedGenerationBytes,
+    CanonicalStateRoots, CoordinatedFingerprint, CoordinatedPair, LifecycleFingerprint,
+    RetainedGeneration, RetainedGenerationBytes,
 };
 pub use reexec::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, NoRootOracle,
     PostStateRootOracle, SidecarReexecLimits, SidecarValidationOutcome, TimedValidation,
-    TrieCacheDisposition,
+    TrieCacheDisposition, ValidatorRules,
 };
-pub use timings::ValidationPhaseTimings;
+pub use timings::{AdmissionSource, AdmissionTimings, ValidationPhaseTimings};

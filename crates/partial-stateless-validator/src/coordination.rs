@@ -24,7 +24,7 @@ use partial_stateless::{
     PartialTrieNodeCache,
 };
 use reth_ethereum_primitives::EthPrimitives;
-use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
+use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
 use serde::Serialize;
 use std::time::Instant;
@@ -42,6 +42,16 @@ pub struct CoordinatedPair {
     /// Any K beyond 1 would need genuinely extra copies, and a deeper reorg falls back to whatever
     /// the caller has — a rebuild for a full node, a snapshot request for a standalone validator.
     pub previous_generation: Option<RetainedGeneration>,
+    /// Header of the block this pair is the state *after*, kept so a child can be checked against
+    /// it.
+    ///
+    /// Read through [`Self::accepted_parent`] rather than directly. Parent-dependent consensus —
+    /// number and parent-hash linkage, timestamp monotonicity, the gas-limit ramp, the EIP-1559
+    /// base fee, EIP-4844 blob gas — needs the whole parent header, and the readiness tracker
+    /// keeps only a number and a hash. This is the validator's *own* record of what it accepted;
+    /// a header offered alongside the block being validated is the producer describing the
+    /// standard it wants to be held to.
+    pub accepted_head: Option<SealedHeader>,
 }
 
 impl CoordinatedPair {
@@ -51,6 +61,57 @@ impl CoordinatedPair {
             cache_root: self.cache.cache_root(),
             trie_cache_root: self.trie_cache.cache_root(),
             trie_state_root: self.trie_cache.state_root(),
+        }
+    }
+
+    /// The parent header a child block may be validated against, if this pair can vouch for one.
+    ///
+    /// Never trusted from the field. Any path that replaces the caches without replacing the
+    /// header — a canonical rebuild, a snapshot restore, an undo that rolled back and then failed
+    /// — would otherwise leave a header describing a generation this pair is no longer at, and a
+    /// child checked against it would be checked against a parent that never was.
+    ///
+    /// **Height alone is not enough, and that is the whole reason this is a method.** A canonical
+    /// rebuild installs the winning sibling at the *same* number the abandoned one had, so a
+    /// height check would hand back the abandoned header while the caches hold the winner: parent
+    /// consensus measured against one branch, execution against the other. So the header is
+    /// checked against everything the readiness tracker independently authenticated — the anchor's
+    /// hash and number, the cache root, the trie state root — and against the trie cache itself.
+    /// Only a header that agrees with all of them can be the one these caches are the state after.
+    ///
+    /// Requiring `Ready` falls out of that and is correct on its own terms: a warming or
+    /// recovering pair has no authenticated parent to offer, and admitting untrusted input
+    /// against a guess is exactly what section 4.2 exists to forbid. Absence is a rejection.
+    pub fn accepted_parent(&self) -> Option<&SealedHeader> {
+        let header = self.accepted_head.as_ref()?;
+        let ready = self.readiness.ready_parent()?;
+        (header.number() == self.cache.current_block() &&
+            header.number() == ready.anchor.block_number &&
+            header.hash() == ready.anchor.block_hash &&
+            header.state_root() == ready.trie_state_root &&
+            self.cache.cache_root() == ready.anchor.cache_root &&
+            self.trie_cache.state_root() == Some(header.state_root()))
+        .then_some(header)
+    }
+
+    /// What two pairs must agree on to be at the same point in the chain's *history*.
+    ///
+    /// Separate from [`Self::fingerprint`], which answers whether two pairs hold the same cache
+    /// generation. A snapshot reproduces the caches without reproducing how they were reached, so
+    /// a restored pair legitimately has no accepted head and no retained generation while being
+    /// cache-identical to the pair it came from. Folding these fields into the cache fingerprint
+    /// would make the bootstrap gate fail on that difference, which is not the difference it
+    /// exists to catch.
+    pub fn lifecycle_fingerprint(&self) -> LifecycleFingerprint {
+        LifecycleFingerprint {
+            accepted_head: self
+                .accepted_head
+                .as_ref()
+                .map(|header| (header.number(), header.hash())),
+            retained_generation: self
+                .previous_generation
+                .as_ref()
+                .map(|retained| (retained.block_number, retained.block_hash)),
         }
     }
 
@@ -64,16 +125,29 @@ impl CoordinatedPair {
         displaced: Option<PartialTrieNodeCache>,
         block_hash: B256,
         block_number: u64,
+        accepted_head: SealedHeader,
         enabled: bool,
     ) {
+        // Taken before the retention is rebuilt so the generation being kept carries the header it
+        // was accepted under. An undo has to restore both together: rolling the caches back to the
+        // parent while leaving the child's header in place would validate the replacement block
+        // against the very block the reorg discarded.
+        //
+        // Unconditional, unlike the trie retention below. The accepted head is what parent-checks
+        // run against on the *next* block, so it advances whether or not this run retains for
+        // reorgs; the K = 1 memory control turns off retention, not admission.
+        let displaced_accepted_head = self.accepted_head.replace(accepted_head);
         // Dropping `displaced` here rather than declining to produce it is deliberate: the
         // transition still copies the parent trie and still hands the copy back, so the control
         // arm pays exactly the work the production arm pays and differs only in what it keeps.
         // A control that also skipped the copy would be measuring two changes at once.
-        self.previous_generation = enabled
-            .then_some(displaced)
-            .flatten()
-            .map(|trie_cache| RetainedGeneration { trie_cache, block_hash, block_number });
+        self.previous_generation =
+            enabled.then_some(displaced).flatten().map(|trie_cache| RetainedGeneration {
+                trie_cache,
+                block_hash,
+                block_number,
+                accepted_head: displaced_accepted_head,
+            });
     }
 
     /// What the retained generation costs right now, for the K = 1 memory control.
@@ -112,6 +186,10 @@ impl CoordinatedPair {
         self.cache.reset();
         self.readiness.reset();
         self.forget_retained_generation();
+        // A pair that has accepted nothing has no parent to offer. `accepted_parent` would refuse
+        // a stale header anyway once the cache height drops to zero; clearing it is the honest
+        // representation rather than one the guard happens to catch.
+        self.accepted_head = None;
     }
 
     /// Undo exactly one committed block, returning the pair to `target_hash`.
@@ -183,6 +261,11 @@ impl CoordinatedPair {
             return None
         }
         self.trie_cache = retained.trie_cache;
+        // Restored together with the caches, and only now that the rollback has succeeded. Between
+        // the `take` above and this line the pair holds the child's header over the parent's
+        // caches; `accepted_parent` reports absence for exactly that window, and every early
+        // return in it sends the caller to a rebuild that replaces the header wholesale.
+        self.accepted_head = retained.accepted_head;
 
         let checkpoint = TrustedCheckpoint {
             block_number: retained.block_number,
@@ -230,6 +313,25 @@ pub struct RetainedGeneration {
     pub trie_cache: PartialTrieNodeCache,
     pub block_hash: B256,
     pub block_number: u64,
+    /// Accepted head as of this generation, restored with it by a depth-1 undo.
+    ///
+    /// `None` when the generation predates any accepted header — a pair one block out of a cold
+    /// reset retains a trie it has no header for. Undoing into that is sound: the pair is warming,
+    /// and [`CoordinatedPair::accepted_parent`] then reports absence rather than a guess.
+    pub accepted_head: Option<SealedHeader>,
+}
+
+/// What two coordinated pairs must agree on to have reached the same point the same way.
+///
+/// Deliberately not part of [`CoordinatedFingerprint`]. That one answers "are these the same cache
+/// generation", which a snapshot restore reproduces exactly; this one answers "did they get here
+/// by applying the same blocks", which a snapshot restore by construction does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleFingerprint {
+    /// Number and hash of the block this pair is the state after.
+    pub accepted_head: Option<(u64, B256)>,
+    /// Number and hash of the block the retained generation is the state after.
+    pub retained_generation: Option<(u64, B256)>,
 }
 
 /// What the K = 1 retained generation was holding when a block began.

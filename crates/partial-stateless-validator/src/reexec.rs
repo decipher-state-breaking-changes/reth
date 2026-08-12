@@ -1,8 +1,9 @@
 use crate::timings::{
-    CacheDeltaMetrics, CacheRootMetrics, RetentionWalkMetrics, TrieCloneMetrics,
+    AdmissionTimings, CacheDeltaMetrics, CacheRootMetrics, RetentionWalkMetrics, TrieCloneMetrics,
     ValidationPhaseTimings,
 };
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_consensus::{proofs::calculate_receipt_root, TxReceipt};
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use eyre::{bail, eyre, Result};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
@@ -16,14 +17,15 @@ use partial_stateless::{
     CacheAnchor, CacheRootTimings, MaterializedStateProof, PartialStatelessSidecar,
     PartialTrieNodeCache, RetentionTimings, RootWitnessCompletenessReport, StateTargetSet,
 };
-use reth_ethereum_primitives::{calculate_receipt_root_no_memo, EthPrimitives};
+use reth_consensus::FullConsensus;
+use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_primitives_traits::{Account, AlloyBlockHeader, BlockTy, Bytecode, RecoveredBlock};
 use reth_revm::database::{EvmStateProvider, StateProviderDatabase};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::State;
-use std::{collections::HashMap, mem, time::Instant};
+use std::{collections::HashMap, fmt, mem, time::Instant};
 
 pub type SidecarReexecLimits = SidecarWitnessCheckLimits;
 
@@ -35,6 +37,50 @@ pub type SidecarReexecLimits = SidecarWitnessCheckLimits;
 pub enum TrieCacheDisposition {
     Commit,
     Discard,
+}
+
+/// The EVM configuration and consensus rules one validator runs a block under.
+///
+/// Bundled rather than passed as two arguments because they have to describe the same chain, and
+/// because the consensus object carries more than a chain spec: `EthBeaconConsensus` holds flags
+/// such as `skip_requests_hash_check` that change what a block is allowed to be. A full node must
+/// therefore hand its ExEx the node's own consensus rather than a fresh one, or the ExEx could
+/// reject a block its Engine accepted. A standalone validator builds both from the single chain
+/// spec it was configured with.
+pub struct ValidatorRules<'a, Evm, Consensus: ?Sized> {
+    evm_config: &'a Evm,
+    consensus: &'a Consensus,
+}
+
+// Hand-written because deriving would bound `Evm: Copy` and `Consensus: Copy`, which no EVM
+// config or consensus object satisfies. This struct is two shared references and is always freely
+// copyable regardless of what they point at.
+impl<Evm, Consensus: ?Sized> Clone for ValidatorRules<'_, Evm, Consensus> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Evm, Consensus: ?Sized> Copy for ValidatorRules<'_, Evm, Consensus> {}
+
+impl<Evm, Consensus: ?Sized> fmt::Debug for ValidatorRules<'_, Evm, Consensus> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatorRules").finish_non_exhaustive()
+    }
+}
+
+impl<'a, Evm, Consensus: ?Sized> ValidatorRules<'a, Evm, Consensus> {
+    pub const fn new(evm_config: &'a Evm, consensus: &'a Consensus) -> Self {
+        Self { evm_config, consensus }
+    }
+
+    pub const fn evm_config(&self) -> &'a Evm {
+        self.evm_config
+    }
+
+    pub const fn consensus(&self) -> &'a Consensus {
+        self.consensus
+    }
 }
 
 /// A second opinion on the post-state root, computed by something other than this validator.
@@ -104,8 +150,8 @@ pub struct TimedValidation {
 /// This is the entry point a standalone validator uses: no oracle, and therefore no way for the
 /// transition to consult a state database even on a failure branch.
 #[expect(clippy::too_many_arguments)]
-pub fn verify_and_apply_sidecar<Evm>(
-    evm_config: &Evm,
+pub fn verify_and_apply_sidecar<Evm, Consensus>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
@@ -116,9 +162,10 @@ pub fn verify_and_apply_sidecar<Evm>(
 ) -> Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
 {
     verify_and_apply_sidecar_with_oracle(
-        evm_config,
+        rules,
         block,
         prev_cache,
         sidecar,
@@ -137,8 +184,8 @@ where
 /// has already been checked against the header, and before any cache is committed. That ordering
 /// is load-bearing — a disagreeing oracle must leave both caches at the parent generation.
 #[expect(clippy::too_many_arguments)]
-pub fn verify_and_apply_sidecar_with_oracle<Evm, Oracle>(
-    evm_config: &Evm,
+pub fn verify_and_apply_sidecar_with_oracle<Evm, Consensus, Oracle>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
     sidecar: &PartialStatelessSidecar,
@@ -151,6 +198,7 @@ pub fn verify_and_apply_sidecar_with_oracle<Evm, Oracle>(
 ) -> Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
     Oracle: PostStateRootOracle + ?Sized,
 {
     let assisted_start = Instant::now();
@@ -207,7 +255,7 @@ where
     let provider_setup_start = Instant::now();
     let state_provider_db = StateProviderDatabase::new(witness_provider);
     let mut db = State::builder().with_bundle_update().with_database(state_provider_db).build();
-    let block_executor = evm_config.executor(&mut db);
+    let block_executor = rules.evm_config().executor(&mut db);
     let provider_setup_us = provider_setup_start.elapsed().as_micros() as u64;
 
     let evm_start = Instant::now();
@@ -223,7 +271,41 @@ where
     let evm_call_us = evm_start.elapsed().as_micros() as u64;
     let evm_us = evm_call_us.saturating_sub(accessed_state_capture_us);
     drop(db);
-    let execution_receipts_root = calculate_receipt_root_no_memo(&execution_output.result.receipts);
+
+    // Canonical post-execution consensus admission, before anything downstream is computed and
+    // long before anything is mutated.
+    //
+    // Position is deliberate. Everything below this point — hashing the post state, cloning the
+    // trie, walking the sparse trie for the root, the external oracle, the miss-policy check — is
+    // work a block that already disagrees with its own header does not deserve, and the state root
+    // check further down cannot stand in for this one: a block can carry a correct state root and
+    // still lie about gas used, receipts, logs bloom, or its requests hash.
+    //
+    // Reth's own implementation rather than a comparison written here. The three ad-hoc equality
+    // checks this replaces omitted the logs bloom entirely and had no fork gating, so they passed
+    // blocks that Reth's Engine would reject. Delegating also means `skip_requests_hash_check` and
+    // every future fork rule arrive with the consensus object instead of being reimplemented.
+    //
+    // The receipts root is handed over rather than recomputed inside: materializing the blooms
+    // once serves both the root and the block bloom, which is what `verify_receipts` would do
+    // anyway, and it leaves `execution_receipts_root` available for the caller's differential.
+    let post_execution_start = Instant::now();
+    let receipts_with_bloom =
+        execution_output.result.receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+    let execution_receipts_root = calculate_receipt_root(&receipts_with_bloom);
+    let execution_logs_bloom =
+        receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom_ref());
+    drop(receipts_with_bloom);
+    rules
+        .consensus()
+        .validate_block_post_execution(
+            block,
+            &execution_output.result,
+            Some((execution_receipts_root, execution_logs_bloom)),
+        )
+        .map_err(|err| eyre!("post-execution consensus validation failed: {err}"))?;
+    let post_execution_consensus_us = post_execution_start.elapsed().as_micros() as u64;
+
     let execution_requests_hash = execution_output.result.requests.requests_hash();
     let execution_requests_empty = execution_output.result.requests.is_empty();
 
@@ -366,6 +448,10 @@ where
     let trie_storage_tries_copied = cow_copies_taken().saturating_sub(cow_copies_before);
 
     let mut timings = ValidationPhaseTimings {
+        // Left at its default: this entry point is handed an already-recovered block, so every
+        // admission phase reads `None` rather than zero. `admission::admit_execution_data` fills
+        // it in for the path that does the work.
+        admission: AdmissionTimings::default(),
         context_check_us,
         witness_self_consistency_us,
         materialize_us,
@@ -373,6 +459,7 @@ where
         evm_call_us,
         accessed_state_capture_us,
         evm_us,
+        post_execution_consensus_us,
         hash_post_state_us,
         trie_clone_us,
         trie_clone_detail: TrieCloneMetrics::from(&trie_clone_detail),
@@ -647,6 +734,120 @@ mod tests {
         policy::{AccountData, LastNBlocksPolicy},
         PartialExecutionWitness, PartialExecutionWitnessState, WitnessResult, WitnessTargets,
     };
+
+    /// The check S1a delegates to catches what the comparisons it replaced could not.
+    ///
+    /// The three ad-hoc equality checks that used to run in the benchmark caller compared gas used,
+    /// the receipts root, and the requests hash — and nothing else. A header carrying a correct
+    /// receipts root beside a wrong logs bloom passed all three. It is not a theoretical gap: the
+    /// bloom is what light clients filter on, and it is derived from the same receipts the root
+    /// commits to, so a block can only disagree on one of them by lying.
+    ///
+    /// Driving the whole `verify_and_apply_sidecar` path would need an EVM, a witness, and a real
+    /// block; what matters here is which rule set the core now defers to, so this exercises that
+    /// rule set directly against the same consensus object the core is handed.
+    #[test]
+    fn a_correct_receipts_root_beside_a_wrong_logs_bloom_is_rejected() {
+        use alloy_consensus::{
+            constants::EMPTY_OMMER_ROOT_HASH, Block as AlloyBlock, BlockBody, Header,
+            EMPTY_ROOT_HASH,
+        };
+        use alloy_evm::block::BlockExecutionResult;
+        use alloy_primitives::{Address, Log, LogData, U256};
+        use reth_chainspec::ChainSpecBuilder;
+        use reth_consensus::FullConsensus;
+        use reth_ethereum_primitives::{EthPrimitives, Receipt as EthReceipt, TxType};
+        use std::sync::Arc;
+
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().paris_activated().build());
+        let consensus = reth_ethereum_consensus::EthBeaconConsensus::new(chain_spec);
+
+        let receipt = EthReceipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 21_000,
+            logs: vec![Log {
+                address: Address::repeat_byte(0x11),
+                data: LogData::new_unchecked(vec![B256::repeat_byte(0x22)], Bytes::new()),
+            }],
+        };
+        let receipts = [receipt.clone()];
+        let receipts_with_bloom =
+            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let honest_root = calculate_receipt_root(&receipts_with_bloom);
+        let honest_bloom = receipts_with_bloom
+            .iter()
+            .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom_ref());
+        assert_ne!(honest_bloom, Bloom::ZERO, "the fixture must produce a non-empty bloom");
+
+        let result = BlockExecutionResult {
+            receipts: vec![receipt],
+            requests: Default::default(),
+            gas_used: 21_000,
+            blob_gas_used: 0,
+        };
+        let header = Header {
+            number: 2,
+            gas_used: 21_000,
+            gas_limit: 30_000_000,
+            receipts_root: honest_root,
+            logs_bloom: honest_bloom,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            transactions_root: EMPTY_ROOT_HASH,
+            difficulty: U256::ZERO,
+            ..Default::default()
+        };
+        let honest = RecoveredBlock::new_unhashed(
+            AlloyBlock { header: header.clone(), body: BlockBody::default() },
+            Vec::new(),
+        );
+        FullConsensus::<EthPrimitives>::validate_block_post_execution(
+            &consensus, &honest, &result, None,
+        )
+        .expect("the fixture itself must be a block the rules accept");
+
+        // One bit of the bloom flipped: the receipts root still matches, and every comparison the
+        // caller used to make still passes.
+        let mut tampered_bloom = honest_bloom;
+        tampered_bloom.0[0] ^= 0x01;
+        let tampered = RecoveredBlock::new_unhashed(
+            AlloyBlock {
+                header: Header { logs_bloom: tampered_bloom, ..header },
+                body: BlockBody::default(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            tampered.header().receipts_root,
+            honest_root,
+            "the receipts root must still agree, or this proves nothing about the bloom"
+        );
+
+        FullConsensus::<EthPrimitives>::validate_block_post_execution(
+            &consensus, &tampered, &result, None,
+        )
+        .expect_err("a wrong logs bloom must be rejected");
+    }
+
+    /// An admission phase that did not run is not an admission phase that was free.
+    #[test]
+    fn absent_admission_phases_cost_nothing_and_zero_ones_are_still_reported() {
+        use crate::timings::AdmissionTimings;
+
+        assert_eq!(AdmissionTimings::default().total_us(), 0);
+        let performed = AdmissionTimings {
+            sender_recovery_us: Some(0),
+            pre_execution_consensus_us: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(performed.total_us(), 7);
+        assert_eq!(
+            performed.sender_recovery_us,
+            Some(0),
+            "a phase that ran in under a microsecond must stay distinguishable from one that did \
+             not run"
+        );
+    }
 
     /// The standalone validator's cross-check is absent, not merely disabled.
     ///

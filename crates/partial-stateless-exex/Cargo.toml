@@ -39,6 +39,7 @@ reth-ethereum = { workspace = true, features = ["full", "cli"] }
 reth-trie-common = { workspace = true }
 reth-trie-parallel.workspace = true
 reth-provider = { workspace = true, features = ["jemalloc"] }
+reth-consensus = { workspace = true }
 reth-evm = { workspace = true }
 reth-execution-access = { workspace = true }
 reth-revm = { workspace = true }
@@ -51,6 +52,7 @@ partial-stateless = { path = "../partial-stateless" }
 partial-stateless-validator = { path = "../partial-stateless-validator" }
 
 # alloy
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
@@ -66,6 +68,3 @@ serde.workspace = true
 serde_json.workspace = true
 bincode = { workspace = true }
 libc.workspace = true
-
-[dev-dependencies]
-alloy-consensus.workspace = true

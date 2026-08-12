@@ -44,7 +44,21 @@ use std::{
 /// phase: `account_trie_detail.accounting_us`, `account_trie_detail.branch_hash_probe_us`, and
 /// each walk's `productive_path_us`. All three are zero unless requested. Subtract whichever are
 /// nonzero before comparing a V9 run's totals or per-entry coefficients against a V8 one.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 9;
+///
+/// **V10 adds admission.** Every `partial`/`weak` timing block now carries an `admission` object —
+/// `source`, `input_decode_us`, `payload_validation_us`, `sender_recovery_us`,
+/// `pre_execution_consensus_us` — plus a sibling `post_execution_consensus_us`. The four admission
+/// timings are nullable and a null is not a zero: it means the path that produced this record was
+/// handed a block that had already cleared that stage, which is what `source: "recovered"` names.
+/// Every record this harness writes is `recovered`, because a run driven by a reth node is handed
+/// blocks its Engine already admitted; a standalone validator reading Engine payloads reports
+/// `execution_data` and fills the phases in. Reading a null as zero would report a validator that
+/// skips admission as one that admits for free.
+///
+/// V10 changes no V9 field and moves no work between existing phases, so a V9 run and a V10 run
+/// from an ExEx are directly comparable: the new phases are null or, for
+/// `post_execution_consensus_us`, the small cost S1a added.
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 10;
 
 /// Phase instrumentation, produced by the validator core rather than by this harness.
 ///
@@ -372,7 +386,15 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 9);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 10);
+        // Admission is nullable, and the distinction is the point: `null` means the stage was
+        // already cleared before this validator saw the block, `0` means it ran and cost nothing.
+        // A record that could not express the difference would make an ExEx run look like a
+        // standalone one that admits for free.
+        assert_eq!(value["partial"]["admission"]["source"], "recovered");
+        assert!(value["partial"]["admission"]["sender_recovery_us"].is_null());
+        assert!(value["partial"]["admission"].get("payload_validation_us").is_some());
+        assert!(value["partial"].get("post_execution_consensus_us").is_some());
         // The storage walk's own timers start after the copy, so without this field the gap
         // between storage retention's total and its phases has no name.
         assert!(value["partial"].get("retention_storage_trie_cow_us").is_some());

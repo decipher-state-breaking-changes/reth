@@ -42,7 +42,7 @@ use partial_stateless::{
 };
 use partial_stateless_validator::{
     admit_block, block_context, inject_recovery, BlockAdmission, CanonicalStateRoots,
-    CoordinatedPair, RetainedGenerationBytes,
+    CoordinatedPair, RetainedGenerationBytes, ValidatorRules,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -51,7 +51,7 @@ use reth_ethereum::{
     provider::StateProviderFactory,
     EthPrimitives,
 };
-use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
+use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
 use reth_provider::{
     BlockIdReader, BlockReader, CanonicalOverlayFactory, HeaderProvider, ProviderResult,
 };
@@ -761,6 +761,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                             cache: restored.cache,
                             trie_cache: restored.trie_cache,
                             previous_generation: None,
+                            accepted_head: None,
                             readiness: restored.readiness,
                         })
                     }
@@ -851,6 +852,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
         trie_cache: PartialTrieNodeCache::new(),
         readiness: config.new_readiness_tracker(),
         previous_generation: None,
+        accepted_head: None,
     })
 }
 
@@ -923,6 +925,20 @@ where
     rebuild_pair_at(ctx, options, pair, target_hash, failures)
 }
 
+/// The rules this ExEx validates under: the node's own EVM config and the node's own consensus.
+///
+/// Taking `ctx.components.consensus()` rather than constructing an `EthBeaconConsensus` here is
+/// load-bearing. The consensus object carries flags — `skip_requests_hash_check` among them — that
+/// decide what a block is allowed to be, so a freshly built instance could reject a block this
+/// very node's Engine already accepted, and the ExEx would report a consensus failure that says
+/// more about its own configuration than about the block.
+fn node_rules<Node>(ctx: &ExExContext<Node>) -> ValidatorRules<'_, Node::Evm, Node::Consensus>
+where
+    Node: FullNodeComponents,
+{
+    ValidatorRules::new(ctx.evm_config(), ctx.components.consensus())
+}
+
 /// Adapts a node provider to [`CanonicalStateRoots`].
 struct CanonicalChain<P>(P);
 
@@ -972,8 +988,14 @@ where
         Ok(ready) => {
             *failures = 0;
             // The rebuild replaced the pair from canonical state; whatever was retained described
-            // a generation this one does not descend from.
+            // a generation this one does not descend from. The accepted head goes with it, and for
+            // a sharper reason: a reorg rebuild installs the winning sibling at the *same* number
+            // the abandoned block had, so a header left behind here would be one `accepted_parent`
+            // has to reject on hash rather than on height. Clearing it makes the state honest
+            // instead of leaving the guard to catch it, and the pair readmits a head by applying
+            // its next block.
             pair.forget_retained_generation();
+            pair.accepted_head = None;
             pair.last_readiness_label = pair.readiness.state().label();
             info!(
                 target: "partial_stateless",
@@ -1064,7 +1086,7 @@ where
 
     if options.sidecar_role == SidecarRole::Verifier {
         let displaced_trie_cache = verify_live_sidecar(
-            ctx.evm_config(),
+            node_rules(ctx),
             state_provider.as_ref(),
             block,
             &mut pair.coordinated.cache,
@@ -1082,6 +1104,7 @@ where
             pair,
             displaced_trie_cache,
             &block_ctx,
+            block.clone_sealed_header(),
             options.retain_generation,
         );
         return Ok(())
@@ -1128,7 +1151,7 @@ where
         };
 
     let report = create_sidecar_for_block(
-        ctx.evm_config(),
+        node_rules(ctx),
         state_provider.as_ref(),
         block,
         &mut pair.coordinated.cache,
@@ -1153,7 +1176,13 @@ where
         sidecar,
         displaced_trie_cache,
     } = report;
-    finish_committed_transition(pair, displaced_trie_cache, &block_ctx, options.retain_generation);
+    finish_committed_transition(
+        pair,
+        displaced_trie_cache,
+        &block_ctx,
+        block.clone_sealed_header(),
+        options.retain_generation,
+    );
 
     advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
 }
@@ -1168,12 +1197,14 @@ fn finish_committed_transition(
     pair: &mut LivePair,
     displaced_trie_cache: Option<PartialTrieNodeCache>,
     block: &BlockContext,
+    accepted_head: SealedHeader,
     retain_generation: bool,
 ) {
     pair.retain_generation(
         displaced_trie_cache,
         block.parent_hash,
         block.number.saturating_sub(1),
+        accepted_head,
         retain_generation,
     );
     observe_readiness(pair, block);
@@ -1217,7 +1248,7 @@ where
         // Deliberately the provider-free path: a bootstrapped verifier is the case that has no
         // database to fall back on, so validating it with provider help would prove nothing.
         let report = partial_stateless_validator::verify_and_apply_sidecar(
-            ctx.evm_config(),
+            node_rules(ctx),
             block,
             &mut shadow.pair.coordinated.cache,
             &sidecar,
@@ -1316,6 +1347,7 @@ where
                 cache: restored.cache,
                 trie_cache: restored.trie_cache,
                 previous_generation: None,
+                accepted_head: None,
                 readiness: restored.readiness,
             }),
             remaining_blocks: gate.self_test_blocks,
@@ -1360,10 +1392,10 @@ fn admit_after_cold_reset(
         block = block.number,
         "Cold-resetting both caches and warming again from this block"
     );
-    pair.trie_cache = PartialTrieNodeCache::new();
-    pair.cache.reset();
-    pair.readiness.reset();
-    pair.forget_retained_generation();
+    // `cold_reset` rather than the same four field assignments open-coded here. They were
+    // identical when this was written and then were not: the accepted head was added to the pair
+    // and only the shared version learned to clear it.
+    pair.cold_reset();
     match admit_block(&mut pair.readiness, block) {
         // The reset discarded whatever the token described, so this block publishes nothing.
         BlockAdmission::Admitted(_) => Ok(None),
@@ -1472,7 +1504,7 @@ mod tests {
         admit_after_cold_reset, admit_block, block_context, finish_committed_transition,
         inject_recovery, observe_readiness, BlockAdmission, BlockContext, CacheConfig,
         CanonicalStateRoots, CoordinatedPair, LivePair, PartialTrieNodeCache, ProviderResult,
-        SidecarRole,
+        SealedHeader, SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -1495,11 +1527,26 @@ mod tests {
             trie_cache: PartialTrieNodeCache::new(),
             readiness: config.new_readiness_tracker(),
             previous_generation: None,
+            accepted_head: None,
         })
     }
 
     /// Synthesizes a chain whose hashes and state roots derive from block numbers, so a test can
     /// name any block without a fixture.
+    /// A header carrying the identity `ctx` describes, so a synthesized transition advances the
+    /// accepted head the same way a real one does.
+    fn sealed(block: &BlockContext) -> SealedHeader {
+        SealedHeader::new(
+            alloy_consensus::Header {
+                number: block.number,
+                parent_hash: block.parent_hash,
+                state_root: block.state_root,
+                ..Default::default()
+            },
+            block.hash,
+        )
+    }
+
     fn ctx(number: u64) -> BlockContext {
         BlockContext {
             number,
@@ -1789,6 +1836,7 @@ mod tests {
             trie_cache: current.trie_cache,
             readiness: current.readiness,
             previous_generation: None,
+            accepted_head: None,
         });
         // Advance the flat cache one block, which is what leaves the undo record the rollback
         // consumes, and retain the generation that block displaced.
@@ -1804,7 +1852,13 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied, retain);
+        finish_committed_transition(
+            &mut pair,
+            Some(retained.trie_cache),
+            &applied,
+            sealed(&applied),
+            retain,
+        );
         (pair, config, state_root)
     }
 
@@ -1923,7 +1977,7 @@ mod tests {
 
         // `None` is what the builder reports when the transition rolled back, and the old
         // retention describes a generation two blocks back that K = 1 does not promise.
-        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1, true);
+        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1, sealed(&ctx(SNAP_BLOCK + 2)), true);
 
         assert!(pair.previous_generation.is_none());
     }
@@ -1944,7 +1998,13 @@ mod tests {
         }
         assert!(!pair.readiness.window_filled(), "three blocks is not a window");
         apply(&mut pair, SNAP_BLOCK + 1);
-        pair.retain_generation(Some(retained.trie_cache), SNAP_HASH, SNAP_BLOCK, true);
+        pair.retain_generation(
+            Some(retained.trie_cache),
+            SNAP_HASH,
+            SNAP_BLOCK,
+            sealed(&ctx(SNAP_BLOCK + 1)),
+            true,
+        );
 
         assert!(
             pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
@@ -2027,12 +2087,14 @@ mod tests {
             trie_cache: current.trie_cache,
             readiness: current.readiness,
             previous_generation: None,
+            accepted_head: None,
         });
         let reference = LivePair::new(CoordinatedPair {
             cache: reference.cache,
             trie_cache: reference.trie_cache,
             readiness: reference.readiness,
             previous_generation: None,
+            accepted_head: None,
         });
 
         apply_touching(&mut pair, SNAP_BLOCK + 1, ABANDONED);
@@ -2043,9 +2105,140 @@ mod tests {
             state_root,
         };
         admit(&mut pair, &applied);
-        finish_committed_transition(&mut pair, Some(retained.trie_cache), &applied, true);
+        finish_committed_transition(
+            &mut pair,
+            Some(retained.trie_cache),
+            &applied,
+            sealed(&applied),
+            true,
+        );
 
         (pair, reference, config, state_root)
+    }
+
+    #[test]
+    fn a_depth_one_undo_returns_the_accepted_head_to_the_parent() {
+        let (mut pair, _reference, config, state_root) = pair_and_reference_before_a_reorg();
+        let chain = FakeChain::Canonical(SNAP_HASH, state_root);
+        assert_eq!(
+            pair.accepted_parent().map(|header| header.number),
+            Some(SNAP_BLOCK + 1),
+            "the applied block must have advanced the head, or the undo proves nothing"
+        );
+
+        inject_recovery(&mut pair, &chain, SNAP_BLOCK + 1, SNAP_HASH, config.cache_policy_id())
+            .expect("the retained generation is exactly the reorg target");
+
+        // Restored from the retained generation, which predates any accepted header here because
+        // the pair came from a snapshot. Absence is the correct answer: the replacement block must
+        // not be checked against the block the reorg just discarded, and this pair cannot name a
+        // parent it never applied.
+        assert_eq!(
+            pair.accepted_head, None,
+            "the undo must not leave the abandoned block standing as the parent"
+        );
+        assert_eq!(pair.accepted_parent(), None);
+    }
+
+    #[test]
+    fn an_accepted_head_that_outlived_its_caches_is_not_offered_as_a_parent() {
+        // A rebuild or snapshot restore replaces the caches wholesale. Whatever header the pair
+        // was carrying then describes a generation it is no longer at, and admitting a child
+        // against it would check that child against a parent this pair never had.
+        let (mut pair, ..) = pair_and_reference_before_a_reorg();
+        assert!(pair.accepted_parent().is_some(), "precondition: the pair has a usable parent");
+
+        pair.cache.reset();
+
+        assert!(
+            pair.accepted_head.is_some(),
+            "the field is deliberately left alone; the guard is what refuses it"
+        );
+        assert_eq!(
+            pair.accepted_parent(),
+            None,
+            "a header whose number no longer matches the cache must read as absent"
+        );
+    }
+
+    #[test]
+    fn a_sibling_header_at_the_same_height_is_not_offered_as_a_parent() {
+        // The case a height check cannot see, and the one a reorg actually produces: the winning
+        // sibling has the number the abandoned block had. A pair holding the abandoned header over
+        // the winner's caches would measure parent consensus against one branch while executing
+        // against the other, and every number would line up.
+        let (mut pair, ..) = pair_and_reference_before_a_reorg();
+        let accepted = pair.accepted_parent().expect("precondition: usable parent").clone();
+
+        // Same number, same everything the height guard looks at, different block.
+        let sibling = SealedHeader::new(accepted.clone_header(), B256::repeat_byte(0xfe));
+        assert_eq!(sibling.number, accepted.number, "the fixture must keep the height identical");
+        pair.accepted_head = Some(sibling);
+
+        assert_eq!(
+            pair.accepted_parent(),
+            None,
+            "a header at the right height but the wrong hash must read as absent"
+        );
+    }
+
+    #[test]
+    fn a_canonical_rebuild_clears_the_accepted_head_it_no_longer_descends_from() {
+        // Not the guard this time — the state. `rebuild_pair_at` installs a different branch's
+        // caches, so leaving the header behind would be a field that lies until something reads
+        // it. There is no provider in a unit test, so this drives the same clearing the rebuild
+        // performs and pins that the pair reports absence afterwards.
+        let (mut pair, ..) = pair_and_reference_before_a_reorg();
+        assert!(pair.accepted_parent().is_some(), "precondition: the pair has a usable parent");
+
+        pair.forget_retained_generation();
+        pair.accepted_head = None;
+
+        assert_eq!(pair.accepted_parent(), None);
+        assert_eq!(pair.lifecycle_fingerprint().accepted_head, None);
+    }
+
+    #[test]
+    fn a_cold_reset_forgets_the_accepted_head() {
+        let (mut pair, ..) = pair_and_reference_before_a_reorg();
+        assert!(pair.accepted_parent().is_some(), "precondition: the pair has a usable parent");
+
+        pair.cold_reset();
+
+        assert_eq!(pair.accepted_head, None);
+        assert_eq!(pair.lifecycle_fingerprint().accepted_head, None);
+        assert_eq!(pair.lifecycle_fingerprint().retained_generation, None);
+    }
+
+    #[test]
+    fn the_accepted_head_advances_even_when_retention_is_off() {
+        // The K = 1 memory control turns off reorg retention, not admission: the next block still
+        // has to be checked against this one. A control arm that also stopped tracking the parent
+        // would be measuring two changes at once, and the second one is a correctness change.
+        let (mut pair, _reference, ..) = pair_and_reference_before_a_reorg();
+        let next = BlockContext {
+            number: SNAP_BLOCK + 2,
+            hash: numbered(SNAP_BLOCK + 2, 0xdd),
+            parent_hash: numbered(SNAP_BLOCK + 1, 0xaa),
+            state_root: numbered(SNAP_BLOCK + 2, 0x55),
+        };
+        apply_touching(&mut pair, next.number, Address::repeat_byte(0xa2));
+        admit(&mut pair, &next);
+
+        finish_committed_transition(&mut pair, None, &next, sealed(&next), false);
+
+        assert!(pair.previous_generation.is_none(), "retention is off in this arm");
+        // The field, not `accepted_parent()`. This fixture advances the pair with a synthesized
+        // state root the trie cache cannot reproduce, so the pair is no longer `Ready` and the
+        // guard correctly declines to vouch for the header. What is under test is that the head
+        // advanced at all: the K = 1 control turns off reorg retention, not admission, and a
+        // control arm that also stopped tracking the parent would be a correctness change wearing
+        // a memory measurement's clothes.
+        assert_eq!(
+            pair.accepted_head.as_ref().map(SealedHeader::hash),
+            Some(next.hash),
+            "the accepted head must advance regardless of retention"
+        );
     }
 
     #[test]

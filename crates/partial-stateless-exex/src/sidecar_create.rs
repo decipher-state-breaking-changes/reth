@@ -15,7 +15,8 @@ use crate::{
     sidecar_reexec::{verify_and_apply_provider_assisted_sidecar, SidecarReexecLimits},
     CacheConfig,
 };
-use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
+use alloy_consensus::{proofs::calculate_receipt_root, TxReceipt};
+use alloy_primitives::{keccak256, map::B256Map, Bloom, Bytes, B256};
 use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
@@ -36,9 +37,10 @@ use partial_stateless::{
     StateTargetStats, TrieChangeSet, TrieProofTargetV2, WitnessReductionStats,
 };
 use partial_stateless_validator::{
-    verify_and_apply_sidecar, TimedValidation, TrieCacheDisposition,
+    verify_and_apply_sidecar, TimedValidation, TrieCacheDisposition, ValidatorRules,
 };
-use reth_ethereum::{calculate_receipt_root_no_memo, EthPrimitives};
+use reth_consensus::FullConsensus;
+use reth_ethereum::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_execution_access::{AccessCaptureMode, MissReason};
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
@@ -53,7 +55,7 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub(crate) struct BuilderOptions<'a> {
     pub(crate) capture_dir: Option<&'a Path>,
@@ -846,8 +848,8 @@ pub fn build_weak_stateless_sidecar(
     })
 }
 
-fn benchmark_one_sidecar_validation<Evm>(
-    evm_config: &Evm,
+fn benchmark_one_sidecar_validation<Evm, Consensus>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     cache: &mut NetworkStateCache,
     trie_cache: &mut PartialTrieNodeCache,
@@ -857,10 +859,11 @@ fn benchmark_one_sidecar_validation<Evm>(
 ) -> eyre::Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
 {
     let (sidecar, deserialize_us) = deserialize_sidecar_for_benchmark(sidecar_bytes)?;
     let mut report = verify_and_apply_sidecar(
-        evm_config,
+        rules,
         block,
         cache,
         &sidecar,
@@ -892,9 +895,28 @@ const fn weak_builds_first(block_number: u64) -> bool {
     (block_number >> 1) % 2 == 1
 }
 
+/// The consensus-visible outputs of the full-DB execution of one block.
+///
+/// Bundled so the differential has one value to compare rather than four loose arguments, and so
+/// the canonical verdict can travel with the numbers it was computed from. Partial and Weak cannot
+/// reach the differential disagreeing with the header — the validator core rejects them before it
+/// returns — which makes this the only side of the three-way comparison still able to fail there.
+struct HistoricalOutputs {
+    gas_used: u64,
+    receipts_root: B256,
+    requests_hash: B256,
+    requests_empty: bool,
+    /// Whether the full-DB output passed the same canonical post-execution validation the two
+    /// stateless paths passed, logs bloom and fork gating included.
+    ///
+    /// Recorded rather than raised: the differential record exists to carry exactly this
+    /// observation, and aborting on it would discard the record instead of writing it.
+    consensus_ok: bool,
+}
+
 #[expect(clippy::too_many_arguments)]
-fn benchmark_sidecar_validation<Evm>(
-    evm_config: &Evm,
+fn benchmark_sidecar_validation<Evm, Consensus>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     state_provider: &dyn StateProvider,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
@@ -909,15 +931,13 @@ fn benchmark_sidecar_validation<Evm>(
     output_path: &Path,
     historical_full_db_evm_us: u64,
     partial_witness_build_us: u64,
-    historical_gas_used: u64,
-    historical_receipts_root: B256,
-    historical_requests_hash: B256,
-    historical_requests_empty: bool,
+    historical: HistoricalOutputs,
     value_cache_bytes: usize,
     retained_generation: RetainedGenerationBytes,
 ) -> eyre::Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
 {
     // Already built if this block's turn was Weak-first; otherwise build it now, after Partial.
     let WeakStatelessBuild { sidecar: weak_sidecar, build_us: weak_build_us } = match prebuilt_weak
@@ -956,7 +976,7 @@ where
     let weak_first_build = weak_builds_first(block.number());
     let (partial_report, weak_report) = if partial_first {
         let partial_report = benchmark_one_sidecar_validation(
-            evm_config,
+            rules,
             block,
             prev_cache,
             trie_cache,
@@ -965,7 +985,7 @@ where
             limits,
         )?;
         let weak_report = benchmark_one_sidecar_validation(
-            evm_config,
+            rules,
             block,
             &mut weak_cache,
             &mut weak_trie,
@@ -976,7 +996,7 @@ where
         (partial_report, weak_report)
     } else {
         let weak_report = benchmark_one_sidecar_validation(
-            evm_config,
+            rules,
             block,
             &mut weak_cache,
             &mut weak_trie,
@@ -985,7 +1005,7 @@ where
             limits,
         )?;
         let partial_report = benchmark_one_sidecar_validation(
-            evm_config,
+            rules,
             block,
             prev_cache,
             trie_cache,
@@ -1010,22 +1030,27 @@ where
     let expected_requests_hash = block.header().requests_hash();
     let requests_valid = expected_requests_hash.map_or_else(
         || {
-            historical_requests_empty &&
+            historical.requests_empty &&
                 partial_report.outcome.execution_requests_empty &&
                 weak_report.outcome.execution_requests_empty
         },
         |expected| {
-            historical_requests_hash == expected &&
+            historical.requests_hash == expected &&
                 partial_report.outcome.execution_requests_hash == expected &&
                 weak_report.outcome.execution_requests_hash == expected
         },
     );
-    let valid = partial_root == expected_root &&
+    // The Partial and Weak clauses below are retained even though the validator core now rejects a
+    // disagreeing block before returning one: they cost nothing, and reading the record should not
+    // require knowing which comparisons are load-bearing this month. `consensus_ok` is the clause
+    // that carries logs bloom and fork gating, which no equality here covers.
+    let valid = historical.consensus_ok &&
+        partial_root == expected_root &&
         weak_root == expected_root &&
-        historical_gas_used == expected_gas_used &&
+        historical.gas_used == expected_gas_used &&
         partial_report.outcome.execution_gas_used == expected_gas_used &&
         weak_report.outcome.execution_gas_used == expected_gas_used &&
-        historical_receipts_root == expected_receipts_root &&
+        historical.receipts_root == expected_receipts_root &&
         partial_report.outcome.execution_receipts_root == expected_receipts_root &&
         weak_report.outcome.execution_receipts_root == expected_receipts_root &&
         requests_valid;
@@ -1034,7 +1059,7 @@ where
         block_number: block.number(),
         block_hash: block.hash(),
         gas_used: expected_gas_used,
-        historical_gas_used,
+        historical_gas_used: historical.gas_used,
         tx_count: block.transaction_count(),
         verifier_order: if partial_first { "partial-then-weak" } else { "weak-then-partial" },
         builder_order: if weak_first_build { "weak-then-partial" } else { "partial-then-weak" },
@@ -1059,11 +1084,11 @@ where
         partial_state_root: partial_root,
         weak_state_root: weak_root,
         expected_receipts_root,
-        historical_receipts_root,
+        historical_receipts_root: historical.receipts_root,
         partial_receipts_root: partial_report.outcome.execution_receipts_root,
         weak_receipts_root: weak_report.outcome.execution_receipts_root,
         expected_requests_hash,
-        historical_requests_hash,
+        historical_requests_hash: historical.requests_hash,
         partial_requests_hash: partial_report.outcome.execution_requests_hash,
         weak_requests_hash: weak_report.outcome.execution_requests_hash,
         valid,
@@ -1097,8 +1122,8 @@ where
 
     Ok(partial_report)
 }
-pub fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn>(
-    evm_config: &Evm,
+pub fn create_sidecar_for_block<Evm, Consensus, ParentStateRootFn, AncestorHeadersFn>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     state_provider: &dyn StateProvider,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     cache: &mut NetworkStateCache,
@@ -1110,6 +1135,7 @@ pub fn create_sidecar_for_block<Evm, ParentStateRootFn, AncestorHeadersFn>(
 ) -> eyre::Result<BuilderBlockReport>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
     ParentStateRootFn: FnOnce(B256) -> eyre::Result<B256>,
     AncestorHeadersFn: FnOnce(Option<u64>, u64) -> eyre::Result<Vec<Bytes>>,
 {
@@ -1170,7 +1196,7 @@ where
         elapsed_us: historical_full_db_evm_us,
     } = match reused {
         Some(simulation) => simulation,
-        None => simulate_block(evm_config, state_provider, block)?,
+        None => simulate_block(rules.evm_config(), state_provider, block)?,
     };
 
     // Only reached when this block re-executed: in shadow mode always, in `on` mode on the
@@ -1186,11 +1212,42 @@ where
             historical_full_db_evm_us,
         );
     }
-    let historical_gas_used = execution_output.result.gas_used;
-    let historical_receipts_root =
-        calculate_receipt_root_no_memo(&execution_output.result.receipts);
-    let historical_requests_hash = execution_output.result.requests.requests_hash();
-    let historical_requests_empty = execution_output.result.requests.is_empty();
+    // The same canonical post-execution validation the two stateless paths run, applied to the
+    // full-DB output so the differential compares three consensus verdicts rather than three
+    // subsets of one. Only this side can still fail it: the validator core rejects a disagreeing
+    // Partial or Weak block before returning. On B3's reuse path the output is the Engine's own,
+    // which already passed this — redundant there, and the only check of the historical execution
+    // on every other block.
+    let historical_receipts_with_bloom =
+        execution_output.result.receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+    let historical_receipts_root = calculate_receipt_root(&historical_receipts_with_bloom);
+    let historical_logs_bloom = historical_receipts_with_bloom
+        .iter()
+        .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom_ref());
+    drop(historical_receipts_with_bloom);
+    let historical_consensus_ok = match rules.consensus().validate_block_post_execution(
+        block,
+        &execution_output.result,
+        Some((historical_receipts_root, historical_logs_bloom)),
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            error!(
+                target: "partial_stateless",
+                block = block_number,
+                %err,
+                "Full-DB execution disagrees with the block's own header"
+            );
+            false
+        }
+    };
+    let historical = HistoricalOutputs {
+        gas_used: execution_output.result.gas_used,
+        receipts_root: historical_receipts_root,
+        requests_hash: execution_output.result.requests.requests_hash(),
+        requests_empty: execution_output.result.requests.is_empty(),
+        consensus_ok: historical_consensus_ok,
+    };
 
     let hashed_post_state = state_provider.hashed_post_state(&execution_output.state);
 
@@ -1615,7 +1672,7 @@ where
                     };
                 let reexec_report = if let Some(output_path) = options.validation_bench_output {
                     benchmark_sidecar_validation(
-                        evm_config,
+                        rules,
                         state_provider,
                         block,
                         prev_cache_for_reexec,
@@ -1630,16 +1687,13 @@ where
                         output_path,
                         historical_full_db_evm_us,
                         transition_witness_build_us,
-                        historical_gas_used,
-                        historical_receipts_root,
-                        historical_requests_hash,
-                        historical_requests_empty,
+                        historical,
                         cache_memory_before,
                         options.retained_generation,
                     )
                 } else {
                     verify_and_apply_provider_assisted_sidecar(
-                        evm_config,
+                        rules,
                         state_provider,
                         block,
                         prev_cache_for_reexec,

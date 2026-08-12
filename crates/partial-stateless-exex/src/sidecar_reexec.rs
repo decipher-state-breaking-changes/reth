@@ -13,8 +13,9 @@ use partial_stateless::{
 };
 use partial_stateless_validator::{
     verify_and_apply_sidecar_with_oracle, PostStateRootOracle, TimedValidation,
-    TrieCacheDisposition,
+    TrieCacheDisposition, ValidatorRules,
 };
+use reth_consensus::FullConsensus;
 use reth_ethereum::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{BlockTy, RecoveredBlock};
@@ -44,8 +45,8 @@ impl PostStateRootOracle for ProviderRootOracle<'_> {
 /// Identical to the core path in everything but that cross-check, which runs after the local root
 /// has been checked against the header and before either cache is committed.
 #[expect(clippy::too_many_arguments)]
-pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm>(
-    evm_config: &Evm,
+pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm, Consensus>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     full_provider: &dyn StateProvider,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     prev_cache: &mut NetworkStateCache,
@@ -57,9 +58,10 @@ pub(crate) fn verify_and_apply_provider_assisted_sidecar<Evm>(
 ) -> Result<TimedValidation>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
 {
     verify_and_apply_sidecar_with_oracle(
-        evm_config,
+        rules,
         block,
         prev_cache,
         sidecar,

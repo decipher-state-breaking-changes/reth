@@ -296,9 +296,61 @@ impl From<&CloneBreakdown> for CloneBreakdownMetrics {
     }
 }
 
+/// What it cost to turn untrusted input into a block this validator agreed to execute.
+///
+/// Every field is `None` on a path that was handed an already-admitted block. See
+/// [`ValidationPhaseTimings::admission`] for why that is not the same as zero.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct AdmissionTimings {
+    /// Source the block arrived from, naming which of the fields below can be `Some`.
+    pub source: AdmissionSource,
+    /// Decoding the transport frame into an execution payload.
+    pub input_decode_us: Option<u64>,
+    /// Engine-API payload layout and block-hash validation.
+    pub payload_validation_us: Option<u64>,
+    /// Recovering every transaction sender from its signature.
+    pub sender_recovery_us: Option<u64>,
+    /// Canonical header, pre-execution, and against-parent consensus validation.
+    pub pre_execution_consensus_us: Option<u64>,
+}
+
+impl AdmissionTimings {
+    /// Admission work actually performed, treating an absent phase as no cost rather than as zero.
+    pub fn total_us(&self) -> u64 {
+        self.input_decode_us
+            .unwrap_or_default()
+            .saturating_add(self.payload_validation_us.unwrap_or_default())
+            .saturating_add(self.sender_recovery_us.unwrap_or_default())
+            .saturating_add(self.pre_execution_consensus_us.unwrap_or_default())
+    }
+}
+
+/// Which entry point handed this validator its block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionSource {
+    /// A caller that had already decoded, layout-checked, and sender-recovered the block.
+    ///
+    /// The default because it is the ExEx's path, and because a record written before this field
+    /// existed describes exactly that.
+    #[default]
+    Recovered,
+    /// Untrusted Engine-API payload bytes this validator admitted itself.
+    ExecutionData,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ValidationPhaseTimings {
     pub deserialize_us: u64,
+    /// Admission phases, `None` where the caller's input arrived already past that stage.
+    ///
+    /// `None` and `Some(0)` are different facts and must stay distinguishable. A full node's ExEx
+    /// is handed a block its Engine has already decoded, layout-checked, and sender-recovered, so
+    /// these read `None` — the work was done, elsewhere, and is nobody's cost here. A standalone
+    /// validator admits untrusted input and does all of it itself. Collapsing that to `0` would
+    /// report a validator that skips admission as one that admits for free, which is exactly the
+    /// coverage gap B3's telemetry had to be corrected for.
+    pub admission: AdmissionTimings,
     pub context_check_us: u64,
     pub witness_self_consistency_us: u64,
     pub materialize_us: u64,
@@ -310,6 +362,13 @@ pub struct ValidationPhaseTimings {
     /// Executor call excluding benchmark-only access capture. Includes all state-provider lookups
     /// performed by the EVM: Full DB/cache reads for Vanilla, in-memory witness/cache reads here.
     pub evm_us: u64,
+    /// Canonical post-execution consensus validation: gas used, receipts root, logs bloom, and the
+    /// fork-gated requests hash.
+    ///
+    /// Runs before the post state is hashed, so a block that fails it pays none of the trie work
+    /// below. Unlike the admission phases this is not optional — every path through the validator
+    /// executes it — so it is a plain `u64`.
+    pub post_execution_consensus_us: u64,
     pub hash_post_state_us: u64,
     /// Cost of opening the transactional trie snapshot.
     ///
@@ -399,7 +458,9 @@ impl ValidationPhaseTimings {
             .saturating_add(self.witness_self_consistency_us)
             .saturating_add(self.materialize_us)
             .saturating_add(self.provider_setup_us)
+            .saturating_add(self.admission.total_us())
             .saturating_add(self.evm_call_us)
+            .saturating_add(self.post_execution_consensus_us)
             .saturating_add(self.hash_post_state_us)
             .saturating_add(self.trie_clone_us)
             .saturating_add(self.state_root_us)

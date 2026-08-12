@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compatibility tests for validation benchmark retention telemetry."""
 
+import ast
 import sys
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_validation_bench import (
     build_account_copy_section,
+    build_admission_section,
     build_anchor_split_section,
     build_cache_composition_section,
     build_cache_delta_section,
@@ -379,6 +381,96 @@ class AccountCopyDecompositionTest(unittest.TestCase):
     def test_pre_v9_records_emit_nothing(self):
         self.assertEqual(build_account_copy_section([anchor_record()]), [])
         self.assertEqual(build_account_copy_section([partial_record()]), [])
+
+
+
+class AdmissionSectionTest(unittest.TestCase):
+    """A null admission phase is not a zero-cost one, and the report has to keep them apart."""
+
+    @staticmethod
+    def record(admission):
+        return {"partial": {"admission": admission}, "weak": {"admission": admission}}
+
+    def test_a_recovered_only_run_says_so_instead_of_tabulating_zeros(self):
+        recovered = {
+            "source": "recovered",
+            "input_decode_us": None,
+            "payload_validation_us": None,
+            "sender_recovery_us": None,
+            "pre_execution_consensus_us": None,
+        }
+        lines = build_admission_section([self.record(recovered)] * 3)
+
+        text = "\n".join(lines)
+        self.assertIn("recovered", text)
+        self.assertNotIn("| Sender recovery |", text)
+
+    def test_averages_are_taken_only_over_samples_that_performed_the_phase(self):
+        performed = {
+            "source": "execution_data",
+            "input_decode_us": None,
+            "payload_validation_us": 2000,
+            "sender_recovery_us": 4000,
+            "pre_execution_consensus_us": 0,
+        }
+        skipped = {
+            "source": "recovered",
+            "input_decode_us": None,
+            "payload_validation_us": None,
+            "sender_recovery_us": None,
+            "pre_execution_consensus_us": None,
+        }
+        lines = build_admission_section(
+            [self.record(performed), self.record(skipped)]
+        )
+
+        text = "\n".join(lines)
+        # One of two samples recovered senders, at 4 ms. Counting the other as zero would report
+        # 2 ms and describe a validator that recovers senders twice as fast as it does.
+        self.assertIn("| Sender recovery | 1 | 4.00 ms |", text)
+        # Performed and free is a real answer, and must not read as absent.
+        self.assertIn("| Pre-execution consensus | 1 | 0.00 ms |", text)
+        # Never performed by anything in the corpus.
+        self.assertIn("| Input decode | 0 | not performed |", text)
+
+
+class ReportStructureTest(unittest.TestCase):
+    """The report builders must not fall off the end, and must not orphan their own tails.
+
+    Both halves of this failed at once when `build_admission_section` was defined *inside*
+    `build_report`: the report function ended at the call and returned `None`, and everything
+    after the new helper's `return` — the retention, anchor, clone, composition, and workload
+    sections plus the real return — became unreachable. Every unit test still passed, because
+    each section builder was exercised directly and none of them goes through `build_report`.
+    A run would have failed only at `report_path.write_text(None)`, after collecting samples.
+    """
+
+    @staticmethod
+    def module_ast():
+        source = Path(__file__).resolve().parent / "analyze_validation_bench.py"
+        return ast.parse(source.read_text())
+
+    def test_no_report_builder_has_code_after_a_return(self):
+        offenders = []
+        for node in ast.walk(self.module_ast()):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for index, statement in enumerate(node.body[:-1]):
+                if isinstance(statement, ast.Return):
+                    offenders.append(f"{node.name}: line {node.body[index + 1].lineno}")
+        self.assertEqual(offenders, [], f"unreachable code after a return: {offenders}")
+
+    def test_build_report_ends_in_a_return(self):
+        report = next(
+            node
+            for node in ast.walk(self.module_ast())
+            if isinstance(node, ast.FunctionDef) and node.name == "build_report"
+        )
+        self.assertIsInstance(
+            report.body[-1],
+            ast.Return,
+            "build_report fell off the end, so it returns None and the run fails at write time",
+        )
 
 
 if __name__ == "__main__":

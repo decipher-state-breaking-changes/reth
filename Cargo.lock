@@ -6493,6 +6493,7 @@ dependencies = [
  "partial-stateless",
  "partial-stateless-validator",
  "reth-cli-util",
+ "reth-consensus",
  "reth-ethereum",
  "reth-evm",
  "reth-execution-access",
@@ -6512,11 +6513,19 @@ dependencies = [
 name = "partial-stateless-validator"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-evm",
  "alloy-primitives",
+ "alloy-rpc-types-engine",
  "eyre",
  "partial-stateless",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-ethereum-consensus",
  "reth-ethereum-primitives",
  "reth-evm",
+ "reth-execution-types",
+ "reth-payload-validator",
  "reth-primitives-traits",
  "reth-revm",
  "reth-storage-errors",

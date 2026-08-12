@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build-profile guard for the standalone database-free validator (Phase 4b, S0).
+# Build-profile guard for the standalone database-free validator (Phase 4b, S0-S1).
 #
-# Two invariants, both of which have to hold for the standalone claim to mean anything, and
-# neither of which any test can observe:
+# Three invariants, all of which have to hold for the standalone claim to mean anything, and none
+# of which any test can observe:
 #
 #   1. No Reth provider or database implementation is reachable from the package's *normal*
 #      dependency graph. This is what makes "database-free" a compile-time property rather than a
@@ -19,6 +19,13 @@
 #      to reintroduce it -- S3 builds this package as its own binary, which is exactly the build
 #      that would not inherit anything from the ExEx.
 #
+#   3. The signature-recovery backend the production binary runs is actually selected. Since S1
+#      this package recovers senders itself, and without `secp256k1` on reth-primitives-traits the
+#      recovery silently falls back to the pure-Rust k256 path. It was missing until S1 and nothing
+#      showed it, because partial-stateless-exex pulls the feature in through the node graph and a
+#      graph check on the ExEx would have passed. Same shape of defect as invariant 2, on a
+#      different hot path.
+#
 # Usage: check_validator_isolation.sh [package-name]
 
 set -euo pipefail
@@ -28,6 +35,7 @@ PKG="${1:-partial-stateless-validator}"
 # Implementations, not traits. reth-storage-api and reth-storage-errors are deliberately absent.
 FORBIDDEN='^(reth-provider|reth-db|reth-db-common|reth-libmdbx|reth-mdbx-sys|reth-exex|reth-node-builder)$'
 REQUIRED_FEATURES='feature "(asm-keccak|keccak-cache-global)"'
+REQUIRED_RECOVERY='feature "secp256k1"'
 
 status=0
 
@@ -54,6 +62,17 @@ if [ "${edges}" -eq 0 ]; then
   status=1
 else
   echo "ok: ${edges} asm-keccak/keccak-cache-global feature edges on alloy-primitives"
+fi
+
+echo "==> ${PKG}: signature recovery backend"
+recovery="$(cargo tree -p "${PKG}" -e features -i reth-primitives-traits 2>/dev/null \
+  | grep -cE "${REQUIRED_RECOVERY}" || true)"
+if [ "${recovery}" -eq 0 ]; then
+  echo "FAIL: ${PKG} does not select secp256k1 on reth-primitives-traits." >&2
+  echo "      Sender recovery would fall back to k256, which production does not run." >&2
+  status=1
+else
+  echo "ok: ${recovery} secp256k1 feature edges on reth-primitives-traits"
 fi
 
 exit "${status}"

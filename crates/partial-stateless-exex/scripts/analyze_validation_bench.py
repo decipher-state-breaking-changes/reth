@@ -951,6 +951,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         ("Materialize", "materialize_us"),
         ("Provider setup", "provider_setup_us"),
         ("Access capture (excluded from primary)", "accessed_state_capture_us"),
+        ("Post-execution consensus", "post_execution_consensus_us"),
         ("Hash post-state", "hash_post_state_us"),
         ("Sparse-trie root", "state_root_us"),
         ("Exact miss-only policy", "miss_policy_check_us"),
@@ -971,7 +972,6 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         "maintains a leaf digest index too, but over a cache built fresh for each block rather "
         "than a sixty-block window, so its cache-update columns are not a control for Partial's "
         "and must not be normalized against the Partial composition reported below."])
-
     lines.extend(build_retention_split_section(accepted))
     lines.extend(build_anchor_split_section(accepted))
     lines.extend(build_clone_split_section(accepted))
@@ -980,6 +980,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
     lines.extend(build_cache_composition_section(accepted))
     lines.extend(build_cache_delta_section(accepted))
 
+    lines.extend(build_admission_section(accepted))
     orders = [r["verifier_order"] for r in accepted]
     tx_average = statistics.fmean(r["tx_count"] for r in accepted)
     partial_first_count = orders.count("partial-then-weak")
@@ -996,6 +997,60 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         "- Partial and Weak are DB-free during their timed state-access + execution path.",
         "- Network transfer and sidecar file I/O are excluded; witness bytes are reported separately."])
     return "\n".join(lines) + "\n"
+
+
+def build_admission_section(accepted):
+    """Report what admitting the blocks cost, and refuse to average across two answers.
+
+    Admission phases are nullable, and a null is not a zero: it says the caller was handed a block
+    that had already cleared that stage. Averaging nulls as zeros would report a validator that
+    skips admission as one that admits for free, which is the reporting defect B3's telemetry had
+    to be corrected for. A run driven by a reth node is entirely `recovered` and gets one line
+    saying so, rather than a table of zeros that looks like a measurement.
+    """
+    phase_fields = [
+        ("Input decode", "input_decode_us"),
+        ("Payload layout and block hash", "payload_validation_us"),
+        ("Sender recovery", "sender_recovery_us"),
+        ("Pre-execution consensus", "pre_execution_consensus_us"),
+    ]
+    sources = sorted({
+        record["partial"].get("admission", {}).get("source", "recovered")
+        for record in accepted
+    })
+    if sources == ["recovered"]:
+        return ["",
+            "### Admission", "",
+            "- Admission source: **recovered** on all "
+            f"{len(accepted)} samples — the Engine decoded, layout-checked, and sender-recovered "
+            "every block before the ExEx saw it, so this run measures none of that work. A "
+            "standalone validator reading Engine payloads reports `execution_data` and fills these "
+            "phases in.",
+        ]
+
+    lines = ["",
+        "### Admission", "",
+        f"- Admission sources present: **{', '.join(sources)}**",
+        "",
+        "| Phase | Samples that performed it | Avg over those |",
+        "| --- | ---: | ---: |",
+    ]
+    for label, field in phase_fields:
+        performed = [
+            record["partial"]["admission"][field]
+            for record in accepted
+            if record.get("partial", {}).get("admission", {}).get(field) is not None
+        ]
+        if not performed:
+            lines.append(f"| {label} | 0 | not performed |")
+            continue
+        lines.append(
+            f"| {label} | {len(performed)} | {statistics.fmean(performed) / 1000:.2f} ms |"
+        )
+    lines.extend(["",
+        "Counts are reported beside the averages because a phase absent from a sample is not a "
+        "zero-cost phase: the average is over the samples that actually performed it."])
+    return lines
 
 
 def build_overlap_report(accepted, stats: SelectionStats, warmup: int):

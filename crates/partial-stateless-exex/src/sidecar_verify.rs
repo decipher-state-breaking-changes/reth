@@ -7,7 +7,8 @@ use partial_stateless::{
     last_n_blocks_cache_policy_id, network_cache::NetworkStateCache, PartialTrieNodeCache,
     ReadyParent,
 };
-use partial_stateless_validator::TrieCacheDisposition;
+use partial_stateless_validator::{TrieCacheDisposition, ValidatorRules};
+use reth_consensus::FullConsensus;
 use reth_ethereum::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock};
@@ -21,8 +22,8 @@ use tracing::{info, warn};
 /// depth-1 reorg. A verifier gets this for the same reason a builder does: the transition already
 /// copied the parent trie and then overwrote it, so keeping the copy costs nothing beyond holding
 /// it. On any error nothing was displaced — both caches are still at the parent.
-pub(crate) fn verify_live_sidecar<Evm>(
-    evm_config: &Evm,
+pub(crate) fn verify_live_sidecar<Evm, Consensus>(
+    rules: ValidatorRules<'_, Evm, Consensus>,
     state_provider: &dyn StateProvider,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     cache: &mut NetworkStateCache,
@@ -35,6 +36,7 @@ pub(crate) fn verify_live_sidecar<Evm>(
 ) -> eyre::Result<Option<PartialTrieNodeCache>>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Consensus: FullConsensus<EthPrimitives> + ?Sized,
 {
     let block_number = block.number();
     let block_hash = block.hash();
@@ -66,7 +68,7 @@ where
     check_ready_anchor(ready_parent, &sidecar)?;
 
     let report = verify_and_apply_provider_assisted_sidecar(
-        evm_config,
+        rules,
         state_provider,
         block,
         cache,
