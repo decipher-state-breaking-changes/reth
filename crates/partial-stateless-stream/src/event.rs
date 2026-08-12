@@ -123,21 +123,27 @@ pub const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_SNAPSHOT_CHUNKS: u32 = 8192;
 
 impl Checkpoint {
-    /// Splits a package into the chunks that follow this checkpoint, and fills in its header.
+    /// Fills in the snapshot transport fields from the package, without materializing chunks.
     ///
-    /// Chunking lives with the format rather than with the producer because reassembly has to be
-    /// its exact inverse, and the two ends are written months and one process apart.
+    /// A producer writing chunks one at a time uses this and then frames each slice itself, so
+    /// the whole package is never copied a second time; [`Self::chunk`] is the convenience that
+    /// does both at once. Chunking lives with the format rather than with the producer because
+    /// reassembly has to be its exact inverse, and the two ends are written months and one
+    /// process apart.
+    pub fn describe(&mut self, package: &[u8], chunk_bytes: usize) {
+        self.snapshot_bytes = package.len() as u64;
+        self.snapshot_chunks = package.chunks(chunk_bytes.max(1)).count() as u32;
+        self.snapshot_digest = alloy_primitives::keccak256(package);
+    }
+
+    /// Splits a package into the chunks that follow this checkpoint, and fills in its header.
     pub fn chunk(&mut self, package: &[u8], chunk_bytes: usize) -> Vec<SnapshotChunk> {
-        let chunk_bytes = chunk_bytes.max(1);
-        let chunks: Vec<SnapshotChunk> = package
-            .chunks(chunk_bytes)
+        self.describe(package, chunk_bytes);
+        package
+            .chunks(chunk_bytes.max(1))
             .enumerate()
             .map(|(index, bytes)| SnapshotChunk { index: index as u32, bytes: bytes.to_vec() })
-            .collect();
-        self.snapshot_bytes = package.len() as u64;
-        self.snapshot_chunks = chunks.len() as u32;
-        self.snapshot_digest = alloy_primitives::keccak256(package);
-        chunks
+            .collect()
     }
 
     /// Checks that the declared snapshot sizes are ones a consumer can honour.

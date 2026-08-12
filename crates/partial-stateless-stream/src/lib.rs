@@ -67,6 +67,26 @@ pub fn decode_event<'a>(
     Ok((header, event, rest))
 }
 
+/// Serializes one event's body without framing it, naming the kind the frame must carry.
+///
+/// For a producer that buffers events and assigns sequence numbers later than it serializes:
+/// the digest covers the body alone, so a body serialized now and framed with
+/// [`encode_frame_bytes`] at flush time is byte-identical to one encoded in a single step.
+pub fn encode_event_body(event: &StreamEvent) -> Result<(FrameKind, Vec<u8>), FrameError> {
+    let (kind, result) = match event {
+        StreamEvent::Manifest(body) => (FrameKind::Manifest, bincode::serialize(body)),
+        StreamEvent::Checkpoint(body) => (FrameKind::Checkpoint, bincode::serialize(body)),
+        StreamEvent::SnapshotChunk(body) => (FrameKind::SnapshotChunk, bincode::serialize(body)),
+        StreamEvent::Commit(body) => (FrameKind::Commit, bincode::serialize(body)),
+        StreamEvent::Reorg(body) => (FrameKind::Reorg, bincode::serialize(body)),
+        StreamEvent::Reset(body) => (FrameKind::Reset, bincode::serialize(body)),
+        StreamEvent::End(body) => (FrameKind::End, bincode::serialize(body)),
+    };
+    let body =
+        result.map_err(|err| FrameError::Body { kind: kind.as_str(), detail: err.to_string() })?;
+    Ok((kind, body))
+}
+
 /// Encodes one event as a complete frame.
 ///
 /// Takes the same limits a decoder applies, and refuses at encode what no decoder could read —

@@ -24,8 +24,9 @@ pub use partial_stateless::restore::{live_limits, restore_snapshot, RestoredSnap
 use partial_stateless::{
     build_snapshot_package_with_limits,
     network_cache::NetworkStateCache,
+    persistence::CacheState,
     readiness::{ReadyParent, TrustedCheckpoint},
-    CacheSnapshotPackage,
+    CacheConfig, CacheSnapshotPackage,
 };
 use reth_provider::StateProvider;
 use reth_trie_common::TrieInput;
@@ -98,6 +99,60 @@ pub fn export_snapshot(
         "Exported operator-trusted cache snapshot"
     );
     Ok(exported)
+}
+
+/// Rebuilds a cache from a captured [`CacheState`] and exports it, for a worker off the ExEx task.
+///
+/// The capture is taken on the ExEx task at `Ready(H)` — milliseconds — and everything expensive
+/// happens here against the copy: the whole-cache multiproof no longer stalls notification
+/// processing, which is what starved the Engine payload handoff and made the head of every
+/// recorded stream `reconstructed`. The policies are re-derived from the same [`CacheConfig`] the
+/// live cache runs, so the copy's cache root is the live cache root; the consumer's restore
+/// verifies exactly that, against the checkpoint.
+///
+/// What this does *not* move off the export: the state provider's read transaction still spans
+/// the whole multiproof, because the proof must be answered against one consistent view of the
+/// state at H. Chunking that into shorter transactions is deferred hardening, not S3.
+pub fn export_snapshot_from_state(
+    dir: &Path,
+    state: CacheState,
+    ready: &ReadyParent,
+    config: &CacheConfig,
+    state_provider: &dyn StateProvider,
+) -> eyre::Result<ExportedSnapshot> {
+    let cache = state.into_cache(config.account_policy(), config.storage_policy());
+    export_snapshot(dir, &cache, ready, state_provider)
+}
+
+/// An export's outcome without its package: what the completion poll needs, and nothing that
+/// would keep ~130 MiB alive beside the file read-back the recorder is about to do.
+#[derive(Debug)]
+pub struct FinishedExport {
+    /// The checkpoint an importer must be given out of band.
+    pub checkpoint: TrustedCheckpoint,
+    /// Where the package was written.
+    pub package_path: PathBuf,
+    /// Where the checkpoint was written.
+    pub checkpoint_path: PathBuf,
+    /// Serialized package size.
+    pub package_bytes: usize,
+    /// Leaf targets in the final multiproof request.
+    pub proof_targets: usize,
+    /// Wall time of the export.
+    pub elapsed_us: u64,
+}
+
+impl From<ExportedSnapshot> for FinishedExport {
+    fn from(exported: ExportedSnapshot) -> Self {
+        Self {
+            checkpoint: exported.checkpoint,
+            package_path: exported.package_path,
+            checkpoint_path: exported.checkpoint_path,
+            package_bytes: exported.package_bytes,
+            proof_targets: exported.proof_targets,
+            elapsed_us: exported.elapsed_us,
+        }
+    }
 }
 
 /// Writes a package and its checkpoint into `dir`, returning both paths and the package size.

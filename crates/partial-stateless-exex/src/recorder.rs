@@ -9,33 +9,37 @@
 //!
 //! Three rules follow from that, and each of them rules out something simpler.
 //!
-//! **Nothing is written until the checkpoint is.** A replay driver has no state until it restores
-//! one, so commits recorded while the pair was still warming could never be replayed. The stream
-//! therefore starts at the block after the snapshot, which is also exactly what S3's live producer
-//! does — choose H, export, then publish a contiguous stream from H + 1.
+//! **Nothing lands on disk until the checkpoint does.** A replay driver has no state until it
+//! restores one, so commits recorded while the pair was still warming could never be replayed.
+//! While the snapshot export runs off-task, the frames for H + 1 onward wait in a bounded buffer
+//! and are flushed behind the checkpoint, so the on-disk stream still starts at exactly the block
+//! after the snapshot and stays contiguous. The buffer is dropped *whole* on overflow — a trimmed
+//! buffer would be precisely the silent gap the sequence numbers exist to make impossible.
 //!
 //! **A write failure ends the stream rather than skipping a frame.** A corpus with a hole in it
 //! reads as a corpus, and the replay driver would report agreement on a chain nobody ran. So the
 //! first failure disables the recorder, and the missing `End` frame is what tells a reader the
-//! stream was cut rather than finished.
+//! stream was cut rather than finished. Reaching a configured spool bound is different: the
+//! stream is complete up to the bound, so it closes with `End(SpoolLimit)` instead of a cut.
 //!
 //! **A non-empty directory is refused.** Two runs sharing a spool would interleave two epochs
 //! under one sequence space, and the resulting corpus would be undetectably wrong rather than
 //! obviously wrong.
 //!
-//! What this module is not: a live delivery path. It writes files, and S3 is where a consumer
+//! What this module is not: a live delivery path. It writes files, and S3d is where a consumer
 //! reads them without sharing the datadir.
 
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use partial_stateless::readiness::TrustedCheckpoint;
 use partial_stateless_stream::{
-    encode_event, BlockRef, Checkpoint, CommitFrame, CommitInput, CommitOracle, End, EndKind,
-    FrameKind, FrameLimits, Manifest, Reorg, Reset, ResetReason, StreamEvent,
-    DEFAULT_SNAPSHOT_CHUNK_BYTES,
+    encode_event_body, encode_frame_bytes, BlockRef, Checkpoint, CommitFrame, CommitInput,
+    CommitOracle, End, EndKind, FrameKind, FrameLimits, Manifest, Reorg, Reset, ResetReason,
+    SnapshotChunk, StreamEvent, DEFAULT_SNAPSHOT_CHUNK_BYTES, FRAME_HEADER_BYTES,
 };
 use reth_primitives_traits::SealedHeader;
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
 };
@@ -50,6 +54,57 @@ const CHUNK_BYTES_VAR: &str = "PS_STREAM_CHUNK_BYTES";
 /// Stamps the producer identity into the manifest, for a harness that knows its own git sha.
 const PRODUCER_VAR: &str = "PS_STREAM_PRODUCER";
 
+/// Ceiling on bytes buffered while the snapshot export runs. Exceeding it drops the buffer whole.
+const BUFFER_MAX_BYTES_VAR: &str = "PS_STREAM_BUFFER_MAX_BYTES";
+
+/// Ceiling on frames buffered while the snapshot export runs.
+const BUFFER_MAX_FRAMES_VAR: &str = "PS_STREAM_BUFFER_MAX_FRAMES";
+
+/// Ceiling on total spool bytes. Reaching it closes the stream with `End(SpoolLimit)`.
+const MAX_SPOOL_BYTES_VAR: &str = "PS_STREAM_MAX_SPOOL_BYTES";
+
+/// Ceiling on total spool frames — the inode bound beside the byte bound.
+const MAX_SPOOL_FRAMES_VAR: &str = "PS_STREAM_MAX_SPOOL_FRAMES";
+
+/// Default export buffer byte bound.
+///
+/// Measured: the S2 capture's commits averaged 3.32 MiB and a 156 s export spans ~13 blocks, so
+/// the buffer's ordinary load is ~45 MiB. 256 MiB is enough headroom for the widest blocks without
+/// being a number that competes with the snapshot copies for the process's memory.
+const DEFAULT_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default export buffer frame bound.
+const DEFAULT_BUFFER_MAX_FRAMES: usize = 128;
+
+/// Default spool byte bound: a ~6,000-block adoption run at the measured 3.32 MiB per commit is
+/// ~20 GiB plus one snapshot, so 64 GiB bounds the disk without touching any run this workstream
+/// actually performs.
+const DEFAULT_MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Default spool frame bound.
+const DEFAULT_MAX_SPOOL_FRAMES: u64 = 100_000;
+
+/// Where the spool's frames go while the snapshot export runs.
+///
+/// The stream must start at exactly H + 1 and stay contiguous, and the checkpoint for H is not
+/// writable until the export finishes — so the frames between the two wait in memory. Bounded,
+/// and dropped *whole* on overflow: a trimmed buffer would be precisely the silent gap the
+/// sequence numbers exist to make impossible.
+#[derive(Debug)]
+enum SpoolPhase {
+    /// No export has chosen an H. Frames are dropped, because nothing could ever replay them.
+    Idle,
+    /// An export is in flight; frames wait here as pre-encoded bodies, framed at flush time.
+    Buffering {
+        /// Bodies in arrival order, with the kind each will be framed under.
+        frames: VecDeque<(FrameKind, Vec<u8>)>,
+        /// Total buffered body bytes.
+        bytes: usize,
+    },
+    /// The checkpoint and its chunks are on disk; frames write through.
+    Streaming,
+}
+
 /// Writes v1 frames into a spool directory, one atomic file per frame.
 ///
 /// One file per frame rather than one appended segment, because an append is not atomic and a
@@ -62,8 +117,11 @@ pub struct StreamRecorder {
     chunk_bytes: usize,
     producer: String,
     sequence: u64,
-    /// Set once the checkpoint and its chunks are on disk. Commits before this are not recorded.
-    checkpointed: bool,
+    /// Where frames currently go: dropped, buffered behind an in-flight export, or written.
+    phase: SpoolPhase,
+    /// Set when the export buffer overflowed; read (and cleared) by the export owner, which is
+    /// the one that decides whether the attempt is retried.
+    buffer_overflowed: bool,
     /// Set by the first write failure, and never cleared.
     poisoned: bool,
     /// Set once an `End` frame is on disk. A closed stream takes no further frames, and a second
@@ -71,6 +129,12 @@ pub struct StreamRecorder {
     ended: bool,
     /// Bound every written frame is checked against, the same one a reader applies.
     limits: FrameLimits,
+    /// Export-buffer bounds: body bytes and frame count.
+    buffer_max_bytes: usize,
+    buffer_max_frames: usize,
+    /// Whole-spool bounds: bytes and frames (the inode bound). Reaching either closes the stream.
+    max_spool_bytes: u64,
+    max_spool_frames: u64,
     frames: u64,
     bytes: u64,
     /// Highest block whose cache state the producer has written to durable storage.
@@ -103,11 +167,14 @@ impl StreamRecorder {
                 dir.display()
             );
         }
-        let chunk_bytes = std::env::var(CHUNK_BYTES_VAR)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_SNAPSHOT_CHUNK_BYTES)
-            .max(1);
+        fn env_bound<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
+            std::env::var(name).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(default)
+        }
+        let chunk_bytes = env_bound(CHUNK_BYTES_VAR, DEFAULT_SNAPSHOT_CHUNK_BYTES).max(1);
+        let buffer_max_bytes = env_bound(BUFFER_MAX_BYTES_VAR, DEFAULT_BUFFER_MAX_BYTES);
+        let buffer_max_frames = env_bound(BUFFER_MAX_FRAMES_VAR, DEFAULT_BUFFER_MAX_FRAMES);
+        let max_spool_bytes = env_bound(MAX_SPOOL_BYTES_VAR, DEFAULT_MAX_SPOOL_BYTES);
+        let max_spool_frames = env_bound(MAX_SPOOL_FRAMES_VAR, DEFAULT_MAX_SPOOL_FRAMES);
         let producer = std::env::var(PRODUCER_VAR).unwrap_or_else(|_| {
             format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         });
@@ -116,6 +183,10 @@ impl StreamRecorder {
             dir = %dir.display(),
             chunk_bytes,
             producer,
+            buffer_max_bytes,
+            buffer_max_frames,
+            max_spool_bytes,
+            max_spool_frames,
             "Event stream recording ENABLED (PS_STREAM_DIR) — commits are written from the block \
              after the snapshot checkpoint"
         );
@@ -124,10 +195,15 @@ impl StreamRecorder {
             chunk_bytes,
             producer,
             sequence: 0,
-            checkpointed: false,
+            phase: SpoolPhase::Idle,
+            buffer_overflowed: false,
             poisoned: false,
             ended: false,
             limits: FrameLimits::default(),
+            buffer_max_bytes,
+            buffer_max_frames,
+            max_spool_bytes,
+            max_spool_frames,
             frames: 0,
             bytes: 0,
             durable_block: None,
@@ -139,12 +215,74 @@ impl StreamRecorder {
         self.durable_block = Some(block);
     }
 
-    /// Whether a commit written now would land in a replayable stream.
+    /// A recorder for in-crate tests, bypassing the environment gate.
+    #[cfg(test)]
+    pub(crate) fn for_tests(dir: &Path, buffer_max_frames: usize) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            chunk_bytes: 64,
+            producer: "test".to_string(),
+            sequence: 0,
+            phase: SpoolPhase::Idle,
+            buffer_overflowed: false,
+            poisoned: false,
+            ended: false,
+            limits: FrameLimits::default(),
+            buffer_max_bytes: DEFAULT_BUFFER_MAX_BYTES,
+            buffer_max_frames,
+            max_spool_bytes: DEFAULT_MAX_SPOOL_BYTES,
+            max_spool_frames: DEFAULT_MAX_SPOOL_FRAMES,
+            frames: 0,
+            bytes: 0,
+            durable_block: None,
+        }
+    }
+
+    /// Whether a commit's frame material should be assembled at all.
     ///
-    /// False before the checkpoint, after a write failure, and after the stream is closed.
-    /// Callers use it to skip the work of assembling a frame that would be discarded.
-    pub const fn records_commits(&self) -> bool {
-        self.checkpointed && !self.poisoned && !self.ended
+    /// True while an export buffers H + 1 onward *and* after the checkpoint opens the stream —
+    /// the two phases in which a frame emitted now lands in a replayable stream, immediately or
+    /// at the flush behind the checkpoint. A caller that skipped assembly while the export ran
+    /// would flush an empty buffer and record a stream with a hole at its head. False before an
+    /// export chose H, after a write failure, and after the stream closed.
+    pub const fn wants_commit_material(&self) -> bool {
+        !self.poisoned && !self.ended && !matches!(self.phase, SpoolPhase::Idle)
+    }
+
+    /// Opens the buffering phase: an export has chosen H, and every frame from here belongs to
+    /// the stream that will start behind its checkpoint.
+    pub fn begin_buffering(&mut self) {
+        if self.poisoned || self.ended {
+            return
+        }
+        if matches!(self.phase, SpoolPhase::Idle) {
+            self.phase = SpoolPhase::Buffering { frames: VecDeque::new(), bytes: 0 };
+        }
+    }
+
+    /// Drops the buffer whole and returns to dropping frames; the attempt it belonged to failed.
+    pub fn abandon_buffering(&mut self, why: &str) {
+        if let SpoolPhase::Buffering { frames, bytes } = &mut self.phase {
+            warn!(
+                target: "partial_stateless_stream",
+                dropped_frames = frames.len(),
+                dropped_bytes = *bytes,
+                why,
+                "Export buffering abandoned; the buffered frames are dropped whole rather than \
+                 trimmed, and the stream has not opened"
+            );
+            self.phase = SpoolPhase::Idle;
+        }
+    }
+
+    /// Whether the export buffer overflowed since the last check. Reading it clears it.
+    ///
+    /// Overflow already dropped the buffer and returned the recorder to dropping frames; what
+    /// the owner of the export decides is only whether a fresh attempt is worth starting.
+    pub const fn take_buffer_overflow(&mut self) -> bool {
+        let overflowed = self.buffer_overflowed;
+        self.buffer_overflowed = false;
+        overflowed
     }
 
     /// Writes the stream identity. Must be the first frame.
@@ -168,7 +306,7 @@ impl StreamRecorder {
             producer: self.producer.clone(),
             first_sequence: 1,
         };
-        self.write(FrameKind::Manifest, &StreamEvent::Manifest(manifest));
+        self.write_event(&StreamEvent::Manifest(manifest));
     }
 
     /// Writes the checkpoint and the snapshot package it describes, and opens the commit stream.
@@ -213,65 +351,130 @@ impl StreamRecorder {
             snapshot_chunks: 0,
             snapshot_digest: B256::ZERO,
         };
-        let chunks = frame.chunk(package, self.chunk_bytes);
-        let chunk_count = chunks.len();
-        self.write(FrameKind::Checkpoint, &StreamEvent::Checkpoint(frame));
-        for chunk in chunks {
-            self.write(FrameKind::SnapshotChunk, &StreamEvent::SnapshotChunk(chunk));
+        // Described rather than chunked: the chunks are framed one slice at a time below, so the
+        // package is never copied whole a second time.
+        frame.describe(package, self.chunk_bytes);
+        let chunk_count = frame.snapshot_chunks as u64;
+        let (kind, checkpoint_body) = match encode_event_body(&StreamEvent::Checkpoint(frame)) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.poison("checkpoint", &eyre::eyre!("{err}"));
+                return
+            }
+        };
+
+        // Preflight: everything the checkpoint opens must fit inside the spool bounds *before*
+        // its first frame is written. A cap that fired between the checkpoint and its chunks, or
+        // between the chunks and the buffered commits, would close a spool that no consumer can
+        // restore from — "closed" and "unrestorable" at once.
+        let header = FRAME_HEADER_BYTES as u64;
+        // Exact body bytes plus a small per-chunk allowance for bincode's index and length fields.
+        let chunk_frame_overhead = header + 16;
+        let buffered_cost: u64 = match &self.phase {
+            SpoolPhase::Buffering { frames, bytes } => *bytes as u64 + header * frames.len() as u64,
+            _ => 0,
+        };
+        let buffered_count = match &self.phase {
+            SpoolPhase::Buffering { frames, .. } => frames.len() as u64,
+            _ => 0,
+        };
+        let projected_bytes = self
+            .bytes
+            .saturating_add(header + checkpoint_body.len() as u64)
+            .saturating_add(package.len() as u64 + chunk_frame_overhead * chunk_count)
+            .saturating_add(buffered_cost);
+        let projected_frames = self.frames + 1 + chunk_count + buffered_count;
+        if projected_bytes > self.max_spool_bytes || projected_frames > self.max_spool_frames {
+            self.abandon_buffering(
+                "the checkpoint, its chunks, and the buffered commits would \
+                 not fit the spool bounds",
+            );
+            self.write_end(
+                EndKind::SpoolLimit,
+                format!(
+                    "checkpoint at block {} needs ~{projected_bytes} bytes / {projected_frames} \
+                     frames against bounds {} / {}",
+                    checkpoint.block_number, self.max_spool_bytes, self.max_spool_frames
+                ),
+            );
+            return
+        }
+
+        self.write_body(kind, checkpoint_body);
+        for (index, slice) in package.chunks(self.chunk_bytes.max(1)).enumerate() {
+            if self.poisoned {
+                return
+            }
+            let chunk = SnapshotChunk { index: index as u32, bytes: slice.to_vec() };
+            self.write_event(&StreamEvent::SnapshotChunk(chunk));
         }
         if self.poisoned {
             return
         }
-        self.checkpointed = true;
+        // Flush what accumulated while the export ran — same order, fresh contiguous sequences —
+        // and only then write through directly.
+        let buffered = match &mut self.phase {
+            SpoolPhase::Buffering { frames, .. } => std::mem::take(frames),
+            _ => VecDeque::new(),
+        };
+        let flushed = buffered.len();
+        for (kind, body) in buffered {
+            self.write_body(kind, body);
+        }
+        if self.poisoned {
+            return
+        }
+        self.phase = SpoolPhase::Streaming;
         info!(
             target: "partial_stateless_stream",
             block = checkpoint.block_number,
             block_hash = ?checkpoint.block_hash,
             package_bytes = package.len(),
             chunks = chunk_count,
+            flushed_commits = flushed,
             has_accepted_head = accepted_head.is_some(),
             "Wrote the checkpoint and its snapshot; the commit stream starts at the next block"
         );
     }
 
-    /// Writes one canonical block.
+    /// Records one canonical block: buffered while the export runs, written once the stream is
+    /// open.
     ///
     /// The durability watermark is filled in here rather than by the caller, because it is the
     /// recorder's own bookkeeping and a caller that had to remember it would eventually forget.
     pub fn write_commit(&mut self, input: CommitInput, mut oracle: CommitOracle) {
-        if !self.records_commits() {
+        if !self.wants_commit_material() {
             return
         }
         oracle.durability_watermark = self.durable_block;
         let block = input.block;
         let provenance = input.payload_provenance;
-        self.write(
-            FrameKind::Commit,
-            &StreamEvent::Commit(Box::new(CommitFrame::new(input, oracle))),
-        );
+        let buffered = matches!(self.phase, SpoolPhase::Buffering { .. });
+        self.emit(&StreamEvent::Commit(Box::new(CommitFrame::new(input, oracle))));
         info!(
             target: "partial_stateless_stream",
             block = block.number,
             block_hash = ?block.hash,
             sequence = self.sequence,
             provenance = provenance.as_str(),
+            buffered,
             frames = self.frames,
             spool_bytes = self.bytes,
             "Recorded a commit frame"
         );
     }
 
-    /// Writes an abandoned branch. The winning branch follows as ordinary commits.
+    /// Records an abandoned branch. The winning branch follows as ordinary commits.
     pub fn write_reorg(&mut self, reorg: Reorg) {
-        if !self.records_commits() {
+        if !self.wants_commit_material() {
             return
         }
-        self.write(FrameKind::Reorg, &StreamEvent::Reorg(reorg));
+        self.emit(&StreamEvent::Reorg(reorg));
     }
 
     /// Tells a consumer it cannot continue from what it holds.
     pub fn write_reset(&mut self, reason: ResetReason, detail: impl Into<String>) {
-        if !self.records_commits() {
+        if !self.wants_commit_material() {
             return
         }
         let reset = Reset { reason, detail: detail.into() };
@@ -281,7 +484,7 @@ impl StreamRecorder {
             detail = %reset.detail,
             "Recorded a reset; a consumer of this stream must re-bootstrap here"
         );
-        self.write(FrameKind::Reset, &StreamEvent::Reset(reset));
+        self.emit(&StreamEvent::Reset(reset));
     }
 
     /// Closes the stream. A corpus without this ended unexpectedly.
@@ -296,7 +499,7 @@ impl StreamRecorder {
             return
         }
         let end = End { kind, reason: reason.into(), last_sequence: self.sequence - 1 };
-        self.write(FrameKind::End, &StreamEvent::End(end));
+        self.write_event(&StreamEvent::End(end));
         self.ended = true;
         info!(
             target: "partial_stateless_stream",
@@ -308,13 +511,74 @@ impl StreamRecorder {
         );
     }
 
-    /// Encodes and writes one frame, poisoning the recorder if anything fails.
-    fn write(&mut self, kind: FrameKind, event: &StreamEvent) {
+    /// Routes one event by phase: dropped before an export chose H, buffered while it runs,
+    /// written through once the stream is open.
+    fn emit(&mut self, event: &StreamEvent) {
         if self.poisoned || self.ended {
             return
         }
+        match self.phase {
+            SpoolPhase::Idle => {}
+            SpoolPhase::Buffering { .. } => self.buffer(event),
+            SpoolPhase::Streaming => self.write_event(event),
+        }
+    }
+
+    /// Serializes one event into the buffer, dropping the buffer whole on overflow.
+    fn buffer(&mut self, event: &StreamEvent) {
+        let (kind, body) = match encode_event_body(event) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.poison("encode", &eyre::eyre!("{err}"));
+                return
+            }
+        };
+        let (max_bytes, max_frames) = (self.buffer_max_bytes, self.buffer_max_frames);
+        let SpoolPhase::Buffering { frames, bytes } = &mut self.phase else { return };
+        let projected = bytes.saturating_add(body.len());
+        if projected > max_bytes || frames.len() + 1 > max_frames {
+            self.buffer_overflowed = true;
+            self.abandon_buffering(
+                "the export buffer bound was reached; the stream cannot start contiguously at \
+                 H + 1 from this attempt",
+            );
+            return
+        }
+        *bytes = projected;
+        frames.push_back((kind, body));
+    }
+
+    /// Encodes and writes one frame, poisoning the recorder if anything fails.
+    fn write_event(&mut self, event: &StreamEvent) {
+        if self.poisoned || self.ended {
+            return
+        }
+        match encode_event_body(event) {
+            Ok((kind, body)) => self.write_body(kind, body),
+            Err(err) => self.poison("encode", &eyre::eyre!("{err}")),
+        }
+    }
+
+    /// Frames one pre-encoded body with the next sequence and writes it atomically.
+    fn write_body(&mut self, kind: FrameKind, body: Vec<u8>) {
+        if self.poisoned || self.ended {
+            return
+        }
+        // The spool bounds close the stream rather than poisoning it: a bounded stream is
+        // complete up to its bound. The End frame itself is exempt, so reaching the bound is
+        // still recorded as an orderly close rather than read back as a cut.
+        if kind != FrameKind::End {
+            let projected = self.bytes.saturating_add((FRAME_HEADER_BYTES + body.len()) as u64);
+            if projected > self.max_spool_bytes || self.frames + 1 > self.max_spool_frames {
+                self.write_end(
+                    EndKind::SpoolLimit,
+                    format!("spool bound reached before a {} frame", kind.as_str()),
+                );
+                return
+            }
+        }
         let sequence = self.sequence;
-        let result = encode_event(sequence, event, &self.limits)
+        let result = encode_frame_bytes(kind, sequence, &body, &self.limits)
             .map_err(|err| eyre::eyre!("{err}"))
             .and_then(|bytes| {
                 let path = self.dir.join(format!("{sequence:012}_{}.frame", kind.as_str()));
@@ -327,19 +591,22 @@ impl StreamRecorder {
                 self.frames += 1;
                 self.bytes += len as u64;
             }
-            Err(err) => {
-                self.poisoned = true;
-                error!(
-                    target: "partial_stateless_stream",
-                    sequence,
-                    kind = kind.as_str(),
-                    error = %err,
-                    frames = self.frames,
-                    "Failed to write a stream frame; recording stops here rather than leaving a \
-                     hole. The corpus ends without an End frame, which is how a reader will know"
-                );
-            }
+            Err(err) => self.poison(kind.as_str(), &err),
         }
+    }
+
+    /// Disables the recorder after a failure; the corpus ends without an `End` frame.
+    fn poison(&mut self, kind: &'static str, err: &eyre::Report) {
+        self.poisoned = true;
+        error!(
+            target: "partial_stateless_stream",
+            sequence = self.sequence,
+            kind,
+            error = %err,
+            frames = self.frames,
+            "Failed to write a stream frame; recording stops here rather than leaving a \
+             hole. The corpus ends without an End frame, which is how a reader will know"
+        );
     }
 }
 
@@ -377,19 +644,7 @@ mod tests {
     use partial_stateless_stream::{decode_event, FrameLimits};
 
     fn recorder(dir: &Path) -> StreamRecorder {
-        StreamRecorder {
-            dir: dir.to_path_buf(),
-            chunk_bytes: 64,
-            producer: "test".to_string(),
-            sequence: 0,
-            checkpointed: false,
-            poisoned: false,
-            ended: false,
-            limits: FrameLimits::default(),
-            frames: 0,
-            bytes: 0,
-            durable_block: None,
-        }
+        StreamRecorder::for_tests(dir, DEFAULT_BUFFER_MAX_FRAMES)
     }
 
     fn checkpoint() -> TrustedCheckpoint {
@@ -437,13 +692,13 @@ mod tests {
         let dir = spool_dir("before-checkpoint");
         let mut recorder = recorder(&dir);
         recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
-        assert!(!recorder.records_commits());
+        assert!(!recorder.wants_commit_material());
 
         recorder.write_reset(ResetReason::Gap, "ignored before the checkpoint");
         assert_eq!(frames_in(&dir), vec![(0, FrameKind::Manifest)]);
 
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 200]);
-        assert!(recorder.records_commits());
+        assert!(recorder.wants_commit_material());
 
         // 200 bytes at a 64-byte chunk is four chunks, and they follow the checkpoint in order.
         assert_eq!(
@@ -507,7 +762,7 @@ mod tests {
         // Removing the directory is the cheapest true I/O failure available here.
         fs::remove_dir_all(&dir).expect("remove spool");
         recorder.write_reset(ResetReason::Overflow, "producer queue overflowed");
-        assert!(!recorder.records_commits(), "the first failure stops recording");
+        assert!(!recorder.wants_commit_material(), "the first failure stops recording");
 
         fs::create_dir_all(&dir).expect("recreate");
         recorder.write_end(EndKind::Shutdown, "shutdown");
@@ -589,6 +844,102 @@ mod tests {
 
         let (_, end) = last_end(&dir);
         assert_eq!(end.kind, EndKind::ProducerFault);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The spec sentence, as a filesystem assertion: frames emitted while the export runs land
+    /// *behind* the checkpoint and its chunks, in arrival order, with contiguous sequences.
+    #[test]
+    fn frames_buffered_during_the_export_flush_behind_the_checkpoint_in_order() {
+        let dir = spool_dir("buffered-flush");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.begin_buffering();
+        assert!(recorder.wants_commit_material(), "buffering wants commit material assembled");
+
+        // Two frames arrive while the export is in flight; a reorg between them must keep its
+        // position relative to the resets.
+        recorder.write_reset(ResetReason::Gap, "first buffered");
+        recorder.write_reorg(Reorg {
+            common_ancestor: BlockRef { number: 1, hash: B256::with_last_byte(1) },
+            abandoned: vec![],
+            winning_tip: None,
+        });
+        recorder.write_reset(ResetReason::Gap, "second buffered");
+        assert_eq!(frames_in(&dir), vec![(0, FrameKind::Manifest)], "nothing on disk yet");
+
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
+        assert_eq!(
+            frames_in(&dir),
+            vec![
+                (0, FrameKind::Manifest),
+                (1, FrameKind::Checkpoint),
+                (2, FrameKind::SnapshotChunk),
+                (3, FrameKind::SnapshotChunk),
+                (4, FrameKind::Reset),
+                (5, FrameKind::Reorg),
+                (6, FrameKind::Reset),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Overflow drops the buffer whole. A trimmed buffer would flush a stream whose head is
+    /// missing — exactly the hidden drop the sequence numbers exist to make impossible.
+    #[test]
+    fn a_buffer_overflow_drops_the_buffer_whole_and_reports_once() {
+        let dir = spool_dir("buffer-overflow");
+        let mut recorder = recorder(&dir);
+        recorder.buffer_max_frames = 1;
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.begin_buffering();
+
+        recorder.write_reset(ResetReason::Gap, "fits");
+        assert!(!recorder.take_buffer_overflow(), "one frame fits");
+        recorder.begin_buffering(); // no-op: already buffering
+        recorder.write_reset(ResetReason::Gap, "overflows");
+
+        assert!(recorder.take_buffer_overflow(), "the second frame overflowed the bound");
+        assert!(!recorder.take_buffer_overflow(), "reading the overflow clears it");
+        assert!(!recorder.wants_commit_material(), "the failed attempt dropped back to Idle");
+        assert_eq!(frames_in(&dir), vec![(0, FrameKind::Manifest)], "nothing was flushed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The preflight runs before the checkpoint's first frame: a spool that cannot hold the
+    /// checkpoint, its chunks, and the buffered commits together gets an `End(SpoolLimit)` and
+    /// no partial checkpoint — "closed but unrestorable" must not be constructible.
+    #[test]
+    fn a_checkpoint_that_would_not_fit_the_spool_bound_is_not_started() {
+        let dir = spool_dir("preflight");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.max_spool_bytes = recorder.bytes + 64; // room for nothing more
+        recorder.begin_buffering();
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 200]);
+
+        let kinds: Vec<FrameKind> = frames_in(&dir).iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(kinds, vec![FrameKind::Manifest, FrameKind::End], "no partial checkpoint");
+        let (_, end) = last_end(&dir);
+        assert_eq!(end.kind, EndKind::SpoolLimit);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The running spool bound closes the stream in order, with the End frame itself exempt so
+    /// the close is recorded rather than read back as a cut.
+    #[test]
+    fn reaching_the_spool_bound_closes_the_stream_with_an_end_frame() {
+        let dir = spool_dir("spool-bound");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 64]);
+        recorder.max_spool_frames = recorder.frames + 1; // one more payload frame fits
+        recorder.write_reset(ResetReason::Gap, "fits");
+        recorder.write_reset(ResetReason::Gap, "over the bound");
+
+        let (_, end) = last_end(&dir);
+        assert_eq!(end.kind, EndKind::SpoolLimit);
+        assert!(!recorder.wants_commit_material(), "a closed stream takes no more frames");
         let _ = fs::remove_dir_all(&dir);
     }
 }

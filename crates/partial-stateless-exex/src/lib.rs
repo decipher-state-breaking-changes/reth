@@ -34,7 +34,7 @@ use futures::TryStreamExt;
 pub use partial_stateless::CacheConfig;
 use partial_stateless::{
     network_cache::NetworkStateCache,
-    persistence::{load_from_file, save_to_file},
+    persistence::{load_from_file, save_to_file, CacheState},
     policy::{CachePolicy, LastNBlocksPolicy},
     readiness::{
         BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
@@ -73,7 +73,8 @@ use sidecar_verify::verify_live_sidecar;
 use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
 
@@ -211,6 +212,11 @@ pub struct RunOptions {
     /// How many blocks a snapshot-restored shadow pair is carried and compared against the live
     /// pair. Zero disables the in-process bootstrap gate.
     pub bootstrap_self_test_blocks: u32,
+    /// Fresh export attempts allowed after the first one fails or its buffer overflows.
+    ///
+    /// Each retry chooses a new H at the next `Ready`; when they run out the stream closes with
+    /// `End(ExportFailure)` — an intentionally closed empty stream, not a cut one.
+    pub stream_export_retries: u32,
     /// Whether the Engine publishes the payloads it validated and this ExEx takes them.
     ///
     /// Not read from a variable of its own: the producer's gate is `PS_ENGINE_PAYLOAD`, and a
@@ -229,6 +235,18 @@ impl RunOptions {
             return Err(eyre::eyre!("PS_VALIDATION_BENCH requires PS_SIDECAR_ROLE=builder-verifier"))
         }
         let bootstrap_self_test_blocks = env_u32("PS_BOOTSTRAP_SELF_TEST", 0);
+        if bootstrap_self_test_blocks > 0 && std::env::var_os("PS_STREAM_DIR").is_some() {
+            // The self-test compares fingerprints at the export block, which requires the export
+            // to run synchronously with the pair frozen at H. A recording run exports off-task
+            // precisely so the pair keeps moving — the two are structurally incompatible, and the
+            // live follower is the recording run's bootstrap evidence.
+            return Err(eyre::eyre!(
+                "PS_BOOTSTRAP_SELF_TEST cannot be combined with PS_STREAM_DIR: a recording run \
+                 exports off-task while the pair keeps advancing, and the in-process self-test \
+                 needs the pair frozen at the export block. Validate the stream with ps-replay \
+                 instead."
+            ))
+        }
         Ok(Self {
             config,
             sidecar_role,
@@ -265,6 +283,7 @@ impl RunOptions {
                 std::env::var_os("PS_STREAM_DIR").is_some(),
             bootstrap_import: env_flag("PS_BOOTSTRAP_IMPORT"),
             bootstrap_self_test_blocks,
+            stream_export_retries: env_u32("PS_STREAM_EXPORT_RETRIES", 1),
             payload_tap: payload_tap::tap_enabled(),
             sidecar_dir,
         })
@@ -459,6 +478,14 @@ struct BootstrapGate {
     export_pending: bool,
     self_test_blocks: u32,
     shadow: Option<ShadowPair>,
+    /// The off-task export, when one is running or has finished.
+    job: ExportJob,
+    /// Fresh attempts allowed after a failure. Zero means the next failure closes the stream.
+    retries_left: u32,
+    /// Monotonic attempt counter, naming each attempt's own export directory.
+    attempt: u32,
+    /// Whether the accepted-head wait has been logged, so a rare condition does not log per block.
+    waiting_for_accepted_head_logged: bool,
 }
 
 impl BootstrapGate {
@@ -467,12 +494,42 @@ impl BootstrapGate {
             export_pending: options.bootstrap_export,
             self_test_blocks: options.bootstrap_self_test_blocks,
             shadow: None,
+            job: ExportJob::Idle,
+            retries_left: options.stream_export_retries,
+            attempt: 0,
+            waiting_for_accepted_head_logged: false,
         }
     }
 
     const fn wants_sidecar(&self) -> bool {
         self.shadow.is_some()
     }
+}
+
+/// The snapshot export as the notification loop sees it.
+///
+/// The blocking task itself cannot be cancelled — once spawned it runs to completion — so
+/// "abandoning" an attempt means dropping the receiver: the worker's send fails silently and its
+/// files sit in an attempt directory nothing will ever promote. That is also why each attempt
+/// exports into its own directory rather than the fixed operator paths: a stale worker finishing
+/// minutes late must not overwrite a newer attempt's package.
+enum ExportJob {
+    /// No export running.
+    Idle,
+    /// An export is running on a blocking thread; the pair keeps advancing meanwhile.
+    InFlight {
+        /// Where the worker's result arrives.
+        rx: mpsc::Receiver<eyre::Result<bootstrap_io::FinishedExport>>,
+        /// The accepted head captured at H — the pair's own has advanced past it by the time the
+        /// export completes, and the checkpoint frame must carry H's header, not the tip's.
+        accepted_head: SealedHeader,
+        /// The attempt's private export directory.
+        attempt_dir: PathBuf,
+        /// When the export was spawned.
+        started: Instant,
+    },
+    /// An export completed and its checkpoint (if recording) is on disk.
+    Finished,
 }
 
 /// A second coordinated pair restored from an exported snapshot, carried alongside the live one.
@@ -1196,7 +1253,8 @@ where
                 .map_err(Into::into)
         };
 
-    let records_commits = recorder.as_ref().is_some_and(|recorder| recorder.records_commits());
+    let records_commits =
+        recorder.as_ref().is_some_and(|recorder| recorder.wants_commit_material());
     let report = create_sidecar_for_block(
         node_rules(ctx),
         state_provider.as_ref(),
@@ -1409,19 +1467,22 @@ fn finish_committed_transition(
     log_readiness_change(pair, block, before, after);
 }
 
-/// Runs the in-process sync/bootstrap gate: export at the first Ready, then compare.
+/// Runs the bootstrap gate: export at the first usable Ready, then compare or stream.
 ///
-/// Step by step this is the section 4.7 bootstrap gate almost verbatim: the run warms normally and
-/// exports at `Ready(H)`; a second pair is restored from that package in the same process; and
-/// when H + 1 arrives it is validated against both pairs through the same provider-free path. That
-/// path already checks that the restored cache's own expected miss set equals the miss manifest
-/// the live pair built, so miss-set agreement is structural rather than a separate assertion here.
+/// Two export paths live here, and which one runs is decided at startup. The self-test keeps the
+/// original synchronous export — it compares fingerprints at H, which requires the pair frozen
+/// there, and `RunOptions::from_env` refuses to combine it with a recorder. Every other run
+/// exports **off-task**: the state is captured at `Ready(H)` in milliseconds, the whole-cache
+/// multiproof runs on a blocking thread, and the pair keeps advancing — which is what keeps the
+/// Engine payload handoff drained and the head of a recorded stream `witnessed` instead of
+/// `reconstructed`. Frames for H + 1 onward buffer in the recorder and flush behind the
+/// checkpoint when the export completes.
 fn advance_bootstrap_gate<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
     pair: &mut LivePair,
     gate: &mut BootstrapGate,
-    recorder: Option<&mut recorder::StreamRecorder>,
+    mut recorder: Option<&mut recorder::StreamRecorder>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     sidecar: Option<&PartialStatelessSidecar>,
 ) -> eyre::Result<()>
@@ -1500,6 +1561,29 @@ where
         }
     }
 
+    // The self-test keeps the synchronous export; everything else exports off-task. The poll
+    // runs before a new attempt can start, so a checkpoint that completed during this block
+    // flushes before the next block buffers on top of it.
+    if options.bootstrap_self_test_blocks > 0 {
+        return advance_self_test_export(ctx, options, pair, gate)
+    }
+    poll_export_job(options, gate, &mut recorder);
+    maybe_start_export(ctx, options, pair, gate, recorder);
+    Ok(())
+}
+
+/// The self-test's synchronous export: the pair is frozen at H for the export's whole duration,
+/// which is exactly what lets the restored shadow be compared against it fingerprint-for-
+/// fingerprint on the same block. Recording runs never come here (`RunOptions::from_env`).
+fn advance_self_test_export<Node>(
+    ctx: &ExExContext<Node>,
+    options: &RunOptions,
+    pair: &mut LivePair,
+    gate: &mut BootstrapGate,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
+{
     if !gate.export_pending {
         return Ok(())
     }
@@ -1536,25 +1620,7 @@ where
         }
     };
 
-    // Written from the file rather than from the in-memory package, so the stream carries exactly
-    // the bytes an operator would ship and a mismatch between the two cannot hide here.
-    if let Some(recorder) = recorder {
-        match std::fs::read(&exported.package_path) {
-            Ok(package) => {
-                recorder.write_checkpoint(&exported.checkpoint, pair.accepted_parent(), &package)
-            }
-            Err(err) => {
-                error!(
-                    target: "partial_stateless_stream",
-                    path = %exported.package_path.display(),
-                    error = %err,
-                    "Could not read back the exported snapshot; this stream records no commits"
-                );
-            }
-        }
-    }
-
-    if gate.self_test_blocks > 0 {
+    {
         let restored = bootstrap_io::restore_snapshot(
             exported.package,
             &exported.checkpoint,
@@ -1590,6 +1656,235 @@ where
         gate.shadow = Some(shadow);
     }
     Ok(())
+}
+
+/// Checks the running export: a completed one opens the stream, a failed one is retried or ends
+/// it, and a buffer overflow fails the attempt even while the worker is still running.
+fn poll_export_job(
+    options: &RunOptions,
+    gate: &mut BootstrapGate,
+    recorder: &mut Option<&mut recorder::StreamRecorder>,
+) {
+    // Overflow first: once the buffer is gone the stream cannot start contiguously at this
+    // attempt's H + 1, and waiting minutes for the multiproof to finish buys nothing.
+    if recorder.as_mut().is_some_and(|recorder| recorder.take_buffer_overflow()) &&
+        matches!(gate.job, ExportJob::InFlight { .. })
+    {
+        // Dropping the receiver abandons the worker: its send fails silently and its files sit
+        // in an attempt directory nothing promotes.
+        gate.job = ExportJob::Idle;
+        fail_export_attempt(gate, recorder, "the export buffer overflowed");
+        return
+    }
+
+    let received = match &gate.job {
+        ExportJob::InFlight { rx, .. } => match rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return,
+            received => received,
+        },
+        _ => return,
+    };
+    let ExportJob::InFlight { accepted_head, attempt_dir, started, .. } =
+        std::mem::replace(&mut gate.job, ExportJob::Idle)
+    else {
+        return
+    };
+    match received {
+        Ok(Ok(finished)) => {
+            complete_export(options, gate, recorder, finished, accepted_head, attempt_dir, started)
+        }
+        Ok(Err(err)) => {
+            fail_export_attempt(gate, recorder, &format!("snapshot export failed: {err:#}"))
+        }
+        Err(_) => fail_export_attempt(
+            gate,
+            recorder,
+            "the export worker exited without a result (panic or early drop)",
+        ),
+    }
+}
+
+/// Retires a failed attempt: a fresh H at the next Ready while retries remain, `End` after.
+fn fail_export_attempt(
+    gate: &mut BootstrapGate,
+    recorder: &mut Option<&mut recorder::StreamRecorder>,
+    why: &str,
+) {
+    if let Some(recorder) = recorder.as_mut() {
+        recorder.abandon_buffering(why);
+    }
+    if gate.retries_left > 0 {
+        gate.retries_left -= 1;
+        gate.export_pending = true;
+        warn!(
+            target: "partial_stateless",
+            why,
+            retries_left = gate.retries_left,
+            "Snapshot export attempt failed; a fresh H will be chosen at the next Ready"
+        );
+    } else {
+        if let Some(recorder) = recorder.as_mut() {
+            recorder.write_end(
+                EndKind::ExportFailure,
+                format!("snapshot export failed with no retries left: {why}"),
+            );
+        }
+        error!(
+            target: "partial_stateless",
+            why,
+            "Snapshot export failed with no retries left; this stream records no commits"
+        );
+    }
+}
+
+/// Opens the stream behind a completed export: promote, read back, checkpoint, flush.
+fn complete_export(
+    options: &RunOptions,
+    gate: &mut BootstrapGate,
+    recorder: &mut Option<&mut recorder::StreamRecorder>,
+    finished: bootstrap_io::FinishedExport,
+    accepted_head: SealedHeader,
+    attempt_dir: PathBuf,
+    started: Instant,
+) {
+    // Promote the attempt's files onto the fixed operator paths. Only the accepted attempt is
+    // ever promoted, which is what makes a stale worker finishing minutes late harmless: it
+    // writes into a directory nothing reads.
+    let package_path = options.bootstrap_dir.join(bootstrap_io::PACKAGE_FILE);
+    let checkpoint_path = options.bootstrap_dir.join(bootstrap_io::CHECKPOINT_FILE);
+    if let Err(err) = std::fs::rename(&finished.package_path, &package_path)
+        .and_then(|()| std::fs::rename(&finished.checkpoint_path, &checkpoint_path))
+    {
+        fail_export_attempt(
+            gate,
+            recorder,
+            &format!("could not promote the exported snapshot onto the operator paths: {err}"),
+        );
+        return
+    }
+    let _ = std::fs::remove_dir(&attempt_dir);
+    info!(
+        target: "partial_stateless",
+        block = finished.checkpoint.block_number,
+        block_hash = ?finished.checkpoint.block_hash,
+        package_bytes = finished.package_bytes,
+        proof_targets = finished.proof_targets,
+        export_us = finished.elapsed_us,
+        wall_ms = started.elapsed().as_millis() as u64,
+        "Off-task snapshot export completed; the pair kept advancing throughout"
+    );
+
+    // Written from the file rather than from the in-memory package, so the stream carries exactly
+    // the bytes an operator would ship and a mismatch between the two cannot hide here. The
+    // accepted head is the one captured at H — the pair's own has advanced past it.
+    if recorder.is_some() {
+        let package = match std::fs::read(&package_path) {
+            Ok(package) => package,
+            Err(err) => {
+                fail_export_attempt(
+                    gate,
+                    recorder,
+                    &format!("could not read back the exported snapshot: {err}"),
+                );
+                return
+            }
+        };
+        if let Some(recorder) = recorder.as_mut() {
+            recorder.write_checkpoint(&finished.checkpoint, Some(&accepted_head), &package);
+        }
+    }
+    gate.job = ExportJob::Finished;
+}
+
+/// Starts an off-task export at `Ready(H)`, capturing everything the worker needs on this task.
+///
+/// The capture is the cheap half — a plain-data copy of the flat cache, the Ready parent, and
+/// the accepted head — and it happens here so the worker's view is exactly H no matter how far
+/// the pair advances while the multiproof runs. The accepted head is *required*: a live stream's
+/// checkpoint without its own header would leave a standalone consumer unable to admit H + 1,
+/// and `NoAcceptedParent` is a rejection, not a wait.
+fn maybe_start_export<Node>(
+    ctx: &ExExContext<Node>,
+    options: &RunOptions,
+    pair: &LivePair,
+    gate: &mut BootstrapGate,
+    mut recorder: Option<&mut recorder::StreamRecorder>,
+) where
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
+{
+    if !gate.export_pending || !matches!(gate.job, ExportJob::Idle) {
+        return
+    }
+    let Some(ready) = pair.readiness.ready_parent().cloned() else { return };
+    let Some(accepted_head) = pair.accepted_parent().cloned() else {
+        // Ready with no accepted head happens one block out of a snapshot restore or a cold
+        // reset; the next applied block supplies one, so this is a wait rather than a failure.
+        if !gate.waiting_for_accepted_head_logged {
+            info!(
+                target: "partial_stateless",
+                block = ready.anchor.block_number,
+                "Ready without an accepted head; the snapshot export waits for the next block"
+            );
+            gate.waiting_for_accepted_head_logged = true;
+        }
+        return
+    };
+    gate.export_pending = false;
+    gate.waiting_for_accepted_head_logged = false;
+    gate.attempt += 1;
+
+    let capture_started = Instant::now();
+    let state = CacheState::from_cache(&pair.cache);
+    let cache_capture_us = capture_started.elapsed().as_micros() as u64;
+    let provider_started = Instant::now();
+    // The snapshot's proof must be answered against the state the Ready parent names. The
+    // provider is opened here and moved into the worker, so its read transaction spans the
+    // multiproof — off this task, but still one long transaction; shortening it is deferred
+    // hardening, not S3.
+    let provider = match ctx.provider().history_by_block_hash(ready.anchor.block_hash) {
+        Ok(provider) => provider,
+        Err(err) => {
+            fail_export_attempt(
+                gate,
+                &mut recorder,
+                &format!("no state provider at the export anchor: {err}"),
+            );
+            return
+        }
+    };
+    let provider_open_us = provider_started.elapsed().as_micros() as u64;
+
+    let attempt_dir = options.bootstrap_dir.join(format!("export-attempt-{}", gate.attempt));
+    let worker_dir = attempt_dir.clone();
+    let config = options.config;
+    let worker_ready = ready.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    tokio::task::spawn_blocking(move || {
+        let result = bootstrap_io::export_snapshot_from_state(
+            &worker_dir,
+            state,
+            &worker_ready,
+            &config,
+            provider.as_ref(),
+        )
+        .map(bootstrap_io::FinishedExport::from);
+        // A dropped receiver means the attempt was abandoned; the files stay in the attempt
+        // directory, unpromoted and inert.
+        let _ = tx.send(result);
+    });
+    info!(
+        target: "partial_stateless",
+        block = ready.anchor.block_number,
+        block_hash = ?ready.anchor.block_hash,
+        attempt = gate.attempt,
+        cache_capture_us,
+        provider_open_us,
+        "Snapshot export started off-task; frames buffer until its checkpoint lands"
+    );
+    if let Some(recorder) = recorder {
+        recorder.begin_buffering();
+    }
+    gate.job = ExportJob::InFlight { rx, accepted_head, attempt_dir, started: Instant::now() };
 }
 
 /// Drops both caches and readmits the block, warming again from it.
@@ -2592,5 +2887,229 @@ mod tests {
             pair.previous_generation.is_none(),
             "the reset pair does not descend from the retained generation"
         );
+    }
+
+    /// The off-task export's lifecycle, driven without a worker: the gate and the recorder are
+    /// what own an attempt's outcome, and the blocking task itself is just a sender.
+    mod export_job {
+        use super::super::{
+            bootstrap_io, fail_export_attempt, poll_export_job, recorder::StreamRecorder,
+            BootstrapGate, EndKind, ExportJob, RunOptions,
+        };
+        use crate::CacheConfig;
+        use alloy_primitives::B256;
+        use partial_stateless::readiness::TrustedCheckpoint;
+        use partial_stateless_stream::{decode_event, FrameKind, FrameLimits, StreamEvent};
+        use reth_primitives_traits::SealedHeader;
+        use std::{
+            fs,
+            path::{Path, PathBuf},
+            sync::mpsc,
+            time::Instant,
+        };
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("ps-export-job-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("temp dir");
+            dir
+        }
+
+        fn gate_with(job: ExportJob, retries_left: u32) -> BootstrapGate {
+            BootstrapGate {
+                export_pending: false,
+                self_test_blocks: 0,
+                shadow: None,
+                job,
+                retries_left,
+                attempt: 1,
+                waiting_for_accepted_head_logged: false,
+            }
+        }
+
+        fn in_flight(
+            rx: mpsc::Receiver<eyre::Result<bootstrap_io::FinishedExport>>,
+            attempt_dir: PathBuf,
+        ) -> ExportJob {
+            ExportJob::InFlight {
+                rx,
+                accepted_head: SealedHeader::new_unhashed(alloy_consensus::Header::default()),
+                attempt_dir,
+                started: Instant::now(),
+            }
+        }
+
+        fn options_with_bootstrap_dir(dir: &Path) -> RunOptions {
+            let mut options =
+                RunOptions::from_env(CacheConfig::default()).expect("default options");
+            options.bootstrap_dir = dir.to_path_buf();
+            options
+        }
+
+        fn spool_kinds(dir: &Path) -> Vec<FrameKind> {
+            let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+                .expect("spool readable")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "frame"))
+                .collect();
+            paths.sort();
+            paths
+                .iter()
+                .map(|path| {
+                    let bytes = fs::read(path).expect("frame readable");
+                    let (header, _, _) =
+                        decode_event(&bytes, &FrameLimits::default()).expect("frame decodes");
+                    header.kind
+                })
+                .collect()
+        }
+
+        fn last_end_kind(dir: &Path) -> EndKind {
+            let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+                .expect("spool readable")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "frame"))
+                .collect();
+            paths.sort();
+            let bytes = fs::read(paths.last().expect("spool not empty")).expect("readable");
+            let (_, event, _) =
+                decode_event(&bytes, &FrameLimits::default()).expect("frame decodes");
+            let StreamEvent::End(end) = event else { panic!("last frame is an End") };
+            end.kind
+        }
+
+        /// A worker that died (panicked or dropped its sender) is a failed attempt; while a
+        /// retry remains, the gate re-arms so the next Ready chooses a fresh H.
+        #[test]
+        fn a_dead_worker_rearms_the_export_while_retries_remain() {
+            let spool = temp_dir("dead-worker-spool");
+            let bootstrap = temp_dir("dead-worker-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            drop(tx);
+            let mut gate = gate_with(in_flight(rx, bootstrap.join("export-attempt-1")), 1);
+            let mut holder = Some(&mut recorder);
+            poll_export_job(&options, &mut gate, &mut holder);
+
+            assert!(gate.export_pending, "a fresh H will be chosen at the next Ready");
+            assert_eq!(gate.retries_left, 0);
+            assert!(matches!(gate.job, ExportJob::Idle));
+            assert!(!recorder.wants_commit_material(), "the buffer was abandoned whole");
+            assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest], "no End yet");
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// With no retries left, a failed attempt closes the stream as `ExportFailure`: an
+        /// intentionally closed empty stream, not a cut one.
+        #[test]
+        fn an_exhausted_export_closes_the_stream_as_an_export_failure() {
+            let spool = temp_dir("exhausted-spool");
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+
+            let mut gate = gate_with(ExportJob::Idle, 0);
+            let mut holder = Some(&mut recorder);
+            fail_export_attempt(&mut gate, &mut holder, "test failure");
+
+            assert!(!gate.export_pending, "no further attempt is armed");
+            assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest, FrameKind::End]);
+            assert_eq!(last_end_kind(&spool), EndKind::ExportFailure);
+            let _ = fs::remove_dir_all(&spool);
+        }
+
+        /// A buffer overflow fails the attempt even though the worker is still running: the
+        /// stream can no longer start contiguously at this attempt's H + 1, and the abandoned
+        /// worker's files land in an attempt directory nothing promotes.
+        #[test]
+        fn a_buffer_overflow_fails_the_attempt_while_the_worker_still_runs() {
+            let spool = temp_dir("overflow-spool");
+            let bootstrap = temp_dir("overflow-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut recorder = StreamRecorder::for_tests(&spool, 1);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "fits");
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "overflows");
+
+            // The sender stays alive: the worker is still grinding through the multiproof.
+            let (_tx, rx) = mpsc::sync_channel::<eyre::Result<bootstrap_io::FinishedExport>>(1);
+            let mut gate = gate_with(in_flight(rx, bootstrap.join("export-attempt-1")), 1);
+            let mut holder = Some(&mut recorder);
+            poll_export_job(&options, &mut gate, &mut holder);
+
+            assert!(matches!(gate.job, ExportJob::Idle), "the receiver was dropped");
+            assert!(gate.export_pending, "the attempt is retried with a fresh H");
+            assert_eq!(gate.retries_left, 0);
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// The completion path end to end, with a fabricated worker result: promote onto the
+        /// operator paths, read back, checkpoint, and flush the buffered frames behind it in
+        /// arrival order.
+        #[test]
+        fn a_completed_export_promotes_checkpoints_and_flushes_the_buffer() {
+            let spool = temp_dir("complete-spool");
+            let bootstrap = temp_dir("complete-bootstrap");
+            let attempt_dir = bootstrap.join("export-attempt-1");
+            fs::create_dir_all(&attempt_dir).expect("attempt dir");
+            let package_path = attempt_dir.join(bootstrap_io::PACKAGE_FILE);
+            let checkpoint_path = attempt_dir.join(bootstrap_io::CHECKPOINT_FILE);
+            fs::write(&package_path, [7u8; 100]).expect("package");
+            fs::write(&checkpoint_path, b"{}").expect("checkpoint");
+
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "buffered");
+
+            let finished = bootstrap_io::FinishedExport {
+                checkpoint: TrustedCheckpoint {
+                    block_number: 25_737_234,
+                    block_hash: B256::with_last_byte(0x11),
+                    state_root: B256::with_last_byte(0x22),
+                    cache_root: B256::with_last_byte(0x33),
+                    cache_policy_id: B256::with_last_byte(0x44),
+                },
+                package_path,
+                checkpoint_path,
+                package_bytes: 100,
+                proof_targets: 1,
+                elapsed_us: 1,
+            };
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(Ok(finished)).expect("send");
+            let mut gate = gate_with(in_flight(rx, attempt_dir.clone()), 1);
+            let mut holder = Some(&mut recorder);
+            poll_export_job(&options, &mut gate, &mut holder);
+
+            assert!(matches!(gate.job, ExportJob::Finished));
+            assert!(bootstrap.join(bootstrap_io::PACKAGE_FILE).exists(), "promoted");
+            assert!(!attempt_dir.exists(), "the empty attempt directory was removed");
+            // 100 bytes at the test chunk size of 64 is two chunks; the buffered reset follows.
+            assert_eq!(
+                spool_kinds(&spool),
+                vec![
+                    FrameKind::Manifest,
+                    FrameKind::Checkpoint,
+                    FrameKind::SnapshotChunk,
+                    FrameKind::SnapshotChunk,
+                    FrameKind::Reset,
+                ]
+            );
+            assert!(recorder.wants_commit_material(), "the stream is open");
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
     }
 }
