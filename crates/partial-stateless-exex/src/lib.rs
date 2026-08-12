@@ -579,7 +579,18 @@ where
     // whole run re-executing windows that never install.
     let mut rebuild_failures = 0u32;
 
-    while let Some(notification) = ctx.notifications.try_next().await? {
+    loop {
+        // Every `?`-shaped exit from this loop must classify itself first: the recorder's drop
+        // cannot tell an error return from reth dropping the future at shutdown — both run the
+        // destructor — so an unclassified propagation would close a crashed producer's stream as
+        // an orderly `Shutdown`.
+        let notification = match ctx.notifications.try_next().await {
+            Ok(Some(notification)) => notification,
+            Ok(None) => break,
+            Err(err) => {
+                return Err(fail_producer(recorder.as_mut(), err, "the notification stream failed"))
+            }
+        };
         match &notification {
             ExExNotification::ChainCommitted { new } => {
                 let tip_block = *new.range().end();
@@ -752,7 +763,15 @@ where
             let tip = committed_chain.tip().number;
             match pair.readiness.acknowledgeable_height() {
                 Some((number, hash)) => {
-                    ctx.events.send(ExExEvent::FinishedHeight(BlockNumHash::new(number, hash)))?;
+                    if let Err(err) =
+                        ctx.events.send(ExExEvent::FinishedHeight(BlockNumHash::new(number, hash)))
+                    {
+                        return Err(fail_producer(
+                            recorder.as_mut(),
+                            eyre::Report::new(err),
+                            "the acknowledgement channel closed",
+                        ))
+                    }
                     if let Some(gap) = pair.readiness.first_gap() {
                         error!(
                             target: "partial_stateless",
@@ -784,6 +803,21 @@ where
     }
 
     Ok(())
+}
+
+/// Classifies an error exit from the notification loop before it propagates.
+///
+/// Idempotent through `write_end` itself: a path that already wrote a more specific `End` keeps
+/// it, because the first close wins.
+fn fail_producer(
+    recorder: Option<&mut recorder::StreamRecorder>,
+    err: eyre::Report,
+    what: &str,
+) -> eyre::Report {
+    if let Some(recorder) = recorder {
+        recorder.write_end(EndKind::ProducerFault, format!("{what}: {err:#}"));
+    }
+    err.wrap_err(what.to_string())
 }
 
 /// Describes a branch change as the stream's one unwind event.
@@ -3023,6 +3057,32 @@ mod tests {
             assert!(!gate.export_pending, "no further attempt is armed");
             assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest, FrameKind::End]);
             assert_eq!(last_end_kind(&spool), EndKind::ExportFailure);
+            let _ = fs::remove_dir_all(&spool);
+        }
+
+        /// An error propagating out of the notification loop is a producer fault, and it must be
+        /// classified *before* the propagation: the recorder's drop runs on both an error return
+        /// and reth's shutdown, and would close a crashed producer as an orderly `Shutdown`.
+        #[test]
+        fn an_error_exit_from_the_loop_is_a_producer_fault_not_a_shutdown() {
+            let spool = temp_dir("loop-error-spool");
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+
+            let err = super::super::fail_producer(
+                Some(&mut recorder),
+                eyre::eyre!("channel closed"),
+                "the notification stream failed",
+            );
+
+            assert!(err.to_string().contains("the notification stream failed"), "{err:#}");
+            assert_eq!(last_end_kind(&spool), EndKind::ProducerFault);
+            drop(recorder);
+            assert_eq!(
+                last_end_kind(&spool),
+                EndKind::ProducerFault,
+                "the drop must not re-close a classified stream"
+            );
             let _ = fs::remove_dir_all(&spool);
         }
 
