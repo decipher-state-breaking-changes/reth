@@ -134,11 +134,28 @@ impl SpoolTail {
         Ok(lowest)
     }
 
-    /// Reads the frame at a scanned-for sequence, by its name.
+    /// Reads the frame at a scanned-for sequence, by its name — held to the same name-vs-header
+    /// authority check as ordinary delivery. Recovery is where an attacker would aim a renamed
+    /// frame, precisely because verdicts are already stopped there.
     pub fn read_at(&self, sequence: u64, kind: FrameKind) -> Result<SpooledFrame, TailFault> {
         let path = self.dir.join(frame_name(sequence, kind));
-        read_frame_file(&path, &self.limits)
-            .map_err(|err| TailFault::Undecodable { path, detail: format!("{err:#}") })
+        let frame = read_frame_file(&path, &self.limits).map_err(|err| TailFault::Undecodable {
+            path: path.clone(),
+            detail: format!("{err:#}"),
+        })?;
+        if frame.header.sequence != sequence || frame.header.kind != kind {
+            return Err(TailFault::Undecodable {
+                path,
+                detail: format!(
+                    "the file name claims sequence {sequence} kind {}, the header says sequence \
+                     {} kind {}",
+                    kind.as_str(),
+                    frame.header.sequence,
+                    frame.header.kind.as_str()
+                ),
+            })
+        }
+        Ok(frame)
     }
 
     /// Counts the commit frames in `[from, to)`, so a recovery can say what it skipped.
@@ -378,6 +395,20 @@ mod tests {
 
         assert_eq!(tail.scan_for(FrameKind::Checkpoint, 0).expect("scans"), Some(7));
         assert_eq!(tail.scan_for(FrameKind::Checkpoint, 8).expect("scans"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `read_at` is recovery's read path, and it holds the frame to the same authority check as
+    /// delivery: a frame renamed onto a scanned-for sequence is refused, not trusted.
+    #[test]
+    fn read_at_refuses_a_frame_whose_header_disagrees_with_its_name() {
+        let dir = spool_dir("read-at");
+        let bytes = encode_event(5, &filler(), &FrameLimits::default()).expect("encodes");
+        fs::write(dir.join(frame_name(9, FrameKind::End)), bytes).expect("write");
+        let tail = SpoolTail::new(&dir, FrameLimits::default());
+
+        let fault = tail.read_at(9, FrameKind::End).expect_err("the mismatch is refused");
+        assert!(matches!(fault, TailFault::Undecodable { .. }), "{fault}");
         let _ = fs::remove_dir_all(&dir);
     }
 

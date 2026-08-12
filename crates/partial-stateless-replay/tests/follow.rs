@@ -382,6 +382,75 @@ fn a_reorg_frame_stops_verdicts() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Recovery reads the sequence space in order: an `End` below a later checkpoint means the
+/// stream closed there, and whatever was appended past it must not restart verdicts.
+#[test]
+fn recovery_takes_an_end_below_a_later_checkpoint() {
+    let dir = spool_dir("end-before-checkpoint");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let next = write_checkpoint(&dir, 1, &fixture);
+    // The gap: `next` never exists, so the follower enters NeedsSnapshot. The stream then ends —
+    // and a checkpoint sits *past* the End, which on a closed stream is trailing garbage.
+    write_frame(&dir, next + 1, FrameKind::End, &end_frame(next + 1, EndKind::Shutdown));
+    let _ = write_checkpoint(&dir, next + 2, &fixture);
+
+    let report = follow(&dir, &options()).expect("follows");
+    assert!(matches!(
+        report.outcome,
+        FollowOutcome::Ended { kind: EndKind::Shutdown, before_checkpoint: false }
+    ));
+    assert_eq!(report.restores, 1, "the trailing checkpoint never restored a second pair");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An End reached through the recovery scan is held to the same numbering promise as one
+/// delivered in order; recovery is not a laxer grammar.
+#[test]
+fn a_mis_numbered_end_in_recovery_is_refused() {
+    let dir = spool_dir("recovery-end-numbering");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    write_frame(
+        &dir,
+        2,
+        FrameKind::End,
+        &StreamEvent::End(End { kind: EndKind::Shutdown, reason: "test".into(), last_sequence: 5 }),
+    );
+
+    let error = follow(&dir, &options()).expect_err("a numbering lie is refused");
+    assert!(error.to_string().contains("names 5"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every verdict line names its payload's provenance: the standalone claim is that recorded
+/// Engine payloads were consumed directly, and the per-block record is where that is proven
+/// rather than asserted.
+#[test]
+fn a_verdict_line_carries_the_payload_provenance() {
+    let dir = spool_dir("provenance");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Commit,
+        &commit_frame(ANCHOR_BLOCK + 1, fixture.checkpoint.block.hash),
+    );
+
+    let verdicts = dir.join("out").join("follow.jsonl");
+    let mut with_verdicts = options();
+    with_verdicts.verdicts = Some(verdicts.clone());
+    let report = follow(&dir, &with_verdicts).expect("follows");
+
+    // The synthetic commit carries no payload, so it is rejected — and the rejection line still
+    // names what the payload was.
+    assert!(matches!(report.outcome, FollowOutcome::Faulted { .. }));
+    let lines = fs::read_to_string(&verdicts).expect("verdict stream");
+    assert!(lines.contains("\"payload_provenance\":\"absent\""), "{lines}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The rebootstrap gate: a gap stops verdicts, a fresh checkpoint restarts them at its own
 /// H′ + 1, and the commits that fell in between are counted rather than silently discarded.
 ///

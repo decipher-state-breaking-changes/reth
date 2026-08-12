@@ -130,6 +130,7 @@ fn write_record(
         "admission_us": report.admission_us,
         "transition_us": report.transition_us,
         "elapsed_ms": elapsed_ms,
+        "closed": report.closed,
         "terminal": report.terminal,
         "skipped_after_fault": report.skipped_after_fault,
         "blocks": report.blocks,
@@ -144,8 +145,13 @@ fn write_record(
 
 /// Runs the live follower and maps its outcome onto the documented exit codes.
 fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
+    let started = std::time::Instant::now();
     let report = follow(dir, options)?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     report_follow(&report);
+    if let Some(path) = &options.verdicts {
+        write_follow_summary(path, &options.label, &report, elapsed_ms)?;
+    }
     let code = follow_exit_code(&report);
     if code == 0 {
         return Ok(())
@@ -163,6 +169,7 @@ fn report_follow(report: &FollowReport) {
         commits_skipped_in_recovery = report.commits_skipped_in_recovery,
         witnessed = report.replay.witnessed,
         reconstructed = report.replay.reconstructed,
+        absent = report.replay.absent,
         disagreements = report.replay.disagreements.len(),
         failures = report.replay.failures.len(),
         agreed = report.agreed(),
@@ -174,6 +181,58 @@ fn report_follow(report: &FollowReport) {
     for failure in &report.replay.failures {
         error!(target: "ps_follow", %failure, "Failure");
     }
+}
+
+/// One `kind: "summary"` line closing the verdict stream, so a harness judges the run on the
+/// follower's own aggregate counters rather than inferring them from an exit code — an exit code
+/// alone cannot distinguish "verified 100 witnessed blocks" from "verified nothing at all".
+fn write_follow_summary(
+    path: &std::path::Path,
+    label: &str,
+    report: &FollowReport,
+    elapsed_ms: u64,
+) -> eyre::Result<()> {
+    use std::io::Write;
+    let (outcome, end_kind, before_checkpoint, waiting_in) = match &report.outcome {
+        FollowOutcome::Ended { kind, before_checkpoint } => {
+            ("ended", Some(kind.as_str()), Some(*before_checkpoint), None)
+        }
+        FollowOutcome::Faulted { .. } => ("faulted", None, None, None),
+        FollowOutcome::MaxBlocks => ("max_blocks", None, None, None),
+        FollowOutcome::IdleTimeout { waiting_in } => {
+            ("idle_timeout", None, None, Some(*waiting_in))
+        }
+    };
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "benchmark": "standalone_follow_v1",
+        "kind": "summary",
+        "label": label,
+        "outcome": outcome,
+        "end_kind": end_kind,
+        "before_checkpoint": before_checkpoint,
+        "waiting_in": waiting_in,
+        "blocks_verified": report.blocks_verified,
+        "commits": report.replay.commits,
+        "witnessed": report.replay.witnessed,
+        "reconstructed": report.replay.reconstructed,
+        "absent": report.replay.absent,
+        "disagreements": report.replay.disagreements.len(),
+        "failures": report.replay.failures.len(),
+        "mutations_checked": report.replay.mutations_checked,
+        "mutation_failures": report.replay.mutation_failures.len(),
+        "restores": report.restores,
+        "needs_snapshot_entries": report.needs_snapshot_entries,
+        "commits_skipped_in_recovery": report.commits_skipped_in_recovery,
+        "last_needs_snapshot": report.last_needs_snapshot.map(|reason| reason.as_str()),
+        "last_verified": report.last_verified.map(|block| block.number),
+        "agreed": report.agreed(),
+        "admission_is_load_bearing": report.replay.admission_is_load_bearing(),
+        "elapsed_ms": elapsed_ms,
+    });
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{record}")?;
+    Ok(())
 }
 
 fn follow_exit_code(report: &FollowReport) -> i32 {

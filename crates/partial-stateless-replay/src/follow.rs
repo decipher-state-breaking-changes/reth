@@ -29,7 +29,7 @@ use partial_stateless_stream::{
     BlockRef, Checkpoint, EndKind, FrameKind, FrameLimits, Manifest, ResetReason, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
-use partial_stateless_validator::SidecarReexecLimits;
+use partial_stateless_validator::{PayloadProvenance, SidecarReexecLimits};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -414,6 +414,10 @@ impl<'a> Follower<'a> {
             StreamEvent::Commit(commit) => {
                 let (input, oracle) = commit.split();
                 let block = input.block;
+                // Captured before `replay_commit` consumes the input: the S3 claim is that the
+                // validator consumed the *recorded* Engine payload, and provenance is how each
+                // verdict line proves which kind of payload it was measured against.
+                let provenance = input.payload_provenance;
 
                 // Exactly H + 1, checked on the frame itself before anything is decoded. The
                 // admission path would also refuse a wrong child, but as a consensus failure —
@@ -451,6 +455,7 @@ impl<'a> Follower<'a> {
                             verdict,
                             block,
                             sequence,
+                            provenance,
                             new_disagreements,
                             &self.replay,
                         )?;
@@ -471,6 +476,7 @@ impl<'a> Follower<'a> {
                             "rejected",
                             block,
                             sequence,
+                            provenance,
                             new_disagreements,
                             &self.replay,
                         )?;
@@ -488,6 +494,7 @@ impl<'a> Follower<'a> {
                             "fault",
                             block,
                             sequence,
+                            provenance,
                             new_disagreements,
                             &self.replay,
                         )?;
@@ -663,6 +670,11 @@ impl<'a> Follower<'a> {
 
     /// One recovery pass: a fresh checkpoint restarts the grammar at its own sequence; an `End`
     /// proves no recovery is coming.
+    ///
+    /// Both are looked for on every pass and the lower sequence wins, because the sequence space
+    /// is the stream's word order: a checkpoint written *after* an `End` is a trailing frame on a
+    /// closed stream, not a recovery, and preferring it would let anything appended to a dead
+    /// spool restart verdicts.
     fn scan_for_recovery(&mut self) -> eyre::Result<Step> {
         let Phase::NeedsSnapshot { manifest, reason, scan_from } =
             std::mem::replace(&mut self.phase, Phase::AwaitingManifest)
@@ -670,15 +682,22 @@ impl<'a> Follower<'a> {
             return Err(eyre::eyre!("the recovery scan ran outside NeedsSnapshot"))
         };
 
-        if let Some(found) = self
+        let checkpoint_at = self
             .tail
             .scan_for(FrameKind::Checkpoint, scan_from)
-            .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?
-        {
+            .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
+        let end_at = self
+            .tail
+            .scan_for(FrameKind::End, scan_from)
+            .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
+
+        if let Some(found) = checkpoint_at.filter(|found| end_at.is_none_or(|end| *found < end)) {
+            // Skipped commits are part of the record, and a count that failed to read is not a
+            // count of zero — an I/O error here fails the recovery rather than shrinking it.
             let skipped = self
                 .tail
                 .count_commits_between(self.tail.next_sequence(), found)
-                .unwrap_or_default();
+                .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
             self.commits_skipped_in_recovery += skipped;
             info!(
                 target: "ps_follow",
@@ -691,28 +710,36 @@ impl<'a> Follower<'a> {
             return Ok(Step::Continue)
         }
 
-        // No checkpoint. An End frame anywhere above the watermark settles that none is coming.
-        if let Some(end_at) = self
-            .tail
-            .scan_for(FrameKind::End, scan_from)
-            .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?
-        {
+        // No usable checkpoint. An End frame above the watermark settles that no recovery is
+        // coming — read back through the same authority checks as ordinary delivery, its
+        // numbering promise included.
+        if let Some(end_at) = end_at {
             let frame = self
                 .tail
                 .read_at(end_at, FrameKind::End)
                 .map_err(|fault| eyre::eyre!("the End frame did not read back: {fault}"))?;
-            if let StreamEvent::End(end) = frame.event {
-                info!(
+            let StreamEvent::End(end) = frame.event else {
+                return Err(eyre::eyre!(
+                    "the frame at sequence {end_at} is named End but decoded as something else"
+                ))
+            };
+            self.check_end_numbering(&end.reason, end.last_sequence, end_at)?;
+            if let Some(trailing) = checkpoint_at {
+                warn!(
                     target: "ps_follow",
-                    kind = end.kind.as_str(),
-                    "The stream ended while waiting for a recovery checkpoint"
+                    end_sequence = end_at,
+                    checkpoint_sequence = trailing,
+                    "A checkpoint exists past the End frame; a closed stream has no recovery, so \
+                     it is a trailing frame, not a restart"
                 );
-                self.sink.state("ended", end.kind.as_str(), &end.reason, self.last_verified)?;
-                return Ok(Step::Done(FollowOutcome::Ended {
-                    kind: end.kind,
-                    before_checkpoint: false,
-                }))
             }
+            info!(
+                target: "ps_follow",
+                kind = end.kind.as_str(),
+                "The stream ended while waiting for a recovery checkpoint"
+            );
+            self.sink.state("ended", end.kind.as_str(), &end.reason, self.last_verified)?;
+            return Ok(Step::Done(FollowOutcome::Ended { kind: end.kind, before_checkpoint: false }))
         }
 
         self.phase = Phase::NeedsSnapshot { manifest, reason, scan_from };
@@ -820,6 +847,7 @@ impl VerdictSink {
         verdict: &str,
         block: BlockRef,
         sequence: u64,
+        provenance: PayloadProvenance,
         disagreements: usize,
         replay: &ReplayReport,
     ) -> eyre::Result<()> {
@@ -834,6 +862,7 @@ impl VerdictSink {
             "block_hash": format!("{:?}", block.hash),
             "sequence": sequence,
             "verdict": verdict,
+            "payload_provenance": provenance.as_str(),
             "disagreements": disagreements,
             "admission_us": timing.map(|timing| timing.admission_us),
             "transition_us": timing.map(|timing| timing.transition_us),
