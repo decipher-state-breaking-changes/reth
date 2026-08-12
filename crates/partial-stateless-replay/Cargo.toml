@@ -47,8 +47,14 @@ bincode.workspace = true
 eyre.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 reth-chainspec = { workspace = true, features = ["std"] }
+# The follow tests build a real restorable snapshot fixture: a one-account state proved with the
+# same trie machinery the producer's export uses. Dev-only, so the isolation-checked normal graph
+# is untouched.
+reth-trie = { workspace = true }
+reth-trie-common = { workspace = true }

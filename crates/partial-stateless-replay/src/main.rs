@@ -2,12 +2,24 @@
 //!
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] [--label <name>]
+//! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
+//!           [--ack <path>] [--mutations] [--json <path>] [--label <name>]
 //! ```
 //!
-//! Exits non-zero when the replay disagreed with the recording anywhere, because the whole point
-//! of running it is that a disagreement is a result rather than a diagnostic.
+//! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
+//! whole point of running it is that a disagreement is a result rather than a diagnostic.
+//!
+//! Follow mode consumes the spool while a producer is still writing it — the S3 live consumer —
+//! and its exit codes are states, not just errors: `0` a cleanly ended, fully agreeing stream;
+//! `1` a disagreement, fault, or fault-kind end; `2` the run timed out waiting in
+//! `NeedsSnapshot` (recovery never came); `3` the stream ended before any checkpoint; `4` the
+//! run timed out waiting for frames. Without `--idle-timeout-secs` the follower waits forever,
+//! because a quiet spool and a killed producer are indistinguishable from files alone.
 
-use partial_stateless_replay::{replay, ReplayOptions, ReplayReport};
+use partial_stateless_replay::{
+    follow, replay, FollowOptions, FollowOutcome, FollowReport, ReplayOptions, ReplayReport,
+};
+use partial_stateless_stream::EndKind;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -19,7 +31,11 @@ fn main() -> eyre::Result<()> {
         )
         .init();
 
-    let Args { dir, options, json, label } = parse_args()?;
+    let mode = parse_args()?;
+    let Mode::Batch(Args { dir, options, json, label }) = mode else {
+        let Mode::Follow { dir, options } = mode else { unreachable!() };
+        return run_follow(&dir, &options)
+    };
     let started = std::time::Instant::now();
     let report = replay(&dir, &options)?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -126,6 +142,53 @@ fn write_record(
     Ok(())
 }
 
+/// Runs the live follower and maps its outcome onto the documented exit codes.
+fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
+    let report = follow(dir, options)?;
+    report_follow(&report);
+    let code = follow_exit_code(&report);
+    if code == 0 {
+        return Ok(())
+    }
+    std::process::exit(code);
+}
+
+fn report_follow(report: &FollowReport) {
+    info!(
+        target: "ps_follow",
+        outcome = ?report.outcome,
+        blocks_verified = report.blocks_verified,
+        restores = report.restores,
+        needs_snapshot_entries = report.needs_snapshot_entries,
+        commits_skipped_in_recovery = report.commits_skipped_in_recovery,
+        witnessed = report.replay.witnessed,
+        reconstructed = report.replay.reconstructed,
+        disagreements = report.replay.disagreements.len(),
+        failures = report.replay.failures.len(),
+        agreed = report.agreed(),
+        "Follow finished"
+    );
+    for (block, disagreement) in &report.replay.disagreements {
+        error!(target: "ps_follow", block = block.number, %disagreement, "Disagreement");
+    }
+    for failure in &report.replay.failures {
+        error!(target: "ps_follow", %failure, "Failure");
+    }
+}
+
+fn follow_exit_code(report: &FollowReport) -> i32 {
+    match &report.outcome {
+        FollowOutcome::Ended { before_checkpoint: true, .. } => 3,
+        FollowOutcome::Ended { kind: EndKind::Shutdown | EndKind::SpoolLimit, .. } => {
+            i32::from(!report.agreed())
+        }
+        FollowOutcome::Ended { .. } | FollowOutcome::Faulted { .. } => 1,
+        FollowOutcome::MaxBlocks => i32::from(!report.agreed()),
+        FollowOutcome::IdleTimeout { waiting_in } if *waiting_in == "needs_snapshot" => 2,
+        FollowOutcome::IdleTimeout { .. } => 4,
+    }
+}
+
 struct Args {
     dir: PathBuf,
     options: ReplayOptions,
@@ -133,8 +196,17 @@ struct Args {
     label: String,
 }
 
-fn parse_args() -> eyre::Result<Args> {
-    let mut args = std::env::args().skip(1);
+enum Mode {
+    Batch(Args),
+    Follow { dir: PathBuf, options: FollowOptions },
+}
+
+fn parse_args() -> eyre::Result<Mode> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|arg| arg == "--follow") {
+        return parse_follow_args(raw)
+    }
+    let mut args = raw.into_iter();
     let mut dir = None;
     let mut options = ReplayOptions::default();
     let mut json = None;
@@ -157,7 +229,9 @@ fn parse_args() -> eyre::Result<Args> {
             "-h" | "--help" => {
                 println!(
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] \
-                     [--label <name>]"
+                     [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
+                     [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--mutations] \
+                     [--json <path>] [--label <name>]"
                 );
                 std::process::exit(0);
             }
@@ -166,5 +240,47 @@ fn parse_args() -> eyre::Result<Args> {
         }
     }
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay <spool-dir> [--limit N]"))?;
-    Ok(Args { dir, options, json, label })
+    Ok(Mode::Batch(Args { dir, options, json, label }))
+}
+
+fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
+    let mut args = raw.into_iter();
+    let mut dir = None;
+    let mut options = FollowOptions::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--follow" => {}
+            "--poll-ms" => {
+                let raw = args.next().ok_or_else(|| eyre::eyre!("--poll-ms needs a value"))?;
+                options.poll = std::time::Duration::from_millis(raw.parse()?);
+            }
+            "--max-blocks" => {
+                let raw = args.next().ok_or_else(|| eyre::eyre!("--max-blocks needs a count"))?;
+                options.max_blocks = Some(raw.parse()?);
+            }
+            "--idle-timeout-secs" => {
+                let raw =
+                    args.next().ok_or_else(|| eyre::eyre!("--idle-timeout-secs needs a value"))?;
+                options.idle_timeout = Some(std::time::Duration::from_secs(raw.parse()?));
+            }
+            "--ack" => {
+                options.ack = Some(PathBuf::from(
+                    args.next().ok_or_else(|| eyre::eyre!("--ack needs a path"))?,
+                ));
+            }
+            "--mutations" => options.mutations = true,
+            "--json" => {
+                options.verdicts = Some(PathBuf::from(
+                    args.next().ok_or_else(|| eyre::eyre!("--json needs a path"))?,
+                ));
+            }
+            "--label" => {
+                options.label = args.next().ok_or_else(|| eyre::eyre!("--label needs a name"))?;
+            }
+            other if dir.is_none() => dir = Some(PathBuf::from(other)),
+            other => return Err(eyre::eyre!("unexpected argument {other}")),
+        }
+    }
+    let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay --follow <spool-dir>"))?;
+    Ok(Mode::Follow { dir, options })
 }

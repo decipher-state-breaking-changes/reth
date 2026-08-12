@@ -9,7 +9,7 @@
 use crate::{
     compare::{block_label, compare_accepted, compare_rejected, Disagreement},
     mutate::Mutation,
-    spool::read_spool,
+    spool::SpoolIter,
 };
 use alloy_rlp::Decodable;
 use partial_stateless::{
@@ -139,7 +139,7 @@ impl std::fmt::Display for ReplayFault {
 }
 
 /// What one commit's replay did to the pair.
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     /// The commit ran to a verdict and was compared against the oracle.
     Compared,
     /// The commit could not run and touched no validator state; the next commit may proceed.
@@ -177,31 +177,20 @@ impl ReplayReport {
 }
 
 /// Replays a recorded stream and checks it against its own oracle.
+///
+/// Frames are read one at a time rather than materialized: a long corpus is tens of gigabytes of
+/// commits, and holding it whole would make the corpus-as-evidence design unusable at exactly the
+/// lengths that matter.
 pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport> {
-    let spool = read_spool(dir, &options.frame_limits)?;
-    info!(
-        target: "ps_replay",
-        dir = %dir.display(),
-        frames = spool.frames.len(),
-        bytes = spool.bytes,
-        closed = spool.closed,
-        "Read the recorded stream"
-    );
-    if !spool.closed {
-        warn!(
-            target: "ps_replay",
-            "The corpus has no End frame, so it was cut rather than finished. Everything below \
-             describes the prefix that survived"
-        );
-    }
+    let mut spool = SpoolIter::open(dir, &options.frame_limits)?;
 
-    let mut report = ReplayReport { closed: spool.closed, ..Default::default() };
+    let mut report = ReplayReport::default();
     let mut manifest: Option<Manifest> = None;
     let mut checkpoint: Option<Checkpoint> = None;
     let mut chunks: Vec<SnapshotChunk> = Vec::new();
     let mut restored: Option<ReplayState> = None;
 
-    for frame in spool.frames {
+    while let Some(frame) = spool.next_frame()? {
         // A faulted pair replays nothing further. The remaining frames are counted rather than
         // run: replaying commits against a blocked pair would generate one `BlockSkipped`
         // failure per block, and a single fault would read as a cascade.
@@ -304,6 +293,22 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
         }
     }
 
+    report.closed = spool.closed();
+    info!(
+        target: "ps_replay",
+        dir = %dir.display(),
+        bytes = spool.bytes(),
+        closed = report.closed,
+        "Read the recorded stream"
+    );
+    if !report.closed {
+        warn!(
+            target: "ps_replay",
+            "The corpus has no End frame, so it was cut rather than finished. Everything above \
+             describes the prefix that survived"
+        );
+    }
+
     Ok(report)
 }
 
@@ -313,16 +318,16 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
 /// decide what a block is allowed to be, so a validator that rebuilt it per block would be one
 /// configuration change away from disagreeing with itself mid-stream — and it would charge the
 /// construction to every measured block.
-struct ReplayState {
-    pair: CoordinatedPair,
-    config: CacheConfig,
-    chain_spec: Arc<ChainSpec>,
-    consensus: EthBeaconConsensus<ChainSpec>,
-    evm_config: EthEvmConfig<ChainSpec>,
+pub(crate) struct ReplayState {
+    pub(crate) pair: CoordinatedPair,
+    pub(crate) config: CacheConfig,
+    pub(crate) chain_spec: Arc<ChainSpec>,
+    pub(crate) consensus: EthBeaconConsensus<ChainSpec>,
+    pub(crate) evm_config: EthEvmConfig<ChainSpec>,
 }
 
 /// Restores the pair a replay validates against, from the checkpoint and its chunks.
-fn restore(
+pub(crate) fn restore(
     manifest: &Manifest,
     checkpoint: &Checkpoint,
     chunks: &[SnapshotChunk],
@@ -333,17 +338,7 @@ fn restore(
     let package = bincode::deserialize(&package_bytes)
         .map_err(|err| eyre::eyre!("recorded snapshot package did not decode: {err}"))?;
 
-    let config = CacheConfig {
-        account_window: manifest.account_window,
-        storage_window: manifest.storage_window,
-    };
-    if config.cache_policy_id() != manifest.cache_policy_id {
-        eyre::bail!(
-            "manifest names policy {:?} but its own windows derive {:?}",
-            manifest.cache_policy_id,
-            config.cache_policy_id()
-        );
-    }
+    let config = config_for(manifest)?;
     let trusted = TrustedCheckpoint {
         block_number: checkpoint.block.number,
         block_hash: checkpoint.block.hash,
@@ -384,8 +379,24 @@ fn restore(
     })
 }
 
+/// The cache configuration a manifest names, cross-checked against its own policy id.
+pub(crate) fn config_for(manifest: &Manifest) -> eyre::Result<CacheConfig> {
+    let config = CacheConfig {
+        account_window: manifest.account_window,
+        storage_window: manifest.storage_window,
+    };
+    if config.cache_policy_id() != manifest.cache_policy_id {
+        eyre::bail!(
+            "manifest names policy {:?} but its own windows derive {:?}",
+            manifest.cache_policy_id,
+            config.cache_policy_id()
+        );
+    }
+    Ok(config)
+}
+
 /// Decodes the checkpoint's accepted head, refusing any header that disagrees with it.
-fn decode_accepted_head(checkpoint: &Checkpoint) -> Option<SealedHeader> {
+pub(crate) fn decode_accepted_head(checkpoint: &Checkpoint) -> Option<SealedHeader> {
     if checkpoint.accepted_head_rlp.is_empty() {
         return None
     }
@@ -412,7 +423,7 @@ fn decode_accepted_head(checkpoint: &Checkpoint) -> Option<SealedHeader> {
     Some(sealed)
 }
 
-fn chain_spec_for(manifest: &Manifest) -> eyre::Result<Arc<ChainSpec>> {
+pub(crate) fn chain_spec_for(manifest: &Manifest) -> eyre::Result<Arc<ChainSpec>> {
     // One chain for now, and named rather than inferred: a validator that guessed a chain spec
     // from a chain id would be choosing fork activation times on the producer's behalf.
     if manifest.chain_id != MAINNET.chain.id() {
@@ -440,7 +451,7 @@ fn chain_spec_for(manifest: &Manifest) -> eyre::Result<Arc<ChainSpec>> {
 /// `admit_block` has moved readiness to `Applying`, so a failure there must not return with the
 /// tracker still in that transient state: the ExEx's fail-stop masked exactly that leak, and a
 /// standalone driver that outlives the rejection makes it observable.
-fn replay_commit(
+pub(crate) fn replay_commit(
     state: &mut ReplayState,
     input: CommitInput,
     oracle: &CommitOracle,

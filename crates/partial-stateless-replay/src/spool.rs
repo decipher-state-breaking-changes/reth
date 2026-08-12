@@ -54,6 +54,86 @@ pub fn read_frame_file(path: &Path, limits: &FrameLimits) -> eyre::Result<Spoole
     Ok(SpooledFrame { header, event, bytes: raw.len() as u64 })
 }
 
+/// Iterates a complete spool in sequence order, holding one frame in memory at a time.
+///
+/// This is what lets a deterministic replay of a long corpus run in constant frame memory: a
+/// 6,000-block corpus is roughly 20 GiB of commits, and the old whole-directory read held all of
+/// it. The directory listing orders the walk, but the *authority* stays with each frame's own
+/// header: a file whose header sequence is not the position the walk expects is refused, so a
+/// rename cannot reorder the corpus — it can only break it loudly.
+#[derive(Debug)]
+pub struct SpoolIter {
+    paths: Vec<std::path::PathBuf>,
+    position: usize,
+    limits: FrameLimits,
+    /// Set when an `End` frame was yielded; any frame after it is a refusal.
+    ended: bool,
+    closed: bool,
+    bytes: u64,
+}
+
+impl SpoolIter {
+    /// Opens a spool for iteration. Enumerates the directory; reads nothing yet.
+    pub fn open(dir: &Path, limits: &FrameLimits) -> eyre::Result<Self> {
+        let mut paths: Vec<_> = fs::read_dir(dir)
+            .map_err(|err| eyre::eyre!("cannot read spool {}: {err}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "frame"))
+            .collect();
+        if paths.is_empty() {
+            eyre::bail!("spool {} holds no frames", dir.display());
+        }
+        paths.sort();
+        Ok(Self { paths, position: 0, limits: *limits, ended: false, closed: false, bytes: 0 })
+    }
+
+    /// Reads the next frame, enforcing contiguity and the End-frame placement rules.
+    pub fn next_frame(&mut self) -> eyre::Result<Option<SpooledFrame>> {
+        let Some(path) = self.paths.get(self.position) else { return Ok(None) };
+        if self.ended {
+            eyre::bail!("spool continues past its End frame: {}", path.display());
+        }
+        let frame = read_frame_file(path, &self.limits)?;
+        if frame.header.sequence != self.position as u64 {
+            eyre::bail!(
+                "spool is not contiguous: sequence {} arrived where {} was expected. A corpus \
+                 with a hole reads as a corpus, so this is refused rather than replayed",
+                frame.header.sequence,
+                self.position
+            );
+        }
+        if let StreamEvent::End(end) = &frame.event {
+            if end.last_sequence.checked_add(1) != Some(frame.header.sequence) {
+                eyre::bail!(
+                    "the End frame at sequence {} names {} as the last frame; its predecessor \
+                     was {}",
+                    frame.header.sequence,
+                    end.last_sequence,
+                    frame.header.sequence.saturating_sub(1)
+                );
+            }
+            self.ended = true;
+            self.closed = true;
+        }
+        self.position += 1;
+        self.bytes = self.bytes.saturating_add(frame.bytes);
+        Ok(Some(frame))
+    }
+
+    /// Whether the stream ended with an `End` frame rather than being cut.
+    ///
+    /// Meaningful once iteration is done; before that it reports what has been seen so far.
+    pub const fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Total bytes read so far.
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 /// A whole spool, read and checked for contiguity.
 #[derive(Debug)]
 pub struct Spool {
@@ -68,62 +148,15 @@ pub struct Spool {
 /// Reads every `.frame` file in `dir` and returns them in sequence order.
 ///
 /// Fails rather than skips on anything malformed. A driver whose corpus is its evidence cannot
-/// treat an unreadable frame as an absent one.
+/// treat an unreadable frame as an absent one. This materializes the whole spool; a caller with a
+/// large corpus should walk [`SpoolIter`] instead.
 pub fn read_spool(dir: &Path, limits: &FrameLimits) -> eyre::Result<Spool> {
-    let mut paths: Vec<_> = fs::read_dir(dir)
-        .map_err(|err| eyre::eyre!("cannot read spool {}: {err}", dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "frame"))
-        .collect();
-    if paths.is_empty() {
-        eyre::bail!("spool {} holds no frames", dir.display());
-    }
-    paths.sort();
-
-    let mut frames = Vec::with_capacity(paths.len());
-    let mut bytes = 0u64;
-    for path in &paths {
-        let frame = read_frame_file(path, limits)?;
-        bytes = bytes.saturating_add(frame.bytes);
+    let mut iter = SpoolIter::open(dir, limits)?;
+    let mut frames = Vec::new();
+    while let Some(frame) = iter.next_frame()? {
         frames.push(frame);
     }
-
-    frames.sort_by_key(|frame| frame.header.sequence);
-    for (position, frame) in frames.iter().enumerate() {
-        if frame.header.sequence != position as u64 {
-            eyre::bail!(
-                "spool {} is not contiguous: sequence {} arrived where {position} was expected. \
-                 A corpus with a hole reads as a corpus, so this is refused rather than replayed",
-                dir.display(),
-                frame.header.sequence
-            );
-        }
-        // The End frame closes the stream: nothing may follow it, and it must name the frame it
-        // followed. An End that misnumbers its predecessor means the corpus and its closer
-        // disagree about what the corpus is, which is not a warning.
-        if let StreamEvent::End(end) = &frame.event {
-            if position + 1 != frames.len() {
-                eyre::bail!(
-                    "spool {} continues past its End frame at sequence {}",
-                    dir.display(),
-                    frame.header.sequence
-                );
-            }
-            if end.last_sequence.checked_add(1) != Some(frame.header.sequence) {
-                eyre::bail!(
-                    "the End frame at sequence {} names {} as the last frame; its predecessor \
-                     was {}",
-                    frame.header.sequence,
-                    end.last_sequence,
-                    frame.header.sequence.saturating_sub(1)
-                );
-            }
-        }
-    }
-
-    let closed = matches!(frames.last().map(|frame| &frame.event), Some(StreamEvent::End(_)));
-    Ok(Spool { frames, closed, bytes })
+    Ok(Spool { frames, closed: iter.closed(), bytes: iter.bytes() })
 }
 
 #[cfg(test)]

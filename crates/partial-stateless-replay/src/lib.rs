@@ -26,10 +26,14 @@
 
 pub mod compare;
 pub mod driver;
+pub mod follow;
 pub mod mutate;
 pub mod spool;
+pub mod tail;
 
 pub use compare::Disagreement;
 pub use driver::{replay, BlockTiming, ReplayFault, ReplayOptions, ReplayReport};
+pub use follow::{follow, FollowOptions, FollowOutcome, FollowReport, NeedsSnapshotReason};
 pub use mutate::Mutation;
-pub use spool::{read_frame_file, read_spool, Spool, SpooledFrame};
+pub use spool::{read_frame_file, read_spool, Spool, SpoolIter, SpooledFrame};
+pub use tail::{SpoolTail, TailEvent, TailFault};
