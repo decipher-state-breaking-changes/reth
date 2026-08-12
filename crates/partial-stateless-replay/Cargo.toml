@@ -1,0 +1,54 @@
+[package]
+name = "partial-stateless-replay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Database-free replay driver for recorded partial-stateless validation streams"
+
+[lib]
+name = "partial_stateless_replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ps-replay"
+path = "src/main.rs"
+
+[features]
+# Same reason as `partial-stateless-validator`, and this is the package where it finally bites:
+# this binary is built on its own, so nothing else's feature selection reaches it.
+# `check_validator_isolation.sh` runs against this package and fails the build profile if these
+# stop arriving.
+default = ["asm-keccak", "keccak-cache-global"]
+
+asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+
+[dependencies]
+partial-stateless = { path = "../partial-stateless" }
+partial-stateless-stream = { path = "../partial-stateless-stream" }
+partial-stateless-validator = { path = "../partial-stateless-validator" }
+
+# Implementation crates only where they carry no state database. The forbidden set is the
+# validator's, enforced against this package by `check_validator_isolation.sh`.
+reth-chainspec = { workspace = true, features = ["std"] }
+reth-consensus = { workspace = true, features = ["std"] }
+reth-ethereum-consensus = { workspace = true, features = ["std"] }
+reth-ethereum-primitives = { workspace = true, features = ["std"] }
+reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std", "secp256k1", "rayon"] }
+revm = { workspace = true }
+
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
+
+bincode.workspace = true
+eyre.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+reth-chainspec = { workspace = true, features = ["std"] }

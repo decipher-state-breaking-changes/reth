@@ -16,14 +16,16 @@
 //! names. Both sides here derive their policies and their ID from one [`CacheConfig`], which is
 //! what keeps that gap closed on this path.
 
-use crate::CacheConfig;
 use alloy_primitives::B256;
+// The restore half lives in `partial-stateless` and is re-exported here, because a node without a
+// database restores exactly the same way a node with one does and a second copy would be a second
+// thing to keep in step. Only the export needs a provider, so only the export stayed.
+pub use partial_stateless::restore::{live_limits, restore_snapshot, RestoredSnapshot};
 use partial_stateless::{
     build_snapshot_package_with_limits,
     network_cache::NetworkStateCache,
-    readiness::{CacheObservation, CacheReadinessTracker, ReadyParent, TrustedCheckpoint},
-    verify_and_restore_with_limits, BootstrapLimits, CacheAnchor, CacheSnapshotPackage,
-    PartialTrieNodeCache,
+    readiness::{ReadyParent, TrustedCheckpoint},
+    CacheSnapshotPackage,
 };
 use reth_provider::StateProvider;
 use reth_trie_common::TrieInput;
@@ -33,24 +35,6 @@ use std::{
     time::Instant,
 };
 use tracing::{info, warn};
-
-/// Bounds for a snapshot this operator produced or was handed out of band.
-///
-/// [`BootstrapLimits::default`] is sized for an *untrusted peer* package and a live mainnet Last-N
-/// window does not fit inside it: a 60-block account window holds on the order of a hundred
-/// thousand accounts and several hundred thousand storage slots, and the multiproof covering all
-/// of them is far larger than the default 64 MiB. These bounds still exist — a decode is not
-/// unbounded — but they are set for the artifact this ExEx actually exchanges rather than for an
-/// arbitrary peer, which is the same trust boundary the checkpoint already draws.
-pub fn live_limits() -> BootstrapLimits {
-    BootstrapLimits {
-        max_accounts: 2_000_000,
-        max_storage_slots: 8_000_000,
-        max_codes: 500_000,
-        max_state_proof_bytes: 2 * 1024 * 1024 * 1024,
-        max_code_bytes: 1024 * 1024 * 1024,
-    }
-}
 
 /// Filename of the snapshot package inside the configured bootstrap directory.
 pub const PACKAGE_FILE: &str = "cache_snapshot.bin";
@@ -178,82 +162,6 @@ pub fn load_snapshot(
     let stored: StoredCheckpoint = serde_json::from_slice(&fs::read(&checkpoint_path)?)
         .map_err(|err| eyre::eyre!("failed to decode {}: {err}", checkpoint_path.display()))?;
     Ok(Some((package, stored.into())))
-}
-
-/// Verifies a package against its checkpoint and returns an installed, Ready coordinated pair.
-///
-/// Nothing is mutated in place: the caller receives the restored pair and the tracker only reaches
-/// `Ready` if every check passed, so a rejected package leaves whatever the caller already had.
-pub fn restore_snapshot(
-    package: CacheSnapshotPackage,
-    checkpoint: &TrustedCheckpoint,
-    config: &CacheConfig,
-) -> eyre::Result<RestoredSnapshot> {
-    let started = Instant::now();
-    if checkpoint.cache_policy_id != config.cache_policy_id() {
-        eyre::bail!(
-            "bootstrap checkpoint names policy {:?} but this node runs {:?}",
-            checkpoint.cache_policy_id,
-            config.cache_policy_id()
-        );
-    }
-    let expected_anchor = CacheAnchor {
-        block_number: checkpoint.block_number,
-        block_hash: checkpoint.block_hash,
-        cache_policy_id: checkpoint.cache_policy_id,
-        cache_root: checkpoint.cache_root,
-    };
-    let restored = verify_and_restore_with_limits(
-        package,
-        &expected_anchor,
-        checkpoint.state_root,
-        config.account_policy(),
-        config.storage_policy(),
-        &live_limits(),
-    )
-    .map_err(|err| {
-        eyre::eyre!("bootstrap snapshot at block {} rejected: {err}", checkpoint.block_number)
-    })?;
-
-    let mut readiness = config.new_readiness_tracker();
-    let observation = CacheObservation::capture(&restored.value_cache, &restored.trie_cache);
-    let ready =
-        readiness.restore_from_checkpoint(checkpoint, &observation).cloned().map_err(|err| {
-            eyre::eyre!(
-                "restored snapshot at block {} was rejected by the readiness checkpoint: {err:?}",
-                checkpoint.block_number
-            )
-        })?;
-
-    info!(
-        target: "partial_stateless",
-        block = checkpoint.block_number,
-        block_hash = ?checkpoint.block_hash,
-        accounts = restored.value_cache.accounts().len(),
-        storage = restored.value_cache.storage().len(),
-        codes = restored.value_cache.codes().len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "Restored coordinated cache pair from an operator-trusted snapshot; this node trusts \
-         whoever supplied the checkpoint"
-    );
-    Ok(RestoredSnapshot {
-        cache: restored.value_cache,
-        trie_cache: restored.trie_cache,
-        readiness,
-        ready,
-    })
-}
-
-/// A coordinated pair restored from a snapshot, with its own tracker already promoted.
-pub struct RestoredSnapshot {
-    /// Authenticated flat values.
-    pub cache: NetworkStateCache,
-    /// Authenticated trie paths for exactly those values.
-    pub trie_cache: PartialTrieNodeCache,
-    /// A tracker at `Ready(H)`, carried with the pair so a shadow pair has its own lifecycle.
-    pub readiness: CacheReadinessTracker,
-    /// The parent this pair may validate the child of.
-    pub ready: ReadyParent,
 }
 
 /// Writes through a temporary file so a crash cannot leave a half-written artifact in place.

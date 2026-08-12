@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 bincode = { workspace = true }
 
 # utilities
+thiserror.workspace = true
 tracing = { workspace = true }
 
 [features]

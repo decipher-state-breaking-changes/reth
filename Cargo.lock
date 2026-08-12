@@ -6475,6 +6475,7 @@ dependencies = [
  "revm-state",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -6509,6 +6510,32 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "partial-stateless-replay"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "bincode",
+ "eyre",
+ "partial-stateless",
+ "partial-stateless-stream",
+ "partial-stateless-validator",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm-ethereum",
+ "reth-primitives-traits",
+ "revm",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

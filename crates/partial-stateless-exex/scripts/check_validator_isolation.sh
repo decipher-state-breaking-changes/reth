@@ -26,11 +26,25 @@
 #      graph check on the ExEx would have passed. Same shape of defect as invariant 2, on a
 #      different hot path.
 #
-# Usage: check_validator_isolation.sh [package-name]
+# The three packages below are checked together because the claim is about the *binary*, and the
+# binary is built from all three. `partial-stateless-stream` is where the frame format and the
+# recorded oracle live, and `partial-stateless-replay` is the standalone process itself — the first
+# thing that runs the validator core outside a reth node. A graph check that covered only the core
+# would pass while the process that runs it linked a provider.
+#
+# Usage: check_validator_isolation.sh [package-name ...]
 
 set -euo pipefail
 
-PKG="${1:-partial-stateless-validator}"
+if [ "$#" -gt 0 ]; then
+  PACKAGES=("$@")
+else
+  PACKAGES=(
+    partial-stateless-validator
+    partial-stateless-stream
+    partial-stateless-replay
+  )
+fi
 
 # Implementations, not traits. reth-storage-api and reth-storage-errors are deliberately absent.
 FORBIDDEN='^(reth-provider|reth-db|reth-db-common|reth-libmdbx|reth-mdbx-sys|reth-exex|reth-node-builder)$'
@@ -39,10 +53,14 @@ REQUIRED_RECOVERY='feature "secp256k1"'
 
 status=0
 
+check_package() {
+  local PKG="$1"
+
 echo "==> ${PKG}: normal dependency graph"
 if ! deps="$(cargo tree -p "${PKG}" -e normal --prefix none 2>/dev/null)"; then
   echo "FAIL: cargo tree could not resolve package '${PKG}'" >&2
-  exit 2
+  status=2
+  return
 fi
 
 if hits="$(printf '%s\n' "${deps}" | awk '{print $1}' | sort -u | grep -E "${FORBIDDEN}")"; then
@@ -74,5 +92,10 @@ if [ "${recovery}" -eq 0 ]; then
 else
   echo "ok: ${recovery} secp256k1 feature edges on reth-primitives-traits"
 fi
+}
+
+for pkg in "${PACKAGES[@]}"; do
+  check_package "${pkg}"
+done
 
 exit "${status}"

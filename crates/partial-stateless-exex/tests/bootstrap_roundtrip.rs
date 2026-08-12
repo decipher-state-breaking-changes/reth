@@ -119,9 +119,9 @@ fn cached<T>(value: T) -> CachedEntry<T> {
 
 /// `RestoredSnapshot` holds a `NetworkStateCache`, which has no `Debug`, so `expect_err` is out.
 fn expect_rejection(
-    result: eyre::Result<bootstrap_io::RestoredSnapshot>,
+    result: Result<bootstrap_io::RestoredSnapshot, partial_stateless::RestoreError>,
     context: &str,
-) -> eyre::Report {
+) -> partial_stateless::RestoreError {
     match result {
         Ok(_) => panic!("{context}"),
         Err(error) => error,

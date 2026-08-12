@@ -11,12 +11,14 @@
 pub mod accessed_state;
 pub mod bootstrap;
 pub mod cold_admission;
+pub mod config;
 pub mod fixture;
 pub mod network_cache;
 pub mod participant;
 pub mod persistence;
 pub mod policy;
 pub mod readiness;
+pub mod restore;
 pub mod shared_trie;
 pub mod trie_cache;
 pub mod witness;
@@ -34,6 +36,7 @@ pub use bootstrap::{
 pub use cold_admission::{
     admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };
+pub use config::CacheConfig;
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache};
 pub use participant::ParticipantCache;
@@ -43,6 +46,7 @@ pub use readiness::{
     BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
     ReadinessError, ReadyParent, TrustedCheckpoint,
 };
+pub use restore::{live_limits, restore_snapshot, RestoreError, RestoredSnapshot};
 pub use reth_trie_sparse::{CloneBreakdown, CloneMeasureOptions, RetainWitnessPathsMetrics};
 pub use sender_proof::{
     SenderAccountProof, SenderAdmissionInput, SenderProofError, VerifiedSender,

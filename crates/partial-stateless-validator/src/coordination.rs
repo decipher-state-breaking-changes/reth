@@ -150,6 +150,32 @@ impl CoordinatedPair {
             });
     }
 
+    /// Installs the displaced generation and records the transition with readiness, as one step.
+    ///
+    /// Every consumer that applies a block ends here — the ExEx builder, the ExEx verifier, and the
+    /// standalone replay driver — and it is one method rather than a sequence each of them repeats
+    /// because the two halves are not independent. Retention has to see the caches before readiness
+    /// is told the block finished, and a caller that got that order wrong would retain a generation
+    /// readiness had already moved past. Returns the readiness label after the transition, which is
+    /// the only part a run log wants and the only part a validator with no run log ignores.
+    pub fn commit_transition(
+        &mut self,
+        displaced: Option<PartialTrieNodeCache>,
+        block: &BlockContext,
+        accepted_head: SealedHeader,
+        retain: bool,
+    ) -> &'static str {
+        self.retain_generation(
+            displaced,
+            block.parent_hash,
+            block.number.saturating_sub(1),
+            accepted_head,
+            retain,
+        );
+        let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
+        self.readiness.finish_block(block, &observation).label()
+    }
+
     /// What the retained generation costs right now, for the K = 1 memory control.
     ///
     /// Read before a block is built, so it describes the generation the *previous* block
