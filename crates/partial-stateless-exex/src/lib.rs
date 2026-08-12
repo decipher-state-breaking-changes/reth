@@ -17,6 +17,7 @@
 pub mod access_shadow;
 pub mod bootstrap_io;
 pub mod cold_eoa;
+pub mod payload_tap;
 pub mod rebuild;
 
 mod benchmark;
@@ -274,6 +275,12 @@ pub struct RunOptions {
     /// How many blocks a snapshot-restored shadow pair is carried and compared against the live
     /// pair. Zero disables the in-process bootstrap gate.
     pub bootstrap_self_test_blocks: u32,
+    /// Whether the Engine publishes the payloads it validated and this ExEx takes them.
+    ///
+    /// Not read from a variable of its own: the producer's gate is `PS_ENGINE_PAYLOAD`, and a
+    /// consumer with a second switch could be armed against a node that publishes nothing, which
+    /// would report every block as a reconstruction and look like a delivery failure.
+    pub payload_tap: bool,
 }
 
 impl RunOptions {
@@ -318,6 +325,7 @@ impl RunOptions {
             bootstrap_export: env_flag("PS_BOOTSTRAP_EXPORT") || bootstrap_self_test_blocks > 0,
             bootstrap_import: env_flag("PS_BOOTSTRAP_IMPORT"),
             bootstrap_self_test_blocks,
+            payload_tap: payload_tap::tap_enabled(),
             sidecar_dir,
         })
     }
@@ -428,6 +436,13 @@ impl RunOptions {
                 self_test_blocks = self.bootstrap_self_test_blocks,
                 "Operator-trusted snapshot bootstrap ENABLED — a node restoring from this package \
                  trusts whoever supplied its checkpoint"
+            );
+        }
+        if self.payload_tap {
+            info!(
+                target: "partial_stateless",
+                "Engine payload tap ENABLED (PS_ENGINE_PAYLOAD) — canonical blocks carry the \
+                 payload the consensus layer sent, or a derived one labelled as such"
             );
         }
     }
@@ -1036,6 +1051,12 @@ where
     Node::Provider: CanonicalOverlayFactory + BlockReader<Block = BlockTy<EthPrimitives>>,
 {
     let block_number = block.number();
+    // Taken before anything else this block triggers. The handoff records how long each artifact
+    // waited, and a take deferred behind sidecar construction would report a residence no real
+    // consumer would ever see.
+    if options.payload_tap {
+        report_payload_tap(block_number, block.hash(), &payload_tap::tap_payload(block));
+    }
     let block_ctx = block_context(block);
     let ready_parent = match admit_block(&mut pair.readiness, &block_ctx) {
         BlockAdmission::Admitted(ready_parent) => ready_parent,
@@ -1185,6 +1206,54 @@ where
     );
 
     advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
+}
+
+/// Logs one block's payload provenance, and drops the payload.
+///
+/// S2a's whole deliverable is that the seam delivers, so the payload is measured and released
+/// here; S2c is what starts writing it into a frame. The level is the claim: a witnessed payload
+/// is the ordinary case, and a derived one is the case where a later corpus will contain a block
+/// whose admission checks pass without checking anything.
+fn report_payload_tap(block_number: u64, block_hash: B256, tapped: &payload_tap::TappedPayload) {
+    let stats = tapped.stats.as_ref();
+    let queue_depth = stats.map(|stats| stats.queue_depth);
+    let missed = stats.map(|stats| stats.missed);
+    match tapped.provenance {
+        payload_tap::PayloadProvenance::Witnessed => info!(
+            target: "partial_stateless_payload",
+            block = block_number,
+            ?block_hash,
+            provenance = tapped.provenance.as_str(),
+            approx_bytes = tapped.approx_bytes,
+            residence_us = tapped.residence_us,
+            witnessed = tapped.witnessed_total,
+            reconstructed = tapped.reconstructed_total,
+            queue_depth,
+            "Took the Engine's own payload for this block"
+        ),
+        payload_tap::PayloadProvenance::Reconstructed => warn!(
+            target: "partial_stateless_payload",
+            block = block_number,
+            ?block_hash,
+            provenance = tapped.provenance.as_str(),
+            reason = tapped.miss_reason.as_ref().map(reth_execution_access::MissReason::as_str),
+            witnessed = tapped.witnessed_total,
+            reconstructed = tapped.reconstructed_total,
+            queue_depth,
+            missed,
+            "No Engine payload for this block; derived one from the block, whose layout, \
+             block-hash and versioned-hash checks a validator would pass vacuously"
+        ),
+        // Unreachable while `payload_tap` gates the call, and logged rather than asserted because
+        // the gate is read once at startup and the handoff is allocated lazily.
+        payload_tap::PayloadProvenance::Absent => warn!(
+            target: "partial_stateless_payload",
+            block = block_number,
+            ?block_hash,
+            provenance = tapped.provenance.as_str(),
+            "Payload tap is armed but this process is publishing no payloads"
+        ),
+    }
 }
 
 /// Installs the parent generation displaced by a successful transition and makes that transition

@@ -72,7 +72,8 @@ use reth_evm::{
     OnStateHook, SpecFor,
 };
 use reth_execution_access::{
-    global_handoff, AccessCaptureMode, BlockAccessArtifact, ExecutedBlockAccess,
+    global_handoff, global_payload_handoff, AccessCaptureMode, BlockAccessArtifact,
+    EnginePayloadArtifact, ExecutedBlockAccess,
 };
 use reth_execution_cache::{CacheStats, SavedCache};
 use reth_payload_primitives::{
@@ -530,6 +531,15 @@ where
         // rest of the function (setup + execution). For payloads this overlaps the cost of
         // RLP decoding + header hashing.
         let is_payload = matches!(&input, BlockOrPayload::Payload(_));
+        // Taken here because this is the only place the *received* payload still exists: below,
+        // `input` becomes a block, and a block cannot be turned back into the payload that
+        // produced it. Only a payload is captured -- a `BlockOrPayload::Block` arrived from the
+        // downloader rather than from a consensus client, so there is no Engine input to witness.
+        let witnessed_payload = match &input {
+            BlockOrPayload::Payload(payload) => global_payload_handoff()
+                .map(|handoff| (handoff, payload.clone(), payload.transaction_count())),
+            BlockOrPayload::Block(_) => None,
+        };
         let convert_to_block = match &input {
             BlockOrPayload::Payload(_) => {
                 let payload_clone = input.clone();
@@ -1011,6 +1021,34 @@ where
                 output.clone(),
                 captured.capture_us,
             ));
+        }
+
+        // Published under exactly the condition the access artifact is: the state root has
+        // matched, so a consumer never sees a payload this node rejected, and every measured phase
+        // has ended, so the insert lands in no benchmark boundary. Confining the corpus this way
+        // is what makes a separate approval record unnecessary -- an artifact's presence *is* the
+        // approval.
+        if let Some((handoff, payload, transaction_count)) = witnessed_payload {
+            let block_hash = block.hash();
+            // Sized by the block rather than by the payload, because the payload is opaque to
+            // this generic function and the two carry the same transaction bytes. The RLP length
+            // is computed after the last measured phase for the same reason the insert is.
+            let approx_bytes = block.rlp_length();
+            handoff.insert(EnginePayloadArtifact::new(
+                block.number(),
+                block_hash,
+                block.parent_hash(),
+                payload,
+                approx_bytes,
+            ));
+            trace!(
+                target: "engine::tree::payload_validator",
+                number = block.number(),
+                ?block_hash,
+                transaction_count,
+                approx_bytes,
+                "Published the Engine payload for out-of-band consumption"
+            );
         }
 
         let timing_stats = state_provider_stats.map(|stats| {

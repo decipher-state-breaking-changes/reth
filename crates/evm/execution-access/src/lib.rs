@@ -32,6 +32,13 @@ pub use access::{AccountAccess, ExecutedBlockAccess};
 
 mod handoff;
 pub use handoff::{
-    global_handoff, AccessCaptureMode, BlockAccessArtifact, BlockAccessHandoff, HandoffStats,
-    MissReason, TakeOutcome, DEFAULT_HANDOFF_CAPACITY, DEFAULT_HANDOFF_MAX_BYTES,
+    global_handoff, AccessCaptureMode, BlockAccessArtifact, BlockAccessHandoff, BoundedHandoff,
+    HandoffEntry, HandoffStats, MissReason, TakeOutcome, DEFAULT_HANDOFF_CAPACITY,
+    DEFAULT_HANDOFF_MAX_BYTES,
+};
+
+mod payload;
+pub use payload::{
+    global_payload_handoff, payload_capture_enabled, EnginePayloadArtifact, EnginePayloadHandoff,
+    DEFAULT_PAYLOAD_HANDOFF_CAPACITY, DEFAULT_PAYLOAD_HANDOFF_MAX_BYTES,
 };

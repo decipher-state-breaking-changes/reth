@@ -6486,6 +6486,7 @@ dependencies = [
  "alloy-eips 2.0.4",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-engine",
  "bincode",
  "eyre",
  "futures",

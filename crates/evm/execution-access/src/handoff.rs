@@ -65,7 +65,7 @@ pub fn global_handoff() -> Option<&'static BlockAccessHandoff> {
     }))
 }
 
-fn env_override(var: &str, default: usize) -> usize {
+pub(crate) fn env_override(var: &str, default: usize) -> usize {
     let Some(raw) = std::env::var_os(var) else { return default };
     raw.to_str().and_then(|value| value.trim().parse().ok()).unwrap_or_else(|| {
         warn!(target: "execution_access", var, "unparsable handoff bound; using the default");
@@ -175,11 +175,36 @@ impl BlockAccessArtifact {
     pub fn output<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         Arc::clone(&self.output).downcast::<T>().ok()
     }
+}
 
-    /// How long this artifact has been waiting to be consumed.
-    pub fn residence(&self) -> std::time::Duration {
+impl HandoffEntry for BlockAccessArtifact {
+    fn block_hash(&self) -> B256 {
+        self.block_hash
+    }
+
+    fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+
+    fn residence(&self) -> std::time::Duration {
         self.captured_at.elapsed()
     }
+}
+
+/// What the bounded store needs to know about anything it carries.
+///
+/// The store's policy -- key by hash, never block, evict the oldest insert, tombstone what it
+/// dropped -- is the same policy for every artifact a producing node hands out of band, and it is
+/// subtle enough that a second copy of it would be a second thing to get wrong. This trait is the
+/// whole of what [`BoundedHandoff`] asks of an entry, so adding an artifact kind adds a key, a
+/// size, and an age rather than an eviction policy.
+pub trait HandoffEntry {
+    /// The hash this entry is filed and looked up under.
+    fn block_hash(&self) -> B256;
+    /// Rough heap footprint, used to hold the store near its byte budget.
+    fn approx_bytes(&self) -> usize;
+    /// How long this entry has been waiting to be consumed.
+    fn residence(&self) -> std::time::Duration;
 }
 
 /// A bounded map of artifacts keyed by block hash.
@@ -192,10 +217,10 @@ impl BlockAccessArtifact {
 /// still win a reorg, and discarding it because a competing block was committed would remove the
 /// artifact precisely when it is about to be needed.
 #[derive(Debug)]
-pub struct BlockAccessHandoff {
+pub struct BoundedHandoff<A> {
     capacity: usize,
     max_bytes: usize,
-    inner: Mutex<HandoffInner>,
+    inner: Mutex<HandoffInner<A>>,
     /// Hashes dropped because [`Self::insert`] could not take `inner`.
     ///
     /// It cannot live inside `HandoffInner`, because the drop happens exactly when that lock is
@@ -206,7 +231,10 @@ pub struct BlockAccessHandoff {
     metrics: HandoffMetrics,
 }
 
-impl BlockAccessHandoff {
+/// The access-set store the engine publishes to.
+pub type BlockAccessHandoff = BoundedHandoff<BlockAccessArtifact>;
+
+impl<A: HandoffEntry> BoundedHandoff<A> {
     /// Creates a store bounded by both an artifact count and an access-set byte budget.
     pub fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
@@ -223,24 +251,24 @@ impl BlockAccessHandoff {
     /// Returns `false` if the artifact was dropped. This never blocks: a contended lock drops
     /// rather than waits, because the producer here is a node's block-validation path and the
     /// consumer is not something it should ever be scheduled behind.
-    pub fn insert(&self, artifact: BlockAccessArtifact) -> bool {
+    pub fn insert(&self, artifact: A) -> bool {
         let mut inner = match self.inner.try_lock() {
             Ok(inner) => inner,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => {
                 self.metrics.dropped_contended.fetch_add(1, Ordering::Relaxed);
-                self.entomb_contended(artifact.block_hash);
+                self.entomb_contended(artifact.block_hash());
                 return false
             }
         };
 
         // Re-executing a block replaces its artifact rather than accumulating one per attempt.
-        if inner.remove(&artifact.block_hash).is_some() {
+        if inner.remove(&artifact.block_hash()).is_some() {
             self.metrics.replaced.fetch_add(1, Ordering::Relaxed);
         }
 
         while inner.entries.len() >= self.capacity ||
-            (!inner.entries.is_empty() && inner.bytes + artifact.approx_bytes > self.max_bytes)
+            (!inner.entries.is_empty() && inner.bytes + artifact.approx_bytes() > self.max_bytes)
         {
             let Some(oldest) = inner.order.front().copied() else { break };
             // Which bound forced this out, recorded before the removal changes either measure.
@@ -265,7 +293,7 @@ impl BlockAccessHandoff {
     ///
     /// Lookup is by exact hash and never by height, so a consumer can never be handed a sibling's
     /// execution by accident.
-    pub fn take(&self, block_hash: &B256) -> Option<BlockAccessArtifact> {
+    pub fn take(&self, block_hash: &B256) -> Option<A> {
         self.take_outcome(block_hash).artifact()
     }
 
@@ -276,7 +304,7 @@ impl BlockAccessHandoff {
     /// evidence for any *particular* miss, and it silently conflates a sibling that was never
     /// published with one that was published and evicted. Since the stage 4 gate is stated per
     /// miss, the attribution has to be per miss.
-    pub fn take_outcome(&self, block_hash: &B256) -> TakeOutcome {
+    pub fn take_outcome(&self, block_hash: &B256) -> TakeOutcome<A> {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
@@ -363,21 +391,20 @@ impl BlockAccessHandoff {
 
 /// What a take found, and when it found nothing, why.
 ///
-/// The variants differ in size by the width of an artifact, which clippy would rather see boxed.
-/// Boxing it would add an allocation to every successful take in exchange for shrinking a value
-/// that is constructed once per block and consumed immediately, so the lint is declined here.
-#[expect(clippy::large_enum_variant, reason = "boxing costs an allocation per take")]
+/// The variants differ in size by the width of an artifact, which would be worth boxing if the
+/// value lived anywhere. It does not: it is constructed once per block and consumed immediately,
+/// so boxing would trade an allocation on every successful take for a smaller temporary.
 #[derive(Debug)]
-pub enum TakeOutcome {
+pub enum TakeOutcome<A> {
     /// The artifact for the requested hash.
-    Hit(BlockAccessArtifact),
+    Hit(A),
     /// No artifact, with the cause as far as this store can attest to it.
     Miss(MissReason),
 }
 
-impl TakeOutcome {
+impl<A> TakeOutcome<A> {
     /// The artifact, discarding the miss reason.
-    pub fn artifact(self) -> Option<BlockAccessArtifact> {
+    pub fn artifact(self) -> Option<A> {
         match self {
             Self::Hit(artifact) => Some(artifact),
             Self::Miss(_) => None,
@@ -456,10 +483,10 @@ pub struct HandoffStats {
     pub mean_depth_at_take: Option<f64>,
 }
 
-#[derive(Debug, Default)]
-struct HandoffInner {
+#[derive(Debug)]
+struct HandoffInner<A> {
     order: VecDeque<B256>,
-    entries: HashMap<B256, BlockAccessArtifact>,
+    entries: HashMap<B256, A>,
     bytes: usize,
     /// Hashes this store evicted, newest last, so a later miss on one can name its cause.
     ///
@@ -469,16 +496,28 @@ struct HandoffInner {
     tombstones: VecDeque<(B256, MissReason)>,
 }
 
-impl HandoffInner {
-    fn insert(&mut self, artifact: BlockAccessArtifact) {
-        self.bytes += artifact.approx_bytes;
-        self.order.push_back(artifact.block_hash);
-        self.entries.insert(artifact.block_hash, artifact);
+/// Hand-written because `derive(Default)` would demand `A: Default`, which no artifact is.
+impl<A> Default for HandoffInner<A> {
+    fn default() -> Self {
+        Self {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+            bytes: 0,
+            tombstones: VecDeque::new(),
+        }
+    }
+}
+
+impl<A: HandoffEntry> HandoffInner<A> {
+    fn insert(&mut self, artifact: A) {
+        self.bytes += artifact.approx_bytes();
+        self.order.push_back(artifact.block_hash());
+        self.entries.insert(artifact.block_hash(), artifact);
     }
 
-    fn remove(&mut self, block_hash: &B256) -> Option<BlockAccessArtifact> {
+    fn remove(&mut self, block_hash: &B256) -> Option<A> {
         let artifact = self.entries.remove(block_hash)?;
-        self.bytes = self.bytes.saturating_sub(artifact.approx_bytes);
+        self.bytes = self.bytes.saturating_sub(artifact.approx_bytes());
         if let Some(position) = self.order.iter().position(|hash| hash == block_hash) {
             self.order.remove(position);
         }
