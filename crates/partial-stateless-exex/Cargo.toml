@@ -49,6 +49,7 @@ revm = { workspace = true }
 
 # our cache crate and the database-free validator core it drives
 partial-stateless = { path = "../partial-stateless" }
+partial-stateless-stream = { path = "../partial-stateless-stream" }
 partial-stateless-validator = { path = "../partial-stateless-validator" }
 
 # alloy

@@ -19,6 +19,7 @@ pub mod bootstrap_io;
 pub mod cold_eoa;
 pub mod payload_tap;
 pub mod rebuild;
+pub mod recorder;
 
 mod benchmark;
 mod sidecar_create;
@@ -39,7 +40,10 @@ use partial_stateless::{
         ReadyParent,
     },
     sidecar::last_n_blocks_cache_policy_id,
-    PartialStatelessSidecar, PartialTrieNodeCache,
+    CacheAnchor, PartialStatelessSidecar, PartialTrieNodeCache,
+};
+use partial_stateless_stream::{
+    BlockRef as StreamBlockRef, CommitInput, CommitOracle, RecordedVerdict, Reorg, ResetReason,
 };
 use partial_stateless_validator::{
     admit_block, block_context, inject_recovery, BlockAdmission, CanonicalStateRoots,
@@ -49,7 +53,7 @@ use reth_ethereum::{
     chainspec::EthChainSpec,
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::api::{FullNodeComponents, NodeTypes},
-    provider::StateProviderFactory,
+    provider::{Chain, StateProviderFactory},
     EthPrimitives,
 };
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -321,8 +325,12 @@ impl RunOptions {
             bootstrap_dir: std::env::var_os("PS_BOOTSTRAP_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| sidecar_dir.join("bootstrap")),
-            // The self-test needs a package to restore from, so it implies the export.
-            bootstrap_export: env_flag("PS_BOOTSTRAP_EXPORT") || bootstrap_self_test_blocks > 0,
+            // Both the self-test and the recorder need a package to restore from, so both imply
+            // the export. A recording run without one would write a manifest and then nothing,
+            // because a commit before the checkpoint is a commit no consumer could replay.
+            bootstrap_export: env_flag("PS_BOOTSTRAP_EXPORT") ||
+                bootstrap_self_test_blocks > 0 ||
+                std::env::var_os("PS_STREAM_DIR").is_some(),
             bootstrap_import: env_flag("PS_BOOTSTRAP_IMPORT"),
             bootstrap_self_test_blocks,
             payload_tap: payload_tap::tap_enabled(),
@@ -565,6 +573,18 @@ where
 
     let mut pair = load_initial_pair(&options, &cache_path, ctx.head.number);
     let mut gate = BootstrapGate::new(&options);
+    // Built before the first notification so a misconfigured spool fails the run at startup rather
+    // than after the snapshot export has already been paid for.
+    let mut recorder = recorder::StreamRecorder::from_env()?;
+    if let Some(recorder) = recorder.as_mut() {
+        recorder.write_manifest(
+            ctx.config.chain.chain().id(),
+            ctx.config.chain.genesis_hash(),
+            options.config.cache_policy_id(),
+            options.config.account_window,
+            options.config.storage_window,
+        );
+    }
     // A rebuild that keeps failing is almost always a persistent condition — pruned history, or a
     // provider that cannot reach far enough back — and retrying it every block would spend the
     // whole run re-executing windows that never install.
@@ -595,6 +615,7 @@ where
                         &mut pair,
                         &mut gate,
                         &mut rebuild_failures,
+                        recorder.as_mut(),
                         block,
                     ) {
                         return Err(eyre::eyre!("block {block_number} failed: {err:#}"))
@@ -603,7 +624,11 @@ where
 
                 // Cache persistence is unrelated to validation and can perturb later
                 // Engine samples, so the bounded paired benchmark keeps it in memory only.
-                persist_cache(&options, &pair, &cache_path, tip_block, true);
+                if persist_cache(&options, &pair, &cache_path, tip_block, true) &&
+                    let Some(recorder) = recorder.as_mut()
+                {
+                    recorder.note_durable(tip_block);
+                }
             }
             ExExNotification::ChainReorged { old, new } => {
                 let tip_block = *new.range().end();
@@ -631,6 +656,11 @@ where
                     ancestor_hash,
                     &mut rebuild_failures,
                 );
+                // Written before the winning branch's commits, so a consumer learns which blocks
+                // left the chain before it is asked to apply the ones that replaced them.
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.write_reorg(branch_change(old, Some(new)));
+                }
 
                 // Apply the new canonical chain block-by-block, so the builder still produces a
                 // sidecar for each block on the new branch. Rebuilding directly at the new tip
@@ -642,6 +672,7 @@ where
                         &mut pair,
                         &mut gate,
                         &mut rebuild_failures,
+                        recorder.as_mut(),
                         block,
                     ) {
                         return Err(eyre::eyre!("reorg block {block_number} failed: {err:#}"))
@@ -650,7 +681,11 @@ where
 
                 // Production persists the rebuilt cache so a restart cannot reload the old
                 // branch. Benchmark mode deliberately keeps all cache state in memory.
-                persist_cache(&options, &pair, &cache_path, tip_block, true);
+                if persist_cache(&options, &pair, &cache_path, tip_block, true) &&
+                    let Some(recorder) = recorder.as_mut()
+                {
+                    recorder.note_durable(tip_block);
+                }
             }
             ExExNotification::ChainReverted { old } => {
                 // The new tip is the parent of the reverted chain's first block. Addressing it by
@@ -672,16 +707,21 @@ where
                     new_tip_hash,
                     &mut rebuild_failures,
                 );
+                // A pure revert: the same event with no winning tip, because nothing replaces the
+                // abandoned blocks. Collapsing it into the reorg variant keeps a consumer from
+                // needing two ways to unwind.
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.write_reorg(branch_change(old, None));
+                }
 
                 // A pair that could not be rebuilt still describes the reverted branch, and
                 // persisting it would let a restart reload exactly that.
-                persist_cache(
-                    &options,
-                    &pair,
-                    &cache_path,
-                    old.range().start().saturating_sub(1),
-                    recovered,
-                );
+                let durable = old.range().start().saturating_sub(1);
+                if persist_cache(&options, &pair, &cache_path, durable, recovered) &&
+                    let Some(recorder) = recorder.as_mut()
+                {
+                    recorder.note_durable(durable);
+                }
             }
         }
 
@@ -732,22 +772,51 @@ where
         }
     }
 
+    // The notification stream ended, which is a clean shutdown. A corpus without this frame was
+    // cut, and a reader is entitled to tell the two apart.
+    if let Some(recorder) = recorder.as_mut() {
+        recorder.write_end("exex notification stream ended");
+    }
+
     Ok(())
+}
+
+/// Describes a branch change as the stream's one unwind event.
+///
+/// A pure revert is `new = None`: the same abandoned list, no winning tip. Two event kinds would
+/// mean two ways for a consumer to unwind, and the second one would be the one nothing exercises.
+fn branch_change(old: &Chain, new: Option<&Chain>) -> Reorg {
+    let block_ref = |block: &RecoveredBlock<BlockTy<EthPrimitives>>| StreamBlockRef {
+        number: block.number(),
+        hash: block.hash(),
+    };
+    // The common ancestor by hash rather than by height, for the reason the recovery path already
+    // addresses it that way: mid-reorg a height names whichever block the database calls canonical.
+    let first_abandoned = old.blocks().values().next();
+    Reorg {
+        common_ancestor: StreamBlockRef {
+            number: old.range().start().saturating_sub(1),
+            hash: first_abandoned.map(|block| block.parent_hash).unwrap_or_default(),
+        },
+        abandoned: old.blocks().values().map(block_ref).collect(),
+        winning_tip: new.and_then(|new| new.blocks().values().next_back()).map(block_ref),
+    }
 }
 
 /// Writes the flat cache to disk, unless the run is a bounded in-memory benchmark.
 ///
 /// `canonical` is false when the pair may still describe an abandoned branch, in which case
-/// persisting would let a restart reload exactly that.
+/// persisting would let a restart reload exactly that. Returns whether the cache is now durable
+/// through `block`, which is the fact a recorded commit reports and a restart resumes from.
 fn persist_cache(
     options: &RunOptions,
     pair: &LivePair,
     cache_path: &Path,
     block: u64,
     canonical: bool,
-) {
+) -> bool {
     if options.validation_bench || !canonical {
-        return
+        return false
     }
     if let Err(e) = save_to_file(&pair.cache, cache_path) {
         warn!(
@@ -756,7 +825,9 @@ fn persist_cache(
             error = %e,
             "Failed to save cache state to disk"
         );
+        return false
     }
+    true
 }
 
 /// Builds the coordinated pair this run starts from.
@@ -1044,6 +1115,7 @@ fn process_canonical_block<Node>(
     pair: &mut LivePair,
     gate: &mut BootstrapGate,
     rebuild_failures: &mut u32,
+    mut recorder: Option<&mut recorder::StreamRecorder>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
 ) -> eyre::Result<()>
 where
@@ -1054,9 +1126,11 @@ where
     // Taken before anything else this block triggers. The handoff records how long each artifact
     // waited, and a take deferred behind sidecar construction would report a residence no real
     // consumer would ever see.
-    if options.payload_tap {
-        report_payload_tap(block_number, block.hash(), &payload_tap::tap_payload(block));
-    }
+    let tapped = options.payload_tap.then(|| {
+        let tapped = payload_tap::tap_payload(block);
+        report_payload_tap(block_number, block.hash(), &tapped);
+        tapped
+    });
     let block_ctx = block_context(block);
     let ready_parent = match admit_block(&mut pair.readiness, &block_ctx) {
         BlockAdmission::Admitted(ready_parent) => ready_parent,
@@ -1128,6 +1202,9 @@ where
             block.clone_sealed_header(),
             options.retain_generation,
         );
+        // Deliberately no frame. A verifier's outcome is a second opinion about a sidecar someone
+        // else built, and recording it as the producer's own would put a consumer's verdict where
+        // a producer's belongs.
         return Ok(())
     }
 
@@ -1171,6 +1248,7 @@ where
                 .map_err(Into::into)
         };
 
+    let records_commits = recorder.as_ref().is_some_and(|recorder| recorder.records_commits());
     let report = create_sidecar_for_block(
         node_rules(ctx),
         state_provider.as_ref(),
@@ -1183,7 +1261,9 @@ where
                 .parallel_initial_proof
                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
             ready_parent.as_ref(),
-            gate.wants_sidecar(),
+            // The recorder needs the sidecar as a value, and the builder otherwise hands back
+            // only the path it wrote it to.
+            gate.wants_sidecar() || records_commits,
             retained_generation,
         ),
         parent_state_root_by_hash,
@@ -1205,7 +1285,112 @@ where
         options.retain_generation,
     );
 
-    advance_bootstrap_gate(ctx, options, pair, gate, block, sidecar)
+    // After the transition, so the fingerprints describe the generation this block produced rather
+    // than the one it displaced, and before the bootstrap gate, which touches only its own shadow.
+    if let Some(recorder) = recorder.as_deref_mut() {
+        record_commit(recorder, options, pair, block, sidecar.as_ref(), tapped);
+    }
+
+    advance_bootstrap_gate(ctx, options, pair, gate, recorder, block, sidecar.as_ref())
+}
+
+/// Writes one commit frame: the block's input, and what this producer concluded about it.
+///
+/// **What the oracle's fields are worth is not uniform, and pretending otherwise would overstate
+/// the gate.** `next_cache_anchor` is read off the pair's own post-transition state rather than
+/// copied out of the sidecar, so it is the producer's result; `expected_miss` is the sidecar's
+/// claim, which on a builder-recorded stream is the same value the producer computed, so a replay
+/// comparing against it is checking its own derivation against the producer's rather than against
+/// an independent third value. The fields with real teeth are the two fingerprints: the trie cache
+/// root commits retained-path membership, which appears in no sidecar and which a replay computes
+/// entirely on its own.
+fn record_commit(
+    recorder: &mut recorder::StreamRecorder,
+    options: &RunOptions,
+    pair: &LivePair,
+    block: &RecoveredBlock<BlockTy<EthPrimitives>>,
+    sidecar: Option<&PartialStatelessSidecar>,
+    tapped: Option<payload_tap::TappedPayload>,
+) {
+    let Some(sidecar) = sidecar else {
+        // A block that published no sidecar cannot be replayed by anything, so recording it would
+        // add a frame no consumer could use and cost the stream its contiguity claim.
+        recorder.write_reset(
+            ResetReason::Gap,
+            format!("block {} produced no sidecar to record", block.number()),
+        );
+        return
+    };
+    let sidecar_bytes = match bincode::serialize(sidecar) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            recorder.write_reset(
+                ResetReason::Gap,
+                format!("block {} sidecar failed to serialize: {err}", block.number()),
+            );
+            return
+        }
+    };
+    let (payload_json, payload_provenance) = match tapped {
+        Some(tapped) => {
+            let json = tapped.payload.as_ref().and_then(|payload| {
+                serde_json::to_vec(payload)
+                    .inspect_err(|err| {
+                        warn!(
+                            target: "partial_stateless_stream",
+                            block = block.number(),
+                            error = %err,
+                            "Engine payload could not be serialized; recording the commit without \
+                             one rather than with a payload no consumer could parse"
+                        );
+                    })
+                    .ok()
+            });
+            // A payload that failed to serialize is an absent payload and not a witnessed one: the
+            // provenance describes what the frame carries, never what the producer held.
+            let provenance = if json.is_some() {
+                tapped.provenance
+            } else {
+                payload_tap::PayloadProvenance::Absent
+            };
+            (json, provenance)
+        }
+        None => (None, payload_tap::PayloadProvenance::Absent),
+    };
+
+    let fingerprint = pair.fingerprint();
+    let lifecycle = pair.lifecycle_fingerprint();
+    let input = CommitInput {
+        block: StreamBlockRef { number: block.number(), hash: block.hash() },
+        parent_hash: block.parent_hash,
+        payload_provenance,
+        payload_json,
+        sidecar: sidecar_bytes,
+    };
+    let oracle = CommitOracle {
+        verdict: RecordedVerdict::Accepted,
+        state_root: Some(block.state_root()),
+        next_cache_anchor: Some(CacheAnchor {
+            block_number: block.number(),
+            block_hash: block.hash(),
+            cache_policy_id: options.config.cache_policy_id(),
+            cache_root: fingerprint.cache_root,
+        }),
+        expected_miss: Some(sidecar.cache_miss_targets.clone()),
+        readiness_state: pair.readiness.state().label().to_string(),
+        readiness_watermark: pair
+            .readiness
+            .acknowledgeable_height()
+            .map(|(number, hash)| StreamBlockRef { number, hash }),
+        // Filled in by the recorder, which is the only thing that knows it.
+        durability_watermark: None,
+        retained_generation: lifecycle
+            .retained_generation
+            .map(|(number, hash)| StreamBlockRef { number, hash }),
+        coordinated_fingerprint: fingerprint,
+        lifecycle_fingerprint: lifecycle,
+    };
+    recorder.write_commit(input, oracle);
 }
 
 /// Logs one block's payload provenance, and drops the payload.
@@ -1291,8 +1476,9 @@ fn advance_bootstrap_gate<Node>(
     options: &RunOptions,
     pair: &mut LivePair,
     gate: &mut BootstrapGate,
+    recorder: Option<&mut recorder::StreamRecorder>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
-    sidecar: Option<PartialStatelessSidecar>,
+    sidecar: Option<&PartialStatelessSidecar>,
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
@@ -1320,7 +1506,7 @@ where
             node_rules(ctx),
             block,
             &mut shadow.pair.coordinated.cache,
-            &sidecar,
+            sidecar,
             options.config.cache_policy_id(),
             &options.reexec_limits,
             &mut shadow.pair.coordinated.trie_cache,
@@ -1404,6 +1590,24 @@ where
             return Ok(())
         }
     };
+
+    // Written from the file rather than from the in-memory package, so the stream carries exactly
+    // the bytes an operator would ship and a mismatch between the two cannot hide here.
+    if let Some(recorder) = recorder {
+        match std::fs::read(&exported.package_path) {
+            Ok(package) => {
+                recorder.write_checkpoint(&exported.checkpoint, pair.accepted_parent(), &package)
+            }
+            Err(err) => {
+                error!(
+                    target: "partial_stateless_stream",
+                    path = %exported.package_path.display(),
+                    error = %err,
+                    "Could not read back the exported snapshot; this stream records no commits"
+                );
+            }
+        }
+    }
 
     if gate.self_test_blocks > 0 {
         let restored = bootstrap_io::restore_snapshot(
