@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Reads an alternating replay A/B and reports the paired per-block difference.
+"""Reads an alternating replay A/B and reports what it can and cannot resolve.
 
-The pairing is the point. Every block the control arm replayed is the same block, byte for byte,
-that the candidate arm replayed, so the per-block difference has no workload variance in it at all
--- which is exactly what a live paired run cannot offer. What is left is host noise, and the
-round-to-round spread within one arm is the honest estimate of it.
+The pairing is real: every block the control arm replayed is the same block, byte for byte, that
+the candidate arm replayed, so the per-block difference carries no workload variance at all. That
+is what a live paired run cannot offer, and it is the whole reason the corpus exists.
 
-Read the two numbers together and in this order:
+**Pairing does not remove host noise, and on a busy host the host noise is larger.** The
+interference is per *process*, not per block: when a round is slow, every block in it is slow
+together, so averaging blocks within a round does not average the noise away. Read the output in
+this order, and stop at the first line that disqualifies the rest:
 
-  1. `within-arm spread` -- how much one arm moved across rounds with nothing changed. Any
-     difference between arms smaller than this is not a result.
-  2. `paired delta` -- the median per-block candidate-minus-control, over blocks present in both.
+  1. `per-block spread` -- the same block, same binary, across rounds. This is the noise floor.
+     Anything below it is not a result, no matter how the arms compare.
+  2. `min statistic` -- per block, the fastest round in each arm. Interference only ever *adds*
+     time, so the minimum is the least contaminated estimate available. Prefer it.
+  3. `median statistic` -- the same comparison over per-block medians. It inherits the round-level
+     noise through whichever arm happened to catch more slow rounds, which is exactly the failure
+     mode a five-round run is most exposed to. Reported so the two can be compared, not trusted
+     over the minimum.
 
 Usage: analyze_replay_ab.py <ab.jsonl>
 """
@@ -19,26 +26,18 @@ import statistics
 import sys
 from collections import defaultdict
 
-
-def load(path):
-    runs = []
-    with open(path) as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                runs.append(json.loads(line))
-    return runs
-
-
-def arm(label):
-    return label.split("-r")[0]
+# Arms are named, never inferred from sort order: reporting "A minus B" when the reader asked for
+# "candidate minus control" inverts the sign of every conclusion drawn from it.
+CONTROL = "control"
+CANDIDATE = "candidate"
+FIELDS = ("admission_us", "transition_us")
 
 
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
-    runs = load(sys.argv[1])
+    runs = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
     if not runs:
         print("no records")
         return 1
@@ -52,56 +51,70 @@ def main():
 
     arms = defaultdict(list)
     for run in runs:
-        arms[arm(run["label"])].append(run)
+        arms[run["label"].split("-r")[0]].append(run)
 
-    print(f"corpus: {runs[0]['commits']} commits "
-          f"({runs[0]['witnessed']} witnessed, {runs[0]['reconstructed']} reconstructed, "
-          f"{runs[0]['absent']} absent)")
-    if not runs[0].get("admission_is_load_bearing"):
+    first = runs[0]
+    print(f"corpus: {first['commits']} commits ({first['witnessed']} witnessed, "
+          f"{first['reconstructed']} reconstructed, {first['absent']} absent)")
+    if not first.get("admission_is_load_bearing"):
         print("  WARNING: no witnessed payload in this corpus. The admission checks ran and "
               "proved nothing about the rules.")
-    print()
 
-    for name, group in sorted(arms.items()):
-        totals = [r["transition_us"] + r["admission_us"] for r in group]
-        spread = (max(totals) - min(totals)) / statistics.mean(totals) * 100 if totals else 0
-        print(f"{name}: {len(group)} rounds, "
-              f"total {statistics.mean(totals) / 1000:.1f} ms mean, "
-              f"within-arm spread {spread:.2f}%")
+    print("\nround totals (admission + transition):")
+    for name in sorted(arms):
+        totals = [(r["admission_us"] + r["transition_us"]) / 1000 for r in arms[name]]
+        print(f"  {name:10s} {len(totals)} rounds: "
+              + " ".join(f"{t:8.1f}" for t in sorted(totals))
+              + f"   median {statistics.median(totals):8.1f} ms")
 
-    if len(arms) != 2:
-        print("\nonly one arm present; nothing to compare")
-        return 0
+    if CONTROL not in arms or CANDIDATE not in arms:
+        print(f"\nneed both {CONTROL!r} and {CANDIDATE!r} arms; found {sorted(arms)}")
+        return 1
 
-    control_name, candidate_name = sorted(arms)
-    control = per_block(arms[control_name])
-    candidate = per_block(arms[candidate_name])
-    shared = sorted(set(control) & set(candidate))
-    if not shared:
+    control = per_block(arms[CONTROL])
+    candidate = per_block(arms[CANDIDATE])
+    blocks = sorted(set(control) & set(candidate))
+    if not blocks:
         print("\nno block replayed by both arms")
         return 1
 
-    print(f"\npaired over {len(shared)} blocks, {candidate_name} minus {control_name}:")
-    for field in ("admission_us", "transition_us"):
-        deltas = [candidate[b][field] - control[b][field] for b in shared]
-        base = statistics.median([control[b][field] for b in shared])
-        median = statistics.median(deltas)
-        pct = median / base * 100 if base else 0
-        print(f"  {field:14s} median {median:+.0f} us on a {base:.0f} us base ({pct:+.2f}%)")
+    print(f"\nper-block spread, same block and same binary across {len(arms[CONTROL])} rounds:")
+    for field in FIELDS:
+        spreads = [
+            (max(control[b][field]) - min(control[b][field])) / min(control[b][field]) * 100
+            for b in blocks if min(control[b][field]) > 0
+        ]
+        print(f"  {field:14s} median {statistics.median(spreads):6.2f}%  "
+              f"p90 {quantile(spreads, 0.9):6.2f}%   <-- nothing below this is a result")
+
+    for stat, reduce in (("min", min), ("median", statistics.median)):
+        print(f"\n{stat} statistic, paired over {len(blocks)} blocks, "
+              f"{CANDIDATE} minus {CONTROL}:")
+        for field in FIELDS:
+            base = [reduce(control[b][field]) for b in blocks]
+            deltas = [
+                (reduce(candidate[b][field]) - c) / c * 100
+                for b, c in zip(blocks, base) if c > 0
+            ]
+            print(f"  {field:14s} median {statistics.median(deltas):+6.2f}%  "
+                  f"(p10 {quantile(deltas, 0.1):+6.2f}%, p90 {quantile(deltas, 0.9):+6.2f}%)"
+                  f"   base {statistics.median(base) / 1000:8.2f} ms")
     return 0
 
 
 def per_block(group):
-    """Median per-block cost across an arm's rounds, keyed by block number."""
+    """Every round's cost for every block, keyed by block number then field."""
     gathered = defaultdict(lambda: defaultdict(list))
     for run in group:
         for block in run["blocks"]:
-            gathered[block["number"]]["admission_us"].append(block["admission_us"])
-            gathered[block["number"]]["transition_us"].append(block["transition_us"])
-    return {
-        number: {field: statistics.median(values) for field, values in fields.items()}
-        for number, fields in gathered.items()
-    }
+            for field in FIELDS:
+                gathered[block["number"]][field].append(block[field])
+    return gathered
+
+
+def quantile(values, fraction):
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * fraction))]
 
 
 if __name__ == "__main__":
