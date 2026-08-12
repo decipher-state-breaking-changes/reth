@@ -35,7 +35,12 @@ OUT_DIR=$2
 shift 2
 
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-PS_REPLAY_BIN=${PS_REPLAY_BIN:-"$REPO_ROOT/target/release/ps-replay"}
+if [ -z "${PS_REPLAY_BIN:-}" ]; then
+    # The workspace may redirect its target directory; ask cargo rather than guessing.
+    TARGET_DIR=$(cd "$REPO_ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null |
+        sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+    PS_REPLAY_BIN="${TARGET_DIR:-$REPO_ROOT/target}/release/ps-replay"
+fi
 if [ ! -x "$PS_REPLAY_BIN" ]; then
     echo "error: $PS_REPLAY_BIN is not built; run: cargo build --release -p partial-stateless-replay" >&2
     exit 1
