@@ -296,7 +296,7 @@ impl CoordinatedPair {
 /// comparing it covers "retained paths" without walking them. `cache_root` hashes every flat
 /// value *and* its `last_accessed_block`, which is the only complete check on the replay metadata
 /// a state proof cannot attest to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CoordinatedFingerprint {
     pub cache_block: u64,
     pub cache_root: B256,
@@ -326,7 +326,7 @@ pub struct RetainedGeneration {
 /// Deliberately not part of [`CoordinatedFingerprint`]. That one answers "are these the same cache
 /// generation", which a snapshot restore reproduces exactly; this one answers "did they get here
 /// by applying the same blocks", which a snapshot restore by construction does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct LifecycleFingerprint {
     /// Number and hash of the block this pair is the state after.
     pub accepted_head: Option<(u64, B256)>,

@@ -6511,6 +6511,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "partial-stateless-stream"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "bincode",
+ "partial-stateless",
+ "partial-stateless-validator",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "partial-stateless-validator"
 version = "0.1.0"
 dependencies = [

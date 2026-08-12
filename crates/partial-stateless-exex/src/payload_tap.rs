@@ -17,6 +17,7 @@
 //! read at all.
 
 use alloy_rpc_types_engine::ExecutionData;
+pub use partial_stateless_validator::PayloadProvenance;
 use reth_ethereum::EthPrimitives;
 use reth_execution_access::{
     global_payload_handoff, payload_capture_enabled, HandoffEntry, HandoffStats, MissReason,
@@ -50,49 +51,6 @@ pub struct TappedPayload {
     pub witnessed_total: u64,
     /// Payloads derived so far in this process.
     pub reconstructed_total: u64,
-}
-
-/// Where a recorded payload came from, and therefore what a check against it is worth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PayloadProvenance {
-    /// The payload a consensus client sent, taken from the Engine that validated it.
-    ///
-    /// The only provenance under which the payload-layout, block-hash, and versioned-hash checks
-    /// are checks rather than tautologies.
-    Witnessed,
-    /// Derived from the block, because this run was capturing and the Engine's copy was not there.
-    ///
-    /// Structural for two cases rather than exceptional in either: blocks replayed from the ExEx
-    /// WAL after a restart were validated by a process that no longer exists, and backfilled
-    /// blocks were never handed to this node's Engine as payloads at all. Both leave the handoff
-    /// with nothing to give, and `miss_reason` names which.
-    Reconstructed,
-    /// No payload was obtained, and none was derived.
-    ///
-    /// What a run that is not capturing reports. Kept distinct from `Reconstructed` for exactly
-    /// the reason `None` is kept distinct from `Some(0)` in the admission timings: "nobody asked"
-    /// and "asked and had to fall back" are different facts about the run.
-    Absent,
-}
-
-impl PayloadProvenance {
-    /// Stable name for telemetry.
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Witnessed => "witnessed",
-            Self::Reconstructed => "reconstructed",
-            Self::Absent => "absent",
-        }
-    }
-
-    /// Whether the standalone validator's admission checks would be checking anything.
-    ///
-    /// False on a reconstruction, which is not a defect of the reconstruction: a vacuous pass is
-    /// reported as provenance rather than counted as coverage.
-    pub const fn is_load_bearing(&self) -> bool {
-        matches!(self, Self::Witnessed)
-    }
 }
 
 /// Whether payload capture is armed for this process.
@@ -194,27 +152,6 @@ impl TapTotals {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The counts a frame writer reports have to survive the round trip through `as_str`, because
-    /// they are compared across processes rather than within one.
-    #[test]
-    fn provenance_names_are_stable_and_distinct() {
-        let names = [
-            PayloadProvenance::Witnessed.as_str(),
-            PayloadProvenance::Reconstructed.as_str(),
-            PayloadProvenance::Absent.as_str(),
-        ];
-        assert_eq!(names, ["witnessed", "reconstructed", "absent"]);
-    }
-
-    /// Only a witnessed payload makes the admission checks mean anything. A reconstruction is
-    /// recorded, not credited.
-    #[test]
-    fn only_a_witnessed_payload_is_load_bearing() {
-        assert!(PayloadProvenance::Witnessed.is_load_bearing());
-        assert!(!PayloadProvenance::Reconstructed.is_load_bearing());
-        assert!(!PayloadProvenance::Absent.is_load_bearing());
-    }
 
     /// A process that was never asked to capture reports absence rather than fabricating a
     /// payload, so a corpus recorded by accident cannot look like one recorded on purpose.

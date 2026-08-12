@@ -1,0 +1,38 @@
+[package]
+name = "partial-stateless-stream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Wire format for recording, replaying, and delivering partial-stateless validation events"
+
+[lib]
+name = "partial_stateless_stream"
+path = "src/lib.rs"
+
+[features]
+# Mirrors `partial-stateless-validator`, and for the same reason: this package is built on its own
+# by the replay driver, and features unify per package, so a package that does not declare these is
+# silently built without them. See `check_validator_isolation.sh`, which runs against this package
+# too.
+default = ["asm-keccak", "keccak-cache-global"]
+
+asm-keccak = ["alloy-primitives/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+
+[dependencies]
+# The dependency arrow points this way and never the other way. That is the whole of the oracle
+# isolation: `CommitOracle` lives here, so `partial-stateless-validator` cannot name it, and no
+# amount of carelessness inside the validator can turn a recorded expectation into an input.
+partial-stateless = { path = "../partial-stateless" }
+partial-stateless-validator = { path = "../partial-stateless-validator" }
+
+alloy-primitives.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
+
+bincode.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true

@@ -325,6 +325,59 @@ impl AdmissionTimings {
     }
 }
 
+/// Where the input a validator admitted came from, and therefore what admitting it proves.
+///
+/// [`AdmissionSource`] says which entry point ran; this says whether the checks that entry point
+/// performed were checking anything. The two are independent and both are needed: a standalone
+/// validator always reports `ExecutionData`, and a run whose payloads were all derived from blocks
+/// this node had already accepted has still exercised the *code* while proving nothing about the
+/// *rules*.
+///
+/// The same discipline as [`AdmissionTimings`]'s nullability, applied to inputs rather than costs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadProvenance {
+    /// The payload a consensus client sent, taken from the Engine that validated it.
+    ///
+    /// The only provenance under which the payload-layout, block-hash, and versioned-hash checks
+    /// are checks rather than tautologies.
+    Witnessed,
+    /// Derived from a block, because the producer was capturing and had no Engine copy to give.
+    ///
+    /// Structural rather than exceptional for two cases: blocks replayed from an ExEx WAL after a
+    /// restart were validated by a process that no longer exists, and backfilled blocks were never
+    /// handed to an Engine as payloads at all. Deriving a payload from a block hands the validator
+    /// the answers its own checks exist to question — the block hash is supplied rather than
+    /// announced, the versioned hashes are read back off the transactions they bind, and the
+    /// requests travel as a hash — so those checks pass without checking.
+    Reconstructed,
+    /// No payload was obtained and none was derived.
+    ///
+    /// The default because it is what a producer that was never asked to capture reports, and
+    /// because it is the only value that never overstates what a record contains.
+    #[default]
+    Absent,
+}
+
+impl PayloadProvenance {
+    /// Stable name for telemetry.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Witnessed => "witnessed",
+            Self::Reconstructed => "reconstructed",
+            Self::Absent => "absent",
+        }
+    }
+
+    /// Whether admitting this input would be checking anything.
+    ///
+    /// False on a reconstruction, which is not a defect of the reconstruction: a vacuous pass is
+    /// reported as provenance rather than counted as coverage.
+    pub const fn is_load_bearing(&self) -> bool {
+        matches!(self, Self::Witnessed)
+    }
+}
+
 /// Which entry point handed this validator its block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -494,5 +547,58 @@ impl ValidationPhaseTimings {
     pub fn set_deserialize_us(&mut self, deserialize_us: u64) {
         self.deserialize_us = deserialize_us;
         self.recompute_totals();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These names are compared across processes rather than within one — a recorder writes them
+    /// and a replay driver reads them back — so a rename is a corpus break rather than a cosmetic
+    /// change.
+    #[test]
+    fn provenance_names_are_stable_and_distinct() {
+        let names = [
+            PayloadProvenance::Witnessed.as_str(),
+            PayloadProvenance::Reconstructed.as_str(),
+            PayloadProvenance::Absent.as_str(),
+        ];
+        assert_eq!(names, ["witnessed", "reconstructed", "absent"]);
+    }
+
+    /// Only a witnessed payload makes the admission checks mean anything. A reconstruction is
+    /// recorded, not credited.
+    #[test]
+    fn only_a_witnessed_payload_is_load_bearing() {
+        assert!(PayloadProvenance::Witnessed.is_load_bearing());
+        assert!(!PayloadProvenance::Reconstructed.is_load_bearing());
+        assert!(!PayloadProvenance::Absent.is_load_bearing());
+    }
+
+    /// A record written before this field existed, and a producer that never captured, must read
+    /// as absence rather than as the strongest value.
+    #[test]
+    fn the_default_provenance_is_the_one_that_claims_least() {
+        assert_eq!(PayloadProvenance::default(), PayloadProvenance::Absent);
+    }
+
+    /// `None` and `Some(0)` are different facts about an admission phase: one says nobody ran it,
+    /// the other says it was free.
+    #[test]
+    fn an_unrun_admission_phase_costs_nothing_rather_than_zero() {
+        let unrun = AdmissionTimings::default();
+        assert_eq!(unrun.source, AdmissionSource::Recovered);
+        assert_eq!(unrun.payload_validation_us, None);
+        assert_eq!(unrun.total_us(), 0);
+
+        let ran = AdmissionTimings {
+            source: AdmissionSource::ExecutionData,
+            input_decode_us: Some(11),
+            payload_validation_us: Some(0),
+            sender_recovery_us: Some(22),
+            pre_execution_consensus_us: None,
+        };
+        assert_eq!(ran.total_us(), 33);
     }
 }

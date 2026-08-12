@@ -35,4 +35,4 @@ pub use reexec::{
     PostStateRootOracle, SidecarReexecLimits, SidecarValidationOutcome, TimedValidation,
     TrieCacheDisposition, ValidatorRules,
 };
-pub use timings::{AdmissionSource, AdmissionTimings, ValidationPhaseTimings};
+pub use timings::{AdmissionSource, AdmissionTimings, PayloadProvenance, ValidationPhaseTimings};
