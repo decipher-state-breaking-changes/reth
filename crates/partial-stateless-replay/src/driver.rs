@@ -89,6 +89,63 @@ pub struct ReplayReport {
     pub blocks: Vec<BlockTiming>,
     /// Whether the corpus ended with an `End` frame.
     pub closed: bool,
+    /// The fault that stopped the replay, when one did. Everything after it was skipped.
+    pub terminal: Option<String>,
+    /// Commit frames not replayed because a fault preceded them.
+    ///
+    /// Counted rather than reported one by one: before this existed, every commit after a fault
+    /// generated its own `BlockSkipped` failure string, and a single fault read as a cascade.
+    pub skipped_after_fault: u64,
+}
+
+/// Why a replay can go no further on this pair. Every variant names the block it stopped on.
+///
+/// This is the transaction boundary the ExEx never needed: its process fail-stops on the first
+/// error, so nothing ever observed the readiness tracker stranded in `Applying` after a
+/// post-execution rejection. A standalone driver outlives the rejection, so the boundary is made
+/// explicit here — the pair is moved to terminal `Blocked` before anything can observe it.
+#[derive(Debug, Clone)]
+pub enum ReplayFault {
+    /// A failure after admission, inside the transition. The flat and trie caches are preserved
+    /// at the parent generation (the transition's own rollback contract); readiness is moved to
+    /// terminal `Blocked` explicitly rather than left in transient `Applying`.
+    TransitionFailed {
+        /// The block the transition failed on.
+        block: BlockRef,
+        /// What the transition objected to.
+        detail: String,
+    },
+    /// The restored pair itself refused a block the recording accepted. The refusal latched the
+    /// tracker `Blocked`; the pair was not touched past that.
+    ReadinessRefused {
+        /// The block the pair refused.
+        block: BlockRef,
+        /// What readiness objected to.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ReplayFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransitionFailed { block, detail } => {
+                write!(f, "{}: the transition failed: {detail}", block_label(*block))
+            }
+            Self::ReadinessRefused { block, reason } => {
+                write!(f, "{}: the restored pair refused the block: {reason}", block_label(*block))
+            }
+        }
+    }
+}
+
+/// What one commit's replay did to the pair.
+enum CommitOutcome {
+    /// The commit ran to a verdict and was compared against the oracle.
+    Compared,
+    /// The commit could not run and touched no validator state; the next commit may proceed.
+    Rejected,
+    /// The pair can go no further; the driver must stop replaying commits.
+    Fault(ReplayFault),
 }
 
 /// What one replayed block cost.
@@ -145,6 +202,15 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
     let mut restored: Option<ReplayState> = None;
 
     for frame in spool.frames {
+        // A faulted pair replays nothing further. The remaining frames are counted rather than
+        // run: replaying commits against a blocked pair would generate one `BlockSkipped`
+        // failure per block, and a single fault would read as a cascade.
+        if report.terminal.is_some() {
+            if matches!(frame.event, StreamEvent::Commit(_)) {
+                report.skipped_after_fault += 1;
+            }
+            continue
+        }
         match frame.event {
             StreamEvent::Manifest(found) => {
                 info!(
@@ -185,7 +251,21 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     break
                 }
                 let (input, oracle) = commit.split();
-                replay_commit(state, input, &oracle, options, &mut report);
+                let block = input.block;
+                if let CommitOutcome::Fault(fault) =
+                    replay_commit(state, input, &oracle, options, &mut report)
+                {
+                    error!(
+                        target: "ps_replay",
+                        block = block.number,
+                        %fault,
+                        readiness = state.pair.readiness.state().label(),
+                        "The pair can go no further; the remaining commits are skipped, not \
+                         replayed"
+                    );
+                    report.failures.push(fault.to_string());
+                    report.terminal = Some(fault.to_string());
+                }
             }
             StreamEvent::Reorg(reorg) => {
                 // Recorded in v1 and not yet replayed: depth-1 rollback against the retained
@@ -353,13 +433,20 @@ fn chain_spec_for(manifest: &Manifest) -> eyre::Result<Arc<ChainSpec>> {
 }
 
 /// Runs one recorded commit through admission and the transition, then compares.
+///
+/// What each early return leaves behind is part of the contract, not an accident. A decode or
+/// admission failure touches no validator state — `UntrustedAdmission` is stateless with respect
+/// to the pair — so the next commit may still run ([`CommitOutcome::Rejected`]). Everything past
+/// `admit_block` has moved readiness to `Applying`, so a failure there must not return with the
+/// tracker still in that transient state: the ExEx's fail-stop masked exactly that leak, and a
+/// standalone driver that outlives the rejection makes it observable.
 fn replay_commit(
     state: &mut ReplayState,
     input: CommitInput,
     oracle: &CommitOracle,
     options: &ReplayOptions,
     report: &mut ReplayReport,
-) {
+) -> CommitOutcome {
     match input.payload_provenance {
         PayloadProvenance::Witnessed => report.witnessed += 1,
         PayloadProvenance::Reconstructed => report.reconstructed += 1,
@@ -373,18 +460,18 @@ fn replay_commit(
             report.failures.push(format!(
                 "{label}: the commit carries no payload, so admission could not run on it"
             ));
-            return
+            return CommitOutcome::Rejected
         }
         Err(err) => {
             report.failures.push(format!("{label}: recorded payload did not parse: {err}"));
-            return
+            return CommitOutcome::Rejected
         }
     };
     let sidecar: PartialStatelessSidecar = match bincode::deserialize(&input.sidecar) {
         Ok(sidecar) => sidecar,
         Err(err) => {
             report.failures.push(format!("{label}: recorded sidecar did not decode: {err}"));
-            return
+            return CommitOutcome::Rejected
         }
     };
 
@@ -405,7 +492,7 @@ fn replay_commit(
                 err.class()
             ));
             report.disagreements.extend(disagreements.into_iter().map(|d| (input.block, d)));
-            return
+            return CommitOutcome::Rejected
         }
     };
     let admission_us = admitted.timings.total_us();
@@ -413,8 +500,11 @@ fn replay_commit(
 
     let block_ctx = block_context(&admitted.block);
     if let BlockAdmission::Rejected(reason) = admit_block(&mut state.pair.readiness, &block_ctx) {
-        report.failures.push(format!("{label}: the restored pair refused the block: {reason:?}"));
-        return
+        // The refusal itself latched the tracker `Blocked`; the caches were never touched.
+        return CommitOutcome::Fault(ReplayFault::ReadinessRefused {
+            block: input.block,
+            reason: format!("{reason:?}"),
+        })
     }
 
     let started = Instant::now();
@@ -435,8 +525,11 @@ fn replay_commit(
     let validated = match validated {
         Ok(validated) => validated,
         Err(err) => {
-            report.failures.push(format!("{label}: the transition failed: {err:#}"));
-            return
+            return CommitOutcome::Fault(fail_applied_block(
+                &mut state.pair,
+                input.block,
+                format!("{err:#}"),
+            ))
         }
     };
     let mut outcome = validated.outcome;
@@ -446,7 +539,7 @@ fn replay_commit(
     let disagreements = compare_accepted(oracle, &outcome, &state.pair);
     if disagreements.is_empty() {
         report.commits += 1;
-        return
+        return CommitOutcome::Compared
     }
     for disagreement in disagreements {
         error!(
@@ -461,6 +554,20 @@ fn replay_commit(
         report.disagreements.push((input.block, disagreement));
     }
     report.commits += 1;
+    CommitOutcome::Compared
+}
+
+/// Closes the admit-verify-apply boundary after a post-admission failure.
+///
+/// `admit_block` moved readiness to `Applying`; the failed transition preserved both caches at
+/// the parent generation but has no readiness handle to report through. Left there, the tracker
+/// would refuse the next block as `BlockSkipped` while *looking* transient — under the ExEx the
+/// process dies first, and only a standalone driver ever observes the difference. `abandon_block`
+/// makes the stop explicit and terminal: the watermark freezes at the parent, and nothing short
+/// of a reset or a reorg below the block releases it.
+fn fail_applied_block(pair: &mut CoordinatedPair, block: BlockRef, detail: String) -> ReplayFault {
+    pair.readiness.abandon_block(block.number);
+    ReplayFault::TransitionFailed { block, detail }
 }
 
 /// Derives negative frames from a recorded payload and checks the class each must produce.
@@ -523,5 +630,87 @@ fn check_mutations<C>(
                 err.class()
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fail_applied_block, ReplayFault};
+    use alloy_primitives::B256;
+    use partial_stateless::{readiness::BlockContext, CacheConfig, PartialTrieNodeCache};
+    use partial_stateless_stream::BlockRef;
+    use partial_stateless_validator::{admit_block, BlockAdmission, CoordinatedPair};
+
+    fn pair() -> CoordinatedPair {
+        let config = CacheConfig::default();
+        CoordinatedPair {
+            cache: config.new_cache(),
+            trie_cache: PartialTrieNodeCache::new(),
+            previous_generation: None,
+            accepted_head: None,
+            readiness: config.new_readiness_tracker(),
+        }
+    }
+
+    fn ctx(number: u64) -> BlockContext {
+        BlockContext {
+            number,
+            hash: B256::with_last_byte(number as u8),
+            parent_hash: B256::with_last_byte(number as u8 - 1),
+            state_root: B256::with_last_byte(0x55),
+        }
+    }
+
+    /// The leak S1 recorded and this boundary closes: a post-execution rejection preserved both
+    /// caches but left readiness in transient `Applying`, which only the ExEx's fail-stop made
+    /// safe. A standalone driver outlives the rejection, so the stop must be explicit, terminal,
+    /// and observable — and it must not have touched what the rejection promised to preserve.
+    #[test]
+    fn a_post_admission_failure_moves_readiness_to_terminal_blocked() {
+        let mut pair = pair();
+        let block = ctx(100);
+        assert!(matches!(admit_block(&mut pair.readiness, &block), BlockAdmission::Admitted(_)));
+        assert_eq!(pair.readiness.state().label(), "applying", "the leak's starting point");
+        let parent_fingerprint = pair.fingerprint();
+
+        let fault = fail_applied_block(
+            &mut pair,
+            BlockRef { number: block.number, hash: block.hash },
+            "witness self-consistency refused".to_string(),
+        );
+
+        assert!(matches!(fault, ReplayFault::TransitionFailed { .. }));
+        assert_eq!(pair.readiness.state().label(), "blocked", "terminal, not transient");
+        assert_eq!(
+            pair.fingerprint(),
+            parent_fingerprint,
+            "the boundary reports the stop; it does not touch the caches"
+        );
+        assert_eq!(
+            pair.readiness.first_gap(),
+            Some(block.number),
+            "the acknowledgement watermark froze at the failed block"
+        );
+        assert!(
+            matches!(admit_block(&mut pair.readiness, &ctx(101)), BlockAdmission::Rejected(_)),
+            "nothing runs against a pair that stopped"
+        );
+    }
+
+    /// The fault on the very last commit is the case the old code got wrong silently: with no
+    /// next block to trip over the stranded `Applying`, the report was the only witness.
+    #[test]
+    fn a_fault_on_the_final_commit_still_leaves_the_pair_blocked() {
+        let mut pair = pair();
+        let block = ctx(200);
+        assert!(matches!(admit_block(&mut pair.readiness, &block), BlockAdmission::Admitted(_)));
+
+        fail_applied_block(
+            &mut pair,
+            BlockRef { number: block.number, hash: block.hash },
+            "anchor mismatch".to_string(),
+        );
+
+        assert_eq!(pair.readiness.state().label(), "blocked");
     }
 }

@@ -35,8 +35,18 @@ fn main() -> eyre::Result<()> {
         transition_us = report.transition_us,
         elapsed_ms,
         closed = report.closed,
+        skipped_after_fault = report.skipped_after_fault,
         "Replay finished"
     );
+
+    if let Some(terminal) = &report.terminal {
+        error!(
+            target: "ps_replay",
+            %terminal,
+            skipped = report.skipped_after_fault,
+            "The replay stopped on a fault; every commit after it was skipped, not replayed"
+        );
+    }
 
     if !report.admission_is_load_bearing() {
         warn!(
@@ -104,6 +114,8 @@ fn write_record(
         "admission_us": report.admission_us,
         "transition_us": report.transition_us,
         "elapsed_ms": elapsed_ms,
+        "terminal": report.terminal,
+        "skipped_after_fault": report.skipped_after_fault,
         "blocks": report.blocks,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
