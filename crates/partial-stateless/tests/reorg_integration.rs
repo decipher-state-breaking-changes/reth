@@ -88,11 +88,8 @@ fn fingerprint(cache: &NetworkStateCache) -> Fingerprint {
         .iter()
         .map(|(k, e)| (*k, (e.value.nonce, e.value.balance, e.last_accessed_block)))
         .collect();
-    let storage = cache
-        .storage()
-        .iter()
-        .map(|(k, e)| (*k, (e.value, e.last_accessed_block)))
-        .collect();
+    let storage =
+        cache.storage().iter().map(|(k, e)| (*k, (e.value, e.last_accessed_block))).collect();
     (accounts, storage, cache.current_block())
 }
 

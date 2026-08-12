@@ -228,8 +228,10 @@ fn test_cache_coherency_claim_over_cache_transition() {
 /// Test sidecar serialization and deserialization along with build_sidecar_targets logic.
 #[test]
 fn test_sidecar_serialization_and_targets() {
-    use alloy_primitives::map::{B256Map, HashMap};
-    use alloy_primitives::Bytes;
+    use alloy_primitives::{
+        map::{B256Map, HashMap},
+        Bytes,
+    };
     use partial_stateless::{
         network_cache::MissResult,
         sidecar::{
@@ -239,8 +241,9 @@ fn test_sidecar_serialization_and_targets() {
         },
         witness::{build_sidecar_targets, WitnessResult},
     };
-    use reth_trie_common::proof::ProofNodes;
-    use reth_trie_common::{BranchNodeMasks, MultiProof, StorageMultiProof, TrieMask};
+    use reth_trie_common::{
+        proof::ProofNodes, BranchNodeMasks, MultiProof, StorageMultiProof, TrieMask,
+    };
 
     // 1. Create a dummy MultiProof
     let account = Address::repeat_byte(0x11);

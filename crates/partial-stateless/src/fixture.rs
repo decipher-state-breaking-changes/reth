@@ -98,9 +98,7 @@ impl LoadedFixtures {
     /// on a live chain (the LastN window is measured in block height), so the
     /// benchmark should warn about it.
     pub fn is_contiguous(&self) -> bool {
-        self.fixtures
-            .windows(2)
-            .all(|w| w[1].block_number == w[0].block_number + 1)
+        self.fixtures.windows(2).all(|w| w[1].block_number == w[0].block_number + 1)
     }
 
     /// Inclusive `(first, last)` block numbers, if any fixtures loaded.
