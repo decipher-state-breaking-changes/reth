@@ -9,8 +9,9 @@ use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use partial_stateless::{CacheAnchor, StateTargetSet};
 use partial_stateless_stream::{
     decode_event, encode_event, event::SnapshotError, BlockRef, Checkpoint, CommitFrame,
-    CommitInput, CommitOracle, End, FrameKind, FrameLimits, Manifest, RecordedVerdict, Reorg,
-    Reset, ResetReason, SnapshotChunk, StreamEvent, FRAME_HEADER_BYTES,
+    CommitInput, CommitOracle, End, EndKind, FrameKind, FrameLimits, Manifest, RecordedVerdict,
+    Reorg, Reset, ResetReason, SnapshotChunk, StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
+    FRAME_HEADER_BYTES, MAX_SNAPSHOT_CHUNKS,
 };
 use partial_stateless_validator::{
     CoordinatedFingerprint, LifecycleFingerprint, PayloadProvenance,
@@ -87,7 +88,7 @@ fn commit(provenance: PayloadProvenance, payload_json: Option<Vec<u8>>) -> Commi
 }
 
 fn round_trip(sequence: u64, event: StreamEvent) -> StreamEvent {
-    let encoded = encode_event(sequence, &event).expect("encodes");
+    let encoded = encode_event(sequence, &event, &FrameLimits::default()).expect("encodes");
     let (header, decoded, rest) = decode_event(&encoded, &FrameLimits::default()).expect("decodes");
     assert_eq!(header.sequence, sequence);
     assert!(rest.is_empty());
@@ -151,7 +152,7 @@ fn every_v1_event_survives_its_own_encoding() {
     let reset = Reset { reason: ResetReason::Gap, detail: "block 25737236 never arrived".into() };
     assert_eq!(round_trip(5, StreamEvent::Reset(reset.clone())), StreamEvent::Reset(reset));
 
-    let end = End { reason: "producer shutdown".into(), last_sequence: 5 };
+    let end = End { kind: EndKind::Shutdown, reason: "producer shutdown".into(), last_sequence: 5 };
     assert_eq!(round_trip(6, StreamEvent::End(end.clone())), StreamEvent::End(end));
 }
 
@@ -246,9 +247,49 @@ fn a_chunked_snapshot_reassembles_and_says_how_a_broken_one_differs() {
 /// it is holding from the shape of the bytes.
 #[test]
 fn a_decoded_frame_names_its_own_kind() {
-    let end = StreamEvent::End(End { reason: "done".into(), last_sequence: 9 });
-    let encoded = encode_event(9, &end).expect("encodes");
-    let (header, _, _) = decode_event(&encoded, &FrameLimits::default()).expect("decodes");
+    let end = StreamEvent::End(End {
+        kind: EndKind::SpoolLimit,
+        reason: "done".into(),
+        last_sequence: 9,
+    });
+    let encoded = encode_event(10, &end, &FrameLimits::default()).expect("encodes");
+    let (header, decoded, _) = decode_event(&encoded, &FrameLimits::default()).expect("decodes");
     assert_eq!(header.kind, FrameKind::End);
     assert_eq!(header.kind.as_str(), "end");
+    let StreamEvent::End(decoded) = decoded else { panic!("an end frame decodes as an end") };
+    assert_eq!(decoded.kind, EndKind::SpoolLimit);
+    assert_eq!(decoded.kind.as_str(), "spool_limit");
+}
+
+/// The declaration is checked before it can size anything. A checkpoint is operator-trusted for
+/// what it *attests*, not for how much memory its transport fields may claim.
+#[test]
+fn a_snapshot_declaration_past_the_bound_is_refused_before_reassembly() {
+    let oversized = Checkpoint {
+        block: block(25_737_234, 0x11),
+        state_root: B256::with_last_byte(0x44),
+        cache_root: B256::with_last_byte(0x33),
+        cache_policy_id: B256::with_last_byte(0x22),
+        accepted_head_rlp: Vec::new(),
+        snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES + 1,
+        snapshot_chunks: 1,
+        snapshot_digest: B256::ZERO,
+    };
+    assert_eq!(
+        oversized.reassemble(&[]),
+        Err(SnapshotError::DeclaredTooLarge {
+            declared: DEFAULT_MAX_SNAPSHOT_BYTES + 1,
+            limit: DEFAULT_MAX_SNAPSHOT_BYTES,
+        })
+    );
+
+    let too_many =
+        Checkpoint { snapshot_bytes: 1, snapshot_chunks: MAX_SNAPSHOT_CHUNKS + 1, ..oversized };
+    assert_eq!(
+        too_many.validate_declared(DEFAULT_MAX_SNAPSHOT_BYTES),
+        Err(SnapshotError::DeclaredTooManyChunks {
+            declared: MAX_SNAPSHOT_CHUNKS + 1,
+            limit: MAX_SNAPSHOT_CHUNKS,
+        })
+    );
 }

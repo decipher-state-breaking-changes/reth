@@ -34,8 +34,9 @@ pub mod frame;
 pub mod oracle;
 
 pub use event::{
-    BlockRef, Checkpoint, CommitFrame, CommitInput, End, Manifest, Reorg, Reset, ResetReason,
-    SnapshotChunk, SnapshotError, StreamEvent,
+    BlockRef, Checkpoint, CommitFrame, CommitInput, End, EndKind, Manifest, Reorg, Reset,
+    ResetReason, SnapshotChunk, SnapshotError, StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_CHUNKS,
 };
 pub use frame::{
     decode_body, decode_frame, decode_header, encode_frame, encode_frame_bytes, FrameError,
@@ -67,14 +68,25 @@ pub fn decode_event<'a>(
 }
 
 /// Encodes one event as a complete frame.
-pub fn encode_event(sequence: u64, event: &StreamEvent) -> Result<Vec<u8>, FrameError> {
+///
+/// Takes the same limits a decoder applies, and refuses at encode what no decoder could read —
+/// the producer is the one party that can still say *why* a frame was too large.
+pub fn encode_event(
+    sequence: u64,
+    event: &StreamEvent,
+    limits: &FrameLimits,
+) -> Result<Vec<u8>, FrameError> {
     match event {
-        StreamEvent::Manifest(body) => encode_frame(FrameKind::Manifest, sequence, body),
-        StreamEvent::Checkpoint(body) => encode_frame(FrameKind::Checkpoint, sequence, body),
-        StreamEvent::SnapshotChunk(body) => encode_frame(FrameKind::SnapshotChunk, sequence, body),
-        StreamEvent::Commit(body) => encode_frame(FrameKind::Commit, sequence, body),
-        StreamEvent::Reorg(body) => encode_frame(FrameKind::Reorg, sequence, body),
-        StreamEvent::Reset(body) => encode_frame(FrameKind::Reset, sequence, body),
-        StreamEvent::End(body) => encode_frame(FrameKind::End, sequence, body),
+        StreamEvent::Manifest(body) => encode_frame(FrameKind::Manifest, sequence, body, limits),
+        StreamEvent::Checkpoint(body) => {
+            encode_frame(FrameKind::Checkpoint, sequence, body, limits)
+        }
+        StreamEvent::SnapshotChunk(body) => {
+            encode_frame(FrameKind::SnapshotChunk, sequence, body, limits)
+        }
+        StreamEvent::Commit(body) => encode_frame(FrameKind::Commit, sequence, body, limits),
+        StreamEvent::Reorg(body) => encode_frame(FrameKind::Reorg, sequence, body, limits),
+        StreamEvent::Reset(body) => encode_frame(FrameKind::Reset, sequence, body, limits),
+        StreamEvent::End(body) => encode_frame(FrameKind::End, sequence, body, limits),
     }
 }

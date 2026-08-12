@@ -109,6 +109,19 @@ pub struct SnapshotChunk {
     pub bytes: Vec<u8>,
 }
 
+/// Default ceiling on a declared snapshot package.
+///
+/// The S2-0 run's package was 121.8 MiB, so 2 GiB — the same bound the restore path applies to
+/// its own proof — leaves an order of magnitude of headroom while keeping a corrupt or hostile
+/// declaration from becoming a 16 EiB allocation.
+pub const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Ceiling on the declared chunk count.
+///
+/// At the default 8 MiB chunk, 8192 chunks is a 64 GiB package — far past the byte bound above,
+/// so this only ever fires on a declaration that is wrong on its own terms.
+pub const MAX_SNAPSHOT_CHUNKS: u32 = 8192;
+
 impl Checkpoint {
     /// Splits a package into the chunks that follow this checkpoint, and fills in its header.
     ///
@@ -127,12 +140,36 @@ impl Checkpoint {
         chunks
     }
 
+    /// Checks that the declared snapshot sizes are ones a consumer can honour.
+    ///
+    /// Runs on the declaration alone, before any chunk is buffered, because the declaration is
+    /// what a consumer would otherwise size its buffers from — and a corrupt or hostile
+    /// checkpoint must not be able to turn its own claim into an allocation.
+    pub const fn validate_declared(&self, max_snapshot_bytes: u64) -> Result<(), SnapshotError> {
+        if self.snapshot_bytes > max_snapshot_bytes {
+            return Err(SnapshotError::DeclaredTooLarge {
+                declared: self.snapshot_bytes,
+                limit: max_snapshot_bytes,
+            })
+        }
+        if self.snapshot_chunks > MAX_SNAPSHOT_CHUNKS {
+            return Err(SnapshotError::DeclaredTooManyChunks {
+                declared: self.snapshot_chunks,
+                limit: MAX_SNAPSHOT_CHUNKS,
+            })
+        }
+        Ok(())
+    }
+
     /// Reassembles the package this checkpoint described, or says how it disagrees.
     ///
-    /// Checks count, order, total length, and digest — all four, because each catches a delivery
-    /// failure the others do not. A chunk delivered twice passes the digest only if the length
-    /// also matches; a reordered pair passes both length and count.
+    /// Checks the declaration, count, order, total length, and digest, because each catches a
+    /// delivery failure the others do not. A chunk delivered twice passes the digest only if the
+    /// length also matches; a reordered pair passes both length and count. The length is also
+    /// enforced while accumulating, so chunks that oversize the declared package stop being
+    /// copied at the first byte past it rather than after all of them.
     pub fn reassemble(&self, chunks: &[SnapshotChunk]) -> Result<Vec<u8>, SnapshotError> {
+        self.validate_declared(DEFAULT_MAX_SNAPSHOT_BYTES)?;
         if chunks.len() != self.snapshot_chunks as usize {
             return Err(SnapshotError::ChunkCount {
                 expected: self.snapshot_chunks,
@@ -145,6 +182,13 @@ impl Checkpoint {
                 return Err(SnapshotError::OutOfOrder {
                     expected: position as u32,
                     actual: chunk.index,
+                })
+            }
+            let projected = package.len().saturating_add(chunk.bytes.len());
+            if projected as u64 > self.snapshot_bytes {
+                return Err(SnapshotError::Length {
+                    expected: self.snapshot_bytes,
+                    actual: projected as u64,
                 })
             }
             package.extend_from_slice(&chunk.bytes);
@@ -166,6 +210,22 @@ impl Checkpoint {
 /// How a delivered snapshot disagreed with the checkpoint that described it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotError {
+    /// The checkpoint declared a package larger than this consumer will hold.
+    #[error("checkpoint declares a {declared}-byte snapshot; this consumer's bound is {limit}")]
+    DeclaredTooLarge {
+        /// Bytes the checkpoint declared.
+        declared: u64,
+        /// The configured bound.
+        limit: u64,
+    },
+    /// The checkpoint declared more chunks than any package inside the byte bound needs.
+    #[error("checkpoint declares {declared} snapshot chunks; the bound is {limit}")]
+    DeclaredTooManyChunks {
+        /// Chunks the checkpoint declared.
+        declared: u32,
+        /// The configured bound.
+        limit: u32,
+    },
     /// A different number of chunks arrived than were announced.
     #[error("snapshot has {actual} chunks; the checkpoint announced {expected}")]
     ChunkCount {
@@ -322,15 +382,55 @@ pub enum ResetReason {
     SnapshotRequired,
 }
 
+/// Why the producer stopped, as a value a reader may act on.
+///
+/// [`End::reason`] is free text for the run log; this is the parsed field. An `End` frame of any
+/// kind means the writer ran its close path — orderly termination, never success on its own. The
+/// producer writes one on a clean shutdown, on an error return, and on a panic unwind alike, so a
+/// reader judging an outcome reads the kind, not the presence of the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndKind {
+    /// The producer stopped on request: the notification stream ended, or the process was told
+    /// to shut down and its teardown ran.
+    Shutdown,
+    /// The producer hit an internal failure and closed the stream deliberately rather than
+    /// leaving it to be read as cut.
+    ProducerFault,
+    /// A configured spool bound was reached. The stream is complete up to the bound.
+    SpoolLimit,
+    /// The snapshot export failed, so the stream never opened or could not continue.
+    ExportFailure,
+}
+
+impl EndKind {
+    /// Stable name for logs and records.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+            Self::ProducerFault => "producer_fault",
+            Self::SpoolLimit => "spool_limit",
+            Self::ExportFailure => "export_failure",
+        }
+    }
+}
+
 /// The producer has stopped.
 ///
-/// A stream that ends without one of these ended unexpectedly, and the distinction matters to a
-/// replay driver deciding whether a short corpus is a short corpus or a truncated one.
+/// A stream that ends without one of these was cut — the writer never ran its close path — and
+/// the distinction matters to a replay driver deciding whether a short corpus is a short corpus
+/// or a truncated one. What this frame does *not* mean is that the run succeeded: the writer's
+/// destructor emits one on failures too, and [`EndKind`] is what carries the difference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct End {
+    /// Why, as a value. See [`EndKind`].
+    pub kind: EndKind,
     /// Free text for the run log. Never parsed.
     pub reason: String,
     /// Sequence of the last frame before this one, so a consumer can check it saw them all.
+    ///
+    /// The End frame's own header sequence is therefore always `last_sequence + 1`, and a reader
+    /// checks exactly that equality.
     pub last_sequence: u64,
 }
 

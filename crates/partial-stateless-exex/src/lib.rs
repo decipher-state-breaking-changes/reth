@@ -44,7 +44,8 @@ use partial_stateless::{
     CacheAnchor, PartialStatelessSidecar, PartialTrieNodeCache,
 };
 use partial_stateless_stream::{
-    BlockRef as StreamBlockRef, CommitInput, CommitOracle, RecordedVerdict, Reorg, ResetReason,
+    BlockRef as StreamBlockRef, CommitInput, CommitOracle, EndKind, RecordedVerdict, Reorg,
+    ResetReason,
 };
 use partial_stateless_validator::{
     admit_block, block_context, inject_recovery, BlockAdmission, CanonicalStateRoots,
@@ -549,6 +550,15 @@ where
                         recorder.as_mut(),
                         block,
                     ) {
+                        // Written explicitly rather than left to the recorder's drop: the drop
+                        // cannot tell an error return from a clean shutdown, and the reason is
+                        // only known here.
+                        if let Some(recorder) = recorder.as_mut() {
+                            recorder.write_end(
+                                EndKind::ProducerFault,
+                                format!("block {block_number} failed: {err:#}"),
+                            );
+                        }
                         return Err(eyre::eyre!("block {block_number} failed: {err:#}"))
                     }
                 }
@@ -606,6 +616,12 @@ where
                         recorder.as_mut(),
                         block,
                     ) {
+                        if let Some(recorder) = recorder.as_mut() {
+                            recorder.write_end(
+                                EndKind::ProducerFault,
+                                format!("reorg block {block_number} failed: {err:#}"),
+                            );
+                        }
                         return Err(eyre::eyre!("reorg block {block_number} failed: {err:#}"))
                     }
                 }
@@ -703,10 +719,11 @@ where
         }
     }
 
-    // The notification stream ended, which is a clean shutdown. A corpus without this frame was
-    // cut, and a reader is entitled to tell the two apart.
+    // The notification stream ended, which is a clean shutdown. Reth's SIGTERM path never returns
+    // from the loop above — it drops this future — so the recorder's own drop is what closes the
+    // stream there; this explicit call only covers the stream draining on its own.
     if let Some(recorder) = recorder.as_mut() {
-        recorder.write_end("exex notification stream ended");
+        recorder.write_end(EndKind::Shutdown, "exex notification stream ended");
     }
 
     Ok(())

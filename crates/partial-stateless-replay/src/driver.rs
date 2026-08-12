@@ -17,7 +17,7 @@ use partial_stateless::{
 };
 use partial_stateless_stream::{
     BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, SnapshotChunk,
-    StreamEvent,
+    StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
 use partial_stateless_validator::{
     admit_block, block_context, verify_and_apply_sidecar, AdmissionError, BlockAdmission,
@@ -158,7 +158,14 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 );
                 manifest = Some(found);
             }
-            StreamEvent::Checkpoint(found) => checkpoint = Some(found),
+            StreamEvent::Checkpoint(found) => {
+                // The declaration is checked before any chunk is buffered, so a corrupt or
+                // hostile checkpoint cannot turn its own transport fields into an allocation.
+                found
+                    .validate_declared(DEFAULT_MAX_SNAPSHOT_BYTES)
+                    .map_err(|err| eyre::eyre!("checkpoint declaration refused: {err}"))?;
+                checkpoint = Some(found);
+            }
             StreamEvent::SnapshotChunk(chunk) => chunks.push(chunk),
             StreamEvent::Commit(commit) => {
                 let state = match restored.as_mut() {
@@ -204,7 +211,15 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 ));
             }
             StreamEvent::End(end) => {
-                info!(target: "ps_replay", reason = %end.reason, "Stream ended");
+                // Orderly termination, not success: the producer's close path ran, and the kind
+                // says under what circumstances.
+                info!(
+                    target: "ps_replay",
+                    kind = end.kind.as_str(),
+                    reason = %end.reason,
+                    last_sequence = end.last_sequence,
+                    "Stream ended"
+                );
             }
         }
     }

@@ -30,8 +30,9 @@ use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use partial_stateless::readiness::TrustedCheckpoint;
 use partial_stateless_stream::{
-    encode_event, BlockRef, Checkpoint, CommitFrame, CommitInput, CommitOracle, End, FrameKind,
-    Manifest, Reorg, Reset, ResetReason, StreamEvent, DEFAULT_SNAPSHOT_CHUNK_BYTES,
+    encode_event, BlockRef, Checkpoint, CommitFrame, CommitInput, CommitOracle, End, EndKind,
+    FrameKind, FrameLimits, Manifest, Reorg, Reset, ResetReason, StreamEvent,
+    DEFAULT_SNAPSHOT_CHUNK_BYTES,
 };
 use reth_primitives_traits::SealedHeader;
 use std::{
@@ -65,6 +66,11 @@ pub struct StreamRecorder {
     checkpointed: bool,
     /// Set by the first write failure, and never cleared.
     poisoned: bool,
+    /// Set once an `End` frame is on disk. A closed stream takes no further frames, and a second
+    /// `End` would make the first one a lie about where the stream stopped.
+    ended: bool,
+    /// Bound every written frame is checked against, the same one a reader applies.
+    limits: FrameLimits,
     frames: u64,
     bytes: u64,
     /// Highest block whose cache state the producer has written to durable storage.
@@ -120,6 +126,8 @@ impl StreamRecorder {
             sequence: 0,
             checkpointed: false,
             poisoned: false,
+            ended: false,
+            limits: FrameLimits::default(),
             frames: 0,
             bytes: 0,
             durable_block: None,
@@ -133,10 +141,10 @@ impl StreamRecorder {
 
     /// Whether a commit written now would land in a replayable stream.
     ///
-    /// False before the checkpoint and after a write failure. Callers use it to skip the work of
-    /// assembling a frame that would be discarded.
+    /// False before the checkpoint, after a write failure, and after the stream is closed.
+    /// Callers use it to skip the work of assembling a frame that would be discarded.
     pub const fn records_commits(&self) -> bool {
-        self.checkpointed && !self.poisoned
+        self.checkpointed && !self.poisoned && !self.ended
     }
 
     /// Writes the stream identity. Must be the first frame.
@@ -175,7 +183,7 @@ impl StreamRecorder {
         accepted_head: Option<&SealedHeader>,
         package: &[u8],
     ) {
-        if self.poisoned {
+        if self.poisoned || self.ended {
             return
         }
         let mut accepted_head_rlp = Vec::new();
@@ -277,14 +285,22 @@ impl StreamRecorder {
     }
 
     /// Closes the stream. A corpus without this ended unexpectedly.
-    pub fn write_end(&mut self, reason: impl Into<String>) {
-        if self.poisoned {
+    ///
+    /// An `End` frame means the writer ran its close path — orderly termination, never success on
+    /// its own; the kind is what a reader judges. Idempotent, because both an explicit close and
+    /// the drop below can reach it, and a second `End` would make the first one a lie. A recorder
+    /// that wrote nothing writes no `End` either: an empty directory needs no closing, and
+    /// `last_sequence` would have no frame to name.
+    pub fn write_end(&mut self, kind: EndKind, reason: impl Into<String>) {
+        if self.poisoned || self.ended || self.frames == 0 {
             return
         }
-        let end = End { reason: reason.into(), last_sequence: self.sequence };
+        let end = End { kind, reason: reason.into(), last_sequence: self.sequence - 1 };
         self.write(FrameKind::End, &StreamEvent::End(end));
+        self.ended = true;
         info!(
             target: "partial_stateless_stream",
+            kind = kind.as_str(),
             frames = self.frames,
             spool_bytes = self.bytes,
             dir = %self.dir.display(),
@@ -294,12 +310,13 @@ impl StreamRecorder {
 
     /// Encodes and writes one frame, poisoning the recorder if anything fails.
     fn write(&mut self, kind: FrameKind, event: &StreamEvent) {
-        if self.poisoned {
+        if self.poisoned || self.ended {
             return
         }
         let sequence = self.sequence;
-        let result =
-            encode_event(sequence, event).map_err(|err| eyre::eyre!("{err}")).and_then(|bytes| {
+        let result = encode_event(sequence, event, &self.limits)
+            .map_err(|err| eyre::eyre!("{err}"))
+            .and_then(|bytes| {
                 let path = self.dir.join(format!("{sequence:012}_{}.frame", kind.as_str()));
                 write_atomically(&path, &bytes)?;
                 Ok(bytes.len())
@@ -323,6 +340,22 @@ impl StreamRecorder {
                 );
             }
         }
+    }
+}
+
+impl Drop for StreamRecorder {
+    /// Closes the stream when nothing else did.
+    ///
+    /// Reth's shutdown drops the ExEx future while the process is still alive — every spawned
+    /// task is `select`ed against the shutdown signal — so this is what turns a SIGTERM into an
+    /// `End` frame. Only an abrupt kill skips it, and an abruptly killed stream is exactly what a
+    /// missing `End` frame is defined to mean. A panic unwinding through here is a producer
+    /// fault, not a shutdown, and the frame says so; `write` converts I/O failure into poisoning
+    /// rather than panicking, so this cannot double-panic.
+    fn drop(&mut self) {
+        let kind =
+            if std::thread::panicking() { EndKind::ProducerFault } else { EndKind::Shutdown };
+        self.write_end(kind, "recorder dropped before the stream was explicitly closed");
     }
 }
 
@@ -351,6 +384,8 @@ mod tests {
             sequence: 0,
             checkpointed: false,
             poisoned: false,
+            ended: false,
+            limits: FrameLimits::default(),
             frames: 0,
             bytes: 0,
             durable_block: None,
@@ -475,8 +510,85 @@ mod tests {
         assert!(!recorder.records_commits(), "the first failure stops recording");
 
         fs::create_dir_all(&dir).expect("recreate");
-        recorder.write_end("shutdown");
+        recorder.write_end(EndKind::Shutdown, "shutdown");
         assert!(frames_in(&dir).is_empty(), "a poisoned recorder writes nothing further");
+        drop(recorder);
+        assert!(frames_in(&dir).is_empty(), "a poisoned recorder's drop writes nothing either");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Decodes the last frame of the spool as an `End`, with the header sequence beside it.
+    fn last_end(dir: &Path) -> (u64, End) {
+        let (sequence, kind) = *frames_in(dir).last().expect("spool is not empty");
+        assert_eq!(kind, FrameKind::End, "the stream's last frame is an End");
+        let path = dir.join(format!("{sequence:012}_end.frame"));
+        let bytes = fs::read(path).expect("end frame readable");
+        let (_, event, _) = decode_event(&bytes, &FrameLimits::default()).expect("decodes");
+        let StreamEvent::End(end) = event else { panic!("an end frame decodes as an end") };
+        (sequence, end)
+    }
+
+    /// Reth's SIGTERM path drops the ExEx future rather than returning from it, so the drop is
+    /// the only close path an operator stop ever takes. The frame it writes names its
+    /// predecessor, which is the reader's check that it saw every frame.
+    #[test]
+    fn dropping_a_recorder_closes_the_stream_with_one_correctly_numbered_end() {
+        let dir = spool_dir("dropped");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
+        drop(recorder);
+
+        let (sequence, end) = last_end(&dir);
+        assert_eq!(end.kind, EndKind::Shutdown);
+        assert_eq!(end.last_sequence + 1, sequence, "the End frame names its predecessor");
+        let ends = frames_in(&dir).iter().filter(|(_, kind)| *kind == FrameKind::End).count();
+        assert_eq!(ends, 1, "exactly one End frame");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit close keeps its kind and its reason; the drop must not write a second `End`
+    /// that contradicts it.
+    #[test]
+    fn an_explicit_end_survives_the_drop_unamended() {
+        let dir = spool_dir("explicit-end");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.write_end(EndKind::SpoolLimit, "spool byte bound reached");
+        drop(recorder);
+
+        let (_, end) = last_end(&dir);
+        assert_eq!(end.kind, EndKind::SpoolLimit);
+        let ends = frames_in(&dir).iter().filter(|(_, kind)| *kind == FrameKind::End).count();
+        assert_eq!(ends, 1, "the drop does not write a second End");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recorder that wrote nothing has nothing to close: an `End` in an otherwise empty spool
+    /// would have no predecessor for `last_sequence` to name.
+    #[test]
+    fn a_recorder_that_wrote_nothing_writes_no_end_on_drop() {
+        let dir = spool_dir("nothing-written");
+        drop(recorder(&dir));
+        assert!(frames_in(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A panic is a producer fault, not a shutdown, and the stream's close frame says which.
+    #[test]
+    fn a_panic_unwind_closes_the_stream_as_a_producer_fault() {
+        let dir = spool_dir("panicked");
+        let thread_dir = dir.clone();
+        let result = std::thread::spawn(move || {
+            let mut recorder = recorder(&thread_dir);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            panic!("producer failed mid-run");
+        })
+        .join();
+        assert!(result.is_err(), "the thread panicked");
+
+        let (_, end) = last_end(&dir);
+        assert_eq!(end.kind, EndKind::ProducerFault);
         let _ = fs::remove_dir_all(&dir);
     }
 }

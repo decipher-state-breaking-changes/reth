@@ -221,14 +221,30 @@ pub fn encode_frame<T: Serialize>(
     kind: FrameKind,
     sequence: u64,
     body: &T,
+    limits: &FrameLimits,
 ) -> Result<Vec<u8>, FrameError> {
     let payload = bincode::serialize(body)
         .map_err(|err| FrameError::Body { kind: kind.as_str(), detail: err.to_string() })?;
-    Ok(encode_frame_bytes(kind, sequence, &payload))
+    encode_frame_bytes(kind, sequence, &payload, limits)
 }
 
 /// Encodes an already-serialized body into a complete frame.
-pub fn encode_frame_bytes(kind: FrameKind, sequence: u64, payload: &[u8]) -> Vec<u8> {
+///
+/// The bound applies at encode as well as at decode, because an oversized frame is the writer's
+/// failure: written anyway, it would sit in the spool as a frame no consumer can read, and every
+/// reader would trip over it long after the producer that could have said why is gone. The length
+/// is also checked against the header's `u32` field before the cast that would otherwise truncate
+/// it silently.
+pub fn encode_frame_bytes(
+    kind: FrameKind,
+    sequence: u64,
+    payload: &[u8],
+    limits: &FrameLimits,
+) -> Result<Vec<u8>, FrameError> {
+    let bound = limits.max_frame_bytes.min(u32::MAX as usize);
+    if payload.len() > bound {
+        return Err(FrameError::TooLarge { len: payload.len(), limit: bound })
+    }
     let mut out = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
     out.extend_from_slice(&FRAME_MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -238,7 +254,7 @@ pub fn encode_frame_bytes(kind: FrameKind, sequence: u64, payload: &[u8]) -> Vec
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(keccak256(payload).as_slice());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 /// Reads a header without touching the body.
@@ -317,7 +333,8 @@ mod tests {
 
     #[test]
     fn a_frame_round_trips_through_its_own_bytes() {
-        let encoded = encode_frame(FrameKind::Commit, 7, &body()).expect("encodes");
+        let encoded =
+            encode_frame(FrameKind::Commit, 7, &body(), &FrameLimits::default()).expect("encodes");
         let (header, payload, rest) =
             decode_frame(&encoded, &FrameLimits::default()).expect("decodes");
 
@@ -332,8 +349,11 @@ mod tests {
     /// Frames concatenate, because a spool file and a socket are the same bytes back to back.
     #[test]
     fn frames_decode_back_to_back_from_one_buffer() {
-        let mut buffer = encode_frame(FrameKind::Manifest, 1, &body()).expect("encodes");
-        buffer.extend(encode_frame(FrameKind::Commit, 2, &body()).expect("encodes"));
+        let mut buffer = encode_frame(FrameKind::Manifest, 1, &body(), &FrameLimits::default())
+            .expect("encodes");
+        buffer.extend(
+            encode_frame(FrameKind::Commit, 2, &body(), &FrameLimits::default()).expect("encodes"),
+        );
 
         let (first, _, rest) = decode_frame(&buffer, &FrameLimits::default()).expect("decodes");
         let (second, _, tail) = decode_frame(rest, &FrameLimits::default()).expect("decodes");
@@ -347,7 +367,8 @@ mod tests {
     /// with the number of bytes still wanted, and never as a decode failure.
     #[test]
     fn a_truncated_frame_says_how_much_is_missing() {
-        let encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         let cut = encoded.len() - 4;
         assert_eq!(
             decode_frame(&encoded[..cut], &FrameLimits::default()),
@@ -359,7 +380,8 @@ mod tests {
     /// a reader that has one byte cannot yet know whether the magic is wrong.
     #[test]
     fn a_partial_header_is_a_truncation_rather_than_a_bad_stream() {
-        let encoded = encode_frame(FrameKind::End, 1, &body()).expect("encodes");
+        let encoded =
+            encode_frame(FrameKind::End, 1, &body(), &FrameLimits::default()).expect("encodes");
         assert_eq!(
             decode_frame(&encoded[..3], &FrameLimits::default()),
             Err(FrameError::Truncated { expected: FRAME_HEADER_BYTES, actual: 3 })
@@ -368,7 +390,8 @@ mod tests {
 
     #[test]
     fn a_stream_that_is_not_ours_is_rejected_on_its_first_bytes() {
-        let mut encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let mut encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         encoded[..8].copy_from_slice(b"NOTASTRM");
         assert_eq!(
             decode_frame(&encoded, &FrameLimits::default()),
@@ -379,7 +402,8 @@ mod tests {
     /// A body that arrived complete and wrong. Length alone cannot see this.
     #[test]
     fn a_corrupt_body_fails_its_digest_rather_than_decoding() {
-        let mut encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let mut encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         let last = encoded.len() - 1;
         encoded[last] ^= 0xff;
         let error = decode_frame(&encoded, &FrameLimits::default()).expect_err("digest fails");
@@ -389,7 +413,8 @@ mod tests {
     /// A newer producer is refused rather than partly understood.
     #[test]
     fn a_future_format_version_is_refused_and_not_parsed() {
-        let mut encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let mut encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         encoded[8..10].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         assert_eq!(
             decode_frame(&encoded, &FrameLimits::default()),
@@ -399,7 +424,8 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_is_named_rather_than_skipped() {
-        let mut encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let mut encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         encoded[10] = 200;
         assert_eq!(
             decode_frame(&encoded, &FrameLimits::default()),
@@ -411,7 +437,8 @@ mod tests {
     /// honouring it by omission.
     #[test]
     fn reserved_flags_are_refused() {
-        let mut encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let mut encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         encoded[11] = 0b0000_0001;
         assert_eq!(
             decode_frame(&encoded, &FrameLimits::default()),
@@ -423,7 +450,8 @@ mod tests {
     /// corrupt length cannot become an allocation.
     #[test]
     fn an_oversized_frame_is_refused_before_its_body_is_read() {
-        let encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         let limits = FrameLimits { max_frame_bytes: 4 };
         let error = decode_frame(&encoded, &limits).expect_err("bound applies");
         assert!(matches!(error, FrameError::TooLarge { limit: 4, .. }), "{error:?}");
@@ -434,7 +462,8 @@ mod tests {
 
     #[test]
     fn a_body_that_is_not_what_its_kind_claims_fails_to_decode() {
-        let encoded = encode_frame(FrameKind::Commit, 1, &body()).expect("encodes");
+        let encoded =
+            encode_frame(FrameKind::Commit, 1, &body(), &FrameLimits::default()).expect("encodes");
         let (header, payload, _) =
             decode_frame(&encoded, &FrameLimits::default()).expect("decodes");
         let error = decode_body::<[u8; 32]>(header.kind, payload).expect_err("wrong shape");
@@ -445,7 +474,17 @@ mod tests {
     /// against the layout the encoder actually writes.
     #[test]
     fn the_header_is_the_width_the_constant_claims() {
-        let encoded = encode_frame_bytes(FrameKind::End, 0, &[]);
+        let encoded =
+            encode_frame_bytes(FrameKind::End, 0, &[], &FrameLimits::default()).expect("encodes");
         assert_eq!(encoded.len(), FRAME_HEADER_BYTES);
+    }
+
+    /// The writer refuses what no reader could accept. A bound enforced only at decode would let
+    /// a producer spool frames that every consumer trips over after the producer is gone.
+    #[test]
+    fn an_oversized_body_is_refused_at_encode_not_only_at_decode() {
+        let limits = FrameLimits { max_frame_bytes: 4 };
+        let error = encode_frame(FrameKind::Commit, 1, &body(), &limits).expect_err("bound");
+        assert!(matches!(error, FrameError::TooLarge { limit: 4, .. }), "{error:?}");
     }
 }

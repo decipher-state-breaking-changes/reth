@@ -8,7 +8,9 @@
 //! like a complete one to anything that just decodes what it finds, and a replay over such a
 //! corpus would report agreement about a chain nobody ran.
 
-use partial_stateless_stream::{decode_event, FrameHeader, FrameLimits, StreamEvent};
+use partial_stateless_stream::{
+    decode_event, FrameHeader, FrameLimits, StreamEvent, FRAME_HEADER_BYTES,
+};
 use std::{fs, path::Path};
 
 /// One frame as read back.
@@ -18,6 +20,38 @@ pub struct SpooledFrame {
     pub header: FrameHeader,
     /// The decoded body.
     pub event: StreamEvent,
+    /// Bytes the frame file held, for the reader's own accounting.
+    pub bytes: u64,
+}
+
+/// Reads and decodes exactly one frame file.
+///
+/// The size check runs on the file's metadata before the read, because the decoder's own bound
+/// only applies after `fs::read` has already paid for the allocation — a spool entry past every
+/// frame bound is refused without buffering it.
+pub fn read_frame_file(path: &Path, limits: &FrameLimits) -> eyre::Result<SpooledFrame> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| eyre::eyre!("cannot stat frame {}: {err}", path.display()))?;
+    let bound = (FRAME_HEADER_BYTES + limits.max_frame_bytes) as u64;
+    if metadata.len() > bound {
+        eyre::bail!(
+            "frame {} is {} bytes, past the {bound}-byte bound; refused before reading it",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let raw =
+        fs::read(path).map_err(|err| eyre::eyre!("cannot read frame {}: {err}", path.display()))?;
+    let (header, event, rest) = decode_event(&raw, limits)
+        .map_err(|err| eyre::eyre!("frame {} is unusable: {err}", path.display()))?;
+    if !rest.is_empty() {
+        eyre::bail!(
+            "frame {} carries {} trailing bytes; one file holds exactly one frame",
+            path.display(),
+            rest.len()
+        );
+    }
+    Ok(SpooledFrame { header, event, bytes: raw.len() as u64 })
 }
 
 /// A whole spool, read and checked for contiguity.
@@ -50,19 +84,9 @@ pub fn read_spool(dir: &Path, limits: &FrameLimits) -> eyre::Result<Spool> {
     let mut frames = Vec::with_capacity(paths.len());
     let mut bytes = 0u64;
     for path in &paths {
-        let raw = fs::read(path)
-            .map_err(|err| eyre::eyre!("cannot read frame {}: {err}", path.display()))?;
-        bytes += raw.len() as u64;
-        let (header, event, rest) = decode_event(&raw, limits)
-            .map_err(|err| eyre::eyre!("frame {} is unusable: {err}", path.display()))?;
-        if !rest.is_empty() {
-            eyre::bail!(
-                "frame {} carries {} trailing bytes; one file holds exactly one frame",
-                path.display(),
-                rest.len()
-            );
-        }
-        frames.push(SpooledFrame { header, event });
+        let frame = read_frame_file(path, limits)?;
+        bytes = bytes.saturating_add(frame.bytes);
+        frames.push(frame);
     }
 
     frames.sort_by_key(|frame| frame.header.sequence);
@@ -75,6 +99,27 @@ pub fn read_spool(dir: &Path, limits: &FrameLimits) -> eyre::Result<Spool> {
                 frame.header.sequence
             );
         }
+        // The End frame closes the stream: nothing may follow it, and it must name the frame it
+        // followed. An End that misnumbers its predecessor means the corpus and its closer
+        // disagree about what the corpus is, which is not a warning.
+        if let StreamEvent::End(end) = &frame.event {
+            if position + 1 != frames.len() {
+                eyre::bail!(
+                    "spool {} continues past its End frame at sequence {}",
+                    dir.display(),
+                    frame.header.sequence
+                );
+            }
+            if end.last_sequence.checked_add(1) != Some(frame.header.sequence) {
+                eyre::bail!(
+                    "the End frame at sequence {} names {} as the last frame; its predecessor \
+                     was {}",
+                    frame.header.sequence,
+                    end.last_sequence,
+                    frame.header.sequence.saturating_sub(1)
+                );
+            }
+        }
     }
 
     let closed = matches!(frames.last().map(|frame| &frame.event), Some(StreamEvent::End(_)));
@@ -84,7 +129,7 @@ pub fn read_spool(dir: &Path, limits: &FrameLimits) -> eyre::Result<Spool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use partial_stateless_stream::{encode_event, End, FrameKind};
+    use partial_stateless_stream::{encode_event, End, EndKind, FrameKind, Reset, ResetReason};
 
     fn spool_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ps-spool-{name}-{}", std::process::id()));
@@ -94,20 +139,28 @@ mod tests {
     }
 
     fn write(dir: &Path, sequence: u64, event: &StreamEvent, kind: FrameKind) {
-        let bytes = encode_event(sequence, event).expect("encodes");
+        let bytes = encode_event(sequence, event, &FrameLimits::default()).expect("encodes");
         fs::write(dir.join(format!("{sequence:012}_{}.frame", kind.as_str())), bytes)
             .expect("write");
     }
 
+    fn filler() -> StreamEvent {
+        StreamEvent::Reset(Reset { reason: ResetReason::Overflow, detail: "test".into() })
+    }
+
     fn end(last: u64) -> StreamEvent {
-        StreamEvent::End(End { reason: "test".into(), last_sequence: last })
+        StreamEvent::End(End {
+            kind: EndKind::Shutdown,
+            reason: "test".into(),
+            last_sequence: last,
+        })
     }
 
     #[test]
     fn a_spool_reads_back_in_sequence_order_and_reports_that_it_closed() {
         let dir = spool_dir("ordered");
-        write(&dir, 0, &end(0), FrameKind::End);
-        write(&dir, 1, &end(1), FrameKind::End);
+        write(&dir, 0, &filler(), FrameKind::Reset);
+        write(&dir, 1, &end(0), FrameKind::End);
 
         let spool = read_spool(&dir, &FrameLimits::default()).expect("reads");
         assert_eq!(
@@ -123,8 +176,8 @@ mod tests {
     #[test]
     fn a_gap_in_the_sequence_is_refused_rather_than_replayed() {
         let dir = spool_dir("gap");
-        write(&dir, 0, &end(0), FrameKind::End);
-        write(&dir, 2, &end(2), FrameKind::End);
+        write(&dir, 0, &filler(), FrameKind::Reset);
+        write(&dir, 2, &filler(), FrameKind::Reset);
 
         let error = read_spool(&dir, &FrameLimits::default()).expect_err("gap is refused");
         assert!(error.to_string().contains("not contiguous"), "{error}");
@@ -136,18 +189,52 @@ mod tests {
     #[test]
     fn a_stream_without_an_end_frame_reports_that_it_was_cut() {
         let dir = spool_dir("cut");
-        write(
-            &dir,
-            0,
-            &StreamEvent::Reset(partial_stateless_stream::Reset {
-                reason: partial_stateless_stream::ResetReason::Overflow,
-                detail: "test".into(),
-            }),
-            FrameKind::Reset,
-        );
+        write(&dir, 0, &filler(), FrameKind::Reset);
 
         let spool = read_spool(&dir, &FrameLimits::default()).expect("reads");
         assert!(!spool.closed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An End frame closes the stream; frames after it mean the closer lied about where the
+    /// stream stopped, and the corpus cannot be trusted about anything else.
+    #[test]
+    fn a_spool_that_continues_past_its_end_frame_is_refused() {
+        let dir = spool_dir("past-end");
+        write(&dir, 0, &filler(), FrameKind::Reset);
+        write(&dir, 1, &end(0), FrameKind::End);
+        write(&dir, 2, &filler(), FrameKind::Reset);
+
+        let error = read_spool(&dir, &FrameLimits::default()).expect_err("trailing refused");
+        assert!(error.to_string().contains("continues past its End frame"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `last_sequence` names the frame before the End, and the reader holds it to that. The
+    /// off-by-one this catches — an End carrying its *own* sequence — was the recorder's actual
+    /// defect before S3.
+    #[test]
+    fn an_end_frame_that_misnames_its_predecessor_is_refused() {
+        let dir = spool_dir("end-off-by-one");
+        write(&dir, 0, &filler(), FrameKind::Reset);
+        write(&dir, 1, &end(1), FrameKind::End);
+
+        let error = read_spool(&dir, &FrameLimits::default()).expect_err("misnumbered End");
+        assert!(error.to_string().contains("names 1 as the last frame"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The size check runs on metadata, so a file past every frame bound is refused without the
+    /// read that would have buffered it.
+    #[test]
+    fn an_oversized_frame_file_is_refused_before_it_is_read() {
+        let dir = spool_dir("oversized");
+        write(&dir, 0, &filler(), FrameKind::Reset);
+        let limits = FrameLimits { max_frame_bytes: 8 };
+
+        let path = dir.join("000000000000_reset.frame");
+        let error = read_frame_file(&path, &limits).expect_err("bound applies");
+        assert!(error.to_string().contains("refused before reading"), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
