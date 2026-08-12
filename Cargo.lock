@@ -6531,9 +6531,12 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm-ethereum",
  "reth-primitives-traits",
+ "reth-trie",
+ "reth-trie-common",
  "revm",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
