@@ -81,8 +81,25 @@ pub struct ReplayReport {
     pub admission_us: u64,
     /// Total transition wall time across every commit, in microseconds.
     pub transition_us: u64,
+    /// Per-block timings, in the order they were replayed.
+    ///
+    /// Kept per block rather than only as totals because the A/B this corpus exists to enable is a
+    /// *paired* comparison: the same block replayed by two builds is the one comparison with no
+    /// workload variance in it at all, and a total would throw that pairing away.
+    pub blocks: Vec<BlockTiming>,
     /// Whether the corpus ended with an `End` frame.
     pub closed: bool,
+}
+
+/// What one replayed block cost.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct BlockTiming {
+    /// Height.
+    pub number: u64,
+    /// Decode, payload layout, block hash, sender recovery, and pre-execution consensus.
+    pub admission_us: u64,
+    /// The cache transition: witness materialization, execution, root, retention, anchor.
+    pub transition_us: u64,
 }
 
 impl ReplayReport {
@@ -376,7 +393,8 @@ fn replay_commit(
             return
         }
     };
-    report.admission_us += admitted.timings.total_us();
+    let admission_us = admitted.timings.total_us();
+    report.admission_us += admission_us;
 
     let block_ctx = block_context(&admitted.block);
     if let BlockAdmission::Rejected(reason) = admit_block(&mut state.pair.readiness, &block_ctx) {
@@ -395,7 +413,9 @@ fn replay_commit(
         &mut state.pair.trie_cache,
         TrieCacheDisposition::Commit,
     );
-    report.transition_us += started.elapsed().as_micros() as u64;
+    let transition_us = started.elapsed().as_micros() as u64;
+    report.transition_us += transition_us;
+    report.blocks.push(BlockTiming { number: input.block.number, admission_us, transition_us });
 
     let validated = match validated {
         Ok(validated) => validated,

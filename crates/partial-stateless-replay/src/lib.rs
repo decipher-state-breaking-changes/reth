@@ -30,6 +30,6 @@ pub mod mutate;
 pub mod spool;
 
 pub use compare::Disagreement;
-pub use driver::{replay, ReplayOptions, ReplayReport};
+pub use driver::{replay, BlockTiming, ReplayOptions, ReplayReport};
 pub use mutate::Mutation;
 pub use spool::{read_spool, Spool, SpooledFrame};
