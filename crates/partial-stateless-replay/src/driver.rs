@@ -9,7 +9,7 @@
 use crate::{
     compare::{block_label, compare_accepted, compare_rejected, Disagreement},
     mutate::Mutation,
-    reorg::VerifiedHistory,
+    reorg::{apply_reorg, warn_inapplicable, ReorgOutcome, VerifiedHistory},
     spool::SpoolIter,
 };
 use alloy_rlp::Decodable;
@@ -97,6 +97,50 @@ pub struct ReplayReport {
     /// Counted rather than reported one by one: before this existed, every commit after a fault
     /// generated its own `BlockSkipped` failure string, and a single fault read as a cascade.
     pub skipped_after_fault: u64,
+    /// What kind of event stopped the replay, when one did.
+    pub terminal_kind: Option<&'static str>,
+    /// Recorded reorgs this replay undid against the retained generation.
+    pub reorgs_applied: u64,
+    /// Recorded reverts this replay undid. A subset of the same mechanism, counted apart because
+    /// a revert has no branch to follow and so proves a different half of the lifecycle.
+    pub reverts_applied: u64,
+    /// Reorgs that named this consumer's own branch but were past what it could undo.
+    ///
+    /// Not a disagreement and not a failure: a depth-2 reorg is the chain behaving normally and
+    /// the pair behaving correctly. It costs continuity until a checkpoint restores it, which is
+    /// what [`continuous`](Self::continuous) reports.
+    pub reorgs_inapplicable: u64,
+    /// Commit frames not replayed because the driver was waiting to be re-bootstrapped.
+    pub skipped_awaiting_resync: u64,
+    /// Checkpoints the producer published after a reorg this driver had already applied itself,
+    /// verified against the pair's own state and then skipped rather than installed.
+    pub checkpoints_skimmed: u64,
+    /// Winning branches the producer announced and did not deliver in full.
+    pub winning_branch_incomplete: u64,
+    /// Every re-bootstrap this replay performed, and whether it left a hole.
+    pub resyncs: Vec<ResyncRecord>,
+    /// The highest block this replay verified for itself.
+    pub last_verified: Option<u64>,
+}
+
+/// One re-bootstrap of the pair from a checkpoint that arrived mid-corpus.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResyncRecord {
+    /// Sequence of the checkpoint the pair was rebuilt from.
+    pub at_sequence: u64,
+    /// The block the checkpoint restored to.
+    pub block: u64,
+    /// Whether the checkpoint landed on the exact block recovery had asked for.
+    ///
+    /// False makes the recovery an explicit checkpoint reset: the pair is sound again, but the
+    /// interval in [`unverified`](Self::unverified) was never validated by anything, and
+    /// reporting that as continuous recovery would be the one claim this format exists to
+    /// prevent.
+    pub continuous: bool,
+    /// The canonical interval this recovery skipped, when it was not continuous.
+    pub unverified: Option<(u64, u64)>,
+    /// Commit frames observed between the discontinuity and the checkpoint.
+    pub commits_skipped: u64,
 }
 
 /// Why a replay can go no further on this pair. Every variant names the block it stopped on.
@@ -161,11 +205,32 @@ pub struct BlockTiming {
 }
 
 impl ReplayReport {
-    /// Whether the replay agreed with the recording everywhere it could.
+    /// Whether the replay agreed with the recording on every block it compared.
+    ///
+    /// This axis is about the two implementations, and deliberately not about the chain: a reorg
+    /// the pair could not undo says nothing about whether the blocks it *did* replay matched. An
+    /// earlier version folded the two together, so a corpus containing one deep reorg could never
+    /// report agreement no matter how cleanly it recovered.
     pub fn agreed(&self) -> bool {
         self.disagreements.is_empty() &&
             self.failures.is_empty() &&
             self.mutation_failures.is_empty()
+    }
+
+    /// Whether every canonical block the corpus carried was actually verified.
+    ///
+    /// False when a recovery landed somewhere other than the block it asked for, when commits
+    /// went by while the driver was waiting for one, or when an announced winning branch was
+    /// never delivered in full. A run can agree everywhere it looked and still have holes.
+    pub fn continuous(&self) -> bool {
+        self.skipped_awaiting_resync == 0 &&
+            self.winning_branch_incomplete == 0 &&
+            self.resyncs.iter().all(|resync| resync.continuous)
+    }
+
+    /// Whether the replay reached the end of the corpus rather than stopping inside it.
+    pub const fn complete(&self) -> bool {
+        self.terminal.is_none()
     }
 
     /// Whether this run's admission checks were checking anything.
@@ -186,10 +251,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
     let mut spool = SpoolIter::open(dir, &options.frame_limits)?;
 
     let mut report = ReplayReport::default();
-    let mut manifest: Option<Manifest> = None;
-    let mut checkpoint: Option<Checkpoint> = None;
-    let mut chunks: Vec<SnapshotChunk> = Vec::new();
-    let mut restored: Option<ReplayState> = None;
+    let mut phase = BatchPhase::AwaitingManifest;
 
     while let Some(frame) = spool.next_frame()? {
         // A faulted pair replays nothing further. The remaining frames are counted rather than
@@ -201,86 +263,258 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
             }
             continue
         }
-        match frame.event {
-            StreamEvent::Manifest(found) => {
-                info!(
-                    target: "ps_replay",
-                    chain_id = found.chain_id,
-                    epoch = found.epoch,
-                    producer = %found.producer,
-                    account_window = found.account_window,
-                    storage_window = found.storage_window,
-                    "Stream manifest"
-                );
-                manifest = Some(found);
-            }
-            StreamEvent::Checkpoint(found) => {
+        // Checked before the match so the phase is never moved out of without being put back.
+        if matches!(frame.event, StreamEvent::Commit(_)) &&
+            options.limit.is_some_and(|limit| report.commits as usize >= limit)
+        {
+            break
+        }
+        let sequence = frame.header.sequence;
+        phase = match (phase, frame.event) {
+            (phase, StreamEvent::Manifest(found)) => match phase {
+                BatchPhase::AwaitingManifest => {
+                    info!(
+                        target: "ps_replay",
+                        chain_id = found.chain_id,
+                        epoch = found.epoch,
+                        producer = %found.producer,
+                        account_window = found.account_window,
+                        storage_window = found.storage_window,
+                        "Stream manifest"
+                    );
+                    BatchPhase::AwaitingCheckpoint { manifest: found }
+                }
+                // A second manifest is a new epoch: sequence numbers restarted with it, so nothing
+                // below it can be continued into. Recorded as a discontinuity rather than
+                // overwritten, which is what this driver used to do silently.
+                _ => {
+                    report.failures.push(format!(
+                        "a second manifest arrived at sequence {sequence} (epoch {}); the stream \
+                         below it cannot be continued",
+                        found.epoch
+                    ));
+                    BatchPhase::AwaitingResync { manifest: found, target_ancestor: None }
+                }
+            },
+            (phase, StreamEvent::Checkpoint(found)) => {
                 // The declaration is checked before any chunk is buffered, so a corrupt or
                 // hostile checkpoint cannot turn its own transport fields into an allocation.
                 found
                     .validate_declared(DEFAULT_MAX_SNAPSHOT_BYTES)
                     .map_err(|err| eyre::eyre!("checkpoint declaration refused: {err}"))?;
-                checkpoint = Some(found);
-            }
-            StreamEvent::SnapshotChunk(chunk) => chunks.push(chunk),
-            StreamEvent::Commit(commit) => {
-                let state = match restored.as_mut() {
-                    Some(state) => state,
-                    None => {
-                        let manifest = manifest
-                            .as_ref()
-                            .ok_or_else(|| eyre::eyre!("a commit arrived before the manifest"))?;
-                        let checkpoint = checkpoint
-                            .as_ref()
-                            .ok_or_else(|| eyre::eyre!("a commit arrived before the checkpoint"))?;
-                        restored = Some(restore(manifest, checkpoint, &chunks)?);
-                        restored.as_mut().expect("just restored")
+                let (manifest, purpose) = match phase {
+                    BatchPhase::AwaitingManifest => {
+                        eyre::bail!("a checkpoint arrived before the manifest")
+                    }
+                    BatchPhase::AwaitingCheckpoint { manifest } => {
+                        (manifest, CollectPurpose::Install)
+                    }
+                    BatchPhase::AwaitingResync { manifest, target_ancestor } => {
+                        (manifest, CollectPurpose::Resync { target_ancestor })
+                    }
+                    BatchPhase::Collecting { manifest, .. } => {
+                        report.failures.push(format!(
+                            "a checkpoint arrived at sequence {sequence} while the previous one's \
+                             chunks were incomplete"
+                        ));
+                        (manifest, CollectPurpose::Resync { target_ancestor: None })
+                    }
+                    BatchPhase::Live { manifest, state, announced, pending_tip } => {
+                        match announced {
+                            // The producer's recovery checkpoint for a reorg this driver already
+                            // undid by itself. Two independent implementations reached the same
+                            // generation, so comparing them is a live cross-check rather than a
+                            // formality — and installing it would replace state this pair derived
+                            // with state it has no reason to prefer.
+                            Some(ancestor) => (
+                                manifest,
+                                CollectPurpose::CrossCheck { state, ancestor, pending_tip },
+                            ),
+                            None => {
+                                report.failures.push(format!(
+                                    "an unannounced checkpoint arrived at sequence {sequence}; \
+                                     the grammar has no mid-stream checkpoint without a reorg or \
+                                     reset in front of it"
+                                ));
+                                report.last_verified = state.history.tip().map(|tip| tip.number);
+                                (manifest, CollectPurpose::Resync { target_ancestor: None })
+                            }
+                        }
                     }
                 };
-                if options.limit.is_some_and(|limit| report.commits as usize >= limit) {
-                    break
-                }
+                let collecting = BatchPhase::Collecting {
+                    manifest,
+                    checkpoint_sequence: sequence,
+                    checkpoint: found,
+                    chunks: Vec::new(),
+                    purpose,
+                };
+                finish_collection_if_complete(collecting, &mut report)?
+            }
+            (
+                BatchPhase::Collecting {
+                    manifest,
+                    checkpoint,
+                    checkpoint_sequence,
+                    mut chunks,
+                    purpose,
+                },
+                StreamEvent::SnapshotChunk(chunk),
+            ) => {
+                chunks.push(chunk);
+                finish_collection_if_complete(
+                    BatchPhase::Collecting {
+                        manifest,
+                        checkpoint,
+                        checkpoint_sequence,
+                        chunks,
+                        purpose,
+                    },
+                    &mut report,
+                )?
+            }
+            (phase, StreamEvent::SnapshotChunk(_)) => {
+                report.failures.push(format!(
+                    "a snapshot chunk arrived at sequence {sequence} with no checkpoint expecting it"
+                ));
+                phase
+            }
+            (
+                BatchPhase::Live { manifest, mut state, announced, mut pending_tip },
+                StreamEvent::Commit(commit),
+            ) => {
                 let (input, oracle) = commit.split();
                 let block = input.block;
-                if let CommitOutcome::Fault(fault) =
-                    replay_commit(state, input, &oracle, options, &mut report)
-                {
-                    error!(
-                        target: "ps_replay",
-                        block = block.number,
-                        %fault,
-                        readiness = state.pair.readiness.state().label(),
-                        "The pair can go no further; the remaining commits are skipped, not \
-                         replayed"
-                    );
-                    report.failures.push(fault.to_string());
-                    report.terminal = Some(fault.to_string());
+                match replay_commit(&mut state, input, &oracle, options, &mut report) {
+                    CommitOutcome::Fault(fault) => {
+                        error!(
+                            target: "ps_replay",
+                            block = block.number,
+                            %fault,
+                            readiness = state.pair.readiness.state().label(),
+                            "The pair can go no further; the remaining commits are skipped, not \
+                             replayed"
+                        );
+                        report.failures.push(fault.to_string());
+                        report.terminal = Some(fault.to_string());
+                        report.terminal_kind = Some("replay_fault");
+                    }
+                    CommitOutcome::Compared => {
+                        report.last_verified = Some(block.number);
+                        // The producer said which block completes the branch it moved to. Reaching
+                        // that height with a different hash means the frame and the delivery
+                        // disagree about what was replaced, which no later commit can settle.
+                        if let Some(tip) = pending_tip &&
+                            tip.number == block.number
+                        {
+                            if tip.hash == block.hash {
+                                pending_tip = None;
+                            } else {
+                                report.failures.push(format!(
+                                    "the winning branch reached {} as {:?} but the reorg announced \
+                                     {:?}",
+                                    block.number, block.hash, tip.hash
+                                ));
+                                report.terminal = Some(
+                                    "the winning branch did not match its announced tip".into(),
+                                );
+                                report.terminal_kind = Some("winning_tip_mismatch");
+                            }
+                        }
+                    }
+                    CommitOutcome::Rejected => {}
+                }
+                BatchPhase::Live { manifest, state, announced, pending_tip }
+            }
+            (BatchPhase::AwaitingResync { manifest, target_ancestor }, StreamEvent::Commit(_)) => {
+                report.skipped_awaiting_resync += 1;
+                BatchPhase::AwaitingResync { manifest, target_ancestor }
+            }
+            (_, StreamEvent::Commit(_)) => {
+                eyre::bail!(
+                    "a commit arrived at sequence {sequence} before a restorable checkpoint"
+                )
+            }
+            (
+                BatchPhase::Live { manifest, mut state, pending_tip, .. },
+                StreamEvent::Reorg(found),
+            ) => {
+                if pending_tip.is_some() {
+                    // Legitimate: the chain moved again before the previous branch finished. The
+                    // hole it leaves is real all the same, and counted rather than forgotten.
+                    report.winning_branch_incomplete += 1;
+                }
+                match apply_reorg(&mut state, &found) {
+                    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip } => {
+                        if revert {
+                            report.reverts_applied += 1;
+                        } else {
+                            report.reorgs_applied += 1;
+                        }
+                        report.last_verified = Some(ancestor.number);
+                        info!(
+                            target: "ps_replay",
+                            ancestor = ancestor.number,
+                            undone = undone.number,
+                            revert,
+                            "Applied a recorded reorg; the replay continues on the winning branch"
+                        );
+                        BatchPhase::Live {
+                            manifest,
+                            state,
+                            announced: Some(ancestor),
+                            pending_tip: winning_tip,
+                        }
+                    }
+                    ReorgOutcome::Inapplicable { ancestor, depth, detail } => {
+                        report.reorgs_inapplicable += 1;
+                        warn_inapplicable(ancestor, depth, &detail);
+                        report.last_verified = state.history.tip().map(|tip| tip.number);
+                        BatchPhase::AwaitingResync { manifest, target_ancestor: Some(ancestor) }
+                    }
+                    ReorgOutcome::Malformed { detail } => {
+                        report.failures.push(format!(
+                            "the reorg at sequence {sequence} is not a reorg this driver can \
+                             evaluate: {detail}"
+                        ));
+                        report.last_verified = state.history.tip().map(|tip| tip.number);
+                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                    }
                 }
             }
-            StreamEvent::Reorg(reorg) => {
-                // Recorded in v1 and not yet replayed: depth-1 rollback against the retained
-                // generation is S4's gate, and claiming it here by skipping the event would be
-                // exactly the silent drop the format exists to prevent.
+            (phase, StreamEvent::Reorg(found)) => {
+                report.failures.push(format!(
+                    "a reorg at {} arrived with no pair to apply it to",
+                    block_label(found.common_ancestor)
+                ));
+                phase
+            }
+            (phase, StreamEvent::Reset(reset)) => {
+                // The producer's own statement that it moved somewhere no incremental event can
+                // express. Not a failure of this replay, and not something it can recover from
+                // without a checkpoint.
                 warn!(
                     target: "ps_replay",
-                    common_ancestor = reorg.common_ancestor.number,
-                    abandoned = reorg.abandoned.len(),
-                    "Corpus contains a reorg, which this driver does not yet apply; the commits \
-                     after it are replayed against a pair that never unwound and their results are \
-                     not evidence"
+                    reason = ?reset.reason,
+                    detail = %reset.detail,
+                    "The producer recorded a reset; verification stops until a checkpoint arrives"
                 );
-                report.failures.push(format!(
-                    "reorg at {} is not replayed by this driver",
-                    block_label(reorg.common_ancestor)
-                ));
+                match phase {
+                    BatchPhase::Live { manifest, state, .. } => {
+                        report.last_verified = state.history.tip().map(|tip| tip.number);
+                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                    }
+                    BatchPhase::AwaitingCheckpoint { manifest } |
+                    BatchPhase::AwaitingResync { manifest, .. } |
+                    BatchPhase::Collecting { manifest, .. } => {
+                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                    }
+                    BatchPhase::AwaitingManifest => {
+                        eyre::bail!("a reset arrived before the manifest")
+                    }
+                }
             }
-            StreamEvent::Reset(reset) => {
-                report.failures.push(format!(
-                    "producer recorded a reset ({:?}): {}",
-                    reset.reason, reset.detail
-                ));
-            }
-            StreamEvent::End(end) => {
+            (phase, StreamEvent::End(end)) => {
                 // Orderly termination, not success: the producer's close path ran, and the kind
                 // says under what circumstances.
                 info!(
@@ -290,16 +524,24 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     last_sequence = end.last_sequence,
                     "Stream ended"
                 );
+                phase
             }
-        }
+        };
     }
 
+    finish_phase(phase, &mut report);
     report.closed = spool.closed();
     info!(
         target: "ps_replay",
         dir = %dir.display(),
+        commits = report.commits,
+        reorgs_applied = report.reorgs_applied,
+        reverts_applied = report.reverts_applied,
+        disagreements = report.disagreements.len(),
+        failures = report.failures.len(),
         bytes = spool.bytes(),
         closed = report.closed,
+        continuous = report.continuous(),
         "Read the recorded stream"
     );
     if !report.closed {
@@ -311,6 +553,244 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
     }
 
     Ok(report)
+}
+
+/// Where a batch replay is in the stream's grammar.
+///
+/// Replaced four loose locals whose only coupling was the order they happened to be assigned in.
+/// That arrangement could not represent a second checkpoint at all: the restore was one-shot and
+/// the chunk buffer was never cleared, so a corpus carrying a producer's recovery checkpoint was
+/// read as one checkpoint with two checkpoints' worth of chunks appended to it.
+enum BatchPhase {
+    /// Nothing accepted yet; the first frame must be the manifest.
+    AwaitingManifest,
+    /// Identity known; waiting for a checkpoint to bootstrap from.
+    AwaitingCheckpoint { manifest: Manifest },
+    /// A checkpoint arrived and its declared chunks are being collected.
+    Collecting {
+        manifest: Manifest,
+        checkpoint: Checkpoint,
+        /// The checkpoint frame's own sequence, which is what a resume would have to name.
+        checkpoint_sequence: u64,
+        chunks: Vec<SnapshotChunk>,
+        purpose: CollectPurpose,
+    },
+    /// A pair is restored and verifying commits.
+    Live {
+        manifest: Manifest,
+        state: Box<ReplayState>,
+        /// The ancestor an applied reorg just returned to, while its checkpoint may still arrive.
+        announced: Option<BlockRef>,
+        /// The tip an applied reorg said the winning branch would reach.
+        pending_tip: Option<BlockRef>,
+    },
+    /// Verification stopped at a discontinuity; only a checkpoint can restart it.
+    AwaitingResync {
+        manifest: Manifest,
+        /// The block a recovery checkpoint has to land on to be continuous.
+        target_ancestor: Option<BlockRef>,
+    },
+}
+
+/// Why a checkpoint's chunks are being collected.
+enum CollectPurpose {
+    /// The stream's first checkpoint. It becomes the pair.
+    Install,
+    /// A checkpoint announced by a reorg this driver already applied: compared against the pair
+    /// it already holds, then skipped.
+    CrossCheck { state: Box<ReplayState>, ancestor: BlockRef, pending_tip: Option<BlockRef> },
+    /// Recovery from a discontinuity. It becomes the pair, and where it lands decides whether the
+    /// recovery was continuous or an explicit reset.
+    Resync { target_ancestor: Option<BlockRef> },
+}
+
+/// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
+fn finish_collection_if_complete(
+    phase: BatchPhase,
+    report: &mut ReplayReport,
+) -> eyre::Result<BatchPhase> {
+    let BatchPhase::Collecting { manifest, checkpoint, checkpoint_sequence, chunks, purpose } =
+        phase
+    else {
+        return Ok(phase)
+    };
+    if chunks.len() < checkpoint.snapshot_chunks as usize {
+        return Ok(BatchPhase::Collecting {
+            manifest,
+            checkpoint,
+            checkpoint_sequence,
+            chunks,
+            purpose,
+        })
+    }
+    match purpose {
+        CollectPurpose::Install => {
+            let state = restore(&manifest, &checkpoint, &chunks)?;
+            Ok(BatchPhase::Live {
+                manifest,
+                state: Box::new(state),
+                announced: None,
+                pending_tip: None,
+            })
+        }
+        CollectPurpose::CrossCheck { state, ancestor, pending_tip } => {
+            report.checkpoints_skimmed += 1;
+            if let Err(disagreement) =
+                cross_check_recovery_checkpoint(&state, &checkpoint, ancestor)
+            {
+                error!(
+                    target: "ps_replay",
+                    block = checkpoint.block.number,
+                    field = disagreement.field,
+                    recorded = %disagreement.recorded,
+                    replayed = %disagreement.replayed,
+                    "The producer's recovery checkpoint disagrees with the generation this replay \
+                     recovered to. One of the two undid the reorg wrongly"
+                );
+                report.disagreements.push((checkpoint.block, disagreement));
+            }
+            // The bytes are checked even though the package is not installed: a chunk sequence
+            // that does not hash to what the checkpoint declared is a transport fault, and the
+            // pair this replay already holds is not evidence about the snapshot's own integrity.
+            if let Err(err) = checkpoint.reassemble(&chunks) {
+                report.failures.push(format!(
+                    "the recovery checkpoint at sequence {checkpoint_sequence} did not reassemble: \
+                     {err}"
+                ));
+            }
+            Ok(BatchPhase::Live { manifest, state, announced: None, pending_tip })
+        }
+        CollectPurpose::Resync { target_ancestor } => {
+            let state = restore(&manifest, &checkpoint, &chunks)?;
+            let continuous = target_ancestor.is_some_and(|target| target == checkpoint.block) &&
+                report.skipped_awaiting_resync == 0;
+            let unverified = (!continuous)
+                .then(|| {
+                    report
+                        .last_verified
+                        .filter(|last| *last < checkpoint.block.number)
+                        .map(|last| (last + 1, checkpoint.block.number))
+                })
+                .flatten();
+            if continuous {
+                info!(
+                    target: "ps_replay",
+                    block = checkpoint.block.number,
+                    "Recovered at the exact block the reorg named; nothing went unverified"
+                );
+            } else {
+                warn!(
+                    target: "ps_replay",
+                    block = checkpoint.block.number,
+                    ?target_ancestor,
+                    ?unverified,
+                    "Recovered from a checkpoint that is not the block recovery asked for. This is \
+                     an explicit checkpoint reset and makes no validation claim for the interval \
+                     it skipped"
+                );
+            }
+            report.resyncs.push(ResyncRecord {
+                at_sequence: checkpoint_sequence,
+                block: checkpoint.block.number,
+                continuous,
+                unverified,
+                commits_skipped: report.skipped_awaiting_resync,
+            });
+            report.skipped_awaiting_resync = 0;
+            Ok(BatchPhase::Live {
+                manifest,
+                state: Box::new(state),
+                announced: None,
+                pending_tip: None,
+            })
+        }
+    }
+}
+
+/// Records what the corpus ending in this phase means.
+fn finish_phase(phase: BatchPhase, report: &mut ReplayReport) {
+    match phase {
+        BatchPhase::AwaitingResync { target_ancestor, .. } => {
+            let detail = match target_ancestor {
+                Some(ancestor) => {
+                    format!("the corpus ends waiting for a checkpoint at {}", block_label(ancestor))
+                }
+                None => "the corpus ends waiting for a checkpoint".to_string(),
+            };
+            report.terminal_kind = Some("awaiting_resync");
+            report.terminal = Some(detail);
+        }
+        BatchPhase::Collecting { checkpoint, chunks, .. } => {
+            report.terminal_kind = Some("incomplete_checkpoint");
+            report.terminal = Some(format!(
+                "the corpus ends with {} of the checkpoint's {} chunks",
+                chunks.len(),
+                checkpoint.snapshot_chunks
+            ));
+        }
+        BatchPhase::Live { pending_tip: Some(tip), .. } => {
+            report.winning_branch_incomplete += 1;
+            warn!(
+                target: "ps_replay",
+                tip = tip.number,
+                "The corpus ends before the winning branch reached the tip the reorg announced"
+            );
+        }
+        BatchPhase::AwaitingManifest |
+        BatchPhase::AwaitingCheckpoint { .. } |
+        BatchPhase::Live { .. } => {}
+    }
+}
+
+/// Compares a producer's recovery checkpoint against the generation this replay recovered to.
+///
+/// Every field is one both sides derived independently — the producer from its own database, this
+/// consumer by undoing one block — so a mismatch is two implementations disagreeing about the same
+/// chain, which is exactly the kind of defect a recorded corpus exists to surface.
+pub(crate) fn cross_check_recovery_checkpoint(
+    state: &ReplayState,
+    checkpoint: &Checkpoint,
+    ancestor: BlockRef,
+) -> Result<(), Disagreement> {
+    if checkpoint.block != ancestor {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_block",
+            recorded: format!("{:?}", checkpoint.block),
+            replayed: format!("{ancestor:?}"),
+        })
+    }
+    if checkpoint.cache_policy_id != state.config.cache_policy_id() {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_policy",
+            recorded: format!("{:?}", checkpoint.cache_policy_id),
+            replayed: format!("{:?}", state.config.cache_policy_id()),
+        })
+    }
+    let fingerprint = state.pair.fingerprint();
+    if fingerprint.trie_state_root != Some(checkpoint.state_root) {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_state_root",
+            recorded: format!("{:?}", checkpoint.state_root),
+            replayed: format!("{:?}", fingerprint.trie_state_root),
+        })
+    }
+    if fingerprint.cache_root != checkpoint.cache_root {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_cache_root",
+            recorded: format!("{:?}", checkpoint.cache_root),
+            replayed: format!("{:?}", fingerprint.cache_root),
+        })
+    }
+    let announced_head = decode_accepted_head(checkpoint).map(|header| header.hash());
+    let held_head = state.pair.accepted_parent().map(|header| header.hash());
+    if announced_head != held_head {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_accepted_head",
+            recorded: format!("{announced_head:?}"),
+            replayed: format!("{held_head:?}"),
+        })
+    }
+    Ok(())
 }
 
 /// Everything a replay carries between commits.

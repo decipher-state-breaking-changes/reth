@@ -87,18 +87,24 @@ fn main() -> eyre::Result<()> {
         write_record(&path, &label, &report, elapsed_ms)?;
     }
 
-    if report.agreed() {
+    if report.agreed() && report.continuous() && report.complete() {
         info!(
             target: "ps_replay",
-            "The standalone validator agreed with the recording on every field it compared"
+            "The standalone validator agreed with the recording on every field it compared, and \
+             verified every canonical block the corpus carried"
         );
         return Ok(())
     }
+    // Reported apart, because they fail for different reasons and a run that agreed everywhere it
+    // looked but has a hole in what it looked at is a different result from a run that disagreed.
     Err(eyre::eyre!(
-        "{} disagreements, {} failures, {} mutation failures",
+        "{} disagreements, {} failures, {} mutation failures; continuous={}, complete={}{}",
         report.disagreements.len(),
         report.failures.len(),
-        report.mutation_failures.len()
+        report.mutation_failures.len(),
+        report.continuous(),
+        report.complete(),
+        report.terminal.as_ref().map(|why| format!(" ({why})")).unwrap_or_default()
     ))
 }
 
@@ -132,7 +138,22 @@ fn write_record(
         "elapsed_ms": elapsed_ms,
         "closed": report.closed,
         "terminal": report.terminal,
+        "terminal_kind": report.terminal_kind,
         "skipped_after_fault": report.skipped_after_fault,
+        // Three axes rather than one. `agreed` is about the two implementations, `continuous`
+        // about whether any canonical block went unverified, and `complete` about whether the
+        // replay reached the end of the corpus. A reorg the pair could not undo moves the last
+        // two and must not move the first.
+        "continuous": report.continuous(),
+        "complete": report.complete(),
+        "reorgs_applied": report.reorgs_applied,
+        "reverts_applied": report.reverts_applied,
+        "reorgs_inapplicable": report.reorgs_inapplicable,
+        "checkpoints_skimmed": report.checkpoints_skimmed,
+        "skipped_awaiting_resync": report.skipped_awaiting_resync,
+        "winning_branch_incomplete": report.winning_branch_incomplete,
+        "resyncs": report.resyncs,
+        "last_verified": report.last_verified,
         "blocks": report.blocks,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
