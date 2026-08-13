@@ -28,7 +28,7 @@ use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHe
 use reth_storage_errors::provider::ProviderResult;
 use serde::Serialize;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The one coordinated generation a validator maintains, plus what it is authenticated against.
 pub struct CoordinatedPair {
@@ -220,10 +220,18 @@ impl CoordinatedPair {
 
     /// Undo exactly one committed block, returning the pair to `target_hash`.
     ///
-    /// This is the fast path for a depth-1 reorg. It is fail-closed by construction: every
-    /// precondition is checked before anything is mutated, and any rejection returns `None` so the
-    /// caller falls back. A caller's fallback is safe even over a half-restored pair, because
-    /// neither a rebuild nor a snapshot restore consults the previous generation.
+    /// This is the fast path for a depth-1 reorg, and it is a transaction: the pair ends at the
+    /// parent generation or at the child, never between them. Every check — including the
+    /// readiness tracker's, which runs against a copy of the tracker and a prediction of what the
+    /// caches will report — happens before the first mutation, and the mutations that follow
+    /// cannot be refused. That matters here and not for the full node that first needed it: a
+    /// caller with a database can replace a half-restored pair wholesale, and a standalone
+    /// validator has nothing to replace it with.
+    ///
+    /// What a rejection preserves, stated exactly: both caches, the readiness tracker, and the
+    /// accepted head are untouched. The retained generation is *not* always kept — a retention
+    /// tagged with a different block is dropped, because the caller has just named a canonical
+    /// target it does not describe and nothing will ask for it again.
     ///
     /// `target_state_root` must come from the canonical header for `target_hash`. Comparing the
     /// retained trie's own root against it is what makes this an authentication rather than a
@@ -235,11 +243,16 @@ impl CoordinatedPair {
         target_state_root: B256,
         cache_policy_id: B256,
     ) -> Option<ReadyParent> {
-        let retained = self.previous_generation.take()?;
+        // Everything down to the commit marker below reads and never writes, and the tracker's own
+        // verdict is taken on a copy — so the mutations, once they start, cannot be refused
+        // half-way. The retention itself is not consumed until then.
+        let (retained_hash, retained_number, retained_root) = {
+            let retained = self.previous_generation.as_ref()?;
+            (retained.block_hash, retained.block_number, retained.trie_cache.state_root())
+        };
         // Checked before anything is mutated, and before the cheap hash checks are even worth
         // running: a pair that is still warming has no `Ready` to return to, so undoing into it
-        // would trade a rebuild that genuinely fills the window for a claim nothing backs. The
-        // tracker refuses this too, but only after the caches have already been rolled back.
+        // would trade a rebuild that genuinely fills the window for a claim nothing backs.
         if !self.readiness.stays_warm_after_one_undo() {
             debug!(
                 target: "partial_stateless",
@@ -249,26 +262,31 @@ impl CoordinatedPair {
             );
             return None
         }
-        if retained.block_hash != target_hash {
+        if retained_hash != target_hash {
             debug!(
                 target: "partial_stateless",
-                retained_block = retained.block_number,
-                retained_hash = ?retained.block_hash,
+                retained_block = retained_number,
+                retained_hash = ?retained_hash,
                 ?target_hash,
                 "Retained generation belongs to a different block; falling back to a rebuild"
             );
+            // The one lifecycle change a refusal makes, and it is deliberate: this retention
+            // describes a branch the caller has just been told is not canonical, so nothing will
+            // ask for it again. The caches and the tracker are still exactly as they were.
+            self.forget_retained_generation();
             return None
         }
         // Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has
         // to move as one generation.
-        if self.cache.current_block() != retained.block_number + 1 {
+        let undone = self.cache.current_block();
+        if undone != retained_number + 1 {
             return None
         }
-        if retained.trie_cache.state_root() != Some(target_state_root) {
+        if retained_root != Some(target_state_root) {
             warn!(
                 target: "partial_stateless",
-                block = retained.block_number,
-                retained_state_root = ?retained.trie_cache.state_root(),
+                block = retained_number,
+                retained_state_root = ?retained_root,
                 canonical_state_root = ?target_state_root,
                 "Retained generation does not match the canonical state root at its own block; \
                  falling back to a rebuild"
@@ -276,43 +294,94 @@ impl CoordinatedPair {
             return None
         }
 
-        let undone = self.cache.current_block();
-        if let Err(err) = self.cache.rollback_block(undone) {
-            warn!(
+        // What the rollback will install, taken from the record it will consume. Comparing it here
+        // is the same check `rollback_block` would make, moved ahead of the mutation, and it is
+        // what lets the commit below treat the rollback as infallible.
+        let Some(preview) = self.cache.undo_preview() else {
+            debug!(
                 target: "partial_stateless",
                 block = undone,
-                ?err,
-                "Flat rollback refused the block the retained generation undoes"
+                "No undo record to give back; falling back to a rebuild"
+            );
+            return None
+        };
+        if preview.block_number != undone || preview.previous_block != retained_number {
+            debug!(
+                target: "partial_stateless",
+                block = undone,
+                undo_block = preview.block_number,
+                undo_previous = preview.previous_block,
+                retained_block = retained_number,
+                "The newest undo record does not describe the block the retention undoes"
             );
             return None
         }
-        self.trie_cache = retained.trie_cache;
-        // Restored together with the caches, and only now that the rollback has succeeded. Between
-        // the `take` above and this line the pair holds the child's header over the parent's
-        // caches; `accepted_parent` reports absence for exactly that window, and every early
-        // return in it sends the caller to a rebuild that replaces the header wholesale.
-        self.accepted_head = retained.accepted_head;
+        // The post-undo cache root has to be known *before* the undo for this to be a transaction,
+        // and the record carries it only when the parent's root had already been computed. Every
+        // path that reaches here in production computes it every block — the coordinated
+        // fingerprint and the ready parent's anchor both do. A pair that applied a block without
+        // ever rooting its parent falls back instead, which is the fail-closed direction.
+        let Some(previous_cache_root) = preview.previous_cache_root else {
+            debug!(
+                target: "partial_stateless",
+                block = undone,
+                "The parent's cache root was never computed, so the undo cannot be made atomic; \
+                 falling back to a rebuild"
+            );
+            return None
+        };
 
         let checkpoint = TrustedCheckpoint {
-            block_number: retained.block_number,
-            block_hash: retained.block_hash,
+            block_number: retained_number,
+            block_hash: retained_hash,
             state_root: target_state_root,
-            cache_root: self.cache.cache_root(),
+            cache_root: previous_cache_root,
             cache_policy_id,
         };
-        let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
-        match self.readiness.restore_from_undone_block(&checkpoint, &observation) {
-            Ok(ready) => Some(ready.clone()),
+        // Exactly what `CacheObservation::capture` will report once the commit below runs: the
+        // rollback restores `previous_block` and the memoized root verbatim, and the trie is
+        // replaced by the retained one whose root was just checked. So the tracker's answer here
+        // is its answer there, taken while a refusal still costs nothing.
+        let predicted = CacheObservation {
+            cache_block: preview.previous_block,
+            cache_root: previous_cache_root,
+            trie_state_root: retained_root,
+        };
+        let mut next_readiness = self.readiness.clone();
+        let ready = match next_readiness.restore_from_undone_block(&checkpoint, &predicted) {
+            Ok(ready) => ready.clone(),
             Err(err) => {
                 warn!(
                     target: "partial_stateless",
-                    block = retained.block_number,
+                    block = retained_number,
                     ?err,
                     "Readiness rejected the restored generation; falling back to a rebuild"
                 );
-                None
+                return None
             }
+        };
+
+        // ---- commit ----
+        if let Err(err) = self.cache.rollback_block(undone) {
+            // Unreachable: the preview above named this exact block, and nothing between then and
+            // now touches the undo log. Reported rather than asserted because a validator that got
+            // here has a broken invariant, not a block to reject — and the early return is still
+            // sound, since `rollback_block` refuses before it pops.
+            error!(
+                target: "partial_stateless",
+                block = undone,
+                ?err,
+                "Flat rollback refused a block its own undo record named; falling back to a rebuild"
+            );
+            return None
         }
+        let retained = self.previous_generation.take().expect("checked present above");
+        self.trie_cache = retained.trie_cache;
+        // Restored together with the caches. Between here and the tracker swap the pair holds the
+        // parent's header over the parent's caches, and both name the same generation.
+        self.accepted_head = retained.accepted_head;
+        self.readiness = next_readiness;
+        Some(ready)
     }
 }
 

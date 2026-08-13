@@ -2540,6 +2540,84 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_mismatch_is_refused_before_any_mutation() {
+        // The rejection that used to arrive too late. The tracker checks the policy id only after
+        // it has reset itself, and it was reached only after the flat cache had been rolled back
+        // and the trie replaced — so a pair configured against one policy and handed a checkpoint
+        // naming another ended up at neither generation. A caller with a database can throw such a
+        // pair away; the standalone validator this path exists for cannot.
+        let (mut pair, _config, state_root) = pair_one_block_past_a_snapshot();
+        let before = pair.fingerprint();
+        let lifecycle_before = pair.lifecycle_fingerprint();
+        let state_before = pair.readiness.state().label();
+
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, B256::repeat_byte(0x77))
+                .is_none(),
+            "a checkpoint naming a policy this pair is not running is not restorable"
+        );
+
+        assert_eq!(pair.fingerprint(), before, "both caches are where the refusal found them");
+        assert_eq!(pair.lifecycle_fingerprint(), lifecycle_before, "and so is the retention");
+        assert_eq!(pair.readiness.state().label(), state_before, "and the tracker was not reset");
+        assert!(pair.previous_generation.is_some(), "the retention is still the caller's to use");
+    }
+
+    #[test]
+    fn a_pruned_undo_log_is_refused_without_mutation() {
+        // The retained trie reaches one block back; the flat undo log is pruned at finality. When
+        // the two disagree the undo is not available, and the pair must learn that before it moves
+        // rather than from a rollback that refuses half-way through the generation swap.
+        let (mut pair, config, state_root) = pair_one_block_past_a_snapshot();
+        pair.cache.prune_undo_below(SNAP_BLOCK + 1);
+        let before = pair.fingerprint();
+        let state_before = pair.readiness.state().label();
+
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+                .is_none(),
+            "there is no undo record to give the block back with"
+        );
+
+        assert_eq!(pair.fingerprint(), before, "nothing moved");
+        assert_eq!(pair.readiness.state().label(), state_before);
+        assert!(pair.previous_generation.is_some(), "and the retention was not consumed");
+    }
+
+    #[test]
+    fn a_refused_warming_undo_keeps_the_retained_generation() {
+        // A warming pair is refused because it has no `Ready` to return to — but the retention it
+        // holds still describes the branch the caller named, so a later attempt against a warmer
+        // pair is entitled to it. Only a retention tagged with a *different* block is dropped.
+        let config = CacheConfig::default();
+        let (package, checkpoint, state_root) = warm_snapshot(&config);
+        let retained = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let mut pair = cold_pair();
+        for number in (SNAP_BLOCK - 2)..=SNAP_BLOCK {
+            process(&mut pair, number);
+        }
+        apply(&mut pair, SNAP_BLOCK + 1);
+        pair.retain_generation(
+            Some(retained.trie_cache),
+            SNAP_HASH,
+            SNAP_BLOCK,
+            sealed(&ctx(SNAP_BLOCK + 1)),
+            true,
+        );
+
+        assert!(pair
+            .restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+            .is_none());
+
+        assert_eq!(
+            pair.lifecycle_fingerprint().retained_generation,
+            Some((SNAP_BLOCK, SNAP_HASH)),
+            "the refusal was about this pair's warmth, not about what it retained"
+        );
+    }
+
+    #[test]
     fn a_still_warming_pair_refuses_the_undo_and_leaves_the_caches_alone() {
         // What a reorg finds on a node that never got a canonical rebuild: the pair is sound and
         // advancing, but it has replayed nowhere near a window and has no `Ready` to return to.

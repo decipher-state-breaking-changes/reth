@@ -980,6 +980,20 @@ impl NetworkStateCache {
         Some(delta)
     }
 
+    /// What rolling back the newest applied block would restore, without rolling anything back.
+    ///
+    /// Exists so a caller can make the undo a transaction. [`rollback_block`](Self::rollback_block)
+    /// is the only fallible step of a depth-1 recovery, and the values it will install are already
+    /// decided by the record it consumes — so a caller that checks them here can commit knowing
+    /// the rollback cannot refuse, rather than discovering a mismatch with the cache half moved.
+    pub fn undo_preview(&self) -> Option<UndoPreview> {
+        self.undo_log.back().map(|undo| UndoPreview {
+            block_number: undo.block_number,
+            previous_block: undo.previous_block,
+            previous_cache_root: undo.previous_cache_root,
+        })
+    }
+
     pub fn rollback_block(&mut self, block_number: u64) -> Result<(), CacheError> {
         match self.undo_log.back() {
             Some(undo) if undo.block_number == block_number => {}
@@ -1071,6 +1085,25 @@ impl NetworkStateCache {
         self.current_block = 0;
         self.memoized_cache_root = OnceLock::new();
     }
+}
+
+/// What a rollback of the newest applied block would restore.
+///
+/// Returned by [`NetworkStateCache::undo_preview`]; every field is read straight out of the undo
+/// record, so comparing them against what a recovery expects is the same check the rollback would
+/// have made, moved ahead of the mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UndoPreview {
+    /// The block the newest undo record can undo. A rollback of any other block is refused.
+    pub block_number: u64,
+    /// The height the cache returns to.
+    pub previous_block: u64,
+    /// The cache root the rollback reinstalls, when the parent's root had already been computed.
+    ///
+    /// `None` means the memo was empty when the block applied, so the root after the undo is
+    /// whatever recomputing the rolled-back contents yields. It is not wrong, only unpredictable
+    /// before the fact, which is the one thing a transaction needs it to be.
+    pub previous_cache_root: Option<B256>,
 }
 
 /// Result of computing cache misses for a block.
@@ -1421,6 +1454,56 @@ mod tests {
         let evicted_root = cache.cache_root();
         assert_eq!(evicted_root, cache.compute_cache_root_uncached());
         assert_eq!(evicted_root, empty_root);
+    }
+
+    #[test]
+    fn an_undo_preview_names_what_the_rollback_would_restore() {
+        let mut cache = make_cache(10, 10);
+        assert!(cache.undo_preview().is_none(), "nothing applied, nothing to give back");
+
+        let mut parent_accessed = BlockAccessedState::default();
+        parent_accessed.accounts.insert(
+            Address::repeat_byte(0x01),
+            AccountData { nonce: 1, balance: U256::from(10), code_hash: None },
+        );
+        cache.on_block_executed(10, &parent_accessed);
+        let parent_root = cache.cache_root();
+
+        let mut child_accessed = BlockAccessedState::default();
+        child_accessed.accounts.insert(
+            Address::repeat_byte(0x02),
+            AccountData { nonce: 2, balance: U256::from(20), code_hash: None },
+        );
+        cache.on_block_executed(11, &child_accessed);
+
+        let preview = cache.undo_preview().expect("a block was applied");
+        assert_eq!(preview.block_number, 11);
+        assert_eq!(preview.previous_block, 10);
+        assert_eq!(preview.previous_cache_root, Some(parent_root));
+
+        cache.rollback_block(11).unwrap();
+        assert_eq!(cache.current_block(), preview.previous_block, "the preview was exact");
+        assert_eq!(cache.cache_root(), parent_root);
+    }
+
+    #[test]
+    fn an_undo_preview_reports_an_unrooted_parent_as_unpredictable() {
+        let mut cache = make_cache(10, 10);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            Address::repeat_byte(0x01),
+            AccountData { nonce: 1, balance: U256::from(10), code_hash: None },
+        );
+        // No `cache_root()` between the two blocks, so the memo is empty when the second applies.
+        cache.on_block_executed(10, &accessed);
+        cache.on_block_executed(11, &accessed);
+
+        let preview = cache.undo_preview().expect("a block was applied");
+        assert_eq!(preview.previous_block, 10);
+        assert_eq!(
+            preview.previous_cache_root, None,
+            "the root after the undo is honest but not knowable before it"
+        );
     }
 
     #[test]
