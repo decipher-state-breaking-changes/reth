@@ -243,11 +243,10 @@ if [ "$GATE_MODE" = "reorg" ] && [ "${GATE_FORCE_RESTORE:-0}" = "1" ]; then
     # not prove the snapshot behind it would restore a validator that has no retained generation
     # to recover with — the one consumer that most needs it. This installs it and replays the
     # winning branch against it, which is the only thing that does prove it.
-    RESTORE_AT=$(grep '"kind":"state"' "$FOLLOW_JSON" 2>/dev/null |
-        jq -rs 'map(select(.reason == "restored")) | .[-1].sequence // empty' 2>/dev/null || true)
-    RESTORE_AT=${RESTORE_AT:-$(jq -r '.restored_from_sequence // empty' "$ACK_FILE" 2>/dev/null || true)}
+    RESTORE_AT=$(jq -rs 'map(select(.kind == "skimmed")) | .[-1].sequence // empty' \
+        "$FOLLOW_JSON" 2>/dev/null || true)
     if [ -z "$RESTORE_AT" ]; then
-        echo "  FAIL: GATE_FORCE_RESTORE=1 but no recovery checkpoint sequence was recorded" >&2
+        echo "  FAIL: GATE_FORCE_RESTORE=1 but the follower skimmed no recovery checkpoint" >&2
         FAILED=1
     else
         echo "==> forcing a restore from the recovery checkpoint at sequence $RESTORE_AT"
@@ -260,7 +259,9 @@ if [ "$GATE_MODE" = "reorg" ] && [ "${GATE_FORCE_RESTORE:-0}" = "1" ]; then
             { echo "  FAIL: forced-restore batch exit $forced_code" >&2; FAILED=1; }
         if [ -n "$FORCED" ]; then
             check "$FORCED" "the recovery checkpoint really does rebootstrap a validator" \
-                ".agreed == true and .restores_forced != false"
+                "([.resyncs[] | select(.at_sequence == $RESTORE_AT)] | length) == 1"
+            check "$FORCED" "and the winning branch replayed against it agreed throughout" \
+                ".agreed == true and .complete == true"
         fi
     fi
 fi

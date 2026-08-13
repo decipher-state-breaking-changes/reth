@@ -1239,6 +1239,10 @@ impl<'a> Follower<'a> {
             "The producer's recovery checkpoint agrees with the generation this follower \
              recovered to; its snapshot is checked and not installed"
         );
+        // Recorded with its sequence, because agreeing with a checkpoint is not the same as
+        // having shown its snapshot would restore anything — and the offline proof that it would
+        // needs to be told which frame to install.
+        self.sink.skimmed(checkpoint.block, sequence)?;
         if checkpoint.snapshot_chunks == 0 {
             return self.finish_skim(
                 SkimPhase {
@@ -1983,6 +1987,20 @@ impl VerdictSink {
             "unverified_to": unverified.map(|(_, to)| to),
             "last_verified": last_verified.map(|block| block.number),
             "observed_at_ms": now_ms(),
+        }))
+    }
+
+    /// A recovery checkpoint compared against the pair this follower already holds, and skipped.
+    fn skimmed(&mut self, block: BlockRef, sequence: u64) -> eyre::Result<()> {
+        self.write(serde_json::json!({
+            "schema_version": 1,
+            "benchmark": "standalone_follow_v1",
+            "kind": "skimmed",
+            "label": self.label,
+            "block": block.number,
+            "block_hash": format!("{:?}", block.hash),
+            "sequence": sequence,
+            "timestamp_ms": now_ms(),
         }))
     }
 
