@@ -152,6 +152,7 @@ fn write_record(
         "checkpoints_skimmed": report.checkpoints_skimmed,
         "skipped_awaiting_resync": report.skipped_awaiting_resync,
         "winning_branch_incomplete": report.winning_branch_incomplete,
+        "winning_branches_superseded": report.winning_branches_superseded,
         "resyncs": report.resyncs,
         "last_verified": report.last_verified,
         "blocks": report.blocks,
@@ -259,6 +260,8 @@ fn write_follow_summary(
         "restores_reset": report.restores_reset,
         "winning_branches_completed": report.winning_branches_completed,
         "winning_branches_incomplete": report.winning_branches_incomplete,
+        "winning_branches_superseded": report.winning_branches_superseded,
+        "scan_refusals": report.scan_refusals,
         "unverified_intervals": report.unverified_intervals,
         "admission_is_load_bearing": report.replay.admission_is_load_bearing(),
         "elapsed_ms": elapsed_ms,
@@ -268,14 +271,21 @@ fn write_follow_summary(
     Ok(())
 }
 
+/// Both axes, because a follower that agreed everywhere it looked can still have looked at less
+/// than the chain: a recovery that landed somewhere other than the block it asked for leaves an
+/// interval nothing validated, and exiting 0 on that would report a hole as a clean run.
+fn follow_succeeded(report: &FollowReport) -> bool {
+    report.agreed() && report.continuous()
+}
+
 fn follow_exit_code(report: &FollowReport) -> i32 {
     match &report.outcome {
         FollowOutcome::Ended { before_checkpoint: true, .. } => 3,
         FollowOutcome::Ended { kind: EndKind::Shutdown | EndKind::SpoolLimit, .. } => {
-            i32::from(!report.agreed())
+            i32::from(!follow_succeeded(report))
         }
         FollowOutcome::Ended { .. } | FollowOutcome::Faulted { .. } => 1,
-        FollowOutcome::MaxBlocks => i32::from(!report.agreed()),
+        FollowOutcome::MaxBlocks => i32::from(!follow_succeeded(report)),
         FollowOutcome::IdleTimeout { waiting_in } if *waiting_in == "needs_snapshot" => 2,
         FollowOutcome::IdleTimeout { .. } => 4,
     }

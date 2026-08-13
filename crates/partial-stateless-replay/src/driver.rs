@@ -124,8 +124,14 @@ pub struct ReplayReport {
     /// Checkpoints the producer published after a reorg this driver had already applied itself,
     /// verified against the pair's own state and then skipped rather than installed.
     pub checkpoints_skimmed: u64,
-    /// Winning branches the producer announced and did not deliver in full.
+    /// Winning branches the producer announced and did not deliver in full, with nothing valid
+    /// taking their place. A branch replaced by a later reorg is counted as superseded instead.
     pub winning_branch_incomplete: u64,
+    /// Winning branches a later announcement withdrew before the delivery reached their tip.
+    ///
+    /// Diagnostic only. The chain moving twice in quick succession is ordinary, and the interval
+    /// between the two is not an unverified gap — those blocks never became canonical.
+    pub winning_branches_superseded: u64,
     /// Every re-bootstrap this replay performed, and whether it left a hole.
     pub resyncs: Vec<ResyncRecord>,
     /// The highest block this replay verified for itself.
@@ -464,12 +470,18 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 BatchPhase::Live { manifest, mut state, pending_tip, .. },
                 StreamEvent::Reorg(found),
             ) => {
-                if pending_tip.is_some() {
-                    // Legitimate: the chain moved again before the previous branch finished. The
-                    // hole it leaves is real all the same, and counted rather than forgotten.
-                    report.winning_branch_incomplete += 1;
+                // A branch that was still being delivered is not a hole when the producer
+                // itself replaces it: the announcement below supersedes this one, and the blocks
+                // between here and the old tip never became canonical. It *is* a hole when
+                // nothing valid replaces it, which is decided per outcome below.
+                let superseded = pending_tip;
+                let outcome = apply_reorg(&mut state, &found);
+                match (superseded, outcome.withdraws_an_announced_branch()) {
+                    (Some(tip), true) => note_supersession(&mut report, tip, found.winning_tip),
+                    (Some(_), false) => report.winning_branch_incomplete += 1,
+                    (None, _) => {}
                 }
-                match apply_reorg(&mut state, &found) {
+                match outcome {
                     ReorgOutcome::Applied { ancestor, undone, revert, winning_tip } => {
                         if revert {
                             report.reverts_applied += 1;
@@ -491,11 +503,23 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                             pending_tip: winning_tip,
                         }
                     }
-                    ReorgOutcome::Inapplicable { ancestor, depth, detail } => {
+                    // Bound to this driver's own branch, so the ancestor is a block it verified
+                    // and a checkpoint there resumes it exactly. The superseded branch is
+                    // withdrawn by a statement this driver could authenticate.
+                    ReorgOutcome::Unrecoverable { ancestor, depth, detail } => {
                         report.reorgs_inapplicable += 1;
-                        warn_inapplicable(ancestor, depth, &detail);
+                        warn_inapplicable(ancestor, depth, &detail, true);
                         report.last_verified = state.history.tip().map(|tip| tip.number);
                         BatchPhase::AwaitingResync { manifest, target_ancestor: Some(ancestor) }
+                    }
+                    // Well-formed but about a branch this driver never held. It carries no
+                    // authority: no target, so no recovery under it can be called continuous, and
+                    // the branch it interrupted stays counted as unfinished.
+                    ReorgOutcome::Unbound { ancestor, depth, detail } => {
+                        report.reorgs_inapplicable += 1;
+                        warn_inapplicable(ancestor, depth, &detail, false);
+                        report.last_verified = state.history.tip().map(|tip| tip.number);
+                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
                     }
                     ReorgOutcome::Malformed { detail } => {
                         report.failures.push(format!(
@@ -525,7 +549,10 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     "The producer recorded a reset; verification stops until a checkpoint arrives"
                 );
                 match phase {
-                    BatchPhase::Live { manifest, state, .. } => {
+                    BatchPhase::Live { manifest, state, pending_tip, .. } => {
+                        // A reset withdraws the stream without naming a replacement branch, so an
+                        // announced tip that never arrived stays a hole.
+                        report.winning_branch_incomplete += u64::from(pending_tip.is_some());
                         report.last_verified = state.history.tip().map(|tip| tip.number);
                         BatchPhase::AwaitingResync { manifest, target_ancestor: None }
                     }
@@ -659,7 +686,6 @@ fn finish_collection_if_complete(
             })
         }
         CollectPurpose::CrossCheck { state, ancestor, pending_tip } => {
-            report.checkpoints_skimmed += 1;
             if let Err(disagreement) =
                 cross_check_recovery_checkpoint(&state, &checkpoint, ancestor)
             {
@@ -673,7 +699,28 @@ fn finish_collection_if_complete(
                      recovered to. One of the two undid the reorg wrongly"
                 );
                 report.disagreements.push((checkpoint.block, disagreement));
+                // Recorded, and then the checkpoint is installed rather than skipped — the same
+                // answer the follower gives. Carrying on from a generation the operator-trusted
+                // checkpoint source contradicts would make every later block a comparison against
+                // disputed state, and a reader could not tell an independent second finding from
+                // the first one cascading. Installing isolates the finding to the block it is
+                // about; the interval it covers is an explicit reset, never a continuous recovery.
+                let state = restore(&manifest, &checkpoint, &chunks)?;
+                report.resyncs.push(ResyncRecord {
+                    at_sequence: checkpoint_sequence,
+                    block: checkpoint.block.number,
+                    continuous: false,
+                    unverified: None,
+                    commits_skipped: 0,
+                });
+                return Ok(BatchPhase::Live {
+                    manifest,
+                    state: Box::new(state),
+                    announced: None,
+                    pending_tip,
+                })
             }
+            report.checkpoints_skimmed += 1;
             // The bytes are checked even though the package is not installed: a chunk sequence
             // that does not hash to what the checkpoint declared is a transport fault, and the
             // pair this replay already holds is not evidence about the snapshot's own integrity.
@@ -765,6 +812,26 @@ fn finish_phase(phase: BatchPhase, report: &mut ReplayReport) {
         BatchPhase::AwaitingCheckpoint { .. } |
         BatchPhase::Live { .. } => {}
     }
+}
+
+/// Records that a valid new announcement replaced a winning branch that was still being delivered.
+///
+/// Not a hole: the producer withdrew the old tip as a canonical goal, so the blocks between where
+/// the delivery got to and where it had been heading never became canonical and were never owed a
+/// verdict. Only a branch abandoned with nothing valid in its place is counted incomplete.
+fn note_supersession(
+    report: &mut ReplayReport,
+    superseded: BlockRef,
+    replacement: Option<BlockRef>,
+) {
+    report.winning_branches_superseded += 1;
+    info!(
+        target: "ps_replay",
+        superseded = superseded.number,
+        replacement = ?replacement.map(|tip| tip.number),
+        "A second reorg replaced the winning branch before it finished; the old tip is withdrawn, \
+         not missing"
+    );
 }
 
 /// Compares a producer's recovery checkpoint against the generation this replay recovered to.

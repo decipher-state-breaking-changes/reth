@@ -120,14 +120,32 @@ pub(crate) enum ReorgOutcome {
     },
     /// A real reorg of this consumer's own branch that it cannot undo by itself.
     ///
-    /// The pair is left `Recovering`, so it refuses every further commit: a consumer with no
-    /// database has no rebuild, and the only recovery left is a checkpoint at `ancestor`.
-    Inapplicable {
+    /// The common ancestor is a block this consumer verified, so it knows exactly where the
+    /// producer is asking it to stand; it just cannot get there. The pair is left `Recovering`,
+    /// so it refuses every further commit — a consumer with no database has no rebuild — and
+    /// because the ancestor is authenticated, a checkpoint at that exact block is a *continuous*
+    /// recovery: everything below it was verified, and nothing above it is canonical any more.
+    Unrecoverable {
         /// The block a recovery snapshot has to be authenticated at.
         ancestor: BlockRef,
         /// How many blocks left the chain.
         depth: u64,
         /// Why the undo was not available.
+        detail: String,
+    },
+    /// A well-formed reorg naming a common ancestor this consumer never verified.
+    ///
+    /// Nothing was touched. The caller must still stop — the producer has moved somewhere this
+    /// consumer cannot follow — but `ancestor` carries no authority here, so a checkpoint landing
+    /// on it may not be reported as a continuous recovery: this consumer cannot show it ever
+    /// stood on that block. Distinguishing this from [`Unrecoverable`](Self::Unrecoverable) is
+    /// what keeps `continuous` honest.
+    Unbound {
+        /// The block the frame named, for the record only.
+        ancestor: BlockRef,
+        /// How many blocks the frame said left the chain.
+        depth: u64,
+        /// Why the frame could not be bound.
         detail: String,
     },
     /// The frame does not describe a reorg this consumer can evaluate. Nothing was touched.
@@ -137,13 +155,35 @@ pub(crate) enum ReorgOutcome {
     },
 }
 
+impl ReorgOutcome {
+    /// Whether this frame has the standing to withdraw a winning branch still being delivered.
+    ///
+    /// A producer that announces a branch and then reorgs again has not left a hole: the blocks
+    /// between where delivery got to and where it had been heading never became canonical, so no
+    /// verdict was ever owed on them. But only a frame this consumer could authenticate against
+    /// its own history says that. A malformed frame, or one about a branch this consumer never
+    /// stood on, is not a retraction — under it the announced tip is simply unaccounted for, and
+    /// that is a hole.
+    pub(crate) const fn withdraws_an_announced_branch(&self) -> bool {
+        matches!(self, Self::Applied { .. } | Self::Unrecoverable { .. })
+    }
+}
+
 /// Applies a recorded reorg or revert to `state`, or explains why it could not be.
 ///
-/// The order is deliberate. Shape is checked first and leaves the pair alone, because a frame that
-/// is not a reorg should not stop a driver that could still read the rest of the corpus. Once the
-/// shape holds, the producer has said that blocks from `abandoned[0]` upward left the chain, and
-/// that alone is enough to stop verifying against them — so recovery begins before the pair is
-/// asked whether it can finish it.
+/// The order is deliberate, and it is the order of authority.
+///
+/// Shape is judged first and leaves the pair alone, because a frame that is not a reorg should not
+/// stop a driver that could still read the rest of the corpus. The *common ancestor* is bound
+/// next, against this consumer's own verified history, and that check alone decides whether the
+/// block the frame names may anchor a recovery: a consumer that never stood on it cannot call
+/// landing there continuous. Recovery begins the moment the ancestor binds, because from there the
+/// frame is about this consumer's own chain and its blocks above that point are gone — true
+/// whether or not the undo turns out to be available.
+///
+/// Everything after that is about performing the undo, not about locating it. The abandoned suffix
+/// is checked because undoing on the strength of a branch this consumer never held would give back
+/// the wrong block; failing it forfeits the undo, not the ancestor.
 pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcome {
     if let Err(detail) = check_shape(reorg) {
         return ReorgOutcome::Malformed { detail }
@@ -152,10 +192,8 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
     let depth = reorg.abandoned.len() as u64;
     let unwound_from = reorg.abandoned[0].number;
 
-    state.pair.readiness.begin_recovery(unwound_from);
-
     if !state.history.holds(ancestor) {
-        return ReorgOutcome::Inapplicable {
+        return ReorgOutcome::Unbound {
             ancestor,
             depth,
             detail: format!(
@@ -164,15 +202,19 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
             ),
         }
     }
+
+    // The ancestor is this consumer's own block, and the producer says the chain left it behind.
+    state.pair.readiness.begin_recovery(unwound_from);
+
     if !state.history.is_canonical_suffix(&reorg.abandoned) {
-        return ReorgOutcome::Inapplicable {
+        return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
             detail: "the abandoned blocks are not the branch this consumer verified".to_string(),
         }
     }
     if depth != 1 {
-        return ReorgOutcome::Inapplicable {
+        return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
             detail: format!(
@@ -185,7 +227,7 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
     let ReplayState { pair, history, config, .. } = state;
     let policy_id = config.cache_policy_id();
     if try_depth_one_recovery(pair, &*history, ancestor.hash, policy_id).is_none() {
-        return ReorgOutcome::Inapplicable {
+        return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
             detail: "the retained generation could not restore the common ancestor".to_string(),
@@ -205,7 +247,11 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
 }
 
 /// Everything about a reorg frame that can be judged without consulting the pair.
-fn check_shape(reorg: &Reorg) -> Result<(), String> {
+///
+/// Shared with the recovery scan, which reads reorg frames written while a consumer was not
+/// following: a frame that is not a reorg must not be allowed to name the block a recovery is
+/// measured against, or a checkpoint landing on an invented ancestor would be reported continuous.
+pub(crate) fn check_shape(reorg: &Reorg) -> Result<(), String> {
     let Some(first) = reorg.abandoned.first() else {
         return Err("a reorg that abandons no block is not a reorg".to_string())
     };
@@ -244,15 +290,20 @@ struct VerifiedBlock {
 }
 
 /// Reports a reorg the driver could not apply, in the one place both drivers agree on the wording.
-pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str) {
+///
+/// `bound` says whether the frame was about this consumer's own branch, because that is the
+/// difference between "a snapshot at this block resumes me exactly" and "I no longer know where
+/// I am".
+pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bound: bool) {
     warn!(
         target: "ps_replay",
         ancestor = ancestor.number,
         ancestor_hash = ?ancestor.hash,
         depth,
+        bound,
         detail,
-        "A reorg arrived that this pair cannot undo; it stops here and needs a checkpoint \
-         authenticated at the common ancestor"
+        "A reorg arrived that this pair cannot undo; it stops here and needs a checkpoint, \
+         authenticated at the common ancestor when the frame was bound to this branch"
     );
 }
 
@@ -448,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn a_depth_two_reorg_is_inapplicable_and_leaves_the_pair_recovering() {
+    fn a_depth_two_reorg_is_unrecoverable_and_leaves_the_pair_recovering() {
         let (mut state, _) = restored_state();
         let ancestor = state.history.tip().expect("seeded");
         let first = advance(&mut state, ANCHOR_BLOCK + 1, 0xaa, true);
@@ -456,7 +507,7 @@ mod tests {
 
         let outcome = apply_reorg(&mut state, &reorg_of(ancestor, vec![first, second], None));
 
-        let ReorgOutcome::Inapplicable { ancestor: named, depth, .. } = outcome else {
+        let ReorgOutcome::Unrecoverable { ancestor: named, depth, .. } = outcome else {
             panic!("K = 1 reaches one block; anything deeper needs a snapshot")
         };
         assert_eq!(named, ancestor, "naming the ancestor is what makes the refusal actionable");
@@ -468,21 +519,28 @@ mod tests {
     }
 
     #[test]
-    fn an_ancestor_this_consumer_never_verified_is_inapplicable() {
+    fn an_ancestor_this_consumer_never_verified_is_unbound_and_touches_nothing() {
         let (mut state, _) = restored_state();
         let undone = advance(&mut state, ANCHOR_BLOCK + 1, 0xaa, true);
         let foreign = BlockRef { number: ANCHOR_BLOCK, hash: B256::repeat_byte(0x99) };
+        let before = state.pair.fingerprint();
 
         let outcome = apply_reorg(&mut state, &reorg_of(foreign, vec![undone], None));
 
         assert!(
-            matches!(outcome, ReorgOutcome::Inapplicable { .. }),
+            matches!(outcome, ReorgOutcome::Unbound { .. }),
             "a target outside this consumer's own history cannot be authenticated by it"
+        );
+        assert_eq!(state.pair.fingerprint(), before);
+        assert!(
+            matches!(state.pair.readiness.state(), CacheReadiness::Ready(_)),
+            "an unbound frame is a claim about someone else's chain, and moves this pair's \
+             lifecycle no more than it moves its caches"
         );
     }
 
     #[test]
-    fn an_abandoned_branch_that_is_not_this_consumers_is_inapplicable() {
+    fn an_abandoned_branch_that_is_not_this_consumers_cannot_be_undone() {
         let (mut state, _) = restored_state();
         let ancestor = state.history.tip().expect("seeded");
         advance(&mut state, ANCHOR_BLOCK + 1, 0xaa, true);
@@ -492,16 +550,21 @@ mod tests {
 
         let outcome = apply_reorg(&mut state, &reorg_of(ancestor, vec![sibling], None));
 
-        assert!(matches!(outcome, ReorgOutcome::Inapplicable { .. }));
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
         assert_eq!(
             state.pair.cache.current_block(),
             ANCHOR_BLOCK + 1,
             "and nothing was undone on the strength of it"
         );
+        assert!(
+            matches!(state.pair.readiness.state(), CacheReadiness::Recovering),
+            "the ancestor is a block this consumer verified, so it still knows where a recovery \
+             has to land; what it lost is the right to perform the undo itself"
+        );
     }
 
     #[test]
-    fn a_pair_that_retained_nothing_is_inapplicable() {
+    fn a_pair_that_retained_nothing_is_unrecoverable() {
         let (mut state, _) = restored_state();
         let ancestor = state.history.tip().expect("seeded");
         let undone = advance(&mut state, ANCHOR_BLOCK + 1, 0xaa, false);
@@ -509,10 +572,41 @@ mod tests {
         let outcome = apply_reorg(&mut state, &reorg_of(ancestor, vec![undone], None));
 
         assert!(
-            matches!(outcome, ReorgOutcome::Inapplicable { .. }),
+            matches!(outcome, ReorgOutcome::Unrecoverable { .. }),
             "without the displaced trie there is no generation to go back to"
         );
         assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK + 1, "and none was faked");
+        assert!(
+            matches!(state.pair.readiness.state(), CacheReadiness::Recovering),
+            "this frame *was* about this pair's own branch, so its blocks are gone whether or not \
+             the undo was available"
+        );
+    }
+
+    #[test]
+    fn only_a_frame_this_consumer_could_authenticate_withdraws_an_announced_branch() {
+        // The rule both drivers use to decide whether a winning branch that never arrived is a
+        // hole in the record or a goal the producer itself retracted. It is here, and shared,
+        // because getting it wrong in either direction is a wrong headline: counting a retraction
+        // fails a run for following the chain, and not counting an unaccounted branch hides one.
+        let block = BlockRef { number: 1, hash: B256::repeat_byte(0x01) };
+        let detail = String::new();
+
+        assert!(ReorgOutcome::Applied {
+            ancestor: block,
+            undone: block,
+            revert: false,
+            winning_tip: None
+        }
+        .withdraws_an_announced_branch());
+        assert!(ReorgOutcome::Unrecoverable { ancestor: block, depth: 2, detail: detail.clone() }
+            .withdraws_an_announced_branch());
+        assert!(
+            !ReorgOutcome::Unbound { ancestor: block, depth: 1, detail: detail.clone() }
+                .withdraws_an_announced_branch(),
+            "a frame about a branch this consumer never stood on retracts nothing it owed"
+        );
+        assert!(!ReorgOutcome::Malformed { detail }.withdraws_an_announced_branch());
     }
 
     #[test]

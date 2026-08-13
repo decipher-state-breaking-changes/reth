@@ -22,7 +22,7 @@ use crate::{
         chain_spec_for, config_for, cross_check_recovery_checkpoint, decode_accepted_head,
         replay_commit, restore, CommitOutcome, ReplayOptions, ReplayReport, ReplayState,
     },
-    reorg::{apply_reorg, warn_inapplicable, ReorgOutcome},
+    reorg::{apply_reorg, check_shape, warn_inapplicable, ReorgOutcome},
     tail::{SpoolTail, TailEvent, TailFault},
 };
 use alloy_primitives::{Keccak256, B256};
@@ -200,8 +200,15 @@ pub struct FollowReport {
     pub restores_reset: u64,
     /// Winning branches that reached the tip the reorg announced.
     pub winning_branches_completed: u64,
-    /// Winning branches that did not, whether the stream ended or the chain moved again.
+    /// Winning branches that did not, with nothing valid taking their place.
     pub winning_branches_incomplete: u64,
+    /// Winning branches a later valid announcement withdrew before their tip arrived.
+    ///
+    /// Diagnostic only: the chain moving twice in a row is ordinary, and the blocks between the
+    /// two announcements never became canonical, so no verdict was owed on them.
+    pub winning_branches_superseded: u64,
+    /// Frames a recovery scan read and would not act on, so no recovery under them is continuous.
+    pub scan_refusals: u64,
     /// Canonical intervals no verdict covers, in the order they opened.
     pub unverified_intervals: Vec<(u64, u64)>,
 }
@@ -365,8 +372,11 @@ struct Follower<'a> {
     checkpoints_skimmed: u64,
     winning_branches_completed: u64,
     winning_branches_incomplete: u64,
+    winning_branches_superseded: u64,
     restores_continuous: u64,
     restores_reset: u64,
+    /// Frames read during a recovery scan that did not verify, so nothing was taken from them.
+    scan_refusals: u64,
     /// What the scan that found the next checkpoint was looking for, so the restore can say
     /// whether it got it.
     pending_recovery: Option<PendingRecovery>,
@@ -401,8 +411,10 @@ impl<'a> Follower<'a> {
             checkpoints_skimmed: 0,
             winning_branches_completed: 0,
             winning_branches_incomplete: 0,
+            winning_branches_superseded: 0,
             restores_continuous: 0,
             restores_reset: 0,
+            scan_refusals: 0,
             pending_recovery: None,
             unverified_intervals: Vec::new(),
             last_needs_snapshot: None,
@@ -716,12 +728,18 @@ impl<'a> Follower<'a> {
                 )),
             },
             StreamEvent::Reorg(found) => {
-                if pending_tip.is_some() {
-                    // Legitimate: the chain moved again before the previous branch finished. The
-                    // hole is real all the same, and counted rather than forgotten.
-                    self.winning_branches_incomplete += 1;
+                // A branch still being delivered is not a hole when the producer itself replaces
+                // it: the blocks between here and the old tip never became canonical, so no
+                // verdict was ever owed on them. It is a hole only when nothing valid takes its
+                // place, which each outcome below decides for itself.
+                let superseded = pending_tip;
+                let outcome = apply_reorg(&mut state, &found);
+                match (superseded, outcome.withdraws_an_announced_branch()) {
+                    (Some(tip), true) => self.note_supersession(tip, found.winning_tip),
+                    (Some(_), false) => self.winning_branches_incomplete += 1,
+                    (None, _) => {}
                 }
-                match apply_reorg(&mut state, &found) {
+                match outcome {
                     ReorgOutcome::Applied { ancestor, undone, revert, winning_tip } => {
                         if revert {
                             self.reverts_applied += 1;
@@ -755,14 +773,31 @@ impl<'a> Follower<'a> {
                         };
                         Ok(Step::Continue)
                     }
-                    ReorgOutcome::Inapplicable { ancestor, depth, detail } => {
-                        warn_inapplicable(ancestor, depth, &detail);
+                    // Bound to this follower's own branch: the ancestor is a block it verified,
+                    // so a checkpoint at that exact block resumes it with no gap, and the branch
+                    // this reorg interrupted was withdrawn by a statement it could authenticate.
+                    ReorgOutcome::Unrecoverable { ancestor, depth, detail } => {
+                        warn_inapplicable(ancestor, depth, &detail, true);
                         Ok(self.enter_needs_snapshot(
                             manifest,
                             NeedsSnapshotReason::SnapshotRequired,
                             &detail,
                             sequence + 1,
                             Some(ancestor),
+                        ))
+                    }
+                    // Well-formed, but about a branch this follower never held. The ancestor is
+                    // hearsay, so it is not offered as a recovery target: a checkpoint landing on
+                    // it would otherwise be reported as a continuous recovery of a branch this
+                    // follower cannot show it was ever on.
+                    ReorgOutcome::Unbound { ancestor, depth, detail } => {
+                        warn_inapplicable(ancestor, depth, &detail, false);
+                        Ok(self.enter_needs_snapshot(
+                            manifest,
+                            NeedsSnapshotReason::SnapshotRequired,
+                            &detail,
+                            sequence + 1,
+                            None,
                         ))
                     }
                     ReorgOutcome::Malformed { detail } => Ok(self.enter_needs_snapshot(
@@ -774,13 +809,18 @@ impl<'a> Follower<'a> {
                     )),
                 }
             }
-            StreamEvent::Reset(reset) => Ok(self.enter_needs_snapshot(
-                manifest,
-                reset.reason.into(),
-                &reset.detail,
-                sequence + 1,
-                None,
-            )),
+            StreamEvent::Reset(reset) => {
+                // A reset withdraws the stream without naming a replacement branch, so a tip that
+                // never arrived stays a hole.
+                self.winning_branches_incomplete += u64::from(pending_tip.is_some());
+                Ok(self.enter_needs_snapshot(
+                    manifest,
+                    reset.reason.into(),
+                    &reset.detail,
+                    sequence + 1,
+                    None,
+                ))
+            }
             StreamEvent::End(end) => {
                 if pending_tip.is_some() {
                     self.winning_branches_incomplete += 1;
@@ -847,8 +887,12 @@ impl<'a> Follower<'a> {
                  recovered to. One of the two undid the reorg wrongly"
             );
             self.replay.disagreements.push((checkpoint.block, disagreement));
-            // The producer is the authority on what is canonical, so the run continues from its
-            // checkpoint — as an explicit reset, and already recorded as non-agreeing.
+            // The operator-trusted checkpoint source is the authority on what is canonical here —
+            // it is the same authority this follower bootstrapped under — so the run continues
+            // from its checkpoint rather than from a generation it contradicts. Recorded as
+            // non-agreeing, and re-entered through the scan so the restore is classified: it will
+            // be an explicit reset, because a disputed ancestor cannot anchor a continuous claim.
+            // The announced tip is let go with it; the reset already says the run has a hole.
             return Ok(self.enter_needs_snapshot(
                 manifest,
                 NeedsSnapshotReason::SnapshotRequired,
@@ -1129,6 +1173,22 @@ impl<'a> Follower<'a> {
         Step::Continue
     }
 
+    /// Records that a valid new announcement replaced a branch that was still being delivered.
+    ///
+    /// Deliberately not counted as incomplete. The producer withdrew the old tip as a canonical
+    /// goal, so the blocks between where delivery got to and where it had been heading never
+    /// became canonical — counting them would fail a run for following the chain correctly.
+    fn note_supersession(&mut self, superseded: BlockRef, replacement: Option<BlockRef>) {
+        self.winning_branches_superseded += 1;
+        info!(
+            target: "ps_follow",
+            superseded = superseded.number,
+            replacement = ?replacement.map(|tip| tip.number),
+            "A second reorg replaced the winning branch before it finished; the old tip is \
+             withdrawn, not missing"
+        );
+    }
+
     /// The block a recovery still has to land on, after everything announced in the meantime.
     ///
     /// The producer keeps talking during an outage. A later reorg replaces the target with its own
@@ -1137,8 +1197,9 @@ impl<'a> Follower<'a> {
     /// name-versus-header authority as ordinary delivery — recovery is exactly where a renamed
     /// frame would be aimed.
     fn supersede_target(
-        &self,
+        &mut self,
         target: Option<BlockRef>,
+        current: &Manifest,
         scan_from: u64,
         checkpoint_at: u64,
     ) -> eyre::Result<Option<BlockRef>> {
@@ -1158,17 +1219,43 @@ impl<'a> Follower<'a> {
                         .tail
                         .read_at(sequence, kind)
                         .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
-                    match frame.event {
-                        StreamEvent::Reorg(reorg) => Some(reorg.common_ancestor),
-                        _ => {
-                            return Err(eyre::eyre!(
-                                "the frame at sequence {sequence} is named Reorg but decoded as \
-                                 something else"
-                            ))
+                    let StreamEvent::Reorg(reorg) = frame.event else {
+                        return Err(eyre::eyre!(
+                            "the frame at sequence {sequence} is named Reorg but decoded as \
+                             something else"
+                        ))
+                    };
+                    // Judged by the same rules a reorg gets while streaming. An unchecked frame
+                    // could name any block as the ancestor, and a checkpoint landing there would
+                    // then be reported as a continuous recovery of a branch nobody described.
+                    match check_shape(&reorg) {
+                        Ok(()) => Some(reorg.common_ancestor),
+                        Err(detail) => {
+                            self.refuse_in_scan(sequence, "reorg", &detail)?;
+                            None
                         }
                     }
                 }
-                // Neither names a block, so nothing after them can be continuous with anything.
+                FrameKind::Manifest => {
+                    let frame = self
+                        .tail
+                        .read_at(sequence, kind)
+                        .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
+                    let StreamEvent::Manifest(next) = frame.event else {
+                        return Err(eyre::eyre!(
+                            "the frame at sequence {sequence} is named Manifest but decoded as \
+                             something else"
+                        ))
+                    };
+                    // A new epoch withdraws the target either way. It is still checked, because
+                    // the checkpoint that follows will be restored under an identity, and one
+                    // that fails here says the spool is not the stream this follower was reading.
+                    if let Err(detail) = check_epoch_manifest(&next, current, sequence) {
+                        self.refuse_in_scan(sequence, "manifest", &detail)?;
+                    }
+                    None
+                }
+                // A reset names no block, so nothing after it can be continuous with anything.
                 _ => None,
             };
             latest = Some((sequence, announced));
@@ -1186,6 +1273,29 @@ impl<'a> Follower<'a> {
             }
             None => Ok(target),
         }
+    }
+
+    /// Records a frame the recovery scan read and would not act on.
+    ///
+    /// The recovery still proceeds — a later checkpoint can rebootstrap this follower from
+    /// anywhere — but it proceeds with no target, so whatever it lands on is reported as an
+    /// explicit reset rather than a continuous recovery.
+    fn refuse_in_scan(
+        &mut self,
+        sequence: u64,
+        frame: &'static str,
+        detail: &str,
+    ) -> eyre::Result<()> {
+        self.scan_refusals += 1;
+        warn!(
+            target: "ps_follow",
+            sequence,
+            frame,
+            detail,
+            "A frame written during the outage did not verify; the recovery keeps no target and \
+             cannot be continuous"
+        );
+        self.sink.scan_refused(sequence, frame, detail)
     }
 
     /// One recovery pass: a fresh checkpoint restarts the grammar at its own sequence; an `End`
@@ -1223,7 +1333,7 @@ impl<'a> Follower<'a> {
             // reorg during the outage moves the block a snapshot has to be authenticated at, and
             // a reset withdraws the request. Without this, a stale target would let a checkpoint
             // that answers a superseded question be reported as continuous recovery.
-            let target = self.supersede_target(target_ancestor, scan_from, found)?;
+            let target = self.supersede_target(target_ancestor, &manifest, scan_from, found)?;
             // Classified where the checkpoint itself is in hand, which is `restore_pair`; what
             // the scan knows and it does not is what was asked for and what went by in between.
             self.pending_recovery = Some(PendingRecovery { target, skipped });
@@ -1344,6 +1454,8 @@ impl<'a> Follower<'a> {
             restores_reset: self.restores_reset,
             winning_branches_completed: self.winning_branches_completed,
             winning_branches_incomplete: self.winning_branches_incomplete,
+            winning_branches_superseded: self.winning_branches_superseded,
+            scan_refusals: self.scan_refusals,
             unverified_intervals: self.unverified_intervals,
         }
     }
@@ -1470,6 +1582,29 @@ impl VerdictSink {
         }))
     }
 
+    /// A frame the recovery scan read and refused to act on.
+    ///
+    /// Recorded rather than merely logged because it is the reason a recovery that lands on the
+    /// block a reorg named is still not reported as continuous: the frame that named it did not
+    /// verify, so its ancestor is hearsay.
+    fn scan_refused(
+        &mut self,
+        sequence: u64,
+        frame: &'static str,
+        detail: &str,
+    ) -> eyre::Result<()> {
+        self.write(serde_json::json!({
+            "schema_version": 1,
+            "benchmark": "standalone_follow_v1",
+            "kind": "scan_refused",
+            "label": self.label,
+            "sequence": sequence,
+            "frame": frame,
+            "detail": detail,
+            "timestamp_ms": now_ms(),
+        }))
+    }
+
     /// A lifecycle event this follower applied rather than stopped at.
     ///
     /// Written apart from the verdicts because it says something no verdict can: the blocks it
@@ -1570,6 +1705,40 @@ impl VerdictSink {
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+/// Whether a manifest found mid-stream is the next epoch of the stream already being followed.
+///
+/// A second manifest is how a restarted producer says the sequence space began again. It is only
+/// that if it describes the same chain under the same policy and numbers itself as the successor:
+/// anything else is a different stream sharing a directory, and no checkpoint under it may be
+/// restored as though this follower had been reading it all along.
+fn check_epoch_manifest(next: &Manifest, current: &Manifest, sequence: u64) -> Result<(), String> {
+    if next.chain_id != current.chain_id ||
+        next.genesis_hash != current.genesis_hash ||
+        next.cache_policy_id != current.cache_policy_id ||
+        next.account_window != current.account_window ||
+        next.storage_window != current.storage_window
+    {
+        return Err("the manifest describes a different chain or cache policy".to_string())
+    }
+    if next.epoch != current.epoch + 1 {
+        return Err(format!(
+            "the manifest names epoch {} where epoch {} follows {}",
+            next.epoch,
+            current.epoch + 1,
+            current.epoch
+        ))
+    }
+    if next.first_sequence != sequence + 1 {
+        return Err(format!(
+            "the manifest at sequence {sequence} names first_sequence {}, and its own successor \
+             is {}",
+            next.first_sequence,
+            sequence + 1
+        ))
+    }
+    Ok(())
 }
 
 const fn kind_of(event: &StreamEvent) -> FrameKind {

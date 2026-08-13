@@ -2745,6 +2745,66 @@ mod tests {
     }
 
     #[test]
+    fn an_unrooted_parent_is_refused_without_mutation() {
+        // The one refusal the transaction cannot make good on after the fact: the post-undo cache
+        // root has to be known *before* the rollback for the tracker to be run on a clone, and the
+        // undo record carries it only if the parent's root was ever computed. Production computes
+        // it every block, so this is a fixture built to reach the branch — and what it pins is
+        // that the branch is a refusal, not a half-applied generation swap.
+        let config = CacheConfig::default();
+        let (package, checkpoint, state_root) = warm_snapshot(&config);
+        let retained = crate::bootstrap_io::restore_snapshot(package.clone(), &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let current = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
+            .expect("an honest snapshot restores");
+        let mut pair = LivePair::new(CoordinatedPair {
+            cache: current.cache,
+            trie_cache: current.trie_cache,
+            readiness: current.readiness,
+            previous_generation: None,
+            accepted_head: None,
+        });
+        // Restoring computed the anchor's cache root, which is what the *next* block would carry
+        // into its undo record. Spending it on a block that is not the one being undone leaves the
+        // record below with nothing to restore the root from.
+        apply(&mut pair, SNAP_BLOCK);
+        apply(&mut pair, SNAP_BLOCK + 1);
+        assert_eq!(
+            pair.cache.undo_preview().expect("a record exists").previous_cache_root,
+            None,
+            "the fixture only means anything if it reached the branch"
+        );
+        let applied = BlockContext {
+            number: SNAP_BLOCK + 1,
+            hash: numbered(SNAP_BLOCK + 1, 0xbb),
+            parent_hash: SNAP_HASH,
+            state_root,
+        };
+        admit(&mut pair, &applied);
+        finish_committed_transition(
+            &mut pair,
+            Some(retained.trie_cache),
+            &applied,
+            sealed(&applied),
+            true,
+        );
+        let before = pair.fingerprint();
+        let lifecycle_before = pair.lifecycle_fingerprint();
+        let state_before = pair.readiness.state().label();
+
+        assert!(
+            pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
+                .is_none(),
+            "an undo whose result cannot be predicted is not one this pair may start"
+        );
+
+        assert_eq!(pair.fingerprint(), before, "both caches are where the refusal found them");
+        assert_eq!(pair.lifecycle_fingerprint(), lifecycle_before, "and so is the retention");
+        assert_eq!(pair.readiness.state().label(), state_before, "and the tracker was not reset");
+        assert!(pair.previous_generation.is_some(), "the retention is still the caller's to use");
+    }
+
+    #[test]
     fn a_refused_warming_undo_keeps_the_retained_generation() {
         // A warming pair is refused because it has no `Ready` to return to — but the retention it
         // holds still describes the branch the caller named, so a later attempt against a warmer

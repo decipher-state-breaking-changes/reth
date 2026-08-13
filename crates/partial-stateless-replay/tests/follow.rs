@@ -567,3 +567,167 @@ fn a_fresh_checkpoint_rebootstraps_after_a_gap() {
     assert_eq!(report.blocks_verified, 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_checkpoint_at_an_unverified_ancestor_is_not_continuous() {
+    // The frame is well formed and names a real-looking block — but one this follower never
+    // verified, so it cannot show it was ever standing there. Landing on it restores a working
+    // pair and nothing more: the interval below it was never validated by this process, and
+    // reporting that as continuous recovery would be a claim about someone else's branch.
+    let dir = spool_dir("reorg-unbound");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    // The block the recovery checkpoint will land on, named by the reorg down to its hash: the
+    // one shape that would be classified continuous if the ancestor were taken on the frame's
+    // word. This follower restored at `fixture` and has never stood on it.
+    let elsewhere = fixture_at(ANCHOR_BLOCK - 1);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: elsewhere.checkpoint.block,
+            abandoned: vec![fixture.checkpoint.block],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &elsewhere);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 2, "it recovered");
+    assert_eq!(
+        report.restores_continuous, 0,
+        "an ancestor outside this follower's own history anchors nothing"
+    );
+    assert_eq!(report.restores_reset, 1);
+    assert!(!report.continuous());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_malformed_reorg_during_the_outage_cannot_name_the_recovery_target() {
+    // The dangerous shape: a first reorg leaves a legitimate target, and a second frame written
+    // during the outage would move it. If that frame is not read with the same rules a streaming
+    // reorg gets, any checkpoint the producer happens to write next is reported as a continuous
+    // recovery of a branch nothing described.
+    let dir = spool_dir("reorg-scan-shape");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    // Not a reorg: it abandons nothing, while naming the block a checkpoint is about to land on.
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.scan_refusals, 1, "the scan read it and would not act on it");
+    assert_eq!(
+        report.restores_continuous, 0,
+        "the checkpoint landed where a frame that did not verify pointed"
+    );
+    assert_eq!(report.restores_reset, 1);
+    assert!(!report.continuous());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_second_manifest_during_the_outage_is_checked_before_it_is_believed() {
+    // A manifest withdraws the target either way, so continuity is safe without this check. What
+    // is not safe is restoring the checkpoint that follows one: a manifest that fails here says
+    // the directory holds a different stream, not the next epoch of this one.
+    let dir = spool_dir("reorg-scan-manifest");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    let mut foreign = manifest();
+    foreign.chain_id += 1;
+    foreign.epoch = 2;
+    foreign.first_sequence = next + 1;
+    write_frame(&dir, next, FrameKind::Manifest, &StreamEvent::Manifest(foreign));
+    next += 1;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.scan_refusals, 1, "a different chain is not this stream's next epoch");
+    assert_eq!(report.restores_reset, 1);
+    assert_eq!(report.restores_continuous, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_reorgs_in_a_row_are_each_answered_by_their_own_checkpoint() {
+    // The chain moving twice under contention, with the producer re-checkpointing after each. The
+    // follower has to answer both and keep running rather than treating the second as noise on
+    // top of the first. Whether the *first* announced tip is a hole or a goal the producer
+    // retracted is decided by the rule this suite cannot reach — that needs an applied reorg, so
+    // it is unit-tested where it lives, in `ReorgOutcome::withdraws_an_announced_branch`.
+    let dir = spool_dir("reorg-supersede-tip");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    for tip in [ANCHOR_BLOCK + 9, ANCHOR_BLOCK + 11] {
+        write_frame(
+            &dir,
+            next,
+            FrameKind::Reorg,
+            &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+                common_ancestor: fixture.checkpoint.block,
+                abandoned: vec![BlockRef {
+                    number: ANCHOR_BLOCK + 1,
+                    hash: B256::repeat_byte(0xa1),
+                }],
+                winning_tip: Some(BlockRef { number: tip, hash: B256::repeat_byte(0xb2) }),
+            }),
+        );
+        next += 1;
+        // The producer's recovery checkpoint after each, at the block both name.
+        next = write_checkpoint(&dir, next, &fixture);
+    }
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 3, "each reorg was answered by its own checkpoint");
+    assert_eq!(report.restores_continuous, 2, "both landed on the block their reorg named");
+    assert_eq!(report.needs_snapshot_entries, 2, "and neither was mistaken for the other");
+    let _ = fs::remove_dir_all(&dir);
+}
