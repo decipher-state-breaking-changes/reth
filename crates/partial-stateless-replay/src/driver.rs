@@ -9,6 +9,7 @@
 use crate::{
     compare::{block_label, compare_accepted, compare_rejected, Disagreement},
     mutate::Mutation,
+    reorg::VerifiedHistory,
     spool::SpoolIter,
 };
 use alloy_rlp::Decodable;
@@ -319,6 +320,13 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
 /// configuration change away from disagreeing with itself mid-stream — and it would charge the
 /// construction to every measured block.
 pub(crate) struct ReplayState {
+    /// What this consumer verified for itself, and the state roots it derived.
+    ///
+    /// Held beside the pair because recovery has to ask a question only the consumer can answer
+    /// honestly: the canonical state root at a reorg target. A full node asks its provider; the
+    /// recorded frames cannot be asked, because a producer attesting to its own reorg target
+    /// turns the retained generation's authentication into a tautology.
+    pub(crate) history: VerifiedHistory,
     pub(crate) pair: CoordinatedPair,
     pub(crate) config: CacheConfig,
     pub(crate) chain_spec: Arc<ChainSpec>,
@@ -365,6 +373,7 @@ pub(crate) fn restore(
         "Restored a coordinated pair from the recorded checkpoint, with no database"
     );
     Ok(ReplayState {
+        history: VerifiedHistory::restored_at(checkpoint.block, checkpoint.state_root),
         pair: CoordinatedPair {
             cache: restored.cache,
             trie_cache: restored.trie_cache,
@@ -546,6 +555,10 @@ pub(crate) fn replay_commit(
     let mut outcome = validated.outcome;
     let displaced = outcome.displaced_trie_cache.take();
     state.pair.commit_transition(displaced, &block_ctx, admitted.block.clone_sealed_header(), true);
+    // Recorded from this replay's own execution, before the oracle is consulted, so that a reorg
+    // arriving later authenticates its target against what this process verified rather than
+    // against what the producer said about it.
+    state.history.record(input.block, outcome.state_root);
 
     let disagreements = compare_accepted(oracle, &outcome, &state.pair);
     if disagreements.is_empty() {

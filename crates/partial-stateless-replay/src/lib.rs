@@ -28,6 +28,7 @@ pub mod compare;
 pub mod driver;
 pub mod follow;
 pub mod mutate;
+pub mod reorg;
 pub mod spool;
 pub mod tail;
 

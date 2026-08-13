@@ -25,7 +25,10 @@ use partial_stateless::{
 };
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
-use reth_storage_errors::provider::ProviderResult;
+/// Re-exported so [`CanonicalStateRoots`] can be implemented outside this crate without naming
+/// the error crate: a standalone consumer answers the trait from its own verified history, and
+/// making it add a dependency to spell the return type would be a boundary that means nothing.
+pub use reth_storage_errors::provider::ProviderResult;
 use serde::Serialize;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
