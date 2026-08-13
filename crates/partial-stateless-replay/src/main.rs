@@ -298,6 +298,12 @@ fn parse_args() -> eyre::Result<Mode> {
                 options.limit = Some(raw.parse()?);
             }
             "--no-mutations" => options.mutations = false,
+            "--force-restore-at" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--force-restore-at needs a frame sequence"))?;
+                options.force_restore_at = Some(raw.parse()?);
+            }
             "--json" => {
                 json = Some(PathBuf::from(
                     args.next().ok_or_else(|| eyre::eyre!("--json needs a path"))?,
@@ -308,7 +314,8 @@ fn parse_args() -> eyre::Result<Mode> {
             }
             "-h" | "--help" => {
                 println!(
-                    "ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] \
+                    "ps-replay <spool-dir> [--limit N] [--no-mutations] \
+                     [--force-restore-at <sequence>] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--mutations] \
                      [--json <path>] [--label <name>]"

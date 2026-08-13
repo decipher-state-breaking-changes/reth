@@ -231,3 +231,33 @@ fn a_malformed_reorg_is_a_failure() {
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert!(!report.agreed(), "a producer emitting a frame this shape is a defect somewhere");
 }
+
+#[test]
+fn forcing_a_restore_installs_the_recovery_checkpoint() {
+    // Skimming shows the producer's recovery checkpoint agrees with the generation this replay
+    // recovered to. It does not show that the snapshot behind it restores anything, which is the
+    // claim a consumer holding no retained generation depends on — so the flag forces the install.
+    //
+    // What this test can reach: the flag parses, plumbs through, and a forced install produces a
+    // continuous run. What it cannot: the skim-versus-install *difference*, which only appears
+    // when the reorg was applied, and a synthetic spool holds no commit that passes mainnet
+    // admission. That half is the live gate's, against a producer that publishes one.
+    let dir = spool_dir("batch-forced-restore");
+    let fixture = fixture();
+    write_manifest(&dir);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(&dir, next, FrameKind::Reorg, &reorg_above(anchor(&fixture)));
+    next += 1;
+    let recovery_at = next;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let forced = replay(&dir, &ReplayOptions { force_restore_at: Some(recovery_at), ..options() })
+        .expect("the corpus reads");
+
+    assert_eq!(forced.resyncs.len(), 1, "the checkpoint was installed rather than compared");
+    assert_eq!(forced.resyncs[0].at_sequence, recovery_at);
+    assert!(forced.resyncs[0].continuous);
+    assert_eq!(forced.checkpoints_skimmed, 0);
+    assert!(forced.agreed() && forced.continuous() && forced.complete());
+}

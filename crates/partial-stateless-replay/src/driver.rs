@@ -46,6 +46,14 @@ pub struct ReplayOptions {
     pub frame_limits: FrameLimits,
     /// Bounds on sidecar witness decoding.
     pub reexec_limits: SidecarReexecLimits,
+    /// Install the checkpoint at this sequence rather than comparing and skipping it.
+    ///
+    /// A recovery checkpoint is normally cross-checked against the generation the replay already
+    /// recovered to and then skimmed, which proves the two agree but not that the snapshot behind
+    /// it would restore anything. This forces the restore, so a run can show that the producer's
+    /// re-checkpoint is what a consumer holding no retained generation would actually recover
+    /// from — the claim skimming cannot make.
+    pub force_restore_at: Option<u64>,
 }
 
 impl Default for ReplayOptions {
@@ -55,6 +63,7 @@ impl Default for ReplayOptions {
             mutations: true,
             frame_limits: FrameLimits::default(),
             reexec_limits: SidecarReexecLimits::default(),
+            force_restore_at: None,
         }
     }
 }
@@ -326,10 +335,26 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                             // generation, so comparing them is a live cross-check rather than a
                             // formality — and installing it would replace state this pair derived
                             // with state it has no reason to prefer.
-                            Some(ancestor) => (
+                            Some(ancestor) if options.force_restore_at != Some(sequence) => (
                                 manifest,
                                 CollectPurpose::CrossCheck { state, ancestor, pending_tip },
                             ),
+                            // Forced: install it instead, and judge the rest of the corpus against
+                            // the pair the producer's own snapshot produces.
+                            Some(ancestor) => {
+                                info!(
+                                    target: "ps_replay",
+                                    sequence,
+                                    ancestor = ancestor.number,
+                                    "Installing the recovery checkpoint rather than skimming it, \
+                                     as a consumer with no retained generation would have to"
+                                );
+                                report.last_verified = state.history.tip().map(|tip| tip.number);
+                                (
+                                    manifest,
+                                    CollectPurpose::Resync { target_ancestor: Some(ancestor) },
+                                )
+                            }
                             None => {
                                 report.failures.push(format!(
                                     "an unannounced checkpoint arrived at sequence {sequence}; \

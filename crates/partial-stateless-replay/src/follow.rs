@@ -262,6 +262,8 @@ impl<'a> Follower<'a> {
                 mutations: options.mutations,
                 frame_limits: options.frame_limits,
                 reexec_limits: options.reexec_limits.clone(),
+                // An offline forensic switch; a live follower has a producer to ask instead.
+                force_restore_at: None,
             },
             tail: SpoolTail::new(dir, options.frame_limits),
             sink: VerdictSink::open(options)?,
