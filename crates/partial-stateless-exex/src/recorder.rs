@@ -127,6 +127,12 @@ pub struct StreamRecorder {
     /// Set once an `End` frame is on disk. A closed stream takes no further frames, and a second
     /// `End` would make the first one a lie about where the stream stopped.
     ended: bool,
+    /// Set once a checkpoint has landed, so a consumer could restore from this spool.
+    ///
+    /// What it decides is where an abandoned buffer returns to. Before the first checkpoint there
+    /// is nothing on disk to continue, so dropping frames again is right; after it, dropping them
+    /// would be the silent gap in an open stream that the sequence numbers exist to forbid.
+    stream_opened: bool,
     /// Bound every written frame is checked against, the same one a reader applies.
     limits: FrameLimits,
     /// Export-buffer bounds: body bytes and frame count.
@@ -199,6 +205,7 @@ impl StreamRecorder {
             buffer_overflowed: false,
             poisoned: false,
             ended: false,
+            stream_opened: false,
             limits: FrameLimits::default(),
             buffer_max_bytes,
             buffer_max_frames,
@@ -227,6 +234,7 @@ impl StreamRecorder {
             buffer_overflowed: false,
             poisoned: false,
             ended: false,
+            stream_opened: false,
             limits: FrameLimits::default(),
             buffer_max_bytes: DEFAULT_BUFFER_MAX_BYTES,
             buffer_max_frames,
@@ -251,27 +259,47 @@ impl StreamRecorder {
 
     /// Opens the buffering phase: an export has chosen H, and every frame from here belongs to
     /// the stream that will start behind its checkpoint.
+    ///
+    /// Re-entrant from `Streaming`, which is what a mid-stream re-checkpoint needs: after a reorg
+    /// the producer exports at the common ancestor while the winning branch is already arriving,
+    /// and those commits have to wait behind the checkpoint that makes them restorable. A second
+    /// call while already buffering changes nothing — the export that opened it is still the one
+    /// that will close it.
     pub fn begin_buffering(&mut self) {
         if self.poisoned || self.ended {
             return
         }
-        if matches!(self.phase, SpoolPhase::Idle) {
+        if matches!(self.phase, SpoolPhase::Idle | SpoolPhase::Streaming) {
             self.phase = SpoolPhase::Buffering { frames: VecDeque::new(), bytes: 0 };
         }
     }
 
-    /// Drops the buffer whole and returns to dropping frames; the attempt it belonged to failed.
+    /// Whether a checkpoint has landed, so this spool could be restored from.
+    pub const fn stream_opened(&self) -> bool {
+        self.stream_opened
+    }
+
+    /// Drops the buffer whole and returns frames to wherever they belonged before it; the attempt
+    /// the buffer was held for failed.
+    ///
+    /// Where that is depends on whether a checkpoint has already landed. Before one, frames go
+    /// back to being dropped: nothing on disk could replay them. After one, they go back to
+    /// writing through — returning an open stream to `Idle` would silently swallow every frame
+    /// from here on, which is exactly the hidden gap dropping the buffer whole exists to avoid.
+    /// The dropped frames themselves are a hole either way, and a consumer reads them as the
+    /// skipped commits a recovery scan counts.
     pub fn abandon_buffering(&mut self, why: &str) {
         if let SpoolPhase::Buffering { frames, bytes } = &mut self.phase {
             warn!(
                 target: "partial_stateless_stream",
                 dropped_frames = frames.len(),
                 dropped_bytes = *bytes,
+                stream_opened = self.stream_opened,
                 why,
                 "Export buffering abandoned; the buffered frames are dropped whole rather than \
-                 trimmed, and the stream has not opened"
+                 trimmed"
             );
-            self.phase = SpoolPhase::Idle;
+            self.phase = if self.stream_opened { SpoolPhase::Streaming } else { SpoolPhase::Idle };
         }
     }
 
@@ -425,6 +453,7 @@ impl StreamRecorder {
             return
         }
         self.phase = SpoolPhase::Streaming;
+        self.stream_opened = true;
         info!(
             target: "partial_stateless_stream",
             block = checkpoint.block_number,
@@ -433,7 +462,8 @@ impl StreamRecorder {
             chunks = chunk_count,
             flushed_commits = flushed,
             has_accepted_head = accepted_head.is_some(),
-            "Wrote the checkpoint and its snapshot; the commit stream starts at the next block"
+            reopened = flushed > 0,
+            "Wrote the checkpoint and its snapshot; the commit stream continues behind it"
         );
     }
 
@@ -881,6 +911,107 @@ mod tests {
                 (6, FrameKind::Reset),
             ]
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The grammar S4's recovery protocol depends on, as a filesystem assertion: a reorg is
+    /// written through the open stream, the commits behind it wait for the checkpoint that makes
+    /// them restorable, and the sequences stay contiguous across the whole shape.
+    #[test]
+    fn a_mid_stream_checkpoint_lands_behind_the_reorg_with_contiguous_sequences() {
+        let dir = spool_dir("mid-stream-checkpoint");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.begin_buffering();
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
+        assert!(recorder.stream_opened());
+        recorder.write_reset(ResetReason::Gap, "a streamed frame before the reorg");
+
+        // The reorg is written through: a consumer must learn the branch changed before it is
+        // asked to skip anything.
+        recorder.write_reorg(Reorg {
+            common_ancestor: BlockRef { number: 25_737_234, hash: B256::with_last_byte(0x11) },
+            abandoned: vec![BlockRef { number: 25_737_235, hash: B256::with_last_byte(0x12) }],
+            winning_tip: None,
+        });
+        // Then the export re-arms, and the winning branch waits behind the new checkpoint.
+        recorder.begin_buffering();
+        recorder.write_reset(ResetReason::Gap, "buffered winning-branch material");
+        assert_eq!(
+            frames_in(&dir).len(),
+            6,
+            "manifest, checkpoint, two chunks, one streamed reset, the reorg"
+        );
+
+        recorder.write_checkpoint(&checkpoint(), None, &[9u8; 100]);
+
+        assert_eq!(
+            frames_in(&dir),
+            vec![
+                (0, FrameKind::Manifest),
+                (1, FrameKind::Checkpoint),
+                (2, FrameKind::SnapshotChunk),
+                (3, FrameKind::SnapshotChunk),
+                (4, FrameKind::Reset),
+                (5, FrameKind::Reorg),
+                (6, FrameKind::Checkpoint),
+                (7, FrameKind::SnapshotChunk),
+                (8, FrameKind::SnapshotChunk),
+                (9, FrameKind::Reset),
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Abandoning a buffer mid-stream returns to writing through, not to dropping.
+    ///
+    /// The distinction is the whole reason the recorder tracks whether a checkpoint has landed.
+    /// Returning an open stream to `Idle` would swallow every frame from there on — a hole with
+    /// no frame to mark it, which is worse than the buffered frames the abandon already drops.
+    #[test]
+    fn abandoning_a_mid_stream_buffer_returns_to_writing_through() {
+        let dir = spool_dir("abandon-mid-stream");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.begin_buffering();
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
+        recorder.begin_buffering();
+        recorder.write_reset(ResetReason::Gap, "lost with the attempt");
+
+        recorder.abandon_buffering("the export attempt was fenced");
+
+        assert!(recorder.wants_commit_material(), "an open stream still takes frames");
+        recorder.write_reset(ResetReason::Gap, "written through");
+        let kinds: Vec<FrameKind> = frames_in(&dir).iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                FrameKind::Manifest,
+                FrameKind::Checkpoint,
+                FrameKind::SnapshotChunk,
+                FrameKind::SnapshotChunk,
+                FrameKind::Reset,
+            ],
+            "the abandoned frame is gone and the next one is on disk"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same abandon before any checkpoint still drops back to `Idle`: nothing on disk could
+    /// replay those frames, so writing them would put unusable bytes in the corpus.
+    #[test]
+    fn abandoning_a_buffer_before_the_stream_opens_still_drops_frames() {
+        let dir = spool_dir("abandon-pre-open");
+        let mut recorder = recorder(&dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.begin_buffering();
+        recorder.write_reset(ResetReason::Gap, "lost with the attempt");
+
+        recorder.abandon_buffering("the first export attempt failed");
+
+        assert!(!recorder.wants_commit_material());
+        recorder.write_reset(ResetReason::Gap, "also dropped");
+        assert_eq!(frames_in(&dir), vec![(0, FrameKind::Manifest)]);
         let _ = fs::remove_dir_all(&dir);
     }
 

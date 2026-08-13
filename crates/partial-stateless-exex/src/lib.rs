@@ -215,14 +215,52 @@ pub struct RunOptions {
     /// Fresh export attempts allowed after the first one fails or its buffer overflows.
     ///
     /// Each retry chooses a new H at the next `Ready`; when they run out the stream closes with
-    /// `End(ExportFailure)` — an intentionally closed empty stream, not a cut one.
+    /// `End(ExportFailure)`. A branch change does not consume one: fencing an attempt because the
+    /// chain moved is not the attempt failing.
     pub stream_export_retries: u32,
+    /// Whether a branch change re-checkpoints the open stream at the block it recovered to.
+    pub reorg_checkpoint: ReorgCheckpointPolicy,
     /// Whether the Engine publishes the payloads it validated and this ExEx takes them.
     ///
     /// Not read from a variable of its own: the producer's gate is `PS_ENGINE_PAYLOAD`, and a
     /// consumer with a second switch could be armed against a node that publishes nothing, which
     /// would report every block as a reconstruction and look like a delivery failure.
     pub payload_tap: bool,
+}
+
+/// Whether a branch change re-checkpoints the stream at the block the pair recovered to.
+///
+/// The default is `Always`, and the reason is that the producer cannot know what its consumer can
+/// do for itself. A follower holding a retained generation undoes a depth-1 reorg on its own; one
+/// that just restored, just restarted, or met a deeper reorg cannot, and there is no back-channel
+/// to ask which it is. A checkpoint at the common ancestor is what makes both cases recoverable,
+/// and it is the only route for anything past depth 1. The price is a snapshot's worth of spool
+/// per branch change, which the spool bound already governs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorgCheckpointPolicy {
+    /// Re-checkpoint after every reorg, revert, or recovery discontinuity.
+    Always,
+    /// Never re-checkpoint an open stream. The experiment control: it leaves a consumer that
+    /// cannot self-recover waiting, which is what the default exists to avoid.
+    Never,
+}
+
+impl ReorgCheckpointPolicy {
+    fn from_env() -> eyre::Result<Self> {
+        Self::parse(std::env::var("PS_STREAM_REORG_CHECKPOINT").ok().as_deref())
+    }
+
+    fn parse(raw: Option<&str>) -> eyre::Result<Self> {
+        match raw {
+            None | Some("always") => Ok(Self::Always),
+            Some("never") => Ok(Self::Never),
+            // Refused at startup rather than defaulted: a run configured with a value this build
+            // does not know would report a policy it is not running.
+            Some(other) => Err(eyre::eyre!(
+                "PS_STREAM_REORG_CHECKPOINT must be `always` or `never`, not `{other}`"
+            )),
+        }
+    }
 }
 
 impl RunOptions {
@@ -284,6 +322,7 @@ impl RunOptions {
             bootstrap_import: env_flag("PS_BOOTSTRAP_IMPORT"),
             bootstrap_self_test_blocks,
             stream_export_retries: env_u32("PS_STREAM_EXPORT_RETRIES", 1),
+            reorg_checkpoint: ReorgCheckpointPolicy::from_env()?,
             payload_tap: payload_tap::tap_enabled(),
             sidecar_dir,
         })
@@ -299,6 +338,7 @@ impl RunOptions {
             sidecar_dir = %self.sidecar_dir.display(),
             verifier_wait_ms = self.verifier_wait.as_millis(),
             canonical_rebuild = self.canonical_rebuild,
+            reorg_checkpoint = ?self.reorg_checkpoint,
             "Partial Stateless ExEx started — monitoring cache state per block"
         );
         if let Some(dir) = &self.capture_dir {
@@ -653,6 +693,15 @@ where
                     "Chain reorg detected — recovering the coordinated pair at the common ancestor"
                 );
 
+                // Fenced before the recovery runs. Whatever H an in-flight export chose, it
+                // chose it on the branch this notification is abandoning.
+                interrupt_export(
+                    &options,
+                    &mut gate,
+                    &mut recorder.as_mut(),
+                    "the chain reorged under the export",
+                );
+
                 // The pair still sits on the abandoned branch until a rebuild replaces it. It is
                 // left in place rather than cleared: `Recovering` already refuses every block, and
                 // clearing it here would make a failed recovery look like a clean cold start,
@@ -670,6 +719,12 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, Some(new)));
                 }
+                // Started here, before a single winning block applies, because the checkpoint a
+                // consumer needs is the one authenticated at the *common ancestor* — the exact
+                // block the plan requires a recovery snapshot to name. One block later the pair
+                // has already moved past it. The winning branch buffers behind the checkpoint
+                // from this point on.
+                maybe_start_export(&ctx, &options, &pair, &mut gate, recorder.as_mut());
 
                 // Apply the new canonical chain block-by-block, so the builder still produces a
                 // sidecar for each block on the new branch. Rebuilding directly at the new tip
@@ -714,6 +769,13 @@ where
                     "Chain reverted — recovering the coordinated pair at the new tip"
                 );
 
+                interrupt_export(
+                    &options,
+                    &mut gate,
+                    &mut recorder.as_mut(),
+                    "the chain reverted under the export",
+                );
+
                 let recovered = recover_at(
                     &ctx,
                     &options,
@@ -728,6 +790,7 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, None));
                 }
+                maybe_start_export(&ctx, &options, &pair, &mut gate, recorder.as_mut());
 
                 // A pair that could not be rebuilt still describes the reverted branch, and
                 // persisting it would let a restart reload exactly that.
@@ -1113,14 +1176,23 @@ where
         Ok(ready) => {
             *failures = 0;
             // The rebuild replaced the pair from canonical state; whatever was retained described
-            // a generation this one does not descend from. The accepted head goes with it, and for
-            // a sharper reason: a reorg rebuild installs the winning sibling at the *same* number
-            // the abandoned block had, so a header left behind here would be one `accepted_parent`
-            // has to reject on hash rather than on height. Clearing it makes the state honest
-            // instead of leaving the guard to catch it, and the pair readmits a head by applying
-            // its next block.
+            // a generation this one does not descend from, so it goes.
             pair.forget_retained_generation();
-            pair.accepted_head = None;
+            // The header that *was* left behind is the sharper problem: a reorg rebuild installs
+            // the winning sibling at the same number the abandoned block had, so keeping the old
+            // one leaves a header `accepted_parent` has to reject on hash rather than on height.
+            // The answer is not to have none — a headless pair cannot admit its next child and
+            // cannot export a checkpoint anything could restore from — but to install the header
+            // for the hash the rebuild was performed at, fetched from the provider whose state
+            // root the rebuild's own multiproof was just authenticated against. It is by
+            // construction the header this generation is the state after, and `accepted_parent`
+            // re-checks number, hash, state root, cache root and trie root before ever offering
+            // it, so a wrong install is still refused at use. A lookup that fails degrades to
+            // `None` and the pair waits a block, which is what it used to do every time.
+            pair.accepted_head =
+                ctx.provider().sealed_header_by_hash(target_hash).ok().flatten().filter(|header| {
+                    header.hash() == target_hash && header.number() == ready.anchor.block_number
+                });
             pair.last_readiness_label = pair.readiness.state().label();
             info!(
                 target: "partial_stateless",
@@ -1181,19 +1253,51 @@ where
                 recovery_failed = matches!(reason, BlockedReason::RecoveryIncomplete { .. }),
                 "Cache continuity broken"
             );
+            // Whatever the export was going to checkpoint, it is not the generation this pair is
+            // about to become.
+            interrupt_export(
+                options,
+                gate,
+                &mut recorder,
+                "the pair was rebuilt or reset under the export",
+            );
+            // The consumer has to be told, or it would keep applying commits from a pair whose
+            // generation silently changed underneath the stream. Before this, a producer that
+            // rebuilt or cold-reset wrote no frame at all and the commits simply kept coming —
+            // which reads to a follower as the validator disagreeing with itself, block after
+            // block, with nothing in the stream to explain it.
+            let reset_reason = if matches!(reason, BlockedReason::RecoveryIncomplete { .. }) {
+                ResetReason::SnapshotRequired
+            } else {
+                ResetReason::Gap
+            };
+            if let Some(recorder) = recorder.as_mut() {
+                recorder.write_reset(
+                    reset_reason,
+                    format!("block {block_number} broke cache continuity: {reason:?}"),
+                );
+            }
             // An exact rebuild at this block's own parent is worth trying before falling back to a
             // policy window of live warming, and it is the same primitive a reorg recovers with.
-            if rebuild_pair_at(ctx, options, pair, block.parent_hash, rebuild_failures) {
-                match admit_block(&mut pair.readiness, &block_ctx) {
-                    BlockAdmission::Admitted(ready_parent) => ready_parent,
-                    BlockAdmission::Rejected(reason) => eyre::bail!(
+            let admitted =
+                if rebuild_pair_at(ctx, options, pair, block.parent_hash, rebuild_failures) {
+                    match admit_block(&mut pair.readiness, &block_ctx) {
+                        BlockAdmission::Admitted(ready_parent) => ready_parent,
+                        BlockAdmission::Rejected(reason) => eyre::bail!(
                         "block {block_number} was refused by a pair rebuilt at its own parent: \
                          {reason:?}"
                     ),
-                }
-            } else {
-                admit_after_cold_reset(pair, &block_ctx)?
-            }
+                    }
+                } else {
+                    admit_after_cold_reset(pair, &block_ctx)?
+                };
+            // A rebuild lands `Ready` at this block's parent, so the checkpoint can be taken
+            // there — the exact block the consumer's stream continues from. A cold reset has no
+            // such block: it warms for a policy window first, and the checkpoint it eventually
+            // publishes is an explicit reset rather than continuous recovery. The gate below
+            // starts whichever of the two is available.
+            maybe_start_export(ctx, options, pair, gate, recorder.as_deref_mut());
+            admitted
         }
     };
 
@@ -1767,6 +1871,62 @@ fn fail_export_attempt(
             target: "partial_stateless",
             why,
             "Snapshot export failed with no retries left; this stream records no commits"
+        );
+    }
+}
+
+/// Abandons whatever export is armed or running, and decides whether to arm a fresh one.
+///
+/// Called when the chain moves under an export: a reorg, a revert, or a discontinuity the pair
+/// recovered from by rebuilding or resetting. The attempt in flight chose its H before any of
+/// that happened, so its checkpoint may describe a block that is no longer canonical — and a
+/// checkpoint on an abandoned branch is worse than no checkpoint, because a consumer would
+/// restore from it and believe it was on the winning chain.
+///
+/// Dropping the receiver is the whole fence. The blocking task cannot be cancelled, but
+/// `complete_export` is only reachable through the current job's receiver, and each worker writes
+/// into its own attempt directory — so a stale worker finishing minutes later lands somewhere
+/// nothing reads. A completed-but-unpolled result is dropped for the same reason rather than
+/// taken: it is exactly the race this closes.
+fn interrupt_export(
+    options: &RunOptions,
+    gate: &mut BootstrapGate,
+    recorder: &mut Option<&mut recorder::StreamRecorder>,
+    why: &str,
+) {
+    match std::mem::replace(&mut gate.job, ExportJob::Idle) {
+        ExportJob::InFlight { attempt_dir, started, .. } => {
+            warn!(
+                target: "partial_stateless",
+                why,
+                attempt = gate.attempt,
+                attempt_dir = %attempt_dir.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Abandoning a snapshot export the chain moved under; its files are left where \
+                 nothing will promote them"
+            );
+        }
+        // Terminal until now: one stream, one checkpoint. Reopening it is what lets the producer
+        // publish a second one at the block a reorg recovered to.
+        ExportJob::Finished | ExportJob::Idle => {}
+    }
+    if let Some(recorder) = recorder.as_mut() {
+        // Consumed here or the next poll would fail a fresh attempt for the abandoned one's
+        // overflow.
+        let _ = recorder.take_buffer_overflow();
+        recorder.abandon_buffering(why);
+    }
+    // `retries_left` is untouched: this attempt did not fail, it was overtaken. Retries meter
+    // genuine export failures, and spending one here would close a stream over a healthy chain.
+    let opened = recorder.as_ref().is_some_and(|recorder| recorder.stream_opened());
+    gate.export_pending = options.bootstrap_export &&
+        (!opened || options.reorg_checkpoint == ReorgCheckpointPolicy::Always);
+    gate.waiting_for_accepted_head_logged = false;
+    if !gate.export_pending {
+        info!(
+            target: "partial_stateless",
+            why,
+            "The stream is not re-checkpointed: PS_STREAM_REORG_CHECKPOINT=never"
         );
     }
 }
@@ -2818,19 +2978,32 @@ mod tests {
     }
 
     #[test]
-    fn a_canonical_rebuild_clears_the_accepted_head_it_no_longer_descends_from() {
-        // Not the guard this time — the state. `rebuild_pair_at` installs a different branch's
-        // caches, so leaving the header behind would be a field that lies until something reads
-        // it. There is no provider in a unit test, so this drives the same clearing the rebuild
-        // performs and pins that the pair reports absence afterwards.
+    fn a_canonical_header_installed_after_a_rebuild_is_offered_as_a_parent() {
+        // What makes the rebuild install a header rather than clear one. A rebuild used to leave
+        // the pair headless, which cost it a block before it could admit anything and made the
+        // checkpoint it exported unrestorable — a headless checkpoint can never admit H + 1. It
+        // now installs the canonical header for the exact hash it rebuilt at. This is the
+        // soundness that rests on: `accepted_parent` re-derives every field against the readiness
+        // anchor, so an externally supplied header is offered only when it *is* the block this
+        // generation is the state after. There is no provider in a unit test, so the fetch is
+        // stood in for by taking the same header the provider would have returned.
         let (mut pair, ..) = pair_and_reference_before_a_reorg();
-        assert!(pair.accepted_parent().is_some(), "precondition: the pair has a usable parent");
-
+        let canonical = pair.accepted_head.clone().expect("the fixture advanced a block");
         pair.forget_retained_generation();
         pair.accepted_head = None;
+        assert_eq!(pair.accepted_parent(), None, "a headless pair offers nothing");
 
-        assert_eq!(pair.accepted_parent(), None);
-        assert_eq!(pair.lifecycle_fingerprint().accepted_head, None);
+        pair.accepted_head = Some(canonical.clone());
+
+        assert_eq!(
+            pair.accepted_parent().map(|header| header.hash()),
+            Some(canonical.hash()),
+            "the header for the block the rebuild targeted is exactly the parent it may admit on"
+        );
+        assert_eq!(
+            pair.lifecycle_fingerprint().accepted_head,
+            Some((canonical.number, canonical.hash()))
+        );
     }
 
     #[test]
@@ -3056,6 +3229,10 @@ mod tests {
             let mut options =
                 RunOptions::from_env(CacheConfig::default()).expect("default options");
             options.bootstrap_dir = dir.to_path_buf();
+            // Every test in this module is about a run that exports; a run that does not would
+            // have no gate to drive. Set here rather than through the environment so the tests
+            // do not depend on what the process was started with.
+            options.bootstrap_export = true;
             options
         }
 
@@ -3091,6 +3268,211 @@ mod tests {
                 decode_event(&bytes, &FrameLimits::default()).expect("frame decodes");
             let StreamEvent::End(end) = event else { panic!("last frame is an End") };
             end.kind
+        }
+
+        /// A branch change fences the attempt without spending a retry.
+        ///
+        /// The two are different events and were never distinguished before, because a stream had
+        /// exactly one export and nothing could overtake it. `PS_STREAM_EXPORT_RETRIES` meters
+        /// exports that *failed*; spending one because the chain moved would eventually close a
+        /// stream over a perfectly healthy producer.
+        #[test]
+        fn a_branch_change_fences_an_attempt_without_spending_a_retry() {
+            let spool = temp_dir("fence-spool");
+            let bootstrap = temp_dir("fence-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut gate = gate_with(in_flight(rx, bootstrap.join("export-attempt-1")), 1);
+            let mut holder = Some(&mut recorder);
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(
+                matches!(gate.job, ExportJob::Idle),
+                "the receiver is dropped, so the fence holds"
+            );
+            assert_eq!(gate.retries_left, 1, "a fenced attempt is not a failed one");
+            assert!(gate.export_pending, "and a fresh one is armed at the block it recovered to");
+            assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest], "no End: nothing failed");
+            drop(tx);
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// A result already sitting in the channel is dropped rather than taken.
+        ///
+        /// This is the race the fence exists for: the worker finished, the notification loop had
+        /// not polled yet, and the chain moved in between. Promoting that checkpoint would
+        /// publish a snapshot of a block that is no longer canonical — and a consumer restoring
+        /// from it would believe it was on the winning chain.
+        #[test]
+        fn a_finished_but_unpolled_attempt_is_never_promoted() {
+            let spool = temp_dir("unpolled-spool");
+            let bootstrap = temp_dir("unpolled-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let attempt_dir = bootstrap.join("export-attempt-1");
+            fs::create_dir_all(&attempt_dir).expect("attempt dir");
+            let package_path = attempt_dir.join("package.bin");
+            let checkpoint_path = attempt_dir.join("checkpoint.json");
+            fs::write(&package_path, [1u8; 8]).expect("package");
+            fs::write(&checkpoint_path, "{}").expect("checkpoint");
+
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(Ok(bootstrap_io::FinishedExport {
+                checkpoint: TrustedCheckpoint {
+                    block_number: 1,
+                    block_hash: B256::ZERO,
+                    state_root: B256::ZERO,
+                    cache_root: B256::ZERO,
+                    cache_policy_id: B256::with_last_byte(0x44),
+                },
+                package_path: package_path.clone(),
+                checkpoint_path: checkpoint_path.clone(),
+                package_bytes: 8,
+                proof_targets: 1,
+                elapsed_us: 1,
+            }))
+            .expect("the channel takes one");
+
+            let mut gate = gate_with(in_flight(rx, attempt_dir), 1);
+            let mut holder = Some(&mut recorder);
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(
+                !options.bootstrap_dir.join(bootstrap_io::PACKAGE_FILE).exists(),
+                "the fenced attempt's package was never promoted onto the operator path"
+            );
+            assert!(package_path.exists(), "it is still in the attempt directory nothing reads");
+            assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest], "and no checkpoint landed");
+            drop(tx);
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// A finished export is terminal no longer: reopening it is what lets the producer publish
+        /// a second checkpoint at the block a reorg recovered to.
+        #[test]
+        fn a_finished_export_is_reopened_by_a_branch_change() {
+            let spool = temp_dir("reopen-spool");
+            let bootstrap = temp_dir("reopen-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut gate = gate_with(ExportJob::Finished, 0);
+            let mut holder = None;
+
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(matches!(gate.job, ExportJob::Idle));
+            assert!(gate.export_pending);
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// The fence consumes the overflow flag it inherits.
+        ///
+        /// Latent until re-arming existed: the flag is read once, by whoever polls next. A fresh
+        /// attempt started after a fence would otherwise be failed at its first poll for an
+        /// overflow that belonged to the attempt the fence already threw away.
+        #[test]
+        fn the_fence_consumes_a_stale_overflow_flag() {
+            let spool = temp_dir("stale-overflow-spool");
+            let bootstrap = temp_dir("stale-overflow-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut recorder = StreamRecorder::for_tests(&spool, 1);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "fits");
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "overflows");
+
+            let mut gate = gate_with(ExportJob::Idle, 1);
+            let mut holder = Some(&mut recorder);
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(
+                !recorder.take_buffer_overflow(),
+                "the abandoned attempt's overflow does not fail the next one"
+            );
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// `never` still arms the *first* checkpoint: a stream that never opened has nothing to
+        /// re-checkpoint, and leaving it closed would strand a spool with no restorable point.
+        #[test]
+        fn the_never_policy_still_opens_a_stream_that_never_opened() {
+            let spool = temp_dir("never-first-spool");
+            let bootstrap = temp_dir("never-first-bootstrap");
+            let mut options = options_with_bootstrap_dir(&bootstrap);
+            options.reorg_checkpoint = super::super::ReorgCheckpointPolicy::Never;
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+
+            let mut gate = gate_with(ExportJob::Idle, 1);
+            let mut holder = Some(&mut recorder);
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(gate.export_pending, "the stream has no checkpoint yet, so one is still owed");
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// And `never` declines the second one, which is the control the default is measured
+        /// against: the consumer is left to recover on its own or not at all.
+        #[test]
+        fn the_never_policy_declines_to_recheckpoint_an_open_stream() {
+            let spool = temp_dir("never-second-spool");
+            let bootstrap = temp_dir("never-second-bootstrap");
+            let mut options = options_with_bootstrap_dir(&bootstrap);
+            options.reorg_checkpoint = super::super::ReorgCheckpointPolicy::Never;
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder.begin_buffering();
+            let checkpoint = TrustedCheckpoint {
+                block_number: 25_737_234,
+                block_hash: B256::with_last_byte(0x11),
+                state_root: B256::with_last_byte(0x22),
+                cache_root: B256::with_last_byte(0x33),
+                cache_policy_id: B256::with_last_byte(0x44),
+            };
+            recorder.write_checkpoint(&checkpoint, None, &[7u8; 32]);
+            assert!(recorder.stream_opened());
+
+            let mut gate = gate_with(ExportJob::Finished, 1);
+            let mut holder = Some(&mut recorder);
+            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+
+            assert!(!gate.export_pending);
+            assert!(recorder.wants_commit_material(), "the open stream keeps taking frames");
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// An unrecognised policy is refused at startup rather than defaulted, so a run cannot
+        /// report a policy it is not running.
+        #[test]
+        fn an_unknown_reorg_checkpoint_policy_is_a_startup_error() {
+            assert!(matches!(
+                super::super::ReorgCheckpointPolicy::parse(Some("always")),
+                Ok(super::super::ReorgCheckpointPolicy::Always)
+            ));
+            assert!(matches!(
+                super::super::ReorgCheckpointPolicy::parse(None),
+                Ok(super::super::ReorgCheckpointPolicy::Always)
+            ));
+            assert!(matches!(
+                super::super::ReorgCheckpointPolicy::parse(Some("never")),
+                Ok(super::super::ReorgCheckpointPolicy::Never)
+            ));
+            let err = super::super::ReorgCheckpointPolicy::parse(Some("deep-only"))
+                .expect_err("an unknown policy is refused");
+            assert!(err.to_string().contains("deep-only"), "{err}");
         }
 
         /// A worker that died (panicked or dropped its sender) is a failed attempt; while a
