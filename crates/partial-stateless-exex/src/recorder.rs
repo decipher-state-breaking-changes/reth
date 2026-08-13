@@ -22,9 +22,11 @@
 //! stream was cut rather than finished. Reaching a configured spool bound is different: the
 //! stream is complete up to the bound, so it closes with `End(SpoolLimit)` instead of a cut.
 //!
-//! **A non-empty directory is refused.** Two runs sharing a spool would interleave two epochs
-//! under one sequence space, and the resulting corpus would be undetectably wrong rather than
-//! obviously wrong.
+//! **A non-empty directory is refused** unless the operator asks for a resume. Two runs sharing a
+//! spool would otherwise interleave two epochs under one sequence space, and the resulting corpus
+//! would be undetectably wrong rather than obviously wrong. `PS_STREAM_RESUME=1` is the explicit
+//! ask, and it is not a shortcut: the whole spool is read and checked first, because appending to
+//! a corpus this producer has not verified would put its own frames behind someone else's.
 //!
 //! What this module is not: a live delivery path. It writes files, and S3d is where a consumer
 //! reads them without sharing the datadir.
@@ -47,6 +49,9 @@ use tracing::{error, info, warn};
 
 /// Directory the spool is written to. Unset means no recording.
 const STREAM_DIR_VAR: &str = "PS_STREAM_DIR";
+
+/// Set to `1` to continue an existing spool as a new epoch instead of refusing a non-empty one.
+const RESUME_VAR: &str = "PS_STREAM_RESUME";
 
 /// Overrides [`DEFAULT_SNAPSHOT_CHUNK_BYTES`].
 const CHUNK_BYTES_VAR: &str = "PS_STREAM_CHUNK_BYTES";
@@ -143,6 +148,13 @@ pub struct StreamRecorder {
     max_spool_frames: u64,
     frames: u64,
     bytes: u64,
+    /// The newest manifest a resumed spool already held, kept until this producer writes its own.
+    ///
+    /// Identity cannot be checked at startup: `from_env` reads environment variables and knows
+    /// nothing about which chain this node follows. So the survey's answer is carried to
+    /// [`write_manifest`](Self::write_manifest), which is the first moment the two can be
+    /// compared — and the comparison happens before anything is appended.
+    resumed_from: Option<Manifest>,
     /// Highest block whose cache state the producer has written to durable storage.
     ///
     /// Held here rather than passed in per commit because it is producer state that no coordinated
@@ -162,17 +174,9 @@ impl StreamRecorder {
             return Ok(None)
         };
         fs::create_dir_all(&dir)?;
-        let existing = fs::read_dir(&dir)?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "frame"))
-            .count();
-        if existing > 0 {
-            eyre::bail!(
-                "{} already holds {existing} frames; recording into it would interleave two \
-                 epochs under one sequence space. Point {STREAM_DIR_VAR} at an empty directory.",
-                dir.display()
-            );
-        }
+        let limits = FrameLimits::default();
+        let resume = std::env::var(RESUME_VAR).is_ok_and(|raw| raw.trim() == "1");
+        let existing = survey_spool(&dir, &limits, resume)?;
         fn env_bound<T: std::str::FromStr + Copy>(name: &str, default: T) -> T {
             std::env::var(name).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(default)
         }
@@ -196,23 +200,40 @@ impl StreamRecorder {
             "Event stream recording ENABLED (PS_STREAM_DIR) — commits are written from the block \
              after the snapshot checkpoint"
         );
+        if let Some(survey) = &existing {
+            info!(
+                target: "partial_stateless_stream",
+                dir = %dir.display(),
+                frames = survey.frames,
+                bytes = survey.bytes,
+                next_sequence = survey.next_sequence,
+                previous_epoch = survey.manifest.epoch,
+                closed = survey.ended,
+                "Resuming an existing spool as a new epoch; every frame in it was read and checked \
+                 before this producer appended anything"
+            );
+        }
         Ok(Some(Self {
             dir,
             chunk_bytes,
             producer,
-            sequence: 0,
+            sequence: existing.as_ref().map_or(0, |survey| survey.next_sequence),
             phase: SpoolPhase::Idle,
             buffer_overflowed: false,
             poisoned: false,
             ended: false,
+            // Per epoch, not per directory: a resumed spool has a checkpoint in it, but not one
+            // this producer's frames continue from, so its own first checkpoint still opens the
+            // stream it is about to write.
             stream_opened: false,
-            limits: FrameLimits::default(),
+            limits,
             buffer_max_bytes,
             buffer_max_frames,
             max_spool_bytes,
             max_spool_frames,
-            frames: 0,
-            bytes: 0,
+            frames: existing.as_ref().map_or(0, |survey| survey.frames),
+            bytes: existing.as_ref().map_or(0, |survey| survey.bytes),
+            resumed_from: existing.map(|survey| survey.manifest),
             durable_block: None,
         }))
     }
@@ -242,6 +263,7 @@ impl StreamRecorder {
             max_spool_frames: DEFAULT_MAX_SPOOL_FRAMES,
             frames: 0,
             bytes: 0,
+            resumed_from: None,
             durable_block: None,
         }
     }
@@ -322,18 +344,37 @@ impl StreamRecorder {
         account_window: u64,
         storage_window: u64,
     ) {
+        let previous = self.resumed_from.take();
         let manifest = Manifest {
             chain_id,
             genesis_hash,
             cache_policy_id,
             account_window,
             storage_window,
-            // One directory holds one epoch, which `from_env` enforces by refusing a non-empty
-            // one. A producer that resumed into an existing spool would need this to increment.
-            epoch: 1,
+            epoch: previous.as_ref().map_or(1, |manifest| manifest.epoch + 1),
             producer: self.producer.clone(),
-            first_sequence: 1,
+            // Its own position plus one, which is 1 for a fresh spool and the continuation point
+            // for a resumed one. A manifest that disagrees with where it sits is how a consumer
+            // catches one lifted out of another spool.
+            first_sequence: self.sequence + 1,
         };
+        // The first moment the resumed spool's identity can be judged: this is where the chain
+        // this node actually follows arrives. A mismatch stops the recorder before it appends,
+        // because the alternative is a directory holding two chains under one sequence space —
+        // exactly what refusing a non-empty directory exists to prevent.
+        if let Some(previous) = previous &&
+            let Err(err) = manifest.check_succeeds(&previous, self.sequence)
+        {
+            self.poisoned = true;
+            error!(
+                target: "partial_stateless_stream",
+                sequence = self.sequence,
+                error = %err,
+                "The spool being resumed is not this stream; recording stops before appending to \
+                 it. Point PS_STREAM_DIR at an empty directory, or at the right spool"
+            );
+            return
+        }
         self.write_event(&StreamEvent::Manifest(manifest));
     }
 
@@ -611,7 +652,7 @@ impl StreamRecorder {
         let result = encode_frame_bytes(kind, sequence, &body, &self.limits)
             .map_err(|err| eyre::eyre!("{err}"))
             .and_then(|bytes| {
-                let path = self.dir.join(format!("{sequence:012}_{}.frame", kind.as_str()));
+                let path = self.dir.join(frame_file_name(sequence, kind));
                 write_atomically(&path, &bytes)?;
                 Ok(bytes.len())
             });
@@ -658,6 +699,154 @@ impl Drop for StreamRecorder {
 
 /// Writes through a temporary file, so a reader never sees a partially written frame.
 ///
+/// What an existing spool already holds, once every frame in it has been read and checked.
+#[derive(Debug)]
+struct SpoolSurvey {
+    /// The first sequence this producer may write.
+    next_sequence: u64,
+    /// The newest manifest, which the resuming producer's own identity is compared against.
+    manifest: Manifest,
+    /// Frames already on disk, so the spool bounds count the whole directory.
+    frames: u64,
+    /// Bytes already on disk, for the same reason.
+    bytes: u64,
+    /// Whether the last epoch closed with an `End` frame rather than being cut.
+    ended: bool,
+}
+
+/// Reads and checks an existing spool, or refuses it.
+///
+/// `Ok(None)` means the directory holds no frames, which is the ordinary fresh start. A directory
+/// that does hold frames is an error unless `resume` was asked for — and when it was, every frame
+/// is read: names against headers, digests against bodies, sequences against their positions, and
+/// each manifest against the one before it. Nothing cheaper is honest. Reading only the highest
+/// sequence would let a corrupt or foreign spool be extended, and the resulting corpus would carry
+/// this producer's frames behind frames it never checked, which is precisely the shape of evidence
+/// that cannot be withdrawn later.
+///
+/// The cost is a full read of the directory — tens of seconds for a spool of tens of gigabytes.
+/// That is what the explicit opt-in buys.
+fn survey_spool(
+    dir: &Path,
+    limits: &FrameLimits,
+    resume: bool,
+) -> eyre::Result<Option<SpoolSurvey>> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut leftovers: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
+        let path = entry.path();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("frame") => paths.push(path),
+            Some("tmp") => leftovers.push(path),
+            _ => {}
+        }
+    }
+    if paths.is_empty() {
+        // A directory holding only interrupted writes has no stream in it, so it is a fresh start
+        // whether or not a resume was asked for. Clearing them keeps the next survey honest.
+        for path in leftovers {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(None)
+    }
+    if !resume {
+        eyre::bail!(
+            "{} already holds {} frames; recording into it would interleave two epochs under one \
+             sequence space. Point {STREAM_DIR_VAR} at an empty directory, or set {RESUME_VAR}=1 \
+             to continue this spool as a new epoch.",
+            dir.display(),
+            paths.len()
+        );
+    }
+    paths.sort();
+
+    let mut manifest: Option<Manifest> = None;
+    let mut ended = false;
+    let mut bytes = 0u64;
+    for (position, path) in paths.iter().enumerate() {
+        let position = position as u64;
+        let raw = fs::read(path)
+            .map_err(|err| eyre::eyre!("cannot read frame {}: {err}", path.display()))?;
+        let (header, event, rest) = partial_stateless_stream::decode_event(&raw, limits)
+            .map_err(|err| eyre::eyre!("frame {} is unusable: {err}", path.display()))?;
+        if !rest.is_empty() {
+            eyre::bail!(
+                "frame {} carries {} trailing bytes; one file holds exactly one frame",
+                path.display(),
+                rest.len()
+            );
+        }
+        if header.sequence != position {
+            eyre::bail!(
+                "spool {} is not contiguous: sequence {} sits where {position} was expected. \
+                 Appending to a spool with a hole would hide the hole behind new frames",
+                dir.display(),
+                header.sequence
+            );
+        }
+        // The name is what orders the walk, so a renamed file could otherwise reorder the corpus
+        // for anyone reading it in directory order rather than by header.
+        let expected = dir.join(frame_file_name(header.sequence, header.kind));
+        if path != &expected {
+            eyre::bail!(
+                "frame {} is named for something other than the frame it holds ({})",
+                path.display(),
+                expected.display()
+            );
+        }
+        if ended && header.kind != FrameKind::Manifest {
+            eyre::bail!(
+                "spool {} continues past its End frame with a {} frame at sequence {}; only a \
+                 next-epoch manifest may follow an End",
+                dir.display(),
+                header.kind.as_str(),
+                header.sequence
+            );
+        }
+        if position == 0 && !matches!(event, StreamEvent::Manifest(_)) {
+            eyre::bail!("spool {} opens with something other than a manifest", dir.display());
+        }
+        match &event {
+            StreamEvent::Manifest(found) => {
+                match &manifest {
+                    None => found.check_opens(position)?,
+                    Some(previous) => found.check_succeeds(previous, position)?,
+                }
+                manifest = Some(found.clone());
+                ended = false;
+            }
+            StreamEvent::End(end) => {
+                if end.last_sequence.checked_add(1) != Some(header.sequence) {
+                    eyre::bail!(
+                        "the End frame at sequence {} names {} as the last frame",
+                        header.sequence,
+                        end.last_sequence
+                    );
+                }
+                ended = true;
+            }
+            _ => {}
+        }
+        bytes = bytes.saturating_add(raw.len() as u64);
+    }
+    let frames = paths.len() as u64;
+    let manifest = manifest.expect("a spool with frames opened with a manifest");
+    // Two frames past the end: the manifest this producer is about to write, and the first frame
+    // after it. A stream that cannot number its own continuation is not one to continue.
+    if frames.checked_add(2).is_none() || manifest.epoch.checked_add(1).is_none() {
+        eyre::bail!("spool {} has no room left in its sequence or epoch space", dir.display());
+    }
+    for path in leftovers {
+        let _ = fs::remove_file(path);
+    }
+    Ok(Some(SpoolSurvey { next_sequence: frames, manifest, frames, bytes, ended }))
+}
+
+/// The one place a frame's file name is derived, so the writer and every reader agree on it.
+fn frame_file_name(sequence: u64, kind: FrameKind) -> String {
+    format!("{sequence:012}_{}.frame", kind.as_str())
+}
+
 /// The same tmp-and-rename the snapshot export uses. It is not crash-atomic across frames — a
 /// crash can leave a complete prefix and nothing else — which is exactly the guarantee a sequence
 /// numbered spool needs, because a prefix is a valid truncated stream.
@@ -1072,5 +1261,184 @@ mod tests {
         assert_eq!(end.kind, EndKind::SpoolLimit);
         assert!(!recorder.wants_commit_material(), "a closed stream takes no more frames");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recorder built the way `from_env` builds a resumed one, without the environment gate.
+    fn resumed(dir: &Path, survey: SpoolSurvey) -> StreamRecorder {
+        let mut recorder = StreamRecorder::for_tests(dir, DEFAULT_BUFFER_MAX_FRAMES);
+        recorder.sequence = survey.next_sequence;
+        recorder.frames = survey.frames;
+        recorder.bytes = survey.bytes;
+        recorder.resumed_from = Some(survey.manifest);
+        recorder
+    }
+
+    /// Writes a complete one-epoch spool and closes it, which is what a producer leaves behind
+    /// when it is stopped politely.
+    fn closed_epoch(dir: &Path) {
+        let mut recorder = recorder(dir);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
+        recorder.write_end(EndKind::Shutdown, "stopped".to_string());
+    }
+
+    #[test]
+    fn a_non_empty_spool_is_refused_unless_a_resume_was_asked_for() {
+        let dir = spool_dir("resume-refused");
+        closed_epoch(&dir);
+
+        let refused = survey_spool(&dir, &FrameLimits::default(), false);
+
+        assert!(refused.is_err(), "the default is still to refuse someone else's spool");
+        assert!(
+            survey_spool(&dir, &FrameLimits::default(), true).expect("checks out").is_some(),
+            "and the same directory is readable once the operator asks for it"
+        );
+    }
+
+    #[test]
+    fn a_resumed_spool_continues_the_sequence_space_as_the_next_epoch() {
+        // Sequence numbers do not restart with the epoch: one directory has one sequence space,
+        // because frame files are named by it. What the epoch says is that the state broke, which
+        // is the part a consumer must not read continuity into.
+        let dir = spool_dir("resume-continues");
+        closed_epoch(&dir);
+        let survey = survey_spool(&dir, &FrameLimits::default(), true)
+            .expect("checks out")
+            .expect("frames exist");
+        let before = frames_in(&dir);
+
+        let mut recorder = resumed(&dir, survey);
+        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+
+        let after = frames_in(&dir);
+        assert_eq!(&after[..before.len()], &before[..], "nothing already written moved");
+        assert_eq!(after[before.len()], (before.len() as u64, FrameKind::Manifest));
+        let bytes = fs::read(dir.join(frame_file_name(before.len() as u64, FrameKind::Manifest)))
+            .expect("readable");
+        let (_, event, _) = decode_event(&bytes, &FrameLimits::default()).expect("decodes");
+        let StreamEvent::Manifest(written) = event else { panic!("a manifest was written") };
+        assert_eq!(written.epoch, 2);
+        assert_eq!(written.first_sequence, before.len() as u64 + 1);
+    }
+
+    #[test]
+    fn a_resumed_spool_is_not_appended_to_when_it_is_a_different_stream() {
+        // The identity check cannot happen at startup — `from_env` reads environment variables and
+        // has never heard of this node's chain. So it happens at the manifest, and it happens
+        // *before* the manifest is written: a directory holding two chains under one sequence
+        // space is exactly what refusing a non-empty directory exists to prevent.
+        let dir = spool_dir("resume-foreign");
+        closed_epoch(&dir);
+        let survey = survey_spool(&dir, &FrameLimits::default(), true)
+            .expect("checks out")
+            .expect("frames exist");
+        let before = frames_in(&dir);
+
+        let mut recorder = resumed(&dir, survey);
+        recorder.write_manifest(999, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+
+        assert_eq!(frames_in(&dir), before, "nothing was appended");
+        assert!(recorder.poisoned, "and the recorder will not write anything else either");
+    }
+
+    #[test]
+    fn a_spool_with_a_hole_is_refused_rather_than_extended() {
+        let dir = spool_dir("resume-hole");
+        closed_epoch(&dir);
+        let frames = frames_in(&dir);
+        let (sequence, kind) = frames[1];
+        fs::remove_file(dir.join(frame_file_name(sequence, kind))).expect("removable");
+
+        assert!(
+            survey_spool(&dir, &FrameLimits::default(), true).is_err(),
+            "appending would hide the hole behind frames that are not missing"
+        );
+    }
+
+    #[test]
+    fn a_frame_named_for_something_else_is_refused() {
+        // The names order the walk, so a rename is the one edit that can reorder a corpus for a
+        // reader without breaking any single frame.
+        let dir = spool_dir("resume-renamed");
+        closed_epoch(&dir);
+        let frames = frames_in(&dir);
+        let (sequence, kind) = frames[1];
+        fs::rename(
+            dir.join(frame_file_name(sequence, kind)),
+            dir.join(frame_file_name(sequence, FrameKind::Commit)),
+        )
+        .expect("renamable");
+
+        assert!(survey_spool(&dir, &FrameLimits::default(), true).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_frame_is_refused_rather_than_extended() {
+        let dir = spool_dir("resume-corrupt");
+        closed_epoch(&dir);
+        let frames = frames_in(&dir);
+        let (sequence, kind) = frames[1];
+        let path = dir.join(frame_file_name(sequence, kind));
+        let mut bytes = fs::read(&path).expect("readable");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, &bytes).expect("writable");
+
+        assert!(
+            survey_spool(&dir, &FrameLimits::default(), true).is_err(),
+            "the digests are checked, so a body that changed under the header is caught here"
+        );
+    }
+
+    #[test]
+    fn only_a_next_epoch_manifest_may_follow_an_end() {
+        let dir = spool_dir("resume-past-end");
+        closed_epoch(&dir);
+        let next = frames_in(&dir).len() as u64;
+        // A commit appended to a closed stream: legal-looking bytes in an illegal place.
+        let mut recorder = StreamRecorder::for_tests(&dir, DEFAULT_BUFFER_MAX_FRAMES);
+        recorder.sequence = next;
+        recorder.write_event(&StreamEvent::Reset(Reset {
+            reason: ResetReason::Gap,
+            detail: "appended to a closed stream".to_string(),
+        }));
+
+        assert!(survey_spool(&dir, &FrameLimits::default(), true).is_err());
+    }
+
+    #[test]
+    fn interrupted_writes_are_cleared_rather_than_counted() {
+        let dir = spool_dir("resume-tmp");
+        closed_epoch(&dir);
+        let leftover = dir.join("000000000009_commit.tmp");
+        fs::write(&leftover, b"half a frame").expect("writable");
+
+        let survey = survey_spool(&dir, &FrameLimits::default(), true)
+            .expect("checks out")
+            .expect("frames exist");
+
+        assert!(!leftover.exists(), "a partial write is not part of the corpus");
+        assert_eq!(survey.next_sequence, survey.frames, "and it is not counted as one either");
+    }
+
+    #[test]
+    fn the_spool_bounds_count_what_a_resumed_spool_already_holds() {
+        // Otherwise the bound is per-epoch rather than per-directory, and a producer restarted
+        // often enough would pass every check while filling the disk.
+        let dir = spool_dir("resume-bounds");
+        closed_epoch(&dir);
+        let survey = survey_spool(&dir, &FrameLimits::default(), true)
+            .expect("checks out")
+            .expect("frames exist");
+        let on_disk: u64 = frames_in(&dir)
+            .iter()
+            .map(|(sequence, kind)| {
+                fs::metadata(dir.join(frame_file_name(*sequence, *kind))).expect("stat").len()
+            })
+            .sum();
+
+        assert_eq!(survey.bytes, on_disk);
+        assert_eq!(survey.frames, frames_in(&dir).len() as u64);
     }
 }

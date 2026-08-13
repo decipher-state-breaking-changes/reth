@@ -127,6 +127,8 @@ pub struct ReplayReport {
     /// Winning branches the producer announced and did not deliver in full, with nothing valid
     /// taking their place. A branch replaced by a later reorg is counted as superseded instead.
     pub winning_branch_incomplete: u64,
+    /// Producer restarts crossed: a second manifest, and everything that follows rebootstrapped.
+    pub epochs: u64,
     /// Winning branches a later announcement withdrew before the delivery reached their tip.
     ///
     /// Diagnostic only. The chain moving twice in quick succession is ordinary, and the interval
@@ -288,6 +290,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
         phase = match (phase, frame.event) {
             (phase, StreamEvent::Manifest(found)) => match phase {
                 BatchPhase::AwaitingManifest => {
+                    found.check_opens(sequence)?;
                     info!(
                         target: "ps_replay",
                         chain_id = found.chain_id,
@@ -299,15 +302,24 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     );
                     BatchPhase::AwaitingCheckpoint { manifest: found }
                 }
-                // A second manifest is a new epoch: sequence numbers restarted with it, so nothing
-                // below it can be continued into. Recorded as a discontinuity rather than
-                // overwritten, which is what this driver used to do silently.
-                _ => {
-                    report.failures.push(format!(
-                        "a second manifest arrived at sequence {sequence} (epoch {}); the stream \
-                         below it cannot be continued",
-                        found.epoch
-                    ));
+                // A second manifest is a new epoch: the producer restarted and its state broke,
+                // so nothing below it can be continued into. Not a failure — a restart is
+                // ordinary, and one that says so is behaving correctly — but the checkpoint that
+                // follows rebootstraps this driver rather than continuing it, which is an
+                // explicit reset and reported as one.
+                BatchPhase::AwaitingCheckpoint { manifest } |
+                BatchPhase::Collecting { manifest, .. } |
+                BatchPhase::Live { manifest, .. } |
+                BatchPhase::AwaitingResync { manifest, .. } => {
+                    found.check_succeeds(&manifest, sequence)?;
+                    report.epochs += 1;
+                    warn!(
+                        target: "ps_replay",
+                        sequence,
+                        epoch = found.epoch,
+                        "The producer restarted its stream; the next checkpoint rebootstraps this \
+                         replay and the interval across the boundary is not validated"
+                    );
                     BatchPhase::AwaitingResync { manifest: found, target_ancestor: None }
                 }
             },

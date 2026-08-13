@@ -34,8 +34,8 @@ pub mod frame;
 pub mod oracle;
 
 pub use event::{
-    BlockRef, Checkpoint, CommitFrame, CommitInput, End, EndKind, Manifest, Reorg, Reset,
-    ResetReason, SnapshotChunk, SnapshotError, StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
+    BlockRef, Checkpoint, CommitFrame, CommitInput, End, EndKind, Manifest, ManifestError, Reorg,
+    Reset, ResetReason, SnapshotChunk, SnapshotError, StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
     MAX_SNAPSHOT_CHUNKS,
 };
 pub use frame::{

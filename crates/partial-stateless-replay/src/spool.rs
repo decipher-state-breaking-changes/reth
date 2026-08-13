@@ -9,7 +9,7 @@
 //! corpus would report agreement about a chain nobody ran.
 
 use partial_stateless_stream::{
-    decode_event, FrameHeader, FrameLimits, StreamEvent, FRAME_HEADER_BYTES,
+    decode_event, FrameHeader, FrameKind, FrameLimits, StreamEvent, FRAME_HEADER_BYTES,
 };
 use std::{fs, path::Path};
 
@@ -91,10 +91,18 @@ impl SpoolIter {
     /// Reads the next frame, enforcing contiguity and the End-frame placement rules.
     pub fn next_frame(&mut self) -> eyre::Result<Option<SpooledFrame>> {
         let Some(path) = self.paths.get(self.position) else { return Ok(None) };
-        if self.ended {
-            eyre::bail!("spool continues past its End frame: {}", path.display());
-        }
         let frame = read_frame_file(path, &self.limits)?;
+        // One thing may follow an End: the manifest of the next epoch. A producer that restarted
+        // into the same directory closed one stream and opened another, and refusing that would
+        // make its own recovery unreadable. Everything else past an End is a trailing frame on a
+        // closed stream, and replaying it would be replaying something nobody ran.
+        if self.ended {
+            if frame.header.kind != FrameKind::Manifest {
+                eyre::bail!("spool continues past its End frame: {}", path.display());
+            }
+            self.ended = false;
+            self.closed = false;
+        }
         if frame.header.sequence != self.position as u64 {
             eyre::bail!(
                 "spool is not contiguous: sequence {} arrived where {} was expected. A corpus \

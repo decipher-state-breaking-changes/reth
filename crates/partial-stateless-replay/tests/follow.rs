@@ -94,11 +94,29 @@ fn a_headless_checkpoint_cannot_open_the_stream() {
 fn a_second_manifest_is_an_epoch_change() {
     let dir = spool_dir("epoch");
     write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
-    write_frame(&dir, 1, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let mut next = manifest();
+    next.epoch = 2;
+    next.first_sequence = 2;
+    write_frame(&dir, 1, FrameKind::Manifest, &StreamEvent::Manifest(next));
 
     let report = follow(&dir, &options()).expect("follows");
     assert_eq!(report.last_needs_snapshot, Some(NeedsSnapshotReason::EpochChange));
     assert!(matches!(report.outcome, FollowOutcome::IdleTimeout { waiting_in: "needs_snapshot" }));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A restart says the producer's state broke. A frame that merely *looks* like one says nothing,
+/// and treating it as a restart would let any manifest dropped into a directory redirect a
+/// follower's recovery to whatever followed it.
+#[test]
+fn a_second_manifest_that_is_not_the_next_epoch_is_a_protocol_violation() {
+    let dir = spool_dir("epoch-bogus");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    // The same manifest again: same epoch, and numbering that belongs to sequence 0.
+    write_frame(&dir, 1, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+
+    let report = follow(&dir, &options()).expect("follows");
+    assert_eq!(report.last_needs_snapshot, Some(NeedsSnapshotReason::ProtocolViolation));
     let _ = fs::remove_dir_all(&dir);
 }
 

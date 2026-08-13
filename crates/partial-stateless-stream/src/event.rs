@@ -59,13 +59,91 @@ pub struct Manifest {
     pub storage_window: u64,
     /// Increments whenever the producer restarts its stream from a new snapshot.
     ///
-    /// A consumer that sees a new epoch must re-bootstrap rather than continue: sequence numbers
-    /// restart with it, so continuity across an epoch boundary cannot be inferred from them.
+    /// A consumer that sees a new epoch must re-bootstrap rather than continue. The sequence
+    /// space does *not* restart with it in a file spool — one directory has one sequence space,
+    /// and frame files are named by it — so continuity of numbering is exactly what may not be
+    /// read as continuity of state. The epoch is what says the state broke; the numbering only
+    /// says nothing was lost in transit.
     pub epoch: u64,
     /// Producer build identity, recorded so a divergence has somewhere to start.
     pub producer: String,
     /// Sequence number of the frame that follows this one.
+    ///
+    /// Always this manifest's own sequence plus one. It is written down anyway because it is the
+    /// one field that ties the manifest to *where it sits*: a manifest lifted out of another
+    /// spool, or written at the wrong place in this one, disagrees with its own position.
     pub first_sequence: u64,
+}
+
+/// Why a manifest is not usable where it was found.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ManifestError {
+    /// The manifest describes a chain or a cache policy the stream was not already about.
+    #[error("the manifest describes a different {field}")]
+    Identity {
+        /// Which field disagreed.
+        field: &'static str,
+    },
+    /// The epoch did not follow the one before it.
+    #[error("the manifest names epoch {found} where epoch {expected} follows the stream")]
+    Epoch {
+        /// What it said.
+        found: u64,
+        /// What the position allowed.
+        expected: u64,
+    },
+    /// The manifest disagrees with the sequence it was written at.
+    #[error("the manifest at sequence {sequence} names first_sequence {found}, and its own \
+             successor is {}", .sequence + 1)]
+    Position {
+        /// Where it is.
+        sequence: u64,
+        /// What it claimed.
+        found: u64,
+    },
+}
+
+impl Manifest {
+    /// Whether this manifest can open a stream at `sequence`.
+    ///
+    /// Nothing precedes it, so only its own position is checkable. Identity is the operator's to
+    /// judge, and a consumer does that against its own configuration rather than against the
+    /// frame.
+    pub const fn check_opens(&self, sequence: u64) -> Result<(), ManifestError> {
+        if self.first_sequence != sequence + 1 {
+            return Err(ManifestError::Position { sequence, found: self.first_sequence })
+        }
+        Ok(())
+    }
+
+    /// Whether this manifest is the next epoch of the stream `previous` opened.
+    ///
+    /// A second manifest in one spool is how a restarted producer says its state broke and a
+    /// consumer has to re-bootstrap. It is only that if it is about the same chain under the same
+    /// policy and numbers itself as the successor. Anything else is a different stream sharing a
+    /// directory, and nothing under it may be restored as though it continued this one.
+    pub fn check_succeeds(&self, previous: &Self, sequence: u64) -> Result<(), ManifestError> {
+        let field = if self.chain_id != previous.chain_id {
+            Some("chain")
+        } else if self.genesis_hash != previous.genesis_hash {
+            Some("genesis")
+        } else if self.cache_policy_id != previous.cache_policy_id {
+            Some("cache policy")
+        } else if self.account_window != previous.account_window ||
+            self.storage_window != previous.storage_window
+        {
+            Some("cache window")
+        } else {
+            None
+        };
+        if let Some(field) = field {
+            return Err(ManifestError::Identity { field })
+        }
+        if self.epoch != previous.epoch + 1 {
+            return Err(ManifestError::Epoch { found: self.epoch, expected: previous.epoch + 1 })
+        }
+        self.check_opens(sequence)
+    }
 }
 
 /// The operator-trusted checkpoint, and the header of the snapshot that follows it.

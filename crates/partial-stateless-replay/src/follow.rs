@@ -299,6 +299,14 @@ impl Phase {
 }
 
 /// What a recovery scan was looking for when it found a checkpoint.
+/// What the frames written during an outage did to the recovery this follower is waiting on.
+struct Supersession {
+    /// The block a checkpoint now has to land on to be a continuous recovery, if any still does.
+    target: Option<BlockRef>,
+    /// The next epoch's manifest, once it has been checked to be this stream's successor.
+    adopt: Option<Manifest>,
+}
+
 struct PendingRecovery {
     /// The block a continuous recovery has to land on, after supersession.
     target: Option<BlockRef>,
@@ -458,12 +466,7 @@ impl<'a> Follower<'a> {
                 // derive. A wrong manifest is an operator error, not a stream fault.
                 chain_spec_for(&manifest)?;
                 config_for(&manifest)?;
-                if manifest.first_sequence != 1 {
-                    return Err(eyre::eyre!(
-                        "manifest names first_sequence {}, and this format writes 1",
-                        manifest.first_sequence
-                    ))
-                }
+                manifest.check_opens(sequence)?;
                 info!(
                     target: "ps_follow",
                     chain_id = manifest.chain_id,
@@ -487,14 +490,26 @@ impl<'a> Follower<'a> {
                 self.check_end_numbering(&end.reason, end.last_sequence, sequence)?;
                 Ok(Step::Done(FollowOutcome::Ended { kind: end.kind, before_checkpoint: true }))
             }
-            (Phase::AwaitingCheckpoint { manifest }, StreamEvent::Manifest(_)) => Ok(self
-                .enter_needs_snapshot(
-                    manifest,
-                    NeedsSnapshotReason::EpochChange,
-                    "a second manifest arrived; sequence spaces are per-epoch",
-                    sequence + 1,
-                    None,
-                )),
+            (Phase::AwaitingCheckpoint { manifest }, StreamEvent::Manifest(next)) => {
+                match next.check_succeeds(&manifest, sequence) {
+                    Ok(()) => Ok(self.enter_needs_snapshot(
+                        next,
+                        NeedsSnapshotReason::EpochChange,
+                        "a second manifest arrived before any checkpoint of the first",
+                        sequence + 1,
+                        None,
+                    )),
+                    Err(err) => Ok(self.enter_needs_snapshot(
+                        manifest,
+                        NeedsSnapshotReason::ProtocolViolation,
+                        &format!(
+                            "a second manifest arrived that is not this stream's next epoch: {err}"
+                        ),
+                        sequence + 1,
+                        None,
+                    )),
+                }
+            }
             (Phase::AwaitingCheckpoint { manifest }, other) => Ok(self.enter_needs_snapshot(
                 manifest,
                 NeedsSnapshotReason::ProtocolViolation,
@@ -699,13 +714,28 @@ impl<'a> Follower<'a> {
                     }
                 }
             }
-            StreamEvent::Manifest(_) => Ok(self.enter_needs_snapshot(
-                manifest,
-                NeedsSnapshotReason::EpochChange,
-                "a mid-stream manifest means the producer restarted its sequence space",
-                sequence + 1,
-                None,
-            )),
+            // The producer restarted. Its state broke, so nothing below this can be continued
+            // into — but the stream itself goes on, and the follower reads the next epoch under
+            // the new identity once it has checked that it *is* the next epoch of this one.
+            StreamEvent::Manifest(next) => match next.check_succeeds(&manifest, sequence) {
+                Ok(()) => Ok(self.enter_needs_snapshot(
+                    next,
+                    NeedsSnapshotReason::EpochChange,
+                    "the producer restarted its stream; the next checkpoint rebootstraps this \
+                     follower",
+                    sequence + 1,
+                    None,
+                )),
+                Err(err) => Ok(self.enter_needs_snapshot(
+                    manifest,
+                    NeedsSnapshotReason::ProtocolViolation,
+                    &format!(
+                        "a second manifest arrived that is not this stream's next epoch: {err}"
+                    ),
+                    sequence + 1,
+                    None,
+                )),
+            },
             StreamEvent::Checkpoint(checkpoint) => match announced {
                 // The producer's recovery checkpoint for a reorg this follower already undid.
                 // Two implementations reached the same generation independently, so comparing
@@ -1202,7 +1232,8 @@ impl<'a> Follower<'a> {
         current: &Manifest,
         scan_from: u64,
         checkpoint_at: u64,
-    ) -> eyre::Result<Option<BlockRef>> {
+    ) -> eyre::Result<Supersession> {
+        let mut adopt = None;
         let mut latest: Option<(u64, Option<BlockRef>)> = None;
         for kind in [FrameKind::Reorg, FrameKind::Reset, FrameKind::Manifest] {
             let found = self
@@ -1250,8 +1281,9 @@ impl<'a> Follower<'a> {
                     // A new epoch withdraws the target either way. It is still checked, because
                     // the checkpoint that follows will be restored under an identity, and one
                     // that fails here says the spool is not the stream this follower was reading.
-                    if let Err(detail) = check_epoch_manifest(&next, current, sequence) {
-                        self.refuse_in_scan(sequence, "manifest", &detail)?;
+                    match next.check_succeeds(current, sequence) {
+                        Ok(()) => adopt = Some(next),
+                        Err(err) => self.refuse_in_scan(sequence, "manifest", &err.to_string())?,
                     }
                     None
                 }
@@ -1267,11 +1299,12 @@ impl<'a> Follower<'a> {
                     sequence,
                     superseded = ?target.map(|block| block.number),
                     now = ?announced.map(|block| block.number),
+                    epoch_changed = adopt.is_some(),
                     "A later announcement supersedes the recovery target"
                 );
-                Ok(announced)
+                Ok(Supersession { target: announced, adopt })
             }
-            None => Ok(target),
+            None => Ok(Supersession { target, adopt }),
         }
     }
 
@@ -1333,7 +1366,12 @@ impl<'a> Follower<'a> {
             // reorg during the outage moves the block a snapshot has to be authenticated at, and
             // a reset withdraws the request. Without this, a stale target would let a checkpoint
             // that answers a superseded question be reported as continuous recovery.
-            let target = self.supersede_target(target_ancestor, &manifest, scan_from, found)?;
+            let superseded = self.supersede_target(target_ancestor, &manifest, scan_from, found)?;
+            let target = superseded.target;
+            // A new epoch's frames are read under the new epoch's identity. It was checked to be
+            // this stream's successor before it got here, so adopting it is not a change of
+            // subject — it is the same producer saying where its restart begins.
+            let manifest = superseded.adopt.unwrap_or(manifest);
             // Classified where the checkpoint itself is in hand, which is `restore_pair`; what
             // the scan knows and it does not is what was asked for and what went by in between.
             self.pending_recovery = Some(PendingRecovery { target, skipped });
@@ -1705,40 +1743,6 @@ impl VerdictSink {
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-}
-
-/// Whether a manifest found mid-stream is the next epoch of the stream already being followed.
-///
-/// A second manifest is how a restarted producer says the sequence space began again. It is only
-/// that if it describes the same chain under the same policy and numbers itself as the successor:
-/// anything else is a different stream sharing a directory, and no checkpoint under it may be
-/// restored as though this follower had been reading it all along.
-fn check_epoch_manifest(next: &Manifest, current: &Manifest, sequence: u64) -> Result<(), String> {
-    if next.chain_id != current.chain_id ||
-        next.genesis_hash != current.genesis_hash ||
-        next.cache_policy_id != current.cache_policy_id ||
-        next.account_window != current.account_window ||
-        next.storage_window != current.storage_window
-    {
-        return Err("the manifest describes a different chain or cache policy".to_string())
-    }
-    if next.epoch != current.epoch + 1 {
-        return Err(format!(
-            "the manifest names epoch {} where epoch {} follows {}",
-            next.epoch,
-            current.epoch + 1,
-            current.epoch
-        ))
-    }
-    if next.first_sequence != sequence + 1 {
-        return Err(format!(
-            "the manifest at sequence {sequence} names first_sequence {}, and its own successor \
-             is {}",
-            next.first_sequence,
-            sequence + 1
-        ))
-    }
-    Ok(())
 }
 
 const fn kind_of(event: &StreamEvent) -> FrameKind {
