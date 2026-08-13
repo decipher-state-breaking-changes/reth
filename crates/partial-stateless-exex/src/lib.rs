@@ -2745,6 +2745,37 @@ mod tests {
     }
 
     #[test]
+    fn a_cold_reset_readmission_heals_the_acknowledgement_watermark() {
+        // The whole path, through the code the notification handler actually runs. A block that
+        // could not be admitted freezes the watermark below it, and the recovery available to
+        // this producer is a cold reset that re-executes that very block. Until the tracker
+        // recognised that, every run that hit one gap reported a durability watermark stuck at
+        // the block before it for as long as the node stayed up — and a consumer resuming from
+        // that watermark would have replayed from far behind where the producer actually was.
+        let mut pair = cold_pair();
+        for number in 100..=102 {
+            process(&mut pair, number);
+        }
+        assert_eq!(pair.readiness.acknowledgeable_height().map(|(number, _)| number), Some(102));
+
+        // 103 is delivered and never applied, which is what `abandon_block` records.
+        pair.readiness.abandon_block(103);
+        assert_eq!(pair.readiness.first_gap(), Some(103));
+
+        // The handler's own recovery: `admit` cold-resets and readmits, and the block that was
+        // missed is the one that arrives next.
+        process(&mut pair, 103);
+        process(&mut pair, 104);
+
+        assert_eq!(pair.readiness.first_gap(), None, "103 was executed after all");
+        assert_eq!(
+            pair.readiness.acknowledgeable_height().map(|(number, _)| number),
+            Some(104),
+            "and the watermark moves with the chain again"
+        );
+    }
+
+    #[test]
     fn an_unrooted_parent_is_refused_without_mutation() {
         // The one refusal the transaction cannot make good on after the fact: the post-undo cache
         // root has to be known *before* the rollback for the tracker to be run on a clone, and the

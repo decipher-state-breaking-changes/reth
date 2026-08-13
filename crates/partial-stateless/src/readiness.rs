@@ -25,6 +25,7 @@ use crate::{
     network_cache::NetworkStateCache, sidecar::CacheAnchor, trie_cache::PartialTrieNodeCache,
 };
 use alloy_primitives::B256;
+use tracing::debug;
 
 /// Tracks whether the joint cache may be used to validate the next block.
 ///
@@ -384,6 +385,29 @@ impl CacheReadinessTracker {
         if self.window_filled_at.is_none() && self.replay_depth >= self.required_replay_depth() {
             self.window_filled_at = Some(self.replay_depth);
         }
+        // The gap being filled by delivery rather than by a reorg. A cold reset re-executes the
+        // block that was missed, and when the block now applied is exactly the one the watermark
+        // is stuck below *and* chains onto the acknowledged block by hash, everything below it
+        // has genuinely been processed — the latch has nothing left to protect. The hash is what
+        // makes this safe: a sibling at the same height fills nothing, and would otherwise let a
+        // watermark claim a block that was never applied on this branch.
+        //
+        // Recognised here rather than released by a caller, so that every consumer of this
+        // tracker heals the same way and none of them has to know it needs to.
+        if self.first_gap == Some(block.number) &&
+            self.acknowledgeable.is_some_and(|previous| {
+                block.number == previous.number + 1 && block.parent_hash == previous.hash
+            })
+        {
+            debug!(
+                target: "partial_stateless",
+                block = block.number,
+                "The block the acknowledgement watermark was stuck below was re-applied; the \
+                 watermark advances again"
+            );
+            self.first_gap = None;
+        }
+
         // Only contiguous from the start counts: once a block has been skipped, later blocks are
         // applied but the promise "everything below this is processed" is no longer true.
         let contiguous_from_start =
@@ -855,6 +879,44 @@ mod tests {
 
         assert_eq!(tracker.first_gap(), Some(102));
         assert_eq!(tracker.acknowledgeable_height(), Some((101, block_hash(101))));
+    }
+
+    #[test]
+    fn readmitting_the_exact_gap_block_releases_the_watermark() {
+        // The other way a gap stops being a gap. A reorg drops the missing block from the chain;
+        // a cold reset re-executes it. Both leave nothing owed, and until now only the first was
+        // recognised — so a producer that recovered by re-applying the block it missed reported
+        // a durability watermark frozen for the rest of the run.
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        assert_eq!(tracker.first_gap(), Some(101));
+
+        // The cold reset, and then the very block that was missed.
+        tracker.reset();
+        apply_contiguous(&mut tracker, 101, 2);
+
+        assert_eq!(tracker.first_gap(), None, "101 was processed after all");
+        assert_eq!(tracker.acknowledgeable_height(), Some((102, block_hash(102))));
+    }
+
+    #[test]
+    fn a_sibling_at_the_gap_height_does_not_release_the_watermark() {
+        // Same height, different block. Nothing about executing it says the block that was
+        // actually missed was ever processed, and a watermark is a claim about *blocks*.
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        tracker.reset();
+
+        let mut sibling = block(101);
+        sibling.hash = B256::repeat_byte(0xee);
+        sibling.parent_hash = B256::repeat_byte(0xdd);
+        tracker.begin_block(&sibling).expect("a reset admits it");
+        tracker.finish_block(&sibling, &observed(&sibling));
+
+        assert_eq!(tracker.first_gap(), Some(101), "the missing block is still missing");
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
     }
 
     #[test]
