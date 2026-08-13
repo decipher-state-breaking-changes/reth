@@ -3,7 +3,7 @@
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
-//!           [--ack <path>] [--mutations] [--json <path>] [--label <name>]
+//!           [--ack <path>] [--resume] [--mutations] [--json <path>] [--label <name>]
 //! ```
 //!
 //! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
@@ -187,6 +187,8 @@ fn report_follow(report: &FollowReport) {
         target: "ps_follow",
         outcome = ?report.outcome,
         blocks_verified = report.blocks_verified,
+        catch_up_blocks = report.catch_up_blocks,
+        resumed_from = ?report.resumed_from,
         restores = report.restores,
         needs_snapshot_entries = report.needs_snapshot_entries,
         commits_skipped_in_recovery = report.commits_skipped_in_recovery,
@@ -196,6 +198,7 @@ fn report_follow(report: &FollowReport) {
         disagreements = report.replay.disagreements.len(),
         failures = report.replay.failures.len(),
         agreed = report.agreed(),
+        continuous = report.continuous(),
         "Follow finished"
     );
     for (block, disagreement) in &report.replay.disagreements {
@@ -263,6 +266,8 @@ fn write_follow_summary(
         "winning_branches_incomplete": report.winning_branches_incomplete,
         "winning_branches_superseded": report.winning_branches_superseded,
         "scan_refusals": report.scan_refusals,
+        "catch_up_blocks": report.catch_up_blocks,
+        "resumed_from": report.resumed_from,
         "unverified_intervals": report.unverified_intervals,
         "admission_is_load_bearing": report.replay.admission_is_load_bearing(),
         "elapsed_ms": elapsed_ms,
@@ -340,8 +345,8 @@ fn parse_args() -> eyre::Result<Mode> {
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--force-restore-at <sequence>] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
-                     [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--mutations] \
-                     [--json <path>] [--label <name>]"
+                     [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--resume] \
+                     [--mutations] [--json <path>] [--label <name>]"
                 );
                 std::process::exit(0);
             }
@@ -378,6 +383,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                     args.next().ok_or_else(|| eyre::eyre!("--ack needs a path"))?,
                 ));
             }
+            "--resume" => options.resume = true,
             "--mutations" => options.mutations = true,
             "--json" => {
                 options.verdicts = Some(PathBuf::from(

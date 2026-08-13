@@ -61,6 +61,8 @@ pub struct FollowOptions {
     pub verdicts: Option<PathBuf>,
     /// Atomically rewritten consumer watermark, outside the spool directory.
     pub ack: Option<PathBuf>,
+    /// Start from the watermark the ack file records instead of from the stream's first frame.
+    pub resume: bool,
     /// Label stamped into every record.
     pub label: String,
 }
@@ -76,6 +78,7 @@ impl Default for FollowOptions {
             reexec_limits: SidecarReexecLimits::default(),
             verdicts: None,
             ack: None,
+            resume: false,
             label: "unlabelled".to_string(),
         }
     }
@@ -209,6 +212,12 @@ pub struct FollowReport {
     pub winning_branches_superseded: u64,
     /// Frames a recovery scan read and would not act on, so no recovery under them is continuous.
     pub scan_refusals: u64,
+    /// Blocks re-derived on the way back to a watermark a previous run left.
+    ///
+    /// Kept out of `blocks_verified`, which counts what *this* run verified for the first time.
+    pub catch_up_blocks: u64,
+    /// The checkpoint sequence a resumed run rebuilt its pair from.
+    pub resumed_from: Option<u64>,
     /// Canonical intervals no verdict covers, in the order they opened.
     pub unverified_intervals: Vec<(u64, u64)>,
 }
@@ -245,7 +254,14 @@ enum Phase {
     /// Identity verified; waiting for a checkpoint to bootstrap from.
     AwaitingCheckpoint { manifest: Manifest },
     /// A checkpoint arrived; its declared chunks are being collected.
-    CollectingChunks { manifest: Manifest, checkpoint: Checkpoint, chunks: Vec<SnapshotChunk> },
+    CollectingChunks {
+        manifest: Manifest,
+        checkpoint: Checkpoint,
+        /// The checkpoint frame's own sequence, not the last chunk's. It is what a restart has to
+        /// name to come back to this exact pair, so it is carried rather than re-derived.
+        checkpoint_sequence: u64,
+        chunks: Vec<SnapshotChunk>,
+    },
     /// A pair is restored and verifying commits.
     Streaming {
         manifest: Manifest,
@@ -364,6 +380,69 @@ enum Step {
     Done(FollowOutcome),
 }
 
+/// What a previous run wrote down about where it got to.
+///
+/// Only the fields a restart acts on. Everything else in the file is for an operator reading it.
+#[derive(Debug, Clone)]
+struct Ack {
+    /// Highest frame the previous run consumed.
+    last_sequence: u64,
+    /// The block it stood on there, checked when the catch-up reaches that sequence.
+    block: Option<BlockRef>,
+    /// What it was doing: `needs_snapshot` means it was already waiting for a checkpoint.
+    state: String,
+    /// Which epoch it was reading.
+    epoch: u64,
+    /// The checkpoint frame its pair came from. Absent in version 1 acks.
+    restored_from_sequence: Option<u64>,
+}
+
+/// Reads an ack file, or reports that there is nothing to resume from.
+///
+/// A missing file is a fresh start — an operator asking to resume before anything ran should get
+/// a run, not an error. A file that exists and does not parse is an error: it was written by
+/// something, and guessing what it meant is exactly the guessing this format removed.
+fn read_ack(path: &Path) -> eyre::Result<Option<Ack>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(eyre::eyre!("cannot read the ack at {}: {err}", path.display())),
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| eyre::eyre!("the ack at {} is not readable: {err}", path.display()))?;
+    let last_sequence = value
+        .get("last_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| eyre::eyre!("the ack at {} names no sequence", path.display()))?;
+    let block = match (
+        value.get("block").and_then(serde_json::Value::as_u64),
+        value.get("block_hash").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(number), Some(hash)) => Some(BlockRef {
+            number,
+            hash: hash.parse().map_err(|_| {
+                eyre::eyre!("the ack at {} names an unreadable block hash", path.display())
+            })?,
+        }),
+        _ => None,
+    };
+    Ok(Some(Ack {
+        last_sequence,
+        block,
+        state: value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("streaming")
+            .to_string(),
+        // Version 1 predates epochs in the ack, and every version-1 ack was written by a producer
+        // that could not resume a spool, so epoch 1 is not a guess.
+        epoch: value.get("epoch").and_then(serde_json::Value::as_u64).unwrap_or(1).max(1),
+        restored_from_sequence: value
+            .get("restored_from_sequence")
+            .and_then(serde_json::Value::as_u64),
+    }))
+}
+
 struct Follower<'a> {
     options: &'a FollowOptions,
     replay_options: ReplayOptions,
@@ -385,6 +464,18 @@ struct Follower<'a> {
     restores_reset: u64,
     /// Frames read during a recovery scan that did not verify, so nothing was taken from them.
     scan_refusals: u64,
+    /// Highest sequence a previous run had already published a verdict for, while catching up.
+    ///
+    /// A resumed run re-derives everything between the checkpoint it restored from and this
+    /// point. Those blocks were verified once already, so their verdicts are labelled and kept
+    /// out of the live counters — reporting them again would double-count the same work.
+    catch_up_until: Option<u64>,
+    /// Blocks re-derived on the way back to the watermark.
+    catch_up_blocks: u64,
+    /// The sequence a resume started from, for the record.
+    resumed_from: Option<u64>,
+    /// What the ack said the previous run's head was, checked when the catch-up reaches it.
+    resume_watermark: Option<(u64, B256)>,
     /// What the scan that found the next checkpoint was looking for, so the restore can say
     /// whether it got it.
     pending_recovery: Option<PendingRecovery>,
@@ -423,6 +514,10 @@ impl<'a> Follower<'a> {
             restores_continuous: 0,
             restores_reset: 0,
             scan_refusals: 0,
+            catch_up_until: None,
+            catch_up_blocks: 0,
+            resumed_from: None,
+            resume_watermark: None,
             pending_recovery: None,
             unverified_intervals: Vec::new(),
             last_needs_snapshot: None,
@@ -432,6 +527,7 @@ impl<'a> Follower<'a> {
     }
 
     fn run(mut self) -> eyre::Result<FollowReport> {
+        self.resume()?;
         loop {
             if self.options.max_blocks.is_some_and(|max| self.blocks_verified >= max) {
                 return Ok(self.into_report(FollowOutcome::MaxBlocks))
@@ -444,7 +540,16 @@ impl<'a> Follower<'a> {
                     Ok(TailEvent::Frame(frame)) => {
                         self.last_frame_at = Instant::now();
                         let frame = *frame;
-                        self.handle(frame.header.sequence, frame.event)?
+                        let sequence = frame.header.sequence;
+                        let step = self.handle(sequence, frame.event)?;
+                        match (step, self.catch_up_until) {
+                            // The frame the previous run stopped at has now been re-derived, and
+                            // this is the one moment the two runs can be compared.
+                            (Step::Continue, Some(until)) if sequence >= until => {
+                                self.finish_catch_up()?
+                            }
+                            (step, _) => step,
+                        }
                     }
                     Ok(TailEvent::Idle) => self.idle(),
                     Err(fault) => self.tail_fault(fault)?,
@@ -454,6 +559,185 @@ impl<'a> Follower<'a> {
                 Step::Continue => {}
                 Step::Done(outcome) => return Ok(self.into_report(outcome)),
             }
+        }
+    }
+
+    /// Starts from where a previous run stopped, if the operator asked and an ack says where.
+    ///
+    /// Three things have to be true before a single frame is skipped, and none of them is
+    /// inferred. The spool has to be the same stream, epoch by epoch, from its first manifest to
+    /// the one the ack was written under — otherwise "sequence 900" names a frame in somebody
+    /// else's numbering. The sequence the ack points at has to actually hold a checkpoint, in
+    /// that epoch. And the state the previous run was in has to be honoured: one that stopped
+    /// waiting for a snapshot resumes waiting for a snapshot, because the frames it refused are
+    /// still there and replaying past them would accept what it refused.
+    ///
+    /// Everything from the checkpoint up to the ack's own sequence is then re-derived rather than
+    /// trusted. That is the point: the pair is state, and the only honest way to get it back
+    /// without a database is to build it again from the frames that built it the first time.
+    fn resume(&mut self) -> eyre::Result<()> {
+        if !self.options.resume {
+            return Ok(())
+        }
+        let Some(path) = self.options.ack.clone() else {
+            return Err(eyre::eyre!("--resume needs --ack: there is nowhere to resume from"))
+        };
+        let Some(ack) = read_ack(&path)? else {
+            info!(
+                target: "ps_follow",
+                ack = %path.display(),
+                "No ack to resume from; following from the start of the stream"
+            );
+            return Ok(())
+        };
+        let (manifest_at, manifest) = self.verify_epoch_chain(ack.epoch)?;
+        let Some(restored_from) = ack.restored_from_sequence else {
+            // A version-1 ack. Its watermark is real, but it never recorded which checkpoint the
+            // pair came from, and picking "the newest checkpoint at or below the watermark" would
+            // let a restart adopt a checkpoint the previous run had examined and refused. Reading
+            // the epoch from its start costs time and claims nothing false.
+            warn!(
+                target: "ps_follow",
+                ack = %path.display(),
+                "The ack does not say which checkpoint its pair came from, so the epoch is read \
+                 from its start rather than guessed at"
+            );
+            self.tail.skip_to(manifest_at);
+            return Ok(())
+        };
+        if restored_from < manifest_at {
+            return Err(eyre::eyre!(
+                "the ack restored from sequence {restored_from}, which is below epoch {}'s \
+                 manifest at {manifest_at}",
+                ack.epoch
+            ))
+        }
+        // Read by name and header, like every other recovery read: a restart is exactly when a
+        // renamed frame would be aimed at a consumer.
+        let frame = self
+            .tail
+            .read_at(restored_from, FrameKind::Checkpoint)
+            .map_err(|fault| eyre::eyre!("the ack's checkpoint did not read back: {fault}"))?;
+        if !matches!(frame.event, StreamEvent::Checkpoint(_)) {
+            return Err(eyre::eyre!(
+                "the frame at sequence {restored_from} is named Checkpoint but decoded as \
+                 something else"
+            ))
+        }
+        self.resumed_from = Some(restored_from);
+        self.tail.skip_to(restored_from);
+        // Identity is already established — `verify_epoch_chain` read it from the spool's own
+        // manifests and checked every link — so the checkpoint about to arrive has something to
+        // be checked against, which is the whole reason the chain is walked before this point.
+        self.phase = Phase::AwaitingCheckpoint { manifest };
+        self.catch_up_until = Some(ack.last_sequence);
+        // Checked only against a watermark a verdict wrote. A run that stopped waiting for a
+        // snapshot will re-hit whatever stopped it before it gets this far, and that is not a
+        // divergence — it is the same refusal, reached the same way, which is what makes a
+        // restart safe rather than a way past it.
+        self.resume_watermark = (ack.state == "streaming")
+            .then_some(ack.block)
+            .flatten()
+            .map(|block| (block.number, block.hash));
+        self.sink.suppress_ack = true;
+        self.sink.ack_high_water = Some(ack.last_sequence);
+        self.replay_options.mutations = false;
+        info!(
+            target: "ps_follow",
+            restored_from,
+            catch_up_until = ack.last_sequence,
+            epoch = ack.epoch,
+            "Resuming: the pair is rebuilt from the checkpoint the ack names and re-derived up to \
+             its watermark before any new verdict is published"
+        );
+        Ok(())
+    }
+
+    /// Ends a resume's catch-up, checking that this run reached where the last one said it was.
+    ///
+    /// The check is the whole reason the ack carries a block beside a sequence. Two runs reading
+    /// the same frames from the same checkpoint must arrive at the same block; if they do not,
+    /// something between them is not deterministic, and continuing would publish verdicts from a
+    /// pair that is already provably not the one that wrote the watermark.
+    fn finish_catch_up(&mut self) -> eyre::Result<Step> {
+        self.catch_up_until = None;
+        self.sink.suppress_ack = false;
+        self.replay_options.mutations = self.options.mutations;
+        let Some((number, hash)) = self.resume_watermark.take() else {
+            info!(target: "ps_follow", catch_up_blocks = self.catch_up_blocks, "Caught up");
+            return Ok(Step::Continue)
+        };
+        match self.last_verified {
+            Some(head) if head.number == number && head.hash == hash => {
+                info!(
+                    target: "ps_follow",
+                    block = number,
+                    catch_up_blocks = self.catch_up_blocks,
+                    "Caught up to the watermark the previous run left, on the same block it did"
+                );
+                Ok(Step::Continue)
+            }
+            other => {
+                let detail = format!(
+                    "resume divergence: the ack says block {number}/{hash:?}, and replaying the \
+                     same frames from the same checkpoint reached {other:?}"
+                );
+                error!(target: "ps_follow", %detail, "Refusing to publish from a diverged pair");
+                self.sink.state("faulted", "resume_divergence", &detail, self.last_verified)?;
+                Ok(Step::Done(FollowOutcome::Faulted { detail }))
+            }
+        }
+    }
+
+    /// Walks the manifests from the spool's first to `epoch`, checking each follows the last.
+    ///
+    /// Returns the sequence of `epoch`'s own manifest, which is where that epoch's frames begin.
+    /// A chain that does not hold is a hard error rather than a fresh start: the ack's sequence
+    /// numbers were written in a numbering this spool does not have, so nothing in it can be
+    /// acted on, and quietly starting over would hide that from whoever asked to resume.
+    fn verify_epoch_chain(&self, epoch: u64) -> eyre::Result<(u64, Manifest)> {
+        let mut at = 0;
+        let mut previous: Option<Manifest> = None;
+        loop {
+            let frame = self
+                .tail
+                .read_at(at, FrameKind::Manifest)
+                .map_err(|fault| eyre::eyre!("epoch {epoch} could not be traced: {fault}"))?;
+            let StreamEvent::Manifest(found) = frame.event else {
+                return Err(eyre::eyre!(
+                    "the frame at sequence {at} is named Manifest but decoded as something else"
+                ))
+            };
+            match &previous {
+                None => {
+                    chain_spec_for(&found)?;
+                    config_for(&found)?;
+                    found.check_opens(at)?;
+                }
+                Some(previous) => found.check_succeeds(previous, at)?,
+            }
+            if found.epoch == epoch {
+                return Ok((at, found))
+            }
+            if found.epoch > epoch {
+                return Err(eyre::eyre!(
+                    "the ack names epoch {epoch}, and this spool's epochs go {} then {}",
+                    found.epoch - 1,
+                    found.epoch
+                ))
+            }
+            let next = self
+                .tail
+                .scan_for(FrameKind::Manifest, at + 1)
+                .map_err(|fault| eyre::eyre!("epoch {epoch} could not be traced: {fault}"))?
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "the ack names epoch {epoch}, and this spool ends in epoch {}",
+                        found.epoch
+                    )
+                })?;
+            previous = Some(found);
+            at = next;
         }
     }
 
@@ -519,7 +803,7 @@ impl<'a> Follower<'a> {
             )),
 
             (
-                Phase::CollectingChunks { manifest, checkpoint, mut chunks },
+                Phase::CollectingChunks { manifest, checkpoint, checkpoint_sequence, mut chunks },
                 StreamEvent::SnapshotChunk(chunk),
             ) => {
                 if chunk.index as usize != chunks.len() {
@@ -537,10 +821,15 @@ impl<'a> Follower<'a> {
                 }
                 chunks.push(chunk);
                 if chunks.len() < checkpoint.snapshot_chunks as usize {
-                    self.phase = Phase::CollectingChunks { manifest, checkpoint, chunks };
+                    self.phase = Phase::CollectingChunks {
+                        manifest,
+                        checkpoint,
+                        checkpoint_sequence,
+                        chunks,
+                    };
                     return Ok(Step::Continue)
                 }
-                self.restore_pair(manifest, checkpoint, chunks, sequence)
+                self.restore_pair(manifest, checkpoint, chunks, checkpoint_sequence)
             }
             (Phase::CollectingChunks { manifest, .. }, other) => Ok(self.enter_needs_snapshot(
                 manifest,
@@ -622,16 +911,25 @@ impl<'a> Follower<'a> {
                 match outcome {
                     CommitOutcome::Compared => {
                         let verdict = if new_disagreements == 0 { "accepted" } else { "disagreed" };
-                        self.blocks_verified += 1;
+                        // Re-derived on the way back to a watermark, not verified anew. Counted
+                        // apart and labelled in the record, because a resumed run that added them
+                        // to its own total would report the same work twice.
+                        let catch_up = self.catch_up_until.is_some();
+                        if catch_up {
+                            self.catch_up_blocks += 1;
+                        } else {
+                            self.blocks_verified += 1;
+                        }
                         self.last_verified = Some(block);
-                        self.sink.verdict(
+                        self.sink.verdict(Published {
                             verdict,
                             block,
                             sequence,
                             provenance,
-                            new_disagreements,
-                            &self.replay,
-                        )?;
+                            disagreements: new_disagreements,
+                            replay: &self.replay,
+                            catch_up,
+                        })?;
                         // The producer named the block that completes the branch it moved to.
                         // Reaching that height with a different hash means the frame and the
                         // delivery disagree about what replaced what, and no later commit can
@@ -676,14 +974,15 @@ impl<'a> Follower<'a> {
                             .last()
                             .cloned()
                             .unwrap_or_else(|| format!("block {} was rejected", block.number));
-                        self.sink.verdict(
-                            "rejected",
+                        self.sink.verdict(Published {
+                            verdict: "rejected",
                             block,
                             sequence,
                             provenance,
-                            new_disagreements,
-                            &self.replay,
-                        )?;
+                            disagreements: new_disagreements,
+                            replay: &self.replay,
+                            catch_up: self.catch_up_until.is_some(),
+                        })?;
                         self.sink.state(
                             "faulted",
                             "rejected_commit",
@@ -694,14 +993,15 @@ impl<'a> Follower<'a> {
                     }
                     CommitOutcome::Fault(fault) => {
                         let detail = fault.to_string();
-                        self.sink.verdict(
-                            "fault",
+                        self.sink.verdict(Published {
+                            verdict: "fault",
                             block,
                             sequence,
                             provenance,
-                            new_disagreements,
-                            &self.replay,
-                        )?;
+                            disagreements: new_disagreements,
+                            replay: &self.replay,
+                            catch_up: self.catch_up_until.is_some(),
+                        })?;
                         self.sink.state("faulted", "fault", &detail, self.last_verified)?;
                         error!(
                             target: "ps_follow",
@@ -1092,7 +1392,12 @@ impl<'a> Follower<'a> {
         if checkpoint.snapshot_chunks == 0 {
             return self.restore_pair(manifest, checkpoint, Vec::new(), sequence)
         }
-        self.phase = Phase::CollectingChunks { manifest, checkpoint, chunks: Vec::new() };
+        self.phase = Phase::CollectingChunks {
+            manifest,
+            checkpoint,
+            checkpoint_sequence: sequence,
+            chunks: Vec::new(),
+        };
         Ok(Step::Continue)
     }
 
@@ -1102,7 +1407,7 @@ impl<'a> Follower<'a> {
         manifest: Manifest,
         checkpoint: Checkpoint,
         chunks: Vec<SnapshotChunk>,
-        sequence: u64,
+        checkpoint_sequence: u64,
     ) -> eyre::Result<Step> {
         match restore(&manifest, &checkpoint, &chunks) {
             Ok(state) => {
@@ -1144,7 +1449,13 @@ impl<'a> Follower<'a> {
                     classification = class.map(RecoveryClass::as_str),
                     "Restored a pair with no database; verdicts start at the next block"
                 );
-                self.sink.restored(checkpoint.block, class, self.last_verified)?;
+                self.sink.restored(
+                    checkpoint.block,
+                    class,
+                    self.last_verified,
+                    checkpoint_sequence,
+                    manifest.epoch,
+                )?;
                 self.phase = Phase::Streaming {
                     manifest,
                     state: Box::new(state),
@@ -1158,7 +1469,7 @@ impl<'a> Follower<'a> {
                 manifest,
                 NeedsSnapshotReason::ProtocolViolation,
                 &format!("the checkpoint's snapshot did not verify: {err:#}"),
-                sequence + 1,
+                checkpoint_sequence + 1,
                 None,
             )),
         }
@@ -1180,6 +1491,14 @@ impl<'a> Follower<'a> {
     ) -> Step {
         self.needs_snapshot_entries += 1;
         self.last_needs_snapshot = Some(reason);
+        if self.catch_up_until.take().is_some() {
+            // The resumed run re-hit whatever stopped the previous one before reaching its
+            // watermark. Expected, and not a divergence — but the catch-up is over, so this run
+            // starts writing its own acks again rather than staying silent for its whole life.
+            self.sink.suppress_ack = false;
+            self.replay_options.mutations = self.options.mutations;
+            self.resume_watermark = None;
+        }
         let epoch = manifest.epoch;
         warn!(
             target: "ps_follow",
@@ -1196,6 +1515,7 @@ impl<'a> Follower<'a> {
             self.last_verified,
             target_ancestor,
             epoch,
+            self.tail.next_sequence().saturating_sub(1),
         ) {
             warn!(target: "ps_follow", error = %err, "Could not record the state transition");
         }
@@ -1473,7 +1793,8 @@ impl<'a> Follower<'a> {
     }
 
     fn into_report(mut self, outcome: FollowOutcome) -> FollowReport {
-        if let Err(err) = self.sink.ack_state(&outcome, self.last_verified, &self.tail) {
+        let waiting = matches!(self.phase, Phase::NeedsSnapshot { .. });
+        if let Err(err) = self.sink.ack_state(&outcome, waiting, self.last_verified, &self.tail) {
             warn!(target: "ps_follow", error = %err, "Could not write the final ack");
         }
         FollowReport {
@@ -1494,9 +1815,23 @@ impl<'a> Follower<'a> {
             winning_branches_incomplete: self.winning_branches_incomplete,
             winning_branches_superseded: self.winning_branches_superseded,
             scan_refusals: self.scan_refusals,
+            catch_up_blocks: self.catch_up_blocks,
+            resumed_from: self.resumed_from,
             unverified_intervals: self.unverified_intervals,
         }
     }
+}
+
+/// One published verdict, and what it was measured under.
+struct Published<'a> {
+    verdict: &'a str,
+    block: BlockRef,
+    sequence: u64,
+    provenance: PayloadProvenance,
+    disagreements: usize,
+    replay: &'a ReplayReport,
+    /// Re-derived on the way back to a watermark rather than verified for the first time.
+    catch_up: bool,
 }
 
 /// The follower's outputs: a JSONL verdict stream and an atomically rewritten ack file.
@@ -1505,6 +1840,16 @@ struct VerdictSink {
     ack: Option<PathBuf>,
     label: String,
     last_state: &'static str,
+    /// Highest sequence any ack has claimed, so a catch-up cannot walk the watermark backwards.
+    ack_high_water: Option<u64>,
+    /// Set while replaying frames a previous run already acknowledged.
+    suppress_ack: bool,
+    /// Fields the ack carries beside the watermark, kept here because they change on transitions
+    /// rather than per verdict: which epoch, why it stopped, and where its pair came from.
+    ack_epoch: u64,
+    ack_reason: Option<&'static str>,
+    ack_restored_from: Option<u64>,
+    ack_target: Option<BlockRef>,
 }
 
 impl VerdictSink {
@@ -1524,21 +1869,21 @@ impl VerdictSink {
             ack: options.ack.clone(),
             label: options.label.clone(),
             last_state: "starting",
+            ack_high_water: None,
+            suppress_ack: false,
+            ack_epoch: 0,
+            ack_reason: None,
+            ack_restored_from: None,
+            ack_target: None,
         })
     }
 
     /// One verdict line per block. The S5 timing boundaries are laid as `null` rather than
     /// guessed: `delivery_us` and `observed_verdict_latency_us` are measurement disciplines this
     /// phase does not claim.
-    fn verdict(
-        &mut self,
-        verdict: &str,
-        block: BlockRef,
-        sequence: u64,
-        provenance: PayloadProvenance,
-        disagreements: usize,
-        replay: &ReplayReport,
-    ) -> eyre::Result<()> {
+    fn verdict(&mut self, published: Published<'_>) -> eyre::Result<()> {
+        let Published { verdict, block, sequence, provenance, disagreements, replay, catch_up } =
+            published;
         self.last_state = "streaming";
         let timing = replay.blocks.last().filter(|timing| timing.number == block.number);
         self.write(serde_json::json!({
@@ -1556,6 +1901,10 @@ impl VerdictSink {
             "transition_us": timing.map(|timing| timing.transition_us),
             "delivery_us": serde_json::Value::Null,
             "observed_verdict_latency_us": serde_json::Value::Null,
+            // A verdict this run re-derived on its way back to a watermark a previous run left.
+            // Labelled rather than withheld: the line is real evidence that the two runs agreed
+            // on the block, and a reader aggregating live throughput has to be able to skip it.
+            "catch_up": catch_up,
             "observed_at_ms": now_ms(),
         }))?;
         self.write_ack(sequence, Some(block), "streaming")
@@ -1569,13 +1918,21 @@ impl VerdictSink {
     /// protocol asks for and what a bare reason string could never say.
     fn needs_snapshot(
         &mut self,
-        reason: &str,
+        reason: &'static str,
         detail: &str,
         last_verified: Option<BlockRef>,
         target_ancestor: Option<BlockRef>,
         epoch: u64,
+        last_sequence: u64,
     ) -> eyre::Result<()> {
         self.last_state = "needs_snapshot";
+        self.ack_epoch = epoch;
+        self.ack_reason = Some(reason);
+        self.ack_target = target_ancestor;
+        // Written here and not only per verdict: a follower killed while waiting for a checkpoint
+        // would otherwise leave an ack saying "streaming", and a restart would replay towards a
+        // block the previous run had already refused to stand on.
+        self.write_ack(last_sequence, last_verified, "needs_snapshot")?;
         self.write(serde_json::json!({
             "schema_version": 1,
             "benchmark": "standalone_follow_v1",
@@ -1598,8 +1955,17 @@ impl VerdictSink {
         block: BlockRef,
         class: Option<RecoveryClass>,
         last_verified: Option<BlockRef>,
+        checkpoint_sequence: u64,
+        epoch: u64,
     ) -> eyre::Result<()> {
         self.last_state = "streaming";
+        // The one field version 1 could not carry, and the reason a restart had to guess. With it
+        // a resume comes back to *this* checkpoint, not to whichever one looked close enough.
+        self.ack_restored_from = Some(checkpoint_sequence);
+        self.ack_epoch = epoch;
+        self.ack_reason = None;
+        self.ack_target = None;
+        self.write_ack(checkpoint_sequence, last_verified, "restored")?;
         let unverified = match class {
             Some(RecoveryClass::Reset { unverified }) => unverified,
             _ => None,
@@ -1699,14 +2065,22 @@ impl VerdictSink {
     fn ack_state(
         &mut self,
         outcome: &FollowOutcome,
+        waiting: bool,
         last_verified: Option<BlockRef>,
         tail: &SpoolTail,
     ) -> eyre::Result<()> {
-        let state = match outcome {
-            FollowOutcome::Ended { .. } => "ended",
-            FollowOutcome::Faulted { .. } => "faulted",
-            FollowOutcome::MaxBlocks => "max_blocks",
-            FollowOutcome::IdleTimeout { .. } => "idle_timeout",
+        // What the follower was doing outranks how the process stopped. A run that ended while
+        // waiting for a snapshot has to say so, or a restart reading "ended" would replay towards
+        // a block the previous run had already refused to stand on.
+        let state = if waiting {
+            "needs_snapshot"
+        } else {
+            match outcome {
+                FollowOutcome::Ended { .. } => "ended",
+                FollowOutcome::Faulted { .. } => "faulted",
+                FollowOutcome::MaxBlocks => "max_blocks",
+                FollowOutcome::IdleTimeout { .. } => "idle_timeout",
+            }
         };
         self.write_ack(tail.next_sequence().saturating_sub(1), last_verified, state)
     }
@@ -1721,17 +2095,37 @@ impl VerdictSink {
     /// The consumer watermark, rewritten atomically and kept outside the spool so the producer's
     /// own invariants (a fresh spool holds no foreign files) are untouched.
     fn write_ack(
-        &self,
+        &mut self,
         last_sequence: u64,
         block: Option<BlockRef>,
         state: &str,
     ) -> eyre::Result<()> {
         let Some(path) = &self.ack else { return Ok(()) };
+        if self.suppress_ack {
+            return Ok(())
+        }
+        // Monotonic in the sequence space, which is the stream's word order. A restart replays
+        // frames it has already acknowledged, and letting those overwrite the watermark would
+        // move it backwards — the next restart would then start further back again. The block
+        // number is not the key: a reorg legitimately repeats a height on a different branch.
+        if self.ack_high_water.is_some_and(|seen| last_sequence < seen) {
+            return Ok(())
+        }
+        self.ack_high_water = Some(last_sequence);
         let record = serde_json::json!({
+            // Version 1 had five fields and no way to say where the pair came from, so a restart
+            // had to guess a checkpoint. Guessing is what this version exists to remove.
+            "ack_version": 2,
+            "label": self.label,
             "last_sequence": last_sequence,
             "block": block.map(|block| block.number),
             "block_hash": block.map(|block| format!("{:?}", block.hash)),
             "state": state,
+            "epoch": self.ack_epoch,
+            "reason": self.ack_reason,
+            "restored_from_sequence": self.ack_restored_from,
+            "target_ancestor": self.ack_target.map(|block| block.number),
+            "target_ancestor_hash": self.ack_target.map(|block| format!("{:?}", block.hash)),
             "observed_at_ms": now_ms(),
         });
         let temporary = path.with_extension("tmp");
