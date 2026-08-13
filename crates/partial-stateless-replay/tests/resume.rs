@@ -185,37 +185,64 @@ fn a_resume_into_an_epoch_this_spool_does_not_have_is_refused() {
 }
 
 #[test]
-fn a_resume_across_an_epoch_boundary_verifies_the_chain_to_get_there() {
-    let dir = spool_dir("resume-epoch-two");
+fn a_resume_crosses_into_the_epoch_a_restarted_producer_wrote() {
+    // The producer-restart sequence, end to end, with nothing about the ack hand-written: a
+    // follower reads epoch 1 to its End and stops, the producer comes back and appends epoch 2,
+    // and the same follower is started again with --resume.
+    //
+    // Replaying the closed epoch would reach the same End and stop there every time, so the
+    // frames that matter are the ones above it. Crossing is on evidence — the ack's own sequence
+    // must hold the End, and the frame after it must be that epoch's successor.
+    let dir = spool_dir("resume-producer-restart");
     write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
     let mut next = write_checkpoint(&dir, 1, &fixture());
     write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
     next += 1;
+
+    // Epoch 1, followed to its End. The ack this leaves is the one the resume acts on.
+    let first = run(&dir, false);
+    assert!(matches!(first.outcome, partial_stateless_replay::FollowOutcome::Ended { .. }));
+    let ack = read_ack(&dir);
+    assert_eq!(ack["state"], "ended");
+    assert_eq!(ack["epoch"], 1);
+
+    // The producer restarts into the same spool.
     let boundary = next;
     write_frame(
         &dir,
-        next,
+        boundary,
         FrameKind::Manifest,
-        &StreamEvent::Manifest(Manifest { epoch: 2, first_sequence: next + 1, ..manifest() }),
+        &StreamEvent::Manifest(Manifest { epoch: 2, first_sequence: boundary + 1, ..manifest() }),
     );
     next += 1;
-    let second_checkpoint = next;
     next = write_checkpoint(&dir, next, &fixture());
     write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
 
-    // A first run ends at the first epoch's End, so its ack is written in epoch 1.
+    let resumed = run(&dir, true);
+
+    assert_eq!(resumed.resumed_from, Some(boundary), "it started at the new epoch's manifest");
+    assert_eq!(resumed.restores, 1, "and rebootstrapped from the epoch's own checkpoint");
+    assert_eq!(
+        resumed.restores_reset, 1,
+        "an epoch says the producer's state broke, so this is never a continuous recovery"
+    );
+    assert!(!resumed.continuous());
+    assert_eq!(read_ack(&dir)["epoch"], 2, "and the ack moves to the epoch it is now reading");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Crossing is on evidence. Without a successor above the `End` there is nothing to cross to, and
+/// the run stops where the last one did rather than inventing somewhere to go.
+#[test]
+fn a_resume_with_nothing_above_the_end_stops_where_the_last_run_did() {
+    let dir = spool_dir("resume-nothing-above");
+    one_epoch(&dir);
     run(&dir, false);
-    let mut ack = read_ack(&dir);
-    // What the second epoch's own run would have left behind.
-    ack["epoch"] = serde_json::json!(2);
-    ack["restored_from_sequence"] = serde_json::json!(second_checkpoint);
-    ack["last_sequence"] = serde_json::json!(second_checkpoint);
-    fs::write(ack_path(&dir), ack.to_string()).expect("writable");
 
     let resumed = run(&dir, true);
 
-    assert_eq!(resumed.resumed_from, Some(second_checkpoint));
-    assert!(boundary > 1, "the spool really did hold two epochs");
+    assert!(matches!(resumed.outcome, partial_stateless_replay::FollowOutcome::Ended { .. }));
+    assert_eq!(resumed.restores_reset, 0);
     let _ = fs::remove_dir_all(&dir);
 }
 

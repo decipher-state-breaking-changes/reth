@@ -127,8 +127,12 @@ pub struct ReplayReport {
     /// Winning branches the producer announced and did not deliver in full, with nothing valid
     /// taking their place. A branch replaced by a later reorg is counted as superseded instead.
     pub winning_branch_incomplete: u64,
-    /// Producer restarts crossed: a second manifest, and everything that follows rebootstrapped.
-    pub epochs: u64,
+    /// Producer restarts crossed: each is a second manifest, and everything above one
+    /// rebootstrapped rather than continued.
+    ///
+    /// Boundaries, not epochs — a corpus holding two epochs crossed one. Named for what it counts
+    /// because "epochs == 1" on a two-epoch corpus is the kind of off-by-one a reader inherits.
+    pub epoch_transitions: u64,
     /// Winning branches a later announcement withdrew before the delivery reached their tip.
     ///
     /// Diagnostic only. The chain moving twice in quick succession is ordinary, and the interval
@@ -312,7 +316,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 BatchPhase::Live { manifest, .. } |
                 BatchPhase::AwaitingResync { manifest, .. } => {
                     found.check_succeeds(&manifest, sequence)?;
-                    report.epochs += 1;
+                    report.epoch_transitions += 1;
                     warn!(
                         target: "ps_replay",
                         sequence,

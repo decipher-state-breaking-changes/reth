@@ -343,7 +343,7 @@ impl StreamRecorder {
         cache_policy_id: B256,
         account_window: u64,
         storage_window: u64,
-    ) {
+    ) -> eyre::Result<()> {
         let previous = self.resumed_from.take();
         let manifest = Manifest {
             chain_id,
@@ -365,17 +365,19 @@ impl StreamRecorder {
         if let Some(previous) = previous &&
             let Err(err) = manifest.check_succeeds(&previous, self.sequence)
         {
+            // Returned rather than merely poisoning the recorder. A run configured to record and
+            // recording nothing is the failure this module exists to make loud, and a node that
+            // kept producing blocks while its spool sat frozen would surface it hours later as a
+            // corpus that stops mid-run for no stated reason.
             self.poisoned = true;
-            error!(
-                target: "partial_stateless_stream",
-                sequence = self.sequence,
-                error = %err,
-                "The spool being resumed is not this stream; recording stops before appending to \
-                 it. Point PS_STREAM_DIR at an empty directory, or at the right spool"
-            );
-            return
+            return Err(eyre::eyre!(
+                "the spool at {} is not this stream: {err}. Point PS_STREAM_DIR at an empty \
+                 directory, or at the right spool",
+                self.dir.display()
+            ))
         }
         self.write_event(&StreamEvent::Manifest(manifest));
+        Ok(())
     }
 
     /// Writes the checkpoint and the snapshot package it describes, and opens the commit stream.
@@ -910,7 +912,9 @@ mod tests {
     fn commits_are_not_recorded_until_the_checkpoint_is() {
         let dir = spool_dir("before-checkpoint");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         assert!(!recorder.wants_commit_material());
 
         recorder.write_reset(ResetReason::Gap, "ignored before the checkpoint");
@@ -975,7 +979,9 @@ mod tests {
     fn a_write_failure_ends_the_stream_rather_than_skipping_a_frame() {
         let dir = spool_dir("poisoned");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.write_checkpoint(&checkpoint(), None, &[1u8; 8]);
 
         // Removing the directory is the cheapest true I/O failure available here.
@@ -1009,7 +1015,9 @@ mod tests {
     fn dropping_a_recorder_closes_the_stream_with_one_correctly_numbered_end() {
         let dir = spool_dir("dropped");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
         drop(recorder);
 
@@ -1027,7 +1035,9 @@ mod tests {
     fn an_explicit_end_survives_the_drop_unamended() {
         let dir = spool_dir("explicit-end");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.write_end(EndKind::SpoolLimit, "spool byte bound reached");
         drop(recorder);
 
@@ -1055,7 +1065,9 @@ mod tests {
         let thread_dir = dir.clone();
         let result = std::thread::spawn(move || {
             let mut recorder = recorder(&thread_dir);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             panic!("producer failed mid-run");
         })
         .join();
@@ -1072,7 +1084,9 @@ mod tests {
     fn frames_buffered_during_the_export_flush_behind_the_checkpoint_in_order() {
         let dir = spool_dir("buffered-flush");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.begin_buffering();
         assert!(recorder.wants_commit_material(), "buffering wants commit material assembled");
 
@@ -1110,7 +1124,9 @@ mod tests {
     fn a_mid_stream_checkpoint_lands_behind_the_reorg_with_contiguous_sequences() {
         let dir = spool_dir("mid-stream-checkpoint");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.begin_buffering();
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
         assert!(recorder.stream_opened());
@@ -1161,7 +1177,9 @@ mod tests {
     fn abandoning_a_mid_stream_buffer_returns_to_writing_through() {
         let dir = spool_dir("abandon-mid-stream");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.begin_buffering();
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
         recorder.begin_buffering();
@@ -1192,7 +1210,9 @@ mod tests {
     fn abandoning_a_buffer_before_the_stream_opens_still_drops_frames() {
         let dir = spool_dir("abandon-pre-open");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.begin_buffering();
         recorder.write_reset(ResetReason::Gap, "lost with the attempt");
 
@@ -1211,7 +1231,9 @@ mod tests {
         let dir = spool_dir("buffer-overflow");
         let mut recorder = recorder(&dir);
         recorder.buffer_max_frames = 1;
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.begin_buffering();
 
         recorder.write_reset(ResetReason::Gap, "fits");
@@ -1233,7 +1255,9 @@ mod tests {
     fn a_checkpoint_that_would_not_fit_the_spool_bound_is_not_started() {
         let dir = spool_dir("preflight");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.max_spool_bytes = recorder.bytes + 64; // room for nothing more
         recorder.begin_buffering();
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 200]);
@@ -1251,7 +1275,9 @@ mod tests {
     fn reaching_the_spool_bound_closes_the_stream_with_an_end_frame() {
         let dir = spool_dir("spool-bound");
         let mut recorder = recorder(&dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 64]);
         recorder.max_spool_frames = recorder.frames + 1; // one more payload frame fits
         recorder.write_reset(ResetReason::Gap, "fits");
@@ -1277,7 +1303,9 @@ mod tests {
     /// when it is stopped politely.
     fn closed_epoch(dir: &Path) {
         let mut recorder = recorder(dir);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
         recorder.write_checkpoint(&checkpoint(), None, &[7u8; 100]);
         recorder.write_end(EndKind::Shutdown, "stopped".to_string());
     }
@@ -1309,7 +1337,9 @@ mod tests {
         let before = frames_in(&dir);
 
         let mut recorder = resumed(&dir, survey);
-        recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
 
         let after = frames_in(&dir);
         assert_eq!(&after[..before.len()], &before[..], "nothing already written moved");
@@ -1336,8 +1366,9 @@ mod tests {
         let before = frames_in(&dir);
 
         let mut recorder = resumed(&dir, survey);
-        recorder.write_manifest(999, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+        let refused = recorder.write_manifest(999, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
 
+        assert!(refused.is_err(), "and it is the caller's to fail the run on, not a silent stop");
         assert_eq!(frames_in(&dir), before, "nothing was appended");
         assert!(recorder.poisoned, "and the recorder will not write anything else either");
     }

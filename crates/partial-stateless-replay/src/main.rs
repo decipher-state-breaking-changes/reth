@@ -149,7 +149,7 @@ fn write_record(
         "reorgs_applied": report.reorgs_applied,
         "reverts_applied": report.reverts_applied,
         "reorgs_inapplicable": report.reorgs_inapplicable,
-        "epochs": report.epochs,
+        "epoch_transitions": report.epoch_transitions,
         "checkpoints_skimmed": report.checkpoints_skimmed,
         "skipped_awaiting_resync": report.skipped_awaiting_resync,
         "winning_branch_incomplete": report.winning_branch_incomplete,

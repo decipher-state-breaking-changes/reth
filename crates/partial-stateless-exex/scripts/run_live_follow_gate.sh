@@ -29,8 +29,18 @@
 #     GATE_MODE=resume      the restart run: the follower is killed mid-stream and started again
 #                           with --resume. It must come back to the checkpoint its ack names,
 #                           re-derive the blocks between, land on the same block the ack recorded,
-#                           and publish new verdicts only above the watermark it left.
-#                           GATE_KILL_AFTER_SECS controls when the first run is killed (default 90).
+#                           and publish new verdicts only above the watermark it left. The kill
+#                           waits for the first run to be streaming and GATE_KILL_AFTER_BLOCKS
+#                           verdicts in (default 20, GATE_KILL_TIMEOUT_SECS 900): a fixed delay
+#                           can land before the snapshot export finishes, and killing a follower
+#                           that has not verified anything proves nothing about resuming.
+#     GATE_MODE=epoch       the producer-restart run: the producer is stopped, restarted with
+#                           PS_STREAM_RESUME=1 (the operator's move — it holds the datadir), and
+#                           the follower is started again with --resume. The boundary is a
+#                           *deliberate* reset, so this mode does not assert continuity: an epoch
+#                           says the producer's state broke, and the interval across it is
+#                           unvalidated by construction. What it does assert is that the crossing
+#                           was recognised, checked, and reported as the reset it is.
 #     GATE_MODE=truncated   the kill -9 control run: the follower is expected to time out idle
 #                           (a killed producer and a quiet chain look identical from files), and
 #                           the batch pass must report closed=false. Judged offline, separately
@@ -51,10 +61,10 @@ shift 2
 GATE_MODE=${GATE_MODE:-clean}
 case "$GATE_MODE" in
     clean|reorg) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-100} ;;
-    resume) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
+    resume|epoch) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
     truncated) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
     *)
-        echo "error: GATE_MODE must be clean, reorg, resume or truncated, not '$GATE_MODE'" >&2
+        echo "error: GATE_MODE must be clean, reorg, resume, epoch or truncated, not '$GATE_MODE'" >&2
         exit 64
         ;;
 esac
@@ -88,22 +98,57 @@ KILLED_AT_SEQUENCE=""
 if [ "$GATE_MODE" = "resume" ]; then
     # The restart is the thing under test, so the gate performs it. SIGKILL rather than SIGTERM:
     # a follower given the chance to close cleanly would prove nothing about crash recovery.
-    KILL_AFTER=${GATE_KILL_AFTER_SECS:-90}
-    echo "==> live follow against $SPOOL_DIR (first run, killed after ${KILL_AFTER}s)"
+    #
+    # Waited for rather than timed. The snapshot export has taken over two and a half minutes on
+    # this corpus, and a fixed delay that lands before the first checkpoint kills a follower with
+    # no ack at all — a gate failure that says nothing about resuming.
+    KILL_AFTER_BLOCKS=${GATE_KILL_AFTER_BLOCKS:-20}
+    KILL_TIMEOUT=${GATE_KILL_TIMEOUT_SECS:-900}
+    echo "==> live follow against $SPOOL_DIR (first run, killed after $KILL_AFTER_BLOCKS verdicts)"
     "$PS_REPLAY_BIN" --follow "$SPOOL_DIR" \
         --json "$FOLLOW_JSON" --ack "$ACK_FILE" --label "s3-live-gate-resume-first" "$@" &
     first_pid=$!
-    sleep "$KILL_AFTER"
-    kill -9 "$first_pid" 2>/dev/null || true
-    wait "$first_pid" 2>/dev/null || true
-    if [ ! -s "$ACK_FILE" ]; then
-        echo "FAIL: the first run left no ack; there is nothing to resume from" >&2
+    waited=0
+    while [ "$waited" -lt "$KILL_TIMEOUT" ]; do
+        if ! kill -0 "$first_pid" 2>/dev/null; then
+            echo "FAIL: the first run exited on its own before it could be killed" >&2
+            exit 1
+        fi
+        verdicts=$(grep -c '"kind":"verdict"' "$FOLLOW_JSON" 2>/dev/null || echo 0)
+        state=$(jq -r '.state // ""' "$ACK_FILE" 2>/dev/null || echo "")
+        if [ "$state" = "streaming" ] && [ "$verdicts" -ge "$KILL_AFTER_BLOCKS" ]; then
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    if [ "$waited" -ge "$KILL_TIMEOUT" ]; then
+        echo "FAIL: the first run did not reach $KILL_AFTER_BLOCKS verdicts in ${KILL_TIMEOUT}s" >&2
+        kill -9 "$first_pid" 2>/dev/null || true
         exit 1
     fi
+    kill -9 "$first_pid" 2>/dev/null || true
+    wait "$first_pid" 2>/dev/null || true
     KILLED_AT_SEQUENCE=$(jq -r '.last_sequence' "$ACK_FILE")
-    echo "==> killed with the ack at sequence $KILLED_AT_SEQUENCE"
+    echo "==> killed after $verdicts verdicts, with the ack at sequence $KILLED_AT_SEQUENCE"
     # A separate verdict file, so "which lines did the *resumed* run publish" is answerable.
     FOLLOW_JSON="$OUT_DIR/follow-resumed.jsonl"
+    set -- "$@" --resume
+fi
+
+if [ "$GATE_MODE" = "epoch" ]; then
+    # The producer restart is the operator's move: it holds the datadir. By the time this runs the
+    # spool must already carry End, Manifest(epoch 2), and that epoch's checkpoint, and the ack
+    # must be the one the epoch-1 follower left behind.
+    if [ ! -s "$ACK_FILE" ]; then
+        echo "FAIL: GATE_MODE=epoch needs the epoch-1 follower's ack at $ACK_FILE" >&2
+        echo "      run the clean gate first, let it consume the producer's End, then restart" >&2
+        echo "      the producer with PS_STREAM_RESUME=1 and run this mode" >&2
+        exit 1
+    fi
+    ACK_EPOCH_BEFORE=$(jq -r '.epoch // 1' "$ACK_FILE")
+    echo "==> resuming across an epoch boundary (ack was written under epoch $ACK_EPOCH_BEFORE)"
+    FOLLOW_JSON="$OUT_DIR/follow-epoch.jsonl"
     set -- "$@" --resume
 fi
 
@@ -143,19 +188,27 @@ check() { # <record> <label> <jq boolean expression>
 
 echo "==> judging the follow summary"
 check "$SUMMARY" "verified at least $GATE_MIN_BLOCKS blocks" ".blocks_verified >= $GATE_MIN_BLOCKS"
-check "$SUMMARY" "every commit was witnessed" ".witnessed == .blocks_verified"
+# `witnessed` counts every commit this process replayed; `blocks_verified` counts only the ones it
+# verified for the first time. A resumed run re-derives the blocks between its checkpoint and the
+# watermark it left, and those are counted apart — so the identity has a second term there.
+check "$SUMMARY" "every commit was witnessed" \
+    ".witnessed == .blocks_verified + .catch_up_blocks"
 check "$SUMMARY" "no reconstructed payload" ".reconstructed == 0"
 check "$SUMMARY" "no absent payload" ".absent == 0"
 check "$SUMMARY" "no disagreement" ".disagreements == 0"
 check "$SUMMARY" "no failure" ".failures == 0"
-check "$SUMMARY" "exactly one restore, no NeedsSnapshot" ".restores == 1 and .needs_snapshot_entries == 0"
 check "$SUMMARY" "the follower itself agreed" ".agreed == true"
-# The second axis, asserted everywhere: agreeing on every block it looked at is not the same as
-# having looked at every canonical block, and only this distinguishes them.
-check "$SUMMARY" "no canonical block went unverified" ".continuous == true"
-check "$SUMMARY" "every announced branch was delivered in full" ".winning_branches_incomplete == 0"
-check "$SUMMARY" "no recovery landed somewhere it did not ask for" ".restores_reset == 0"
 check "$SUMMARY" "nothing in the recovery scan had to be refused" ".scan_refusals == 0"
+if [ "$GATE_MODE" != "epoch" ]; then
+    # The second axis: agreeing on every block it looked at is not the same as having looked at
+    # every canonical block, and only this distinguishes them. Not asserted in `epoch` mode —
+    # there the discontinuity is the thing under test, and is judged as such below.
+    check "$SUMMARY" "exactly one restore, no NeedsSnapshot" \
+        ".restores == 1 and .needs_snapshot_entries == 0"
+    check "$SUMMARY" "no canonical block went unverified" ".continuous == true"
+    check "$SUMMARY" "every announced branch was delivered in full" ".winning_branches_incomplete == 0"
+    check "$SUMMARY" "no recovery landed somewhere it did not ask for" ".restores_reset == 0"
+fi
 case "$GATE_MODE" in
     clean)
         [ "$follow_code" -eq 0 ] && echo "  ok: follow exit 0" || { echo "  FAIL: follow exit $follow_code, wanted 0" >&2; FAILED=1; }
@@ -204,6 +257,37 @@ case "$GATE_MODE" in
             echo "  FAIL: $NEW_BELOW verdicts at or below sequence $KILLED_AT_SEQUENCE were not labelled catch-up" >&2
             FAILED=1
         fi
+        # The counter and the lines it summarises have to be the same claim, or one of them is
+        # describing a run that did not happen.
+        LABELLED=$(grep -c '"catch_up":true' "$FOLLOW_JSON" 2>/dev/null || echo 0)
+        check "$SUMMARY" "the labelled lines and the catch-up count agree" \
+            ".catch_up_blocks == $LABELLED"
+        ;;
+    epoch)
+        # Exit 0 means agreed *and* continuous, and a producer restart is honestly neither the
+        # second nor pretending to be. Requiring 0 here would be requiring the follower to report
+        # a continuity across the boundary that nobody established, so the record is judged
+        # instead — the same reason the batch exit code is only noted below.
+        echo "  note: follow exit $follow_code (an epoch boundary is a real discontinuity)"
+        # The crossing itself: it started at the new epoch's manifest rather than replaying the
+        # closed one below it, and rebootstrapped from that epoch's own checkpoint.
+        check "$SUMMARY" "the follower crossed into the new epoch" '.resumed_from != null'
+        check "$SUMMARY" "and rebootstrapped there" '.restores == 1'
+        # Reported as the reset it is. An epoch says the producer's state broke, so the interval
+        # across the boundary was validated by nothing, and a run claiming otherwise would be
+        # claiming a continuity nobody established.
+        check "$SUMMARY" "the boundary is reported as an explicit reset" \
+            '.restores_reset == 1 and .restores_continuous == 0'
+        check "$SUMMARY" "and the run does not claim continuity across it" '.continuous == false'
+        ACK_EPOCH_AFTER=$(jq -r '.epoch // 0' "$ACK_FILE")
+        if [ "$ACK_EPOCH_AFTER" -gt "$ACK_EPOCH_BEFORE" ]; then
+            echo "  ok: the ack moved from epoch $ACK_EPOCH_BEFORE to $ACK_EPOCH_AFTER"
+        else
+            echo "  FAIL: the ack is still epoch $ACK_EPOCH_AFTER; the crossing was not recorded" >&2
+            echo "        (if it already says the new epoch, this mode has been run once already;" >&2
+            echo "         it crosses a boundary, so it needs an ack from below one)" >&2
+            FAILED=1
+        fi
         ;;
     truncated)
         [ "$follow_code" -eq 4 ] && echo "  ok: follow exit 4 (idle timeout — a cut stream never says goodbye)" || { echo "  FAIL: follow exit $follow_code, wanted 4" >&2; FAILED=1; }
@@ -213,9 +297,20 @@ case "$GATE_MODE" in
 esac
 
 echo "==> judging the batch record"
-[ "$batch_code" -eq 0 ] && echo "  ok: batch exit 0" || { echo "  FAIL: batch exit $batch_code, wanted 0" >&2; FAILED=1; }
-check "$BATCH" "batch agreed with the recording" ".agreed == true and .terminal == null"
-check "$BATCH" "batch verified every canonical block the corpus carried" ".continuous == true"
+if [ "$GATE_MODE" = "epoch" ]; then
+    # A two-epoch corpus is *not* continuous, and the batch CLI exits non-zero for exactly that
+    # reason. Asserting exit 0 here would be asserting that a producer restart left no gap.
+    echo "  note: batch exit $batch_code (an epoch boundary is a real discontinuity; judged on the record)"
+    check "$BATCH" "batch crossed exactly one epoch boundary" ".epoch_transitions == 1"
+    check "$BATCH" "and rebootstrapped there rather than continuing" \
+        "([.resyncs[] | select(.continuous == false)] | length) >= 1"
+    check "$BATCH" "batch agreed on every block it did verify" ".agreed == true"
+    check "$BATCH" "and read the whole corpus" ".terminal == null and .closed == true"
+else
+    [ "$batch_code" -eq 0 ] && echo "  ok: batch exit 0" || { echo "  FAIL: batch exit $batch_code, wanted 0" >&2; FAILED=1; }
+    check "$BATCH" "batch agreed with the recording" ".agreed == true and .terminal == null"
+    check "$BATCH" "batch verified every canonical block the corpus carried" ".continuous == true"
+fi
 check "$BATCH" "batch saw only witnessed payloads" ".witnessed == .commits and .reconstructed == 0 and .absent == 0"
 case "$GATE_MODE" in
     clean)
@@ -235,6 +330,7 @@ case "$GATE_MODE" in
         # the same conclusion as two follower runs stitched together.
         check "$BATCH" "the spool is closed (End present)" ".closed == true"
         ;;
+    epoch) ;;
     truncated) check "$BATCH" "the spool is cut (no End) — the point of this control run" ".closed == false" ;;
 esac
 

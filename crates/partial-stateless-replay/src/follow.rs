@@ -542,13 +542,18 @@ impl<'a> Follower<'a> {
                         let frame = *frame;
                         let sequence = frame.header.sequence;
                         let step = self.handle(sequence, frame.event)?;
-                        match (step, self.catch_up_until) {
+                        match self.catch_up_until {
                             // The frame the previous run stopped at has now been re-derived, and
-                            // this is the one moment the two runs can be compared.
-                            (Step::Continue, Some(until)) if sequence >= until => {
-                                self.finish_catch_up()?
+                            // this is the one moment the two runs can be compared. Done or not:
+                            // the frame that ends a catch-up is often the End the previous run
+                            // consumed, and a divergence there is still a divergence.
+                            Some(until) if sequence >= until => {
+                                match (self.finish_catch_up()?, step) {
+                                    (caught @ Step::Done(_), _) => caught,
+                                    (Step::Continue, step) => step,
+                                }
                             }
-                            (step, _) => step,
+                            _ => step,
                         }
                     }
                     Ok(TailEvent::Idle) => self.idle(),
@@ -591,6 +596,9 @@ impl<'a> Follower<'a> {
             return Ok(())
         };
         let (manifest_at, manifest) = self.verify_epoch_chain(ack.epoch)?;
+        if self.resume_past_a_closed_epoch(&ack, &manifest)? {
+            return Ok(())
+        }
         let Some(restored_from) = ack.restored_from_sequence else {
             // A version-1 ack. Its watermark is real, but it never recorded which checkpoint the
             // pair came from, and picking "the newest checkpoint at or below the watermark" would
@@ -605,11 +613,15 @@ impl<'a> Follower<'a> {
             self.tail.skip_to(manifest_at);
             return Ok(())
         };
-        if restored_from < manifest_at {
+        // Inside the epoch it claims, and at or below the watermark it claims. A checkpoint above
+        // the watermark was never the pair that wrote it, and one below the manifest belongs to a
+        // different epoch — both are acks that cannot be acted on rather than acks to guess at.
+        if restored_from < manifest_at || restored_from > ack.last_sequence {
             return Err(eyre::eyre!(
-                "the ack restored from sequence {restored_from}, which is below epoch {}'s \
-                 manifest at {manifest_at}",
-                ack.epoch
+                "the ack restored from sequence {restored_from}, which is outside epoch {}'s own \
+                 frames [{manifest_at}, {}]",
+                ack.epoch,
+                ack.last_sequence
             ))
         }
         // Read by name and header, like every other recovery read: a restart is exactly when a
@@ -651,6 +663,75 @@ impl<'a> Follower<'a> {
              its watermark before any new verdict is published"
         );
         Ok(())
+    }
+
+    /// Starts the *next* epoch when the one the ack was written under has already closed.
+    ///
+    /// A producer that was stopped and restarted into its own spool leaves an `End` and then a
+    /// new epoch above it. A follower resuming an ack from below that `End` has nothing to catch
+    /// up to: replaying the closed epoch would reach the same `End` and stop there, every time,
+    /// and the frames it actually needs are the ones above it.
+    ///
+    /// So the boundary is crossed here, and only on evidence. The ack's own sequence has to hold
+    /// the `End` it claims to have consumed, and the frame after it has to be a manifest that
+    /// succeeds the one this ack was written under. Whatever that epoch restores from is an
+    /// explicit checkpoint reset — the epoch says the producer's state broke — so the interval
+    /// between the two runs is recorded as unverified rather than quietly closed.
+    ///
+    /// Returns whether the boundary was crossed. `false` means the ordinary catch-up applies.
+    fn resume_past_a_closed_epoch(&mut self, ack: &Ack, current: &Manifest) -> eyre::Result<bool> {
+        if ack.state != "ended" {
+            return Ok(false)
+        }
+        let end = self
+            .tail
+            .read_at(ack.last_sequence, FrameKind::End)
+            .map_err(|fault| eyre::eyre!("the ack's End frame did not read back: {fault}"))?;
+        let StreamEvent::End(end) = end.event else {
+            return Err(eyre::eyre!(
+                "the ack says epoch {} ended at sequence {}, and that frame is not an End",
+                ack.epoch,
+                ack.last_sequence
+            ))
+        };
+        self.check_end_numbering(&end.reason, end.last_sequence, ack.last_sequence)?;
+        let next_at = ack.last_sequence + 1;
+        let Ok(frame) = self.tail.read_at(next_at, FrameKind::Manifest) else {
+            // Nothing above the End yet: the producer has not come back. Fall through, replay the
+            // closed epoch, and stop at the same End the previous run did — which is the honest
+            // answer, and the run that follows a restarted producer will cross here instead.
+            info!(
+                target: "ps_follow",
+                epoch = ack.epoch,
+                "The epoch this ack was written under is closed and nothing follows it yet"
+            );
+            return Ok(false)
+        };
+        let StreamEvent::Manifest(next) = frame.event else {
+            return Err(eyre::eyre!(
+                "the frame at sequence {next_at} is named Manifest but decoded as something else"
+            ))
+        };
+        next.check_succeeds(current, next_at).map_err(|err| {
+            eyre::eyre!("the frame after epoch {}'s End is not its successor: {err}", ack.epoch)
+        })?;
+        info!(
+            target: "ps_follow",
+            from_epoch = ack.epoch,
+            to_epoch = next.epoch,
+            manifest_at = next_at,
+            "The producer restarted into this spool; resuming at the epoch above the End rather \
+             than replaying the one below it"
+        );
+        // What the previous run stood on, so the interval this restart does not validate can be
+        // named rather than merely counted.
+        self.last_verified = ack.block;
+        // No target: an epoch boundary names no block, so whatever it restores from is a reset.
+        self.pending_recovery = Some(PendingRecovery { target: None, skipped: 0 });
+        self.resumed_from = Some(next_at);
+        self.tail.skip_to(next_at);
+        self.phase = Phase::AwaitingManifest;
+        Ok(true)
     }
 
     /// Ends a resume's catch-up, checking that this run reached where the last one said it was.

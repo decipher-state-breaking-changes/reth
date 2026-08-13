@@ -612,7 +612,7 @@ where
             options.config.cache_policy_id(),
             options.config.account_window,
             options.config.storage_window,
-        );
+        )?;
     }
     // A rebuild that keeps failing is almost always a persistent condition — pruned history, or a
     // provider that cannot reach far enough back — and retrying it every block would spend the
@@ -3373,7 +3373,9 @@ mod tests {
             let bootstrap = temp_dir("fence-bootstrap");
             let options = options_with_bootstrap_dir(&bootstrap);
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
 
             let (tx, rx) = mpsc::sync_channel(1);
@@ -3412,7 +3414,9 @@ mod tests {
             fs::write(&checkpoint_path, "{}").expect("checkpoint");
 
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
 
             let (tx, rx) = mpsc::sync_channel(1);
@@ -3476,7 +3480,9 @@ mod tests {
             let bootstrap = temp_dir("stale-overflow-bootstrap");
             let options = options_with_bootstrap_dir(&bootstrap);
             let mut recorder = StreamRecorder::for_tests(&spool, 1);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
             recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "fits");
             recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "overflows");
@@ -3502,7 +3508,9 @@ mod tests {
             let mut options = options_with_bootstrap_dir(&bootstrap);
             options.reorg_checkpoint = super::super::ReorgCheckpointPolicy::Never;
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
 
             let mut gate = gate_with(ExportJob::Idle, 1);
@@ -3523,7 +3531,9 @@ mod tests {
             let mut options = options_with_bootstrap_dir(&bootstrap);
             options.reorg_checkpoint = super::super::ReorgCheckpointPolicy::Never;
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
             let checkpoint = TrustedCheckpoint {
                 block_number: 25_737_234,
@@ -3574,7 +3584,9 @@ mod tests {
             let bootstrap = temp_dir("dead-worker-bootstrap");
             let options = options_with_bootstrap_dir(&bootstrap);
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
 
             let (tx, rx) = mpsc::sync_channel(1);
@@ -3598,7 +3610,9 @@ mod tests {
         fn an_exhausted_export_closes_the_stream_as_an_export_failure() {
             let spool = temp_dir("exhausted-spool");
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
 
             let mut gate = gate_with(ExportJob::Idle, 0);
@@ -3618,7 +3632,9 @@ mod tests {
         fn an_error_exit_from_the_loop_is_a_producer_fault_not_a_shutdown() {
             let spool = temp_dir("loop-error-spool");
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
 
             let err = super::super::fail_producer(
                 Some(&mut recorder),
@@ -3646,7 +3662,9 @@ mod tests {
             let bootstrap = temp_dir("overflow-bootstrap");
             let options = options_with_bootstrap_dir(&bootstrap);
             let mut recorder = StreamRecorder::for_tests(&spool, 1);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
             recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "fits");
             recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "overflows");
@@ -3680,7 +3698,9 @@ mod tests {
 
             let options = options_with_bootstrap_dir(&bootstrap);
             let mut recorder = StreamRecorder::for_tests(&spool, 8);
-            recorder.write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
             recorder.begin_buffering();
             recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "buffered");
 

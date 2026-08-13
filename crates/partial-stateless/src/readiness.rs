@@ -386,11 +386,18 @@ impl CacheReadinessTracker {
             self.window_filled_at = Some(self.replay_depth);
         }
         // The gap being filled by delivery rather than by a reorg. A cold reset re-executes the
-        // block that was missed, and when the block now applied is exactly the one the watermark
-        // is stuck below *and* chains onto the acknowledged block by hash, everything below it
-        // has genuinely been processed — the latch has nothing left to protect. The hash is what
-        // makes this safe: a sibling at the same height fills nothing, and would otherwise let a
-        // watermark claim a block that was never applied on this branch.
+        // block that was missed, and when the block now applied is at exactly the height the
+        // watermark is stuck below *and* chains onto the acknowledged block, the height has been
+        // processed on the chain this tracker is acknowledging — which is all the latch was
+        // protecting.
+        //
+        // The parent hash is the whole of the guard, and it guards chaining rather than identity.
+        // Callers feed this tracker canonical blocks, so a block applied at the gap height on the
+        // acknowledged chain *is* the block owed at that height, whether or not it is the one
+        // that was first delivered there — if it is a different one, the block that was missed is
+        // no longer canonical and nothing is owed for it either. What the hash rules out is the
+        // dangerous case: a block at that height on a chain this tracker was never on, which
+        // fills nothing and would let the watermark claim heights it never processed.
         //
         // Recognised here rather than released by a caller, so that every consumer of this
         // tracker heals the same way and none of them has to know it needs to.
@@ -901,9 +908,33 @@ mod tests {
     }
 
     #[test]
-    fn a_sibling_at_the_gap_height_does_not_release_the_watermark() {
-        // Same height, different block. Nothing about executing it says the block that was
-        // actually missed was ever processed, and a watermark is a claim about *blocks*.
+    fn a_block_at_the_gap_height_off_the_acknowledged_chain_does_not_release_the_watermark() {
+        // The dangerous case the parent hash exists to rule out. This block sits at the height
+        // the watermark is stuck below, but it descends from something else — so executing it
+        // says nothing about the chain this tracker is acknowledging, and releasing on it would
+        // let the watermark claim a height it never processed on that chain.
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 1);
+        tracker.abandon_block(101);
+        tracker.reset();
+
+        let mut elsewhere = block(101);
+        elsewhere.hash = B256::repeat_byte(0xee);
+        elsewhere.parent_hash = B256::repeat_byte(0xdd);
+        tracker.begin_block(&elsewhere).expect("a reset admits it");
+        tracker.finish_block(&elsewhere, &observed(&elsewhere));
+
+        assert_eq!(tracker.first_gap(), Some(101), "the height is still owed on this chain");
+        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
+    }
+
+    #[test]
+    fn a_sibling_on_the_acknowledged_chain_does_release_the_watermark() {
+        // The deliberate other half, stated so it is a decision rather than an accident. A
+        // different block at the gap height that descends from the acknowledged one is the block
+        // owed at that height: callers feed this tracker canonical blocks, so if this one is
+        // being applied, whatever was first delivered there is no longer canonical and nothing is
+        // owed for it.
         let mut tracker = tracker();
         apply_contiguous(&mut tracker, 100, 1);
         tracker.abandon_block(101);
@@ -911,12 +942,11 @@ mod tests {
 
         let mut sibling = block(101);
         sibling.hash = B256::repeat_byte(0xee);
-        sibling.parent_hash = B256::repeat_byte(0xdd);
         tracker.begin_block(&sibling).expect("a reset admits it");
         tracker.finish_block(&sibling, &observed(&sibling));
 
-        assert_eq!(tracker.first_gap(), Some(101), "the missing block is still missing");
-        assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
+        assert_eq!(tracker.first_gap(), None);
+        assert_eq!(tracker.acknowledgeable_height(), Some((101, sibling.hash)));
     }
 
     #[test]
