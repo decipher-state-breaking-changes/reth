@@ -14,14 +14,32 @@ mod common;
 
 use alloy_primitives::B256;
 use common::{
-    commit_frame, end_frame, fixture, manifest, options, spool_dir, write_checkpoint, write_frame,
-    ANCHOR_BLOCK,
+    commit_frame, end_frame, fixture, fixture_at, manifest, options, spool_dir, write_checkpoint,
+    write_frame, ANCHOR_BLOCK,
 };
 use partial_stateless_replay::{follow, FollowOutcome, NeedsSnapshotReason};
 use partial_stateless_stream::{
     BlockRef, End, EndKind, FrameKind, Reset, ResetReason, StreamEvent,
 };
-use std::fs;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Runs the follower with a JSONL path so the state lines can be asserted on, not just counters.
+fn dir_json(dir: &Path) -> PathBuf {
+    dir.join("follow.jsonl")
+}
+
+/// The last `kind=state` record the follower wrote.
+fn last_state_line(path: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(path).expect("the follower wrote its records");
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["kind"] == "state")
+        .expect("at least one state record")
+}
 
 #[test]
 fn a_foreign_chain_is_refused_before_anything_else() {
@@ -187,8 +205,11 @@ fn a_first_commit_that_is_not_h_plus_one_is_a_gap() {
 /// A reorg frame is fail-closed in follow mode: applying it is S4, and verdicts past an
 /// unapplied reorg would describe a branch the producer left.
 #[test]
-fn a_reorg_frame_stops_verdicts() {
-    let dir = spool_dir("reorg");
+fn a_malformed_reorg_frame_is_a_protocol_violation_with_no_target() {
+    // A frame that abandons no block is not a reorg, so it names no ancestor a snapshot could be
+    // authenticated at. Kept apart from the reorgs this follower can act on, because a request
+    // that names nothing is a different thing to hand an operator than one that names a block.
+    let dir = spool_dir("reorg-malformed");
     write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
     let fixture = fixture();
     let next = write_checkpoint(&dir, 1, &fixture);
@@ -204,7 +225,230 @@ fn a_reorg_frame_stops_verdicts() {
     );
 
     let report = follow(&dir, &options()).expect("follows");
+    assert_eq!(report.last_needs_snapshot, Some(NeedsSnapshotReason::ProtocolViolation));
+    assert_eq!(report.blocks_verified, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_inapplicable_reorg_names_the_block_a_snapshot_must_be_authenticated_at() {
+    // The pair restored a moment ago and has applied nothing, so it has no generation to give
+    // back — the permanent condition of a follower that just started, and the reason the
+    // producer's re-checkpoint exists. What makes the refusal actionable is the ancestor.
+    let dir = spool_dir("reorg-inapplicable");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: Some(BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xb2) }),
+        }),
+    );
+
+    let mut with_json = options();
+    with_json.verdicts = Some(dir_json(&dir));
+    let report = follow(&dir, &with_json).expect("follows");
+
     assert_eq!(report.last_needs_snapshot, Some(NeedsSnapshotReason::SnapshotRequired));
+    assert_eq!(report.reorgs_applied, 0);
+    assert_eq!(report.blocks_verified, 0);
+    let line = last_state_line(&dir_json(&dir));
+    assert_eq!(line["target_ancestor"], serde_json::json!(ANCHOR_BLOCK));
+    assert_eq!(line["epoch"], serde_json::json!(1));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_recovery_checkpoint_at_the_exact_ancestor_is_continuous() {
+    let dir = spool_dir("reorg-continuous");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    // The producer's recovery checkpoint, authenticated at the block the reorg named.
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 2);
+    assert_eq!(report.restores_continuous, 1, "it landed on exactly the block asked for");
+    assert_eq!(report.restores_reset, 0);
+    assert!(report.continuous(), "nothing canonical went unverified");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_recovery_checkpoint_elsewhere_is_an_explicit_reset() {
+    let dir = spool_dir("reorg-reset");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let elsewhere = fixture_at(ANCHOR_BLOCK + 40);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &elsewhere);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores_reset, 1);
+    assert_eq!(report.restores_continuous, 0);
+    assert!(
+        !report.continuous(),
+        "a checkpoint at the new tip makes no validation claim for the interval it skipped"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_later_reorg_supersedes_the_stale_recovery_target() {
+    // The chain kept moving while the follower waited. A checkpoint answering the *first* reorg's
+    // ancestor would be answering a superseded question, and calling that continuous recovery
+    // would claim an interval nothing validated.
+    let dir = spool_dir("reorg-supersede");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let later = fixture_at(ANCHOR_BLOCK + 40);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    // A second reorg during the outage, naming a different ancestor.
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: later.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 41, hash: B256::repeat_byte(0xc3) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(
+        report.restores_continuous, 0,
+        "the checkpoint answers the first reorg, which the second one replaced"
+    );
+    assert_eq!(report.restores_reset, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reset_during_the_scan_withdraws_the_recovery_target() {
+    let dir = spool_dir("reorg-reset-withdraws");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reset,
+        &StreamEvent::Reset(Reset {
+            reason: ResetReason::SnapshotRequired,
+            detail: "the producer cold reset".into(),
+        }),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(
+        report.restores_continuous, 0,
+        "a reset names no block, so nothing after it can be continuous with anything"
+    );
+    assert_eq!(report.restores_reset, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn commits_in_the_recovery_gap_downgrade_a_continuous_recovery_to_a_reset() {
+    let dir = spool_dir("reorg-gap-commits");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    // Winning-branch commits that went by while the follower was waiting: verified by nothing.
+    for number in 0..2 {
+        write_frame(
+            &dir,
+            next,
+            FrameKind::Commit,
+            &commit_frame(ANCHOR_BLOCK + 1 + number, B256::repeat_byte(0xb2)),
+        );
+        next += 1;
+    }
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.commits_skipped_in_recovery, 2);
+    assert_eq!(
+        report.restores_continuous, 0,
+        "blocks went by that this follower never verified, so the recovery has a hole in it"
+    );
+    assert!(!report.continuous());
     let _ = fs::remove_dir_all(&dir);
 }
 

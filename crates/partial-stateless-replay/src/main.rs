@@ -248,6 +248,18 @@ fn write_follow_summary(
         "last_needs_snapshot": report.last_needs_snapshot.map(|reason| reason.as_str()),
         "last_verified": report.last_verified.map(|block| block.number),
         "agreed": report.agreed(),
+        // The second axis: whether any canonical block went unverified. A follower that undid a
+        // reorg itself stays continuous; one that recovered from a checkpoint elsewhere does not,
+        // however cleanly it agreed on the blocks it did see.
+        "continuous": report.continuous(),
+        "reorgs_applied": report.reorgs_applied,
+        "reverts_applied": report.reverts_applied,
+        "checkpoints_skimmed": report.checkpoints_skimmed,
+        "restores_continuous": report.restores_continuous,
+        "restores_reset": report.restores_reset,
+        "winning_branches_completed": report.winning_branches_completed,
+        "winning_branches_incomplete": report.winning_branches_incomplete,
+        "unverified_intervals": report.unverified_intervals,
         "admission_is_load_bearing": report.replay.admission_is_load_bearing(),
         "elapsed_ms": elapsed_ms,
     });

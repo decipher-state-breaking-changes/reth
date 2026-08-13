@@ -134,6 +134,34 @@ impl SpoolTail {
         Ok(lowest)
     }
 
+    /// The highest frame of `kind` in `[from, to)`, for the same scan.
+    ///
+    /// Recovery has to know which announcement it is recovering *from*, not just that one
+    /// happened: a second reorg during the outage redefines the block a snapshot must be
+    /// authenticated at, and a reset withdraws the request entirely. Taking the highest is what
+    /// makes the last word the operative one.
+    pub fn last_before(
+        &self,
+        wanted: FrameKind,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<u64>, TailFault> {
+        let mut highest: Option<u64> = None;
+        for entry in self.entries()? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((sequence, kind)) = parse_frame_name(name) else { continue };
+            if kind == wanted &&
+                sequence >= from &&
+                sequence < to &&
+                highest.is_none_or(|current| sequence > current)
+            {
+                highest = Some(sequence);
+            }
+        }
+        Ok(highest)
+    }
+
     /// Reads the frame at a scanned-for sequence, by its name — held to the same name-vs-header
     /// authority check as ordinary delivery. Recovery is where an attacker would aim a renamed
     /// frame, precisely because verdicts are already stopped there.
