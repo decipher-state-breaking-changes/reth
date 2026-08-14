@@ -3,7 +3,7 @@
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
-//!           [--ack <path>] [--resume] [--mutations] [--json <path>] [--label <name>]
+//!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--json <path>] [--label <name>]
 //! ```
 //!
 //! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
@@ -15,6 +15,9 @@
 //! `NeedsSnapshot` (recovery never came); `3` the stream ended before any checkpoint; `4` the
 //! run timed out waiting for frames. Without `--idle-timeout-secs` the follower waits forever,
 //! because a quiet spool and a killed producer are indistinguishable from files alone.
+
+// The summary record's `json!` block is wide enough to hit the default macro recursion limit.
+#![recursion_limit = "256"]
 
 use partial_stateless_replay::{
     follow, replay, FollowOptions, FollowOutcome, FollowReport, ReplayOptions, ReplayReport,
@@ -36,6 +39,9 @@ fn main() -> eyre::Result<()> {
         let Mode::Follow { dir, options } = mode else { unreachable!() };
         return run_follow(&dir, &options)
     };
+    if let Some(path) = &json {
+        write_manifest(path, "standalone_replay_v1", &label, &dir)?;
+    }
     let started = std::time::Instant::now();
     let report = replay(&dir, &options)?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -120,7 +126,7 @@ fn write_record(
 ) -> eyre::Result<()> {
     use std::io::Write;
     let record = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "standalone_replay_v1",
         "label": label,
         "commits": report.commits,
@@ -135,6 +141,12 @@ fn write_record(
         "mutation_failures": report.mutation_failures.len(),
         "admission_us": report.admission_us,
         "transition_us": report.transition_us,
+        "standalone_validation_us": report.standalone_validation_us,
+        "timing_anomalies": report.timing_anomalies,
+        "watermarks_agreed": report.watermarks_agreed,
+        "watermarks_unrecorded": report.watermarks_unrecorded,
+        "watermark_mismatches": report.watermark_mismatches,
+        "watermark_mismatch_samples": report.watermark_mismatch_samples,
         "elapsed_ms": elapsed_ms,
         "closed": report.closed,
         "terminal": report.terminal,
@@ -166,8 +178,45 @@ fn write_record(
     Ok(())
 }
 
+/// One `kind: "run_manifest"` line opening every JSONL output, so a record is attributable to a
+/// build, a host, and a configuration without asking the operator to remember to say. Collection
+/// is best-effort: an absent field is `null` with a note, never a guess.
+fn write_manifest(
+    path: &std::path::Path,
+    benchmark: &str,
+    label: &str,
+    dir: &std::path::Path,
+) -> eyre::Result<()> {
+    use std::io::Write;
+    let provenance = partial_stateless_stream::RunProvenance::collect(
+        concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION")),
+        partial_stateless_stream::BuildStamp {
+            commit: option_env!("PS_BUILD_COMMIT"),
+            dirty: option_env!("PS_BUILD_DIRTY"),
+            cargo_lock_sha256: option_env!("PS_CARGO_LOCK_SHA256"),
+        },
+        Some(dir),
+    );
+    let record = serde_json::json!({
+        "schema_version": 2,
+        "benchmark": benchmark,
+        "kind": "run_manifest",
+        "label": label,
+        "provenance": provenance,
+    });
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{record}")?;
+    Ok(())
+}
+
 /// Runs the live follower and maps its outcome onto the documented exit codes.
 fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
+    if let Some(path) = &options.verdicts {
+        write_manifest(path, "standalone_follow_v1", &options.label, dir)?;
+    }
     let started = std::time::Instant::now();
     let report = follow(dir, options)?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -230,7 +279,7 @@ fn write_follow_summary(
         }
     };
     let record = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "standalone_follow_v1",
         "kind": "summary",
         "label": label,
@@ -270,11 +319,42 @@ fn write_follow_summary(
         "resumed_from": report.resumed_from,
         "unverified_intervals": report.unverified_intervals,
         "admission_is_load_bearing": report.replay.admission_is_load_bearing(),
+        "admission_us": report.replay.admission_us,
+        "transition_us": report.replay.transition_us,
+        "standalone_validation_us": report.replay.standalone_validation_us,
+        "timing_anomalies": report.replay.timing_anomalies,
+        "latency_anomalies": report.latency_anomalies,
+        "watermarks_agreed": report.replay.watermarks_agreed,
+        "watermarks_unrecorded": report.replay.watermarks_unrecorded,
+        "watermark_mismatches": report.replay.watermark_mismatches,
+        // Publication costs, apart from `decision_latency_us` by construction: a verdict record
+        // cannot carry the cost of writing itself, so the endpoint split is decision-ready
+        // (per-record) plus these distributions (per-run).
+        "verdict_write_us": distribution(&report.verdict_write_us),
+        "ack_write_us": distribution(&report.ack_write_us),
         "elapsed_ms": elapsed_ms,
     });
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{record}")?;
     Ok(())
+}
+
+/// Count, mean, and tail percentiles of one cost series; `null` when nothing was sampled.
+fn distribution(values: &[u64]) -> Option<serde_json::Value> {
+    if values.is_empty() {
+        return None
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let pick = |fraction: f64| sorted[((fraction * (sorted.len() - 1) as f64).round()) as usize];
+    Some(serde_json::json!({
+        "count": sorted.len(),
+        "mean": sorted.iter().sum::<u64>() as f64 / sorted.len() as f64,
+        "p50": pick(0.50),
+        "p95": pick(0.95),
+        "p99": pick(0.99),
+        "max": sorted[sorted.len() - 1],
+    }))
 }
 
 /// Both axes, because a follower that agreed everywhere it looked can still have looked at less
@@ -345,8 +425,8 @@ fn parse_args() -> eyre::Result<Mode> {
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--force-restore-at <sequence>] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
-                     [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--resume] \
-                     [--mutations] [--json <path>] [--label <name>]"
+                     [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
+                     [--resume] [--mutations] [--json <path>] [--label <name>]"
                 );
                 std::process::exit(0);
             }
@@ -383,6 +463,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                     args.next().ok_or_else(|| eyre::eyre!("--ack needs a path"))?,
                 ));
             }
+            "--ack-fsync" => options.ack_fsync = true,
             "--resume" => options.resume = true,
             "--mutations" => options.mutations = true,
             "--json" => {

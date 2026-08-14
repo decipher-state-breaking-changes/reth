@@ -11,7 +11,7 @@
 use partial_stateless_stream::{
     decode_event, FrameHeader, FrameKind, FrameLimits, StreamEvent, FRAME_HEADER_BYTES,
 };
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 /// One frame as read back.
 #[derive(Debug)]
@@ -22,6 +22,30 @@ pub struct SpooledFrame {
     pub event: StreamEvent,
     /// Bytes the frame file held, for the reader's own accounting.
     pub bytes: u64,
+    /// Statting and reading the file into memory. Transport cost, outside the validation
+    /// boundary: `standalone_validation_us` opens where these bytes already exist.
+    pub delivery_us: u64,
+    /// Decoding the envelope and body once the bytes were in memory. The first phase inside the
+    /// validation boundary.
+    pub frame_decode_us: u64,
+    /// The file's modification time — when the producer wrote it, on the same host's clock.
+    ///
+    /// A proxy for when the frame became available, not a measurement of it: the stamp lands on
+    /// the producer's tmp write, a rename before the file is visible, so anything derived from it
+    /// must say so (`available_at_source: "mtime"`).
+    pub modified: Option<std::time::SystemTime>,
+    /// Wall-clock time at the start of the read attempt, before the stat.
+    ///
+    /// Queue wait is this minus the mtime: how long the frame sat visible before a reader came
+    /// for it. Measured at the read's *start* so the read and decode costs — already reported as
+    /// `delivery_us` and `frame_decode_us` — are not double-counted into the wait.
+    pub read_at: std::time::SystemTime,
+    /// Monotonic instant captured immediately before the decode.
+    ///
+    /// This opens the `standalone_validation_us` boundary: the driver closes it after the pair
+    /// commit, so the primary is one continuous wall-clock reading rather than a sum of
+    /// separately-timed segments with untimed gaps between them.
+    pub validation_open: Instant,
 }
 
 /// Reads and decodes exactly one frame file.
@@ -30,8 +54,11 @@ pub struct SpooledFrame {
 /// only applies after `fs::read` has already paid for the allocation — a spool entry past every
 /// frame bound is refused without buffering it.
 pub fn read_frame_file(path: &Path, limits: &FrameLimits) -> eyre::Result<SpooledFrame> {
+    let read_at = std::time::SystemTime::now();
+    let read_started = Instant::now();
     let metadata = fs::metadata(path)
         .map_err(|err| eyre::eyre!("cannot stat frame {}: {err}", path.display()))?;
+    let modified = metadata.modified().ok();
     let bound = (FRAME_HEADER_BYTES + limits.max_frame_bytes) as u64;
     if metadata.len() > bound {
         eyre::bail!(
@@ -42,6 +69,10 @@ pub fn read_frame_file(path: &Path, limits: &FrameLimits) -> eyre::Result<Spoole
     }
     let raw =
         fs::read(path).map_err(|err| eyre::eyre!("cannot read frame {}: {err}", path.display()))?;
+    let delivery_us = read_started.elapsed().as_micros() as u64;
+    // One instant serves both readings: it times the decode and opens the validation boundary
+    // that the driver will close after the pair commit.
+    let decode_started = Instant::now();
     let (header, event, rest) = decode_event(&raw, limits)
         .map_err(|err| eyre::eyre!("frame {} is unusable: {err}", path.display()))?;
     if !rest.is_empty() {
@@ -51,7 +82,17 @@ pub fn read_frame_file(path: &Path, limits: &FrameLimits) -> eyre::Result<Spoole
             rest.len()
         );
     }
-    Ok(SpooledFrame { header, event, bytes: raw.len() as u64 })
+    let frame_decode_us = decode_started.elapsed().as_micros() as u64;
+    Ok(SpooledFrame {
+        header,
+        event,
+        bytes: raw.len() as u64,
+        delivery_us,
+        frame_decode_us,
+        modified,
+        read_at,
+        validation_open: decode_started,
+    })
 }
 
 /// Iterates a complete spool in sequence order, holding one frame in memory at a time.
@@ -262,6 +303,35 @@ mod tests {
 
         let error = read_spool(&dir, &FrameLimits::default()).expect_err("misnumbered End");
         assert!(error.to_string().contains("names 1 as the last frame"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Delivery is the stat and the read; decode is the boundary's first phase; the mtime rides
+    /// along as the availability proxy. All three come from the one read the frame already pays
+    /// for.
+    #[test]
+    fn a_frame_read_reports_its_costs_and_its_mtime() {
+        let dir = spool_dir("costs");
+        write(&dir, 0, &filler(), FrameKind::Reset);
+
+        let frame = read_frame_file(&dir.join("000000000000_reset.frame"), &FrameLimits::default())
+            .expect("reads");
+        assert!(frame.modified.is_some(), "the availability proxy travels with the frame");
+        assert!(
+            frame.modified.unwrap() <= std::time::SystemTime::now(),
+            "a fresh file's mtime is in the past"
+        );
+        assert!(
+            frame.read_at >= frame.modified.unwrap(),
+            "the read attempt started after the file was written, so queue wait is non-negative"
+        );
+        assert!(
+            frame.validation_open.elapsed() >=
+                std::time::Duration::from_micros(frame.frame_decode_us),
+            "the validation boundary opened before the decode it times"
+        );
+        // Zero is a legal reading on a fast filesystem; the fields existing is the contract.
+        let _ = (frame.delivery_us, frame.frame_decode_us);
         let _ = fs::remove_dir_all(&dir);
     }
 

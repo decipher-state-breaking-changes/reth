@@ -73,7 +73,10 @@ use sidecar_verify::verify_live_sidecar;
 use std::{
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -139,6 +142,22 @@ fn env_u32(name: &str, default: u32) -> u32 {
     match value.as_str() {
         "true" | "TRUE" | "yes" | "on" => 1,
         other => other.parse().unwrap_or(default),
+    }
+}
+
+/// `PS_STREAM_EXPORT_MAX_WORKERS`, refused at startup on anything but an integer >= 1.
+///
+/// Hard-erroring where the older `env_u32` silently defaults is deliberate: a run configured
+/// with a bound this build cannot parse would otherwise report a cap it is not enforcing.
+fn env_export_max_workers() -> eyre::Result<usize> {
+    match std::env::var("PS_STREAM_EXPORT_MAX_WORKERS") {
+        Err(_) => Ok(4),
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value >= 1 => Ok(value),
+            _ => Err(eyre::eyre!(
+                "PS_STREAM_EXPORT_MAX_WORKERS must be an integer >= 1, not `{raw}`"
+            )),
+        },
     }
 }
 
@@ -218,8 +237,20 @@ pub struct RunOptions {
     /// `End(ExportFailure)`. A branch change does not consume one: fencing an attempt because the
     /// chain moved is not the attempt failing.
     pub stream_export_retries: u32,
+    /// Live export workers allowed at once, abandoned ones included.
+    ///
+    /// An abandoned worker cannot be cancelled and holds an MDBX read transaction for its whole
+    /// multiproof — minutes — so a reorg storm that fences attempt after attempt would otherwise
+    /// accumulate readers without bound. At the cap a fresh attempt is not spawned;
+    /// `export_pending` stays armed and the next Ready retries once a worker has drained.
+    pub stream_export_max_workers: usize,
     /// Whether a branch change re-checkpoints the open stream at the block it recovered to.
     pub reorg_checkpoint: ReorgCheckpointPolicy,
+    /// The `PS_STREAM_FSYNC` power-loss durability profile, applied to frames, the ack's producer
+    /// counterparts, and snapshot packages. Off by default: the default/benchmark profile keeps
+    /// process-restart durability only, and the price of the power-loss profile is measured
+    /// before it is ever made anyone's default.
+    pub stream_fsync: bool,
     /// Whether the Engine publishes the payloads it validated and this ExEx takes them.
     ///
     /// Not read from a variable of its own: the producer's gate is `PS_ENGINE_PAYLOAD`, and a
@@ -322,6 +353,8 @@ impl RunOptions {
             bootstrap_import: env_flag("PS_BOOTSTRAP_IMPORT"),
             bootstrap_self_test_blocks,
             stream_export_retries: env_u32("PS_STREAM_EXPORT_RETRIES", 1),
+            stream_export_max_workers: env_export_max_workers()?,
+            stream_fsync: recorder::stream_fsync_from_env()?,
             reorg_checkpoint: ReorgCheckpointPolicy::from_env()?,
             payload_tap: payload_tap::tap_enabled(),
             sidecar_dir,
@@ -339,6 +372,7 @@ impl RunOptions {
             verifier_wait_ms = self.verifier_wait.as_millis(),
             canonical_rebuild = self.canonical_rebuild,
             reorg_checkpoint = ?self.reorg_checkpoint,
+            stream_fsync = self.stream_fsync,
             "Partial Stateless ExEx started — monitoring cache state per block"
         );
         if let Some(dir) = &self.capture_dir {
@@ -526,10 +560,21 @@ struct BootstrapGate {
     attempt: u32,
     /// Whether the accepted-head wait has been logged, so a rare condition does not log per block.
     waiting_for_accepted_head_logged: bool,
+    /// Workers alive right now, the abandoned ones included.
+    ///
+    /// The fence drops a worker's receiver, not the worker: it runs its multiproof to completion
+    /// holding an MDBX read transaction the whole way. This gauge is the only thing that knows
+    /// how many are still doing that, so it is what the spawn cap reads — and it is decremented
+    /// by the worker's own drop guard, which is the one signal a fenced worker still sends.
+    live_workers: Arc<AtomicUsize>,
+    /// Ceiling on `live_workers` before a fresh spawn waits instead.
+    max_workers: usize,
+    /// Whether the cap wait has been logged, so a long-running worker does not log per block.
+    worker_cap_logged: bool,
 }
 
 impl BootstrapGate {
-    const fn new(options: &RunOptions) -> Self {
+    fn new(options: &RunOptions) -> Self {
         Self {
             export_pending: options.bootstrap_export,
             self_test_blocks: options.bootstrap_self_test_blocks,
@@ -538,11 +583,57 @@ impl BootstrapGate {
             retries_left: options.stream_export_retries,
             attempt: 0,
             waiting_for_accepted_head_logged: false,
+            live_workers: Arc::new(AtomicUsize::new(0)),
+            max_workers: options.stream_export_max_workers,
+            worker_cap_logged: false,
         }
     }
 
     const fn wants_sidecar(&self) -> bool {
         self.shadow.is_some()
+    }
+
+    /// Whether a fresh export may spawn, counting what the fence cannot stop: abandoned workers
+    /// still holding their MDBX read transactions. Waiting costs one Ready per check; unbounded
+    /// readers cost the database. The caller must not consume `export_pending` on a refusal, so
+    /// the next Ready retries once a worker has drained.
+    fn worker_slot_available(&mut self) -> bool {
+        let live = self.live_workers.load(Ordering::SeqCst);
+        if live >= self.max_workers {
+            if !self.worker_cap_logged {
+                warn!(
+                    target: "partial_stateless",
+                    live,
+                    cap = self.max_workers,
+                    "Export worker cap reached; the fresh attempt waits for a worker to drain \
+                     rather than stacking another read transaction"
+                );
+                self.worker_cap_logged = true;
+            }
+            return false
+        }
+        self.worker_cap_logged = false;
+        true
+    }
+}
+
+/// One occupied slot in the export-worker gauge.
+///
+/// Held by the worker closure and released by `Drop`, so every exit — completion, error, panic
+/// unwind — gives the slot back. Nothing else may decrement the gauge: the notification task
+/// cannot know when a fenced worker finishes, which is the entire reason the gauge exists.
+struct WorkerSlot(Arc<AtomicUsize>);
+
+impl WorkerSlot {
+    fn occupy(gauge: Arc<AtomicUsize>) -> Self {
+        gauge.fetch_add(1, Ordering::SeqCst);
+        Self(gauge)
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -605,6 +696,11 @@ where
     // Built before the first notification so a misconfigured spool fails the run at startup rather
     // than after the snapshot export has already been paid for.
     let mut recorder = recorder::StreamRecorder::from_env()?;
+    // Attempt directories are export machinery, and exports run only when a stream is being
+    // recorded — a run without one has no business deleting anything under the bootstrap dir.
+    if recorder.is_some() {
+        remove_stale_attempt_dirs(&options.bootstrap_dir);
+    }
     if let Some(recorder) = recorder.as_mut() {
         recorder.write_manifest(
             ctx.config.chain.chain().id(),
@@ -1743,6 +1839,7 @@ where
                 &pair.cache,
                 &ready,
                 state_provider.as_ref(),
+                options.stream_fsync,
             )
         }) {
         Ok(exported) => exported,
@@ -1794,6 +1891,45 @@ where
         gate.shadow = Some(shadow);
     }
     Ok(())
+}
+
+/// Removes export attempt directories a previous process left behind.
+///
+/// Safe exactly at startup: no worker of this process exists yet, and an attempt directory is
+/// only ever promoted by the run that created it, so anything present now is an abandoned
+/// attempt's leavings. `complete_export` removes the promoted attempt's own directory; fenced
+/// attempts have nothing else that ever would.
+fn remove_stale_attempt_dirs(bootstrap_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(bootstrap_dir) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        // Exactly the names this process's own export machinery mints: `export-attempt-<digits>`.
+        // A prefix match would also claim an operator's `export-attempt-notes/`, and deleting
+        // anything this process did not create is not cleanup.
+        let stale = path.is_dir() &&
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("export-attempt-"))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                });
+        if !stale {
+            continue
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => info!(
+                target: "partial_stateless",
+                dir = %path.display(),
+                "Removed a stale export attempt directory from a previous run"
+            ),
+            Err(err) => warn!(
+                target: "partial_stateless",
+                dir = %path.display(),
+                %err,
+                "Could not remove a stale export attempt directory"
+            ),
+        }
+    }
 }
 
 /// Checks the running export: a completed one opens the stream, a failed one is retried or ends
@@ -2009,6 +2145,9 @@ fn maybe_start_export<Node>(
     if !gate.export_pending || !matches!(gate.job, ExportJob::Idle) {
         return
     }
+    if !gate.worker_slot_available() {
+        return
+    }
     let Some(ready) = pair.readiness.ready_parent().cloned() else { return };
     let Some(accepted_head) = pair.accepted_parent().cloned() else {
         // Ready with no accepted head happens one block out of a snapshot restore or a cold
@@ -2051,15 +2190,21 @@ fn maybe_start_export<Node>(
     let attempt_dir = options.bootstrap_dir.join(format!("export-attempt-{}", gate.attempt));
     let worker_dir = attempt_dir.clone();
     let config = options.config;
+    let fsync = options.stream_fsync;
     let worker_ready = ready.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    let slot = WorkerSlot::occupy(gate.live_workers.clone());
     tokio::task::spawn_blocking(move || {
+        // Held for the closure's whole life: the drop guard is what tells the gauge this worker
+        // — fenced or not — has actually released its read transaction.
+        let _slot = slot;
         let result = bootstrap_io::export_snapshot_from_state(
             &worker_dir,
             state,
             &worker_ready,
             &config,
             provider.as_ref(),
+            fsync,
         )
         .map(bootstrap_io::FinishedExport::from);
         // A dropped receiver means the attempt was abandoned; the files stay in the attempt
@@ -3270,7 +3415,7 @@ mod tests {
     mod export_job {
         use super::super::{
             bootstrap_io, fail_export_attempt, poll_export_job, recorder::StreamRecorder,
-            BootstrapGate, EndKind, ExportJob, RunOptions,
+            remove_stale_attempt_dirs, BootstrapGate, EndKind, ExportJob, RunOptions, WorkerSlot,
         };
         use crate::CacheConfig;
         use alloy_primitives::B256;
@@ -3280,7 +3425,10 @@ mod tests {
         use std::{
             fs,
             path::{Path, PathBuf},
-            sync::mpsc,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                mpsc, Arc,
+            },
             time::Instant,
         };
 
@@ -3301,6 +3449,9 @@ mod tests {
                 retries_left,
                 attempt: 1,
                 waiting_for_accepted_head_logged: false,
+                live_workers: Arc::new(AtomicUsize::new(0)),
+                max_workers: 4,
+                worker_cap_logged: false,
             }
         }
 
@@ -3314,6 +3465,93 @@ mod tests {
                 attempt_dir,
                 started: Instant::now(),
             }
+        }
+
+        /// The cap refuses a spawn while the gauge is full and yields as soon as a slot drains.
+        /// The refusal must not consume `export_pending` — that contract lives in
+        /// `maybe_start_export`, which returns before touching it.
+        #[test]
+        fn a_spawn_is_refused_at_the_worker_cap() {
+            let mut gate = gate_with(ExportJob::Idle, 1);
+            gate.max_workers = 1;
+            let slot = WorkerSlot::occupy(gate.live_workers.clone());
+
+            assert!(!gate.worker_slot_available(), "one live worker fills a cap of one");
+            drop(slot);
+            assert!(gate.worker_slot_available(), "the drained slot reopens the cap");
+        }
+
+        /// The fence drops the receiver, not the worker: the gauge keeps counting an abandoned
+        /// worker until its own guard drops, because the read transaction it holds is just as
+        /// real after the fence as before it.
+        #[test]
+        fn the_gauge_survives_a_fence_and_decrements_on_completion() {
+            let mut gate = gate_with(ExportJob::Idle, 1);
+            let slot = WorkerSlot::occupy(gate.live_workers.clone());
+            let (_tx, rx) = mpsc::sync_channel::<eyre::Result<bootstrap_io::FinishedExport>>(1);
+            gate.job = in_flight(rx, PathBuf::from("unused"));
+
+            // The fence: replace the job, dropping the receiver. The worker (its slot) lives on.
+            gate.job = ExportJob::Idle;
+            assert_eq!(
+                gate.live_workers.load(Ordering::SeqCst),
+                1,
+                "an abandoned worker still holds its slot"
+            );
+            drop(slot);
+            assert_eq!(gate.live_workers.load(Ordering::SeqCst), 0);
+        }
+
+        /// A worker that panics still gives its slot back: the guard drops on unwind, which is
+        /// the one exit path a counter incremented after the work would miss.
+        #[test]
+        fn a_panicking_worker_still_decrements() {
+            let gauge = Arc::new(AtomicUsize::new(0));
+            let slot = WorkerSlot::occupy(gauge.clone());
+            let worker = std::thread::spawn(move || {
+                let _slot = slot;
+                panic!("simulated worker panic");
+            });
+            assert!(worker.join().is_err(), "the worker panicked as arranged");
+            assert_eq!(gauge.load(Ordering::SeqCst), 0, "the unwind released the slot");
+        }
+
+        /// Startup removes what fenced attempts leave behind — and nothing else. Only this moment
+        /// may clean: while the process runs, an attempt directory may belong to a live worker.
+        #[test]
+        fn startup_removes_stale_attempt_dirs() {
+            let dir = temp_dir("stale-attempts");
+            fs::create_dir_all(dir.join("export-attempt-3")).expect("stale attempt");
+            fs::create_dir_all(dir.join("export-attempt-7")).expect("stale attempt");
+            fs::create_dir_all(dir.join("keep-me")).expect("unrelated dir");
+            fs::write(dir.join("checkpoint.json"), b"{}").expect("operator file");
+
+            remove_stale_attempt_dirs(&dir);
+
+            assert!(!dir.join("export-attempt-3").exists());
+            assert!(!dir.join("export-attempt-7").exists());
+            assert!(dir.join("keep-me").exists(), "only attempt directories are touched");
+            assert!(dir.join("checkpoint.json").exists());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// The name filter is exact, not a prefix: this process mints `export-attempt-<digits>`
+        /// and nothing else, so an operator's `export-attempt-notes/` is not cleanup material.
+        #[test]
+        fn cleanup_claims_only_the_names_this_process_mints() {
+            let dir = temp_dir("stale-attempts-exact");
+            fs::create_dir_all(dir.join("export-attempt-12")).expect("stale attempt");
+            fs::create_dir_all(dir.join("export-attempt-notes")).expect("operator dir");
+            fs::create_dir_all(dir.join("export-attempt-")).expect("no digits");
+            fs::create_dir_all(dir.join("export-attempt-1a")).expect("mixed suffix");
+
+            remove_stale_attempt_dirs(&dir);
+
+            assert!(!dir.join("export-attempt-12").exists(), "digits-only names are claimed");
+            assert!(dir.join("export-attempt-notes").exists(), "a word suffix is not ours");
+            assert!(dir.join("export-attempt-").exists(), "an empty suffix is not ours");
+            assert!(dir.join("export-attempt-1a").exists(), "a mixed suffix is not ours");
+            let _ = fs::remove_dir_all(&dir);
         }
 
         fn options_with_bootstrap_dir(dir: &Path) -> RunOptions {

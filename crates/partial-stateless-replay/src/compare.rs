@@ -103,6 +103,49 @@ pub fn compare_accepted(
     out
 }
 
+/// What comparing one commit's readiness watermarks established.
+#[derive(Debug)]
+pub enum WatermarkComparison {
+    /// Both sides named a watermark and they agree.
+    Agreed,
+    /// The producer recorded no watermark, so there is nothing to disagree with.
+    ///
+    /// Not a mismatch, measured: a producer that warmed from live blocks has no contiguous
+    /// acknowledgeable run when its stream opens, while a consumer restored from the checkpoint
+    /// starts its watermark *at* the checkpoint by that restore's own contract. On the S4 reorg
+    /// corpus this class covered the first 72 of 314 commits and every one of the remaining 242
+    /// agreed — the absence is a fact about the producer's history, not about the chain.
+    Unrecorded,
+    /// Both sides named a watermark and they differ — the class that would be a real finding.
+    Mismatch(Disagreement),
+}
+
+/// Compares the recorded readiness watermark against this replay's own, counter-first.
+///
+/// Kept apart from [`compare_accepted`]'s disagreement set on purpose. The watermark is producer
+/// state whose standalone counterpart had never been compared before S5 — both sides record it,
+/// nothing read it — so a mismatch is counted and sampled rather than failing `agreed`, until
+/// full-corpus runs show whether the both-recorded equality actually holds. Promotion into the
+/// disagreement set is those runs' decision. Its sibling `durability_watermark` is *not*
+/// comparable at all: the consumer persists nothing, the value regresses legitimately on a pure
+/// revert, and a bare block number cannot name its branch — it stays telemetry.
+pub fn compare_readiness_watermark(
+    oracle: &CommitOracle,
+    pair: &CoordinatedPair,
+) -> WatermarkComparison {
+    let Some(recorded) = oracle.readiness_watermark else { return WatermarkComparison::Unrecorded };
+    let replayed =
+        pair.readiness.acknowledgeable_height().map(|(number, hash)| BlockRef { number, hash });
+    if replayed == Some(recorded) {
+        return WatermarkComparison::Agreed
+    }
+    WatermarkComparison::Mismatch(Disagreement {
+        field: "readiness_watermark",
+        recorded: format!("{recorded:?}"),
+        replayed: format!("{replayed:?}"),
+    })
+}
+
 /// Compares a replay's rejection against a recorded one, by class and never by message.
 ///
 /// The class is what two independent validators must agree on. The message is free to gain detail

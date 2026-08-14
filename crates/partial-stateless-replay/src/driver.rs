@@ -7,7 +7,10 @@
 //! replay is most tempted to break, because the frame is right there and it is correct.
 
 use crate::{
-    compare::{block_label, compare_accepted, compare_rejected, Disagreement},
+    compare::{
+        block_label, compare_accepted, compare_readiness_watermark, compare_rejected, Disagreement,
+        WatermarkComparison,
+    },
     mutate::Mutation,
     reorg::{apply_reorg, warn_inapplicable, ReorgOutcome, VerifiedHistory},
     spool::SpoolIter,
@@ -21,9 +24,10 @@ use partial_stateless_stream::{
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
 use partial_stateless_validator::{
-    admit_block, block_context, verify_and_apply_sidecar, AdmissionError, BlockAdmission,
-    CoordinatedPair, PayloadProvenance, SidecarReexecLimits, TrieCacheDisposition,
-    UntrustedAdmission, ValidatorRules,
+    admit_block, block_context,
+    timings::{AdmissionTimings, ValidationPhaseTimings},
+    verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedPair, PayloadProvenance,
+    SidecarReexecLimits, TrieCacheDisposition, UntrustedAdmission, ValidatorRules,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -91,6 +95,35 @@ pub struct ReplayReport {
     pub admission_us: u64,
     /// Total transition wall time across every commit, in microseconds.
     pub transition_us: u64,
+    /// Total standalone-validation wall time across every attempt, in microseconds.
+    ///
+    /// The S5 primary boundary: frame bytes already in memory through the committed verdict.
+    /// Accumulated for every attempt, including rejected and faulted ones, whose entries record
+    /// the cost of the attempt up to where it stopped.
+    pub standalone_validation_us: u64,
+    /// Attempts whose disjoint phase sum exceeded their own wall boundary.
+    ///
+    /// Timer truncation makes the parts read slightly *smaller* than the whole, so the sum
+    /// exceeding the wall is a measurement anomaly, counted rather than clamped away silently —
+    /// `unattributed_validation_us` saturates to zero on such an entry.
+    pub timing_anomalies: u64,
+    /// Commits where both sides named a readiness watermark and they agreed.
+    pub watermarks_agreed: u64,
+    /// Commits whose producer recorded no readiness watermark, so nothing was comparable.
+    ///
+    /// Expected on a producer that warmed from live blocks: it has no contiguous acknowledgeable
+    /// run when its stream opens, while a checkpoint-restored consumer starts its watermark at
+    /// the checkpoint by that restore's own contract.
+    pub watermarks_unrecorded: u64,
+    /// Commits whose recorded readiness watermark differed from this replay's own.
+    ///
+    /// A counter and not a disagreement, deliberately: both sides record the watermark and
+    /// nothing ever compared them before S5, so whether the equality holds is what corpus runs
+    /// establish first. Promotion into the disagreement set waits on those runs coming back
+    /// all-zero.
+    pub watermark_mismatches: u64,
+    /// The first few mismatches verbatim, so a nonzero counter is investigable from the record.
+    pub watermark_mismatch_samples: Vec<String>,
     /// Per-block timings, in the order they were replayed.
     ///
     /// Kept per block rather than only as totals because the A/B this corpus exists to enable is a
@@ -214,15 +247,283 @@ pub(crate) enum CommitOutcome {
     Fault(ReplayFault),
 }
 
-/// What one replayed block cost.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+/// What one replayed attempt cost. One entry per commit frame the driver attempted, in order —
+/// rejected and faulted attempts included, carrying the phases that ran and `null` for the rest.
+///
+/// The timing groups follow one discipline: `phases` holds only mutually exclusive leaves whose
+/// sum is meaningful, `derived` holds aggregates reconstructed from them (never summed with
+/// them), and `details` is the validator core's own instrumentation verbatim — a superset kept
+/// for reference, never for addition.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockTiming {
     /// Height.
     pub number: u64,
+    /// The commit frame's sequence, which is the key an aggregator must use: a reorg legitimately
+    /// repeats a height, and those re-verdicts are abandoned-branch work, not double counting.
+    pub sequence: u64,
+    /// What the attempt produced: `accepted`, `disagreed`, `rejected`, or `fault`.
+    pub verdict: &'static str,
     /// Decode, payload layout, block hash, sender recovery, and pre-execution consensus.
-    pub admission_us: u64,
-    /// The cache transition: witness materialization, execution, root, retention, anchor.
-    pub transition_us: u64,
+    /// `null` when admission never completed.
+    pub admission_us: Option<u64>,
+    /// The cache transition wall clock: witness materialization, execution, root, retention,
+    /// anchor. `null` when the transition never ran.
+    pub transition_us: Option<u64>,
+    /// The S5 primary: frame bytes already in memory through the committed verdict, as one wall
+    /// measurement — never a sum of parts. Excludes the oracle comparison and the mutation
+    /// checks, which are harness work. On a rejected or faulted attempt this is the cost up to
+    /// where the attempt stopped.
+    pub standalone_validation_us: u64,
+    /// Statting and reading the frame file into memory. Transport cost, outside the primary.
+    pub delivery_us: Option<u64>,
+    /// Comparing the verdict against the producer's recorded oracle. Harness work, outside the
+    /// primary: a standalone validator in production has no oracle to consult.
+    pub oracle_compare_us: Option<u64>,
+    /// Deriving and checking negative payloads. Harness work, outside the primary.
+    pub mutation_check_us: Option<u64>,
+    /// `standalone_validation_us` minus the sum of `phases`. Saturates at zero; an attempt whose
+    /// sum exceeded its wall increments the report's `timing_anomalies` instead.
+    pub unattributed_validation_us: u64,
+    /// Mutually exclusive leaf phases. These are the only fields it is valid to add together.
+    pub phases: PhaseLeaves,
+    /// Aggregates derived from the leaves, kept so older metrics stay reconstructible.
+    pub derived: DerivedTimings,
+    /// The validator core's own `ValidationPhaseTimings`, verbatim, completed with the admission
+    /// and sidecar-decode values the driver measured — the same completion the paired harness
+    /// performs. `null` when the transition never ran. A superset of `phases`: reference only.
+    pub details: Option<Box<ValidationPhaseTimings>>,
+}
+
+/// The disjoint leaf phases of one standalone validation, in execution order.
+///
+/// Every field is `null` when its phase did not run — never zero, which would claim the phase was
+/// free. The sum of the present fields is comparable against `standalone_validation_us`; nothing
+/// here overlaps anything else, which is the property the paired schema's flat field list did not
+/// have and the reason this grouping exists.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct PhaseLeaves {
+    /// Decoding the frame envelope and body once its bytes were in memory.
+    pub frame_decode_us: Option<u64>,
+    /// Decoding the Engine-API payload JSON out of the commit body.
+    pub input_decode_us: Option<u64>,
+    /// Decoding the sidecar with bincode. The paired schema calls this `deserialize_us`.
+    pub sidecar_decode_us: Option<u64>,
+    /// Payload layout and block-hash validation.
+    pub payload_validation_us: Option<u64>,
+    /// Recovering every transaction sender from its signature.
+    pub sender_recovery_us: Option<u64>,
+    /// Header, pre-execution, and against-parent consensus validation.
+    pub pre_execution_consensus_us: Option<u64>,
+    pub context_check_us: Option<u64>,
+    pub witness_self_consistency_us: Option<u64>,
+    pub materialize_us: Option<u64>,
+    pub provider_setup_us: Option<u64>,
+    /// The executor call, excluding benchmark-only access capture.
+    pub evm_us: Option<u64>,
+    /// Benchmark-only accessed-state capture. A leaf beside `evm_us`: the two sum to the
+    /// executor-call wall clock.
+    pub accessed_state_capture_us: Option<u64>,
+    pub post_execution_consensus_us: Option<u64>,
+    pub hash_post_state_us: Option<u64>,
+    pub trie_clone_us: Option<u64>,
+    pub state_root_us: Option<u64>,
+    pub root_completeness_us: Option<u64>,
+    pub miss_policy_check_us: Option<u64>,
+    pub cache_update_us: Option<u64>,
+    pub trie_retention_us: Option<u64>,
+    pub next_cache_anchor_us: Option<u64>,
+    pub trie_commit_us: Option<u64>,
+    /// Committing the transition into the coordinated pair and recording the block in this
+    /// consumer's own verified history — the close of the primary boundary.
+    pub pair_commit_us: Option<u64>,
+}
+
+impl PhaseLeaves {
+    /// The sum of every phase that ran. Valid to compute here and nowhere else in this schema.
+    pub fn sum_us(&self) -> u64 {
+        [
+            self.frame_decode_us,
+            self.input_decode_us,
+            self.sidecar_decode_us,
+            self.payload_validation_us,
+            self.sender_recovery_us,
+            self.pre_execution_consensus_us,
+            self.context_check_us,
+            self.witness_self_consistency_us,
+            self.materialize_us,
+            self.provider_setup_us,
+            self.evm_us,
+            self.accessed_state_capture_us,
+            self.post_execution_consensus_us,
+            self.hash_post_state_us,
+            self.trie_clone_us,
+            self.state_root_us,
+            self.root_completeness_us,
+            self.miss_policy_check_us,
+            self.cache_update_us,
+            self.trie_retention_us,
+            self.next_cache_anchor_us,
+            self.trie_commit_us,
+            self.pair_commit_us,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// Aggregates reconstructed from the leaves and the core's own totals. Never added to `phases`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct DerivedTimings {
+    /// The four admission phases together — the value v1 published as `admission_us`.
+    pub admission_total_us: Option<u64>,
+    /// The pre-S5 in-process primary: deserialize + context check + self-consistency +
+    /// materialize + provider setup + EVM. Kept so a v2 record still yields the old metric.
+    pub state_access_execution_us: Option<u64>,
+    /// Deserialize + witness checks/materialization + EVM + hashing + sparse-trie root.
+    pub execution_core_us: Option<u64>,
+    /// The core's own DB-free validation total, diagnostics included.
+    pub raw_total_us: Option<u64>,
+}
+
+/// What it cost to hand this commit's bytes to the validator, measured where the frame was read.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameCosts {
+    /// The commit frame's sequence.
+    pub(crate) sequence: u64,
+    /// Statting and reading the frame file into memory.
+    pub(crate) delivery_us: Option<u64>,
+    /// Decoding the envelope and body. The first leaf inside the validation boundary.
+    pub(crate) frame_decode_us: Option<u64>,
+    /// The instant the frame decode began, which is where the primary boundary opens.
+    ///
+    /// Carried from the read so `standalone_validation_us` is one continuous wall reading from
+    /// decode to pair commit — the untimed dispatch between the read path and `replay_commit`
+    /// lands inside the boundary (and thus in `unattributed_validation_us`) instead of being
+    /// silently dropped by summing separately-timed segments.
+    pub(crate) validation_open: Option<Instant>,
+}
+
+impl FrameCosts {
+    pub(crate) fn of(frame: &crate::spool::SpooledFrame) -> Self {
+        Self {
+            sequence: frame.header.sequence,
+            delivery_us: Some(frame.delivery_us),
+            frame_decode_us: Some(frame.frame_decode_us),
+            validation_open: Some(frame.validation_open),
+        }
+    }
+}
+
+/// Accumulates one attempt's measurements and closes them into a [`BlockTiming`].
+///
+/// Every exit from [`replay_commit`] finishes exactly one of these, which is the contract the
+/// follower's verdict line reads `report.blocks.last()` under: one entry per attempt, always.
+struct AttemptTimer {
+    started: Instant,
+    number: u64,
+    costs: FrameCosts,
+    input_decode_us: Option<u64>,
+    sidecar_decode_us: Option<u64>,
+    mutation_check_us: Option<u64>,
+    admission: Option<AdmissionTimings>,
+    transition_us: Option<u64>,
+    pair_commit_us: Option<u64>,
+    oracle_compare_us: Option<u64>,
+    /// The primary wall, frozen before the oracle comparison so harness work stays outside it.
+    validation_wall_us: Option<u64>,
+    core: Option<Box<ValidationPhaseTimings>>,
+}
+
+impl AttemptTimer {
+    fn open(number: u64, costs: FrameCosts) -> Self {
+        Self {
+            // The boundary opened where the frame decode began, when the read path said so; a
+            // caller without a carried instant (tests, synthetic frames) opens it here instead.
+            started: costs.validation_open.unwrap_or_else(Instant::now),
+            number,
+            costs,
+            input_decode_us: None,
+            sidecar_decode_us: None,
+            mutation_check_us: None,
+            admission: None,
+            transition_us: None,
+            pair_commit_us: None,
+            oracle_compare_us: None,
+            validation_wall_us: None,
+            core: None,
+        }
+    }
+
+    /// Freezes the primary boundary. Called after the pair commit and before the oracle compare;
+    /// an early exit that never gets here is closed at [`finish`](Self::finish) time instead.
+    fn close_validation(&mut self) {
+        self.validation_wall_us = Some(self.started.elapsed().as_micros() as u64);
+    }
+
+    /// Closes the attempt into a [`BlockTiming`] and appends it to the report.
+    fn finish(self, verdict: &'static str, report: &mut ReplayReport) {
+        let wall =
+            self.validation_wall_us.unwrap_or_else(|| self.started.elapsed().as_micros() as u64);
+        // One wall reading, opened at the frame decode and closed at the pair commit. The
+        // mutation checks run inside that window but are harness work, so they are the one
+        // subtraction — labelled beside the primary rather than hidden in it.
+        let standalone_validation_us =
+            wall.saturating_sub(self.mutation_check_us.unwrap_or_default());
+        let core = self.core.as_deref();
+        let phases = PhaseLeaves {
+            frame_decode_us: self.costs.frame_decode_us,
+            input_decode_us: self.input_decode_us,
+            sidecar_decode_us: self.sidecar_decode_us,
+            payload_validation_us: self.admission.and_then(|a| a.payload_validation_us),
+            sender_recovery_us: self.admission.and_then(|a| a.sender_recovery_us),
+            pre_execution_consensus_us: self.admission.and_then(|a| a.pre_execution_consensus_us),
+            context_check_us: core.map(|c| c.context_check_us),
+            witness_self_consistency_us: core.map(|c| c.witness_self_consistency_us),
+            materialize_us: core.map(|c| c.materialize_us),
+            provider_setup_us: core.map(|c| c.provider_setup_us),
+            evm_us: core.map(|c| c.evm_us),
+            accessed_state_capture_us: core.map(|c| c.accessed_state_capture_us),
+            post_execution_consensus_us: core.map(|c| c.post_execution_consensus_us),
+            hash_post_state_us: core.map(|c| c.hash_post_state_us),
+            trie_clone_us: core.map(|c| c.trie_clone_us),
+            state_root_us: core.map(|c| c.state_root_us),
+            root_completeness_us: core.map(|c| c.root_completeness_us),
+            miss_policy_check_us: core.map(|c| c.miss_policy_check_us),
+            cache_update_us: core.map(|c| c.cache_update_us),
+            trie_retention_us: core.map(|c| c.trie_retention_us),
+            next_cache_anchor_us: core.map(|c| c.next_cache_anchor_us),
+            trie_commit_us: core.map(|c| c.trie_commit_us),
+            pair_commit_us: self.pair_commit_us,
+        };
+        let leaf_sum = phases.sum_us();
+        if leaf_sum > standalone_validation_us {
+            report.timing_anomalies += 1;
+        }
+        let derived = DerivedTimings {
+            admission_total_us: self.admission.map(|a| a.total_us()),
+            state_access_execution_us: core.map(|c| c.state_access_execution_us),
+            execution_core_us: core.map(|c| c.execution_core_us),
+            raw_total_us: core.map(|c| c.raw_total_us),
+        };
+        report.standalone_validation_us =
+            report.standalone_validation_us.saturating_add(standalone_validation_us);
+        report.blocks.push(BlockTiming {
+            number: self.number,
+            sequence: self.costs.sequence,
+            verdict,
+            admission_us: self.admission.map(|a| a.total_us()),
+            transition_us: self.transition_us,
+            standalone_validation_us,
+            delivery_us: self.costs.delivery_us,
+            oracle_compare_us: self.oracle_compare_us,
+            mutation_check_us: self.mutation_check_us,
+            unattributed_validation_us: standalone_validation_us.saturating_sub(leaf_sum),
+            phases,
+            derived,
+            details: self.core,
+        });
+    }
 }
 
 impl ReplayReport {
@@ -291,6 +592,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
             break
         }
         let sequence = frame.header.sequence;
+        let costs = FrameCosts::of(&frame);
         phase = match (phase, frame.event) {
             (phase, StreamEvent::Manifest(found)) => match phase {
                 BatchPhase::AwaitingManifest => {
@@ -432,7 +734,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
             ) => {
                 let (input, oracle) = commit.split();
                 let block = input.block;
-                match replay_commit(&mut state, input, &oracle, options, &mut report) {
+                match replay_commit(&mut state, input, &oracle, options, costs, &mut report) {
                     CommitOutcome::Fault(fault) => {
                         error!(
                             target: "ps_replay",
@@ -1053,6 +1355,7 @@ pub(crate) fn replay_commit(
     input: CommitInput,
     oracle: &CommitOracle,
     options: &ReplayOptions,
+    costs: FrameCosts,
     report: &mut ReplayReport,
 ) -> CommitOutcome {
     match input.payload_provenance {
@@ -1061,38 +1364,60 @@ pub(crate) fn replay_commit(
         PayloadProvenance::Absent => report.absent += 1,
     }
     let label = block_label(input.block);
+    // Every exit below finishes this timer exactly once, so `report.blocks` gains one entry per
+    // attempt — rejected and faulted ones included, which is what makes the follower's
+    // `blocks.last()` this attempt's timing rather than a stale neighbour's.
+    let mut timer = AttemptTimer::open(input.block.number, costs);
 
+    let decode_started = Instant::now();
     let payload = match input.payload() {
         Ok(Some(payload)) => payload,
         Ok(None) => {
+            timer.input_decode_us = Some(decode_started.elapsed().as_micros() as u64);
             report.failures.push(format!(
                 "{label}: the commit carries no payload, so admission could not run on it"
             ));
+            timer.finish("rejected", report);
             return CommitOutcome::Rejected
         }
         Err(err) => {
+            timer.input_decode_us = Some(decode_started.elapsed().as_micros() as u64);
             report.failures.push(format!("{label}: recorded payload did not parse: {err}"));
+            timer.finish("rejected", report);
             return CommitOutcome::Rejected
         }
     };
+    timer.input_decode_us = Some(decode_started.elapsed().as_micros() as u64);
+
+    let sidecar_started = Instant::now();
     let sidecar: PartialStatelessSidecar = match bincode::deserialize(&input.sidecar) {
         Ok(sidecar) => sidecar,
         Err(err) => {
+            timer.sidecar_decode_us = Some(sidecar_started.elapsed().as_micros() as u64);
             report.failures.push(format!("{label}: recorded sidecar did not decode: {err}"));
+            timer.finish("rejected", report);
             return CommitOutcome::Rejected
         }
     };
+    timer.sidecar_decode_us = Some(sidecar_started.elapsed().as_micros() as u64);
 
     let admission = UntrustedAdmission::new(state.chain_spec.as_ref(), &state.consensus);
 
     if options.mutations && input.payload_provenance.is_load_bearing() {
+        let mutations_started = Instant::now();
         check_mutations(&admission, &state.pair, &payload, report, &label);
+        timer.mutation_check_us = Some(mutations_started.elapsed().as_micros() as u64);
     }
 
     // The parent comes from the pair and never from the frame. A producer that supplied the parent
     // would be choosing the timestamp, gas limit, and base fee its own block is measured against.
     let admitted = match admission.admit(payload, state.pair.accepted_parent()) {
-        Ok(admitted) => admitted,
+        Ok(mut admitted) => {
+            // The reserved slot admission cannot fill itself: it is handed an already-parsed
+            // payload, and this driver is "whatever read the payload off the wire".
+            admitted.timings.input_decode_us = timer.input_decode_us;
+            admitted
+        }
         Err(err) => {
             let disagreements = compare_rejected(oracle, err.class());
             report.failures.push(format!(
@@ -1100,15 +1425,17 @@ pub(crate) fn replay_commit(
                 err.class()
             ));
             report.disagreements.extend(disagreements.into_iter().map(|d| (input.block, d)));
+            timer.finish("rejected", report);
             return CommitOutcome::Rejected
         }
     };
-    let admission_us = admitted.timings.total_us();
-    report.admission_us += admission_us;
+    timer.admission = Some(admitted.timings);
+    report.admission_us += admitted.timings.total_us();
 
     let block_ctx = block_context(&admitted.block);
     if let BlockAdmission::Rejected(reason) = admit_block(&mut state.pair.readiness, &block_ctx) {
         // The refusal itself latched the tracker `Blocked`; the caches were never touched.
+        timer.finish("fault", report);
         return CommitOutcome::Fault(ReplayFault::ReadinessRefused {
             block: input.block,
             reason: format!("{reason:?}"),
@@ -1128,11 +1455,12 @@ pub(crate) fn replay_commit(
     );
     let transition_us = started.elapsed().as_micros() as u64;
     report.transition_us += transition_us;
-    report.blocks.push(BlockTiming { number: input.block.number, admission_us, transition_us });
+    timer.transition_us = Some(transition_us);
 
     let validated = match validated {
         Ok(validated) => validated,
         Err(err) => {
+            timer.finish("fault", report);
             return CommitOutcome::Fault(fail_applied_block(
                 &mut state.pair,
                 input.block,
@@ -1140,15 +1468,41 @@ pub(crate) fn replay_commit(
             ))
         }
     };
+    // The core's instrumentation, completed the way the paired harness completes it: admission
+    // and the sidecar decode happened out here in the driver, so the core record carries them
+    // only if the driver puts them in.
+    let mut core = validated.timings;
+    core.admission = admitted.timings;
+    core.set_deserialize_us(timer.sidecar_decode_us.unwrap_or_default());
+    timer.core = Some(Box::new(core));
+
     let mut outcome = validated.outcome;
     let displaced = outcome.displaced_trie_cache.take();
+    let commit_started = Instant::now();
     state.pair.commit_transition(displaced, &block_ctx, admitted.block.clone_sealed_header(), true);
     // Recorded from this replay's own execution, before the oracle is consulted, so that a reorg
     // arriving later authenticates its target against what this process verified rather than
     // against what the producer said about it.
     state.history.record(input.block, outcome.state_root);
+    timer.pair_commit_us = Some(commit_started.elapsed().as_micros() as u64);
+    // The verdict is committed; everything after this line is the harness checking itself.
+    timer.close_validation();
 
+    let compare_started = Instant::now();
     let disagreements = compare_accepted(oracle, &outcome, &state.pair);
+    match compare_readiness_watermark(oracle, &state.pair) {
+        WatermarkComparison::Agreed => report.watermarks_agreed += 1,
+        WatermarkComparison::Unrecorded => report.watermarks_unrecorded += 1,
+        WatermarkComparison::Mismatch(mismatch) => {
+            report.watermark_mismatches += 1;
+            if report.watermark_mismatch_samples.len() < 8 {
+                report.watermark_mismatch_samples.push(format!("{label}: {mismatch}"));
+            }
+        }
+    }
+    timer.oracle_compare_us = Some(compare_started.elapsed().as_micros() as u64);
+    let verdict = if disagreements.is_empty() { "accepted" } else { "disagreed" };
+    timer.finish(verdict, report);
     if disagreements.is_empty() {
         report.commits += 1;
         return CommitOutcome::Compared
@@ -1247,11 +1601,13 @@ fn check_mutations<C>(
 
 #[cfg(test)]
 mod tests {
-    use super::{fail_applied_block, ReplayFault};
+    use super::{fail_applied_block, AttemptTimer, FrameCosts, ReplayFault, ReplayReport};
     use alloy_primitives::B256;
     use partial_stateless::{readiness::BlockContext, CacheConfig, PartialTrieNodeCache};
     use partial_stateless_stream::BlockRef;
-    use partial_stateless_validator::{admit_block, BlockAdmission, CoordinatedPair};
+    use partial_stateless_validator::{
+        admit_block, timings::ValidationPhaseTimings, BlockAdmission, CoordinatedPair,
+    };
 
     fn pair() -> CoordinatedPair {
         let config = CacheConfig::default();
@@ -1271,6 +1627,152 @@ mod tests {
             parent_hash: B256::with_last_byte(number as u8 - 1),
             state_root: B256::with_last_byte(0x55),
         }
+    }
+
+    fn costs(frame_decode_us: Option<u64>) -> FrameCosts {
+        FrameCosts { sequence: 7, delivery_us: Some(12), frame_decode_us, validation_open: None }
+    }
+
+    /// Costs whose boundary opened `micros` ago, the way a real frame's read path opens it.
+    fn costs_opened(frame_decode_us: Option<u64>, micros: u64) -> FrameCosts {
+        FrameCosts {
+            sequence: 7,
+            delivery_us: Some(12),
+            frame_decode_us,
+            validation_open: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_micros(micros)),
+        }
+    }
+
+    /// The contract the follower's `blocks.last()` reads under: one entry per attempt, whatever
+    /// the attempt produced, keyed by the frame's sequence rather than the block's height.
+    #[test]
+    fn every_attempt_leaves_exactly_one_timing_entry() {
+        let mut report = ReplayReport::default();
+        AttemptTimer::open(100, costs(Some(5))).finish("rejected", &mut report);
+        AttemptTimer::open(101, costs(Some(5))).finish("accepted", &mut report);
+
+        assert_eq!(report.blocks.len(), 2);
+        assert_eq!(report.blocks[0].verdict, "rejected");
+        assert_eq!(report.blocks[0].sequence, 7);
+        assert_eq!(report.blocks[0].delivery_us, Some(12));
+    }
+
+    /// `phases` holds only mutually exclusive leaves, so their sum stays inside the wall and the
+    /// residual is the boundary's honest remainder.
+    #[test]
+    fn the_disjoint_phases_never_exceed_the_wall_boundary() {
+        let mut report = ReplayReport::default();
+        // The boundary opened 10 ms ago, at the decode the 40 µs leaf times — a leaf inside the
+        // wall, the way a carried `validation_open` puts it there.
+        let timer = AttemptTimer::open(1, costs_opened(Some(40), 10_000));
+        timer.finish("accepted", &mut report);
+
+        let timing = &report.blocks[0];
+        assert!(timing.standalone_validation_us >= timing.phases.sum_us());
+        assert_eq!(
+            timing.unattributed_validation_us,
+            timing.standalone_validation_us - timing.phases.sum_us()
+        );
+        assert_eq!(report.timing_anomalies, 0);
+    }
+
+    /// The primary is one wall reading opened at the frame decode — not the decode cost added to
+    /// a separately-started segment. A carried open instant is what the boundary reads from, and
+    /// the frame-decode leaf changing must not move the primary.
+    #[test]
+    fn the_primary_is_one_wall_clock_from_the_carried_open_instant() {
+        let mut report = ReplayReport::default();
+        AttemptTimer::open(1, costs_opened(Some(40), 10_000)).finish("accepted", &mut report);
+        AttemptTimer::open(2, costs_opened(Some(4_000), 10_000)).finish("accepted", &mut report);
+
+        let (a, b) = (&report.blocks[0], &report.blocks[1]);
+        assert!(a.standalone_validation_us >= 10_000, "the wall covers the carried open");
+        assert!(b.standalone_validation_us >= 10_000);
+        // Both walls are ~10 ms; the hundredfold difference in the decode leaf lives inside them.
+        let spread = a.standalone_validation_us.abs_diff(b.standalone_validation_us);
+        assert!(spread < 5_000, "the leaf is inside the wall, never added to it: {spread}");
+    }
+
+    /// A phase sum past its own wall is timer misbehaviour, and it is counted as such rather than
+    /// clamped into a negative that saturation would silently hide.
+    #[test]
+    fn a_phase_sum_past_the_wall_is_an_anomaly_not_a_negative() {
+        let mut report = ReplayReport::default();
+        let mut timer = AttemptTimer::open(1, costs(Some(10)));
+        timer.input_decode_us = Some(1_000_000);
+        timer.finish("rejected", &mut report);
+
+        assert_eq!(report.timing_anomalies, 1);
+        assert_eq!(report.blocks[0].unattributed_validation_us, 0);
+    }
+
+    /// The primary freezes at the pair commit; the oracle comparison after it is harness work and
+    /// must not widen the boundary however long it takes.
+    #[test]
+    fn the_oracle_compare_stays_outside_the_frozen_boundary() {
+        let mut report = ReplayReport::default();
+        let mut timer = AttemptTimer::open(1, costs(Some(3)));
+        timer.close_validation();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        timer.oracle_compare_us = Some(20_000);
+        timer.finish("accepted", &mut report);
+
+        let timing = &report.blocks[0];
+        assert!(
+            timing.standalone_validation_us < 20_000,
+            "the boundary was frozen before the sleep stood in for the compare"
+        );
+        assert_eq!(timing.oracle_compare_us, Some(20_000));
+    }
+
+    /// The pre-S5 in-process primary must stay derivable from a v2 record: the six components it
+    /// sums are all published leaves, with the sidecar decode standing where `deserialize_us`
+    /// stood in the paired schema.
+    #[test]
+    fn the_old_primary_is_reconstructible_from_a_v2_record() {
+        let mut core = ValidationPhaseTimings {
+            context_check_us: 11,
+            witness_self_consistency_us: 22,
+            materialize_us: 33,
+            provider_setup_us: 44,
+            evm_us: 55,
+            ..Default::default()
+        };
+        core.set_deserialize_us(7);
+
+        let mut report = ReplayReport::default();
+        let mut timer = AttemptTimer::open(1, costs(Some(1)));
+        timer.sidecar_decode_us = Some(7);
+        timer.core = Some(Box::new(core));
+        timer.finish("accepted", &mut report);
+
+        let timing = &report.blocks[0];
+        let reconstructed = timing.phases.sidecar_decode_us.unwrap() +
+            timing.phases.context_check_us.unwrap() +
+            timing.phases.witness_self_consistency_us.unwrap() +
+            timing.phases.materialize_us.unwrap() +
+            timing.phases.provider_setup_us.unwrap() +
+            timing.phases.evm_us.unwrap();
+        assert_eq!(reconstructed, 7 + 11 + 22 + 33 + 44 + 55);
+        assert_eq!(timing.derived.state_access_execution_us, Some(reconstructed));
+    }
+
+    /// A rejected attempt reports the phases that ran and `null` for the rest — never zero, which
+    /// would claim the unrun work was free.
+    #[test]
+    fn a_rejected_attempt_reports_only_the_phases_that_ran() {
+        let mut report = ReplayReport::default();
+        let mut timer = AttemptTimer::open(9, costs(Some(4)));
+        timer.input_decode_us = Some(6);
+        timer.finish("rejected", &mut report);
+
+        let timing = &report.blocks[0];
+        assert_eq!(timing.phases.input_decode_us, Some(6));
+        assert_eq!(timing.phases.sidecar_decode_us, None, "unrun is null, never zero");
+        assert_eq!(timing.admission_us, None);
+        assert_eq!(timing.transition_us, None);
+        assert!(timing.details.is_none());
     }
 
     /// The leak S1 recorded and this boundary closes: a post-execution rejection preserved both

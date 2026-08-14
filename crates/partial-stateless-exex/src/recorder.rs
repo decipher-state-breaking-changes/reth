@@ -44,11 +44,17 @@ use std::{
     collections::VecDeque,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 use tracing::{error, info, warn};
 
 /// Directory the spool is written to. Unset means no recording.
 const STREAM_DIR_VAR: &str = "PS_STREAM_DIR";
+
+/// Set to `1` for the power-loss durability profile: frames are fsynced before their rename and
+/// the spool directory after it. Unset or `0` is the default profile — tmp+rename, durable
+/// across a process restart only.
+const FSYNC_VAR: &str = "PS_STREAM_FSYNC";
 
 /// Set to `1` to continue an existing spool as a new epoch instead of refusing a non-empty one.
 const RESUME_VAR: &str = "PS_STREAM_RESUME";
@@ -161,6 +167,19 @@ pub struct StreamRecorder {
     /// pair carries: the pair knows what it has applied, not what has survived a restart. A
     /// consumer resuming a stream resumes from this and not from the readiness watermark.
     durable_block: Option<u64>,
+    /// The power-loss profile: fsync each frame before its rename, and the directory after it.
+    fsync: bool,
+    /// Set across a checkpoint's frame batch so the directory is fsynced once behind it rather
+    /// than per frame — the checkpoint writes 1 + N chunks + the buffered flush in one burst.
+    defer_dir_sync: bool,
+    /// Total wall time spent writing frames, every fsync included — the deferred per-batch
+    /// directory sync too. Logged at `End`.
+    frame_write_us: u64,
+    /// The fsync share of the above, always a subset of it — the power-loss profile's price,
+    /// measured not assumed.
+    frame_fsync_us: u64,
+    /// Directory fsyncs performed, so a test can pin the batching shape.
+    dir_syncs: u64,
 }
 
 impl StreamRecorder {
@@ -188,6 +207,7 @@ impl StreamRecorder {
         let producer = std::env::var(PRODUCER_VAR).unwrap_or_else(|_| {
             format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         });
+        let fsync = stream_fsync_from_env()?;
         info!(
             target: "partial_stateless_stream",
             dir = %dir.display(),
@@ -197,6 +217,7 @@ impl StreamRecorder {
             buffer_max_frames,
             max_spool_bytes,
             max_spool_frames,
+            fsync,
             "Event stream recording ENABLED (PS_STREAM_DIR) — commits are written from the block \
              after the snapshot checkpoint"
         );
@@ -213,6 +234,7 @@ impl StreamRecorder {
                  before this producer appended anything"
             );
         }
+        write_run_manifest(&dir, &producer);
         Ok(Some(Self {
             dir,
             chunk_bytes,
@@ -235,6 +257,11 @@ impl StreamRecorder {
             bytes: existing.as_ref().map_or(0, |survey| survey.bytes),
             resumed_from: existing.map(|survey| survey.manifest),
             durable_block: None,
+            fsync,
+            defer_dir_sync: false,
+            frame_write_us: 0,
+            frame_fsync_us: 0,
+            dir_syncs: 0,
         }))
     }
 
@@ -265,7 +292,26 @@ impl StreamRecorder {
             bytes: 0,
             resumed_from: None,
             durable_block: None,
+            fsync: false,
+            defer_dir_sync: false,
+            frame_write_us: 0,
+            frame_fsync_us: 0,
+            dir_syncs: 0,
         }
+    }
+
+    /// A power-loss-profile recorder for in-crate tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_fsync(dir: &Path, buffer_max_frames: usize) -> Self {
+        let mut recorder = Self::for_tests(dir, buffer_max_frames);
+        recorder.fsync = true;
+        recorder
+    }
+
+    /// The write-cost totals, for tests that pin the batching shape.
+    #[cfg(test)]
+    pub(crate) const fn write_costs(&self) -> (u64, u64, u64) {
+        (self.frame_write_us, self.frame_fsync_us, self.dir_syncs)
     }
 
     /// Whether a commit's frame material should be assembled at all.
@@ -471,15 +517,20 @@ impl StreamRecorder {
             return
         }
 
+        // One directory fsync behind the whole burst — checkpoint, chunks, buffered flush —
+        // rather than one per frame. The batch is durable when its last rename is.
+        self.defer_dir_sync = self.fsync;
         self.write_body(kind, checkpoint_body);
         for (index, slice) in package.chunks(self.chunk_bytes.max(1)).enumerate() {
             if self.poisoned {
+                self.finish_dir_sync_batch();
                 return
             }
             let chunk = SnapshotChunk { index: index as u32, bytes: slice.to_vec() };
             self.write_event(&StreamEvent::SnapshotChunk(chunk));
         }
         if self.poisoned {
+            self.finish_dir_sync_batch();
             return
         }
         // Flush what accumulated while the export ran — same order, fresh contiguous sequences —
@@ -492,6 +543,7 @@ impl StreamRecorder {
         for (kind, body) in buffered {
             self.write_body(kind, body);
         }
+        self.finish_dir_sync_batch();
         if self.poisoned {
             return
         }
@@ -580,8 +632,30 @@ impl StreamRecorder {
             frames = self.frames,
             spool_bytes = self.bytes,
             dir = %self.dir.display(),
+            fsync = self.fsync,
+            frame_write_us = self.frame_write_us,
+            frame_fsync_us = self.frame_fsync_us,
+            dir_syncs = self.dir_syncs,
             "Closed the event stream"
         );
+    }
+
+    /// Closes a deferred directory-sync batch with the one sync the whole burst shares.
+    fn finish_dir_sync_batch(&mut self) {
+        if !std::mem::replace(&mut self.defer_dir_sync, false) {
+            return
+        }
+        match fsync_dir(&self.dir) {
+            Ok(cost_us) => {
+                // Into both totals, the same way an inline directory sync lands in both through
+                // `write_body`'s wall: `frame_fsync_us` stays a strict subset of `frame_write_us`
+                // whichever path the sync took.
+                self.frame_fsync_us = self.frame_fsync_us.saturating_add(cost_us);
+                self.frame_write_us = self.frame_write_us.saturating_add(cost_us);
+                self.dir_syncs += 1;
+            }
+            Err(err) => self.poison("dir_fsync", &err),
+        }
     }
 
     /// Routes one event by phase: dropped before an export chose H, buffered while it runs,
@@ -651,18 +725,30 @@ impl StreamRecorder {
             }
         }
         let sequence = self.sequence;
+        let write_started = Instant::now();
         let result = encode_frame_bytes(kind, sequence, &body, &self.limits)
             .map_err(|err| eyre::eyre!("{err}"))
             .and_then(|bytes| {
                 let path = self.dir.join(frame_file_name(sequence, kind));
-                write_atomically(&path, &bytes)?;
-                Ok(bytes.len())
+                let mut fsync_us = write_atomically(&path, &bytes, self.fsync)?;
+                // The rename alone is not durable across power loss; the directory entry is.
+                // Deferred across a checkpoint's burst, where one sync behind the batch covers it.
+                if self.fsync && !self.defer_dir_sync {
+                    fsync_us = fsync_us.saturating_add(fsync_dir(&self.dir)?);
+                }
+                Ok((bytes.len(), fsync_us))
             });
         match result {
-            Ok(len) => {
+            Ok((len, fsync_us)) => {
                 self.sequence += 1;
                 self.frames += 1;
                 self.bytes += len as u64;
+                if self.fsync && !self.defer_dir_sync {
+                    self.dir_syncs += 1;
+                }
+                self.frame_fsync_us = self.frame_fsync_us.saturating_add(fsync_us);
+                self.frame_write_us =
+                    self.frame_write_us.saturating_add(write_started.elapsed().as_micros() as u64);
             }
             Err(err) => self.poison(kind.as_str(), &err),
         }
@@ -852,11 +938,99 @@ fn frame_file_name(sequence: u64, kind: FrameKind) -> String {
 /// The same tmp-and-rename the snapshot export uses. It is not crash-atomic across frames — a
 /// crash can leave a complete prefix and nothing else — which is exactly the guarantee a sequence
 /// numbered spool needs, because a prefix is a valid truncated stream.
-fn write_atomically(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
+///
+/// With `fsync` — the power-loss profile — the file is synced *before* the rename, per §4.4's
+/// crash-durable recipe: tmp, fsync, rename, parent-directory fsync. The directory half is the
+/// caller's, because a checkpoint's burst wants one sync behind the batch, not one per frame.
+/// Returns the microseconds the file sync cost; zero on the default profile.
+fn write_atomically(path: &Path, bytes: &[u8], fsync: bool) -> eyre::Result<u64> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)?;
+    let fsync_us = if fsync {
+        let mut file = fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        let sync_started = Instant::now();
+        file.sync_all()?;
+        sync_started.elapsed().as_micros() as u64
+    } else {
+        fs::write(&temporary, bytes)?;
+        0
+    };
     fs::rename(&temporary, path)?;
-    Ok(())
+    Ok(fsync_us)
+}
+
+/// Makes the renames durable: fsyncs the spool directory itself. Returns what it cost.
+fn fsync_dir(dir: &Path) -> eyre::Result<u64> {
+    let started = Instant::now();
+    fs::File::open(dir)?.sync_all()?;
+    Ok(started.elapsed().as_micros() as u64)
+}
+
+/// `PS_STREAM_FSYNC`, refused at startup on anything but `0` or `1`.
+///
+/// A durability profile this build cannot parse must not silently become the default one: the
+/// run would then report a durability it is not providing.
+pub(crate) fn stream_fsync_from_env() -> eyre::Result<bool> {
+    parse_stream_fsync(std::env::var(FSYNC_VAR).ok().as_deref())
+}
+
+fn parse_stream_fsync(raw: Option<&str>) -> eyre::Result<bool> {
+    match raw.map(str::trim) {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(eyre::eyre!("PS_STREAM_FSYNC must be `0` or `1`, not `{other}`")),
+    }
+}
+
+/// Appends this producer's run provenance beside the spool it is about to write.
+///
+/// Beside, not inside: the spool holds nothing but frames, and `survey_spool` enforces that on
+/// resume. One JSONL line per producer start, so a resumed spool accumulates the provenance of
+/// every epoch that wrote to it. Best-effort by the same rule as the collector itself — a run
+/// that cannot stamp its manifest is warned about, not stopped, because the stream is the
+/// product and the manifest is its label.
+fn write_run_manifest(dir: &Path, producer: &str) {
+    use std::io::Write;
+    let provenance = partial_stateless_stream::RunProvenance::collect(
+        producer,
+        partial_stateless_stream::BuildStamp {
+            commit: option_env!("PS_BUILD_COMMIT"),
+            dirty: option_env!("PS_BUILD_DIRTY"),
+            cargo_lock_sha256: option_env!("PS_CARGO_LOCK_SHA256"),
+        },
+        Some(dir),
+    );
+    let record = serde_json::json!({
+        "schema_version": 2,
+        "benchmark": "partial_stateless_stream_producer",
+        "kind": "run_manifest",
+        "provenance": provenance,
+    });
+    // A sibling named after the spool directory, built by appending rather than by
+    // `with_extension`, which would eat a dot in the directory's own name.
+    let name = dir.file_name().map_or_else(
+        || "spool.run-manifest.jsonl".into(),
+        |name| format!("{}.run-manifest.jsonl", name.to_string_lossy()),
+    );
+    let path = dir.parent().unwrap_or_else(|| Path::new(".")).join(name);
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{record}"));
+    match appended {
+        Ok(()) => info!(
+            target: "partial_stateless_stream",
+            path = %path.display(),
+            "Wrote the producer run manifest"
+        ),
+        Err(err) => warn!(
+            target: "partial_stateless_stream",
+            path = %path.display(),
+            %err,
+            "Could not write the producer run manifest; the run is unlabelled, not stopped"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -908,6 +1082,51 @@ mod tests {
     /// A commit before the checkpoint could never be replayed, because a driver has no state to
     /// replay it against. Recording it anyway would put unusable frames in a corpus whose whole
     /// purpose is to be replayable.
+
+    /// The power-loss profile still writes frames every reader decodes — the profile changes
+    /// durability, never bytes — and the directory sync count is the batching contract: one per
+    /// single-frame write, one behind a checkpoint's whole burst.
+    #[test]
+    fn the_fsync_profile_shares_one_directory_sync_per_checkpoint_burst() {
+        let dir = spool_dir("fsync-batch");
+        let mut recorder = StreamRecorder::for_tests_with_fsync(&dir, DEFAULT_BUFFER_MAX_FRAMES);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
+        let (_, _, after_manifest) = recorder.write_costs();
+        assert_eq!(after_manifest, 1, "a single-frame write syncs the directory once");
+
+        // 200 bytes at the 64-byte test chunk size: checkpoint + 4 chunks in one burst.
+        recorder.write_checkpoint(&checkpoint(), None, &[7u8; 200]);
+        let (_, _, after_checkpoint) = recorder.write_costs();
+        assert_eq!(
+            after_checkpoint,
+            after_manifest + 1,
+            "five frames in the burst, one directory sync behind them"
+        );
+        assert_eq!(
+            frames_in(&dir).len(),
+            6,
+            "manifest, checkpoint, and four chunks are all on disk and decodable"
+        );
+
+        recorder.write_reset(ResetReason::Gap, "single frame after the burst");
+        let (write_us, _, after_reset) = recorder.write_costs();
+        assert_eq!(after_reset, after_checkpoint + 1, "back to one sync per frame");
+        assert!(write_us > 0, "the write timer accumulated across the frames");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The profile flag is refused at startup on anything it cannot parse: a run configured with
+    /// a durability this build does not know must not silently run the default one.
+    #[test]
+    fn an_unknown_fsync_profile_is_a_startup_error() {
+        assert!(!parse_stream_fsync(None).expect("unset is the default profile"));
+        assert!(!parse_stream_fsync(Some("0")).expect("0 is the default profile"));
+        assert!(parse_stream_fsync(Some("1")).expect("1 is the power-loss profile"));
+        assert!(parse_stream_fsync(Some("yes")).is_err());
+    }
+
     #[test]
     fn commits_are_not_recorded_until_the_checkpoint_is() {
         let dir = spool_dir("before-checkpoint");

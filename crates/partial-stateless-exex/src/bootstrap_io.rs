@@ -51,6 +51,7 @@ pub fn export_snapshot(
     cache: &NetworkStateCache,
     ready: &ReadyParent,
     state_provider: &dyn StateProvider,
+    fsync: bool,
 ) -> eyre::Result<ExportedSnapshot> {
     let started = Instant::now();
     let mut proof_targets = 0usize;
@@ -77,7 +78,7 @@ pub fn export_snapshot(
     };
 
     let (package_path, checkpoint_path, package_bytes) =
-        write_snapshot(dir, &package, &checkpoint)?;
+        write_snapshot(dir, &package, &checkpoint, fsync)?;
 
     let exported = ExportedSnapshot {
         package,
@@ -119,9 +120,10 @@ pub fn export_snapshot_from_state(
     ready: &ReadyParent,
     config: &CacheConfig,
     state_provider: &dyn StateProvider,
+    fsync: bool,
 ) -> eyre::Result<ExportedSnapshot> {
     let cache = state.into_cache(config.account_policy(), config.storage_policy());
-    export_snapshot(dir, &cache, ready, state_provider)
+    export_snapshot(dir, &cache, ready, state_provider, fsync)
 }
 
 /// An export's outcome without its package: what the completion poll needs, and nothing that
@@ -156,19 +158,27 @@ impl From<ExportedSnapshot> for FinishedExport {
 }
 
 /// Writes a package and its checkpoint into `dir`, returning both paths and the package size.
+///
+/// `fsync` is the power-loss profile: both files are synced before their renames and the
+/// directory once after them, per §4.4's crash-durable recipe. Off, the default profile keeps
+/// the tmp+rename guarantee only.
 pub fn write_snapshot(
     dir: &Path,
     package: &CacheSnapshotPackage,
     checkpoint: &TrustedCheckpoint,
+    fsync: bool,
 ) -> eyre::Result<(PathBuf, PathBuf, usize)> {
     fs::create_dir_all(dir)?;
     let package_path = dir.join(PACKAGE_FILE);
     let checkpoint_path = dir.join(CHECKPOINT_FILE);
     let package_bytes = bincode::serialize(package)
         .map_err(|err| eyre::eyre!("failed to serialize snapshot package: {err}"))?;
-    write_atomically(&package_path, &package_bytes)?;
+    write_atomically(&package_path, &package_bytes, fsync)?;
     let stored = serde_json::to_vec_pretty(&StoredCheckpoint::from(checkpoint))?;
-    write_atomically(&checkpoint_path, &stored)?;
+    write_atomically(&checkpoint_path, &stored, fsync)?;
+    if fsync {
+        fs::File::open(dir)?.sync_all()?;
+    }
     Ok((package_path, checkpoint_path, package_bytes.len()))
 }
 
@@ -223,10 +233,17 @@ pub fn load_snapshot(
 ///
 /// This is not the crash-atomic joint persistence the durable checkpoint design calls for — that
 /// needs generation metadata across both caches — only enough that an interrupted export does not
-/// present a truncated package as a complete one.
-fn write_atomically(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
+/// present a truncated package as a complete one. With `fsync` the file is synced before the
+/// rename; the directory sync is the caller's, one behind whatever it wrote.
+fn write_atomically(path: &Path, bytes: &[u8], fsync: bool) -> eyre::Result<()> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)?;
+    if fsync {
+        let mut file = fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    } else {
+        fs::write(&temporary, bytes)?;
+    }
     fs::rename(&temporary, path)?;
     Ok(())
 }

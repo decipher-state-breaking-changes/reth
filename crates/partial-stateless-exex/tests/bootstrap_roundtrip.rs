@@ -32,7 +32,8 @@ fn a_written_snapshot_restores_the_same_ready_generation() {
     let checkpoint = checkpoint_for(&cache, &config, state_root);
     let package = CacheSnapshotPackage::from_cache(&cache, anchor_for(&checkpoint), &proof);
 
-    bootstrap_io::write_snapshot(&dir, &package, &checkpoint).expect("snapshot must be writable");
+    bootstrap_io::write_snapshot(&dir, &package, &checkpoint, false)
+        .expect("snapshot must be writable");
     let (loaded_package, loaded_checkpoint) = bootstrap_io::load_snapshot(&dir)
         .expect("reading back a snapshot this process just wrote must succeed")
         .expect("the directory holds a package");
@@ -64,7 +65,8 @@ fn a_checkpoint_naming_another_policy_is_refused_before_the_package_is_examined(
     let package = CacheSnapshotPackage::from_cache(&cache, anchor_for(&checkpoint), &proof);
     checkpoint.cache_policy_id = B256::repeat_byte(0x99);
 
-    bootstrap_io::write_snapshot(&dir, &package, &checkpoint).expect("snapshot must be writable");
+    bootstrap_io::write_snapshot(&dir, &package, &checkpoint, false)
+        .expect("snapshot must be writable");
     let (loaded_package, loaded_checkpoint) =
         bootstrap_io::load_snapshot(&dir).unwrap().expect("the directory holds a package");
 
@@ -99,7 +101,7 @@ fn a_package_without_its_checkpoint_is_an_error_rather_than_an_absence() {
     let (cache, proof, state_root) = warm_fixture(&config);
     let checkpoint = checkpoint_for(&cache, &config, state_root);
     let package = CacheSnapshotPackage::from_cache(&cache, anchor_for(&checkpoint), &proof);
-    bootstrap_io::write_snapshot(&dir, &package, &checkpoint).unwrap();
+    bootstrap_io::write_snapshot(&dir, &package, &checkpoint, false).unwrap();
     std::fs::remove_file(dir.join(bootstrap_io::CHECKPOINT_FILE)).unwrap();
 
     let error = bootstrap_io::load_snapshot(&dir)

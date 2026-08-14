@@ -46,7 +46,36 @@
 #                           the batch pass must report closed=false. Judged offline, separately
 #                           from the success gate. Adds --idle-timeout-secs 60 unless one is
 #                           passed.
-#     GATE_MIN_BLOCKS=N     minimum verified blocks (default 100 clean, 1 truncated).
+#     GATE_MODE=long        the S5 cohort run: clean's assertions minus the reorg-zero
+#                           requirement, because a run held open for many hours will legitimately
+#                           meet reorgs (roughly hourly at best) and clean would fail on the first
+#                           one. Reorg/revert counts are reported as observations; when any
+#                           occurred, every winning branch must have completed and (with
+#                           GATE_EXPECT_RECHECKPOINT=1) every recovery checkpoint must have been
+#                           skimmed and agreed with. A reorg past the retained generation's depth
+#                           is also an observation, not a failure: the follower must ask for a
+#                           snapshot and recover *continuously* from the producer's checkpoint —
+#                           what is asserted is that every NeedsSnapshot was answered that way,
+#                           never that none occurred. Default GATE_MIN_BLOCKS is 6000 — the
+#                           matrix-row-5 scale.
+#
+#                           Long refuses --max-blocks: a follower stopped by a block bound exits
+#                           before the producer's End, so the spool never closes and the batch
+#                           gate below could not run on a closed corpus. Instead the follower
+#                           runs unbounded while this script watches the verdict stream; when
+#                           GATE_MIN_BLOCKS live (tail_live) verdicts have been published it
+#                           SIGTERMs the producer named by GATE_PRODUCER_PID — or prints the
+#                           instruction to, if none was named — and the follower then consumes
+#                           the End(shutdown) the producer writes on its way out. On an already
+#                           closed corpus (the offline validation of this mode) the follower
+#                           simply reads to the End and exits: zero live verdicts, no signal.
+#                           GATE_REQUIRE_LIVE=1 additionally asserts the live count reached
+#                           GATE_MIN_BLOCKS — set it on the real capture cohort, where "live"
+#                           is the claim; leave it unset when validating offline.
+#     GATE_PRODUCER_PID=P   long only: the producer to SIGTERM when the live target is reached.
+#     GATE_REQUIRE_LIVE=1   long only: fail unless live (tail_live) verdicts >= GATE_MIN_BLOCKS.
+#     GATE_WATCH_SECS=N     long only: watcher poll interval (default 15).
+#     GATE_MIN_BLOCKS=N     minimum verified blocks (default 100 clean, 6000 long, 1 truncated).
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -61,10 +90,11 @@ shift 2
 GATE_MODE=${GATE_MODE:-clean}
 case "$GATE_MODE" in
     clean|reorg) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-100} ;;
+    long) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-6000} ;;
     resume|epoch) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
     truncated) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
     *)
-        echo "error: GATE_MODE must be clean, reorg, resume, epoch or truncated, not '$GATE_MODE'" >&2
+        echo "error: GATE_MODE must be clean, reorg, resume, epoch, long or truncated, not '$GATE_MODE'" >&2
         exit 64
         ;;
 esac
@@ -154,8 +184,41 @@ fi
 
 echo "==> live follow against $SPOOL_DIR (mode: $GATE_MODE, verdicts: $FOLLOW_JSON)"
 follow_code=0
-"$PS_REPLAY_BIN" --follow "$SPOOL_DIR" \
-    --json "$FOLLOW_JSON" --ack "$ACK_FILE" --label "s3-live-gate-$GATE_MODE" "$@" || follow_code=$?
+LIVE_VERDICTS=0
+if [ "$GATE_MODE" = "long" ]; then
+    if printf '%s\n' "$@" | grep -q -- '--max-blocks'; then
+        echo "error: GATE_MODE=long refuses --max-blocks — a block bound stops the follower" >&2
+        echo "       before the producer's End, so the spool never closes and the batch gate" >&2
+        echo "       cannot run. The watcher below bounds the run instead." >&2
+        exit 64
+    fi
+    "$PS_REPLAY_BIN" --follow "$SPOOL_DIR" \
+        --json "$FOLLOW_JSON" --ack "$ACK_FILE" --label "s3-live-gate-$GATE_MODE" "$@" &
+    follow_pid=$!
+    signaled=0
+    while kill -0 "$follow_pid" 2>/dev/null; do
+        LIVE_VERDICTS=$(grep -c '"tail_live":true' "$FOLLOW_JSON" 2>/dev/null || true)
+        LIVE_VERDICTS=${LIVE_VERDICTS:-0}
+        if [ "$signaled" -eq 0 ] && [ "$LIVE_VERDICTS" -ge "$GATE_MIN_BLOCKS" ]; then
+            signaled=1
+            if [ -n "${GATE_PRODUCER_PID:-}" ]; then
+                echo "==> $LIVE_VERDICTS live verdicts: SIGTERM to producer $GATE_PRODUCER_PID; waiting for End(shutdown)"
+                kill -TERM "$GATE_PRODUCER_PID" 2>/dev/null ||
+                    echo "warning: could not signal $GATE_PRODUCER_PID; stop the producer yourself" >&2
+            else
+                echo "==> $LIVE_VERDICTS live verdicts: target reached — SIGTERM the producer now;"
+                echo "    the follower exits when it consumes the End(shutdown) the producer writes"
+            fi
+        fi
+        sleep "${GATE_WATCH_SECS:-15}"
+    done
+    wait "$follow_pid" || follow_code=$?
+    LIVE_VERDICTS=$(grep -c '"tail_live":true' "$FOLLOW_JSON" 2>/dev/null || true)
+    LIVE_VERDICTS=${LIVE_VERDICTS:-0}
+else
+    "$PS_REPLAY_BIN" --follow "$SPOOL_DIR" \
+        --json "$FOLLOW_JSON" --ack "$ACK_FILE" --label "s3-live-gate-$GATE_MODE" "$@" || follow_code=$?
+fi
 echo "==> follow exit code: $follow_code (0 clean end, 1 disagreement/fault, 2 NeedsSnapshot, 3 ended before checkpoint, 4 idle timeout)"
 
 echo "==> batch re-replay of the same spool (the live stream and the corpus are the same bytes)"
@@ -199,15 +262,31 @@ check "$SUMMARY" "no disagreement" ".disagreements == 0"
 check "$SUMMARY" "no failure" ".failures == 0"
 check "$SUMMARY" "the follower itself agreed" ".agreed == true"
 check "$SUMMARY" "nothing in the recovery scan had to be refused" ".scan_refusals == 0"
+# Counter-first until the F1 cohort confirms it at scale; the gate holds it to zero meanwhile.
+# 424/424 both-recorded comparisons agreed on the s3/s4 corpora (72 s4 commits carried none).
+check "$SUMMARY" "the readiness watermarks agreed wherever both sides recorded one" \
+    "(.watermark_mismatches // 0) == 0"
 if [ "$GATE_MODE" != "epoch" ]; then
     # The second axis: agreeing on every block it looked at is not the same as having looked at
     # every canonical block, and only this distinguishes them. Not asserted in `epoch` mode —
     # there the discontinuity is the thing under test, and is judged as such below.
-    check "$SUMMARY" "exactly one restore, no NeedsSnapshot" \
-        ".restores == 1 and .needs_snapshot_entries == 0"
     check "$SUMMARY" "no canonical block went unverified" ".continuous == true"
     check "$SUMMARY" "every announced branch was delivered in full" ".winning_branches_incomplete == 0"
     check "$SUMMARY" "no recovery landed somewhere it did not ask for" ".restores_reset == 0"
+    if [ "$GATE_MODE" = "long" ]; then
+        # A cohort held open for many hours may meet a reorg past the retained generation's
+        # depth. That is the chain behaving normally and the DB-free design recovering as
+        # designed: NeedsSnapshot, then the producer's recovery checkpoint, restored on the
+        # exact block it asked for. So long does not require zero entries — it requires every
+        # entry answered by a continuous restore (the bootstrap restore is the +1), and none
+        # left pending at the end, which the equality catches: an unanswered entry leaves
+        # `restores` one short.
+        check "$SUMMARY" "every NeedsSnapshot was answered by a continuous restore" \
+            ".restores == 1 + .needs_snapshot_entries and .restores_continuous == .needs_snapshot_entries"
+    else
+        check "$SUMMARY" "exactly one restore, no NeedsSnapshot" \
+            ".restores == 1 and .needs_snapshot_entries == 0"
+    fi
 fi
 case "$GATE_MODE" in
     clean)
@@ -219,6 +298,29 @@ case "$GATE_MODE" in
         # undo a reorg is a different claim and is judged under GATE_MODE=reorg.
         check "$SUMMARY" "the chain never moved under this run" \
             '.reorgs_applied == 0 and .reverts_applied == 0'
+        ;;
+    long)
+        [ "$follow_code" -eq 0 ] && echo "  ok: follow exit 0" || { echo "  FAIL: follow exit $follow_code, wanted 0" >&2; FAILED=1; }
+        check "$SUMMARY" "the stream closed as End(shutdown)" \
+            '.outcome == "ended" and .end_kind == "shutdown" and .before_checkpoint == false'
+        # Reorgs are observations here, not failures: a cohort held open for a day meets the
+        # chain as it is. What is asserted is that every one it met was handled — in place at
+        # depth 1, by a continuous checkpoint restore past it (the common checks above).
+        LIFECYCLE=$(printf '%s' "$SUMMARY" | jq -r '"reorgs=\(.reorgs_applied) reverts=\(.reverts_applied) skimmed=\(.checkpoints_skimmed) needs_snapshot=\(.needs_snapshot_entries) latency_anomalies=\(.latency_anomalies // 0) timing_anomalies=\(.timing_anomalies // 0)"')
+        echo "  observed: $LIFECYCLE"
+        echo "  observed: live(tail_live) verdicts=$LIVE_VERDICTS of $GATE_MIN_BLOCKS wanted"
+        if [ "${GATE_REQUIRE_LIVE:-0}" = "1" ]; then
+            if [ "$LIVE_VERDICTS" -ge "$GATE_MIN_BLOCKS" ]; then
+                echo "  ok: the live capture reached its target"
+            else
+                echo "  FAIL: only $LIVE_VERDICTS live verdicts; the capture claim needs $GATE_MIN_BLOCKS" >&2
+                FAILED=1
+            fi
+        fi
+        if [ "${GATE_EXPECT_RECHECKPOINT:-0}" = "1" ]; then
+            check "$SUMMARY" "every applied reorg/revert had its recovery checkpoint skimmed" \
+                '.checkpoints_skimmed >= (.reorgs_applied + .reverts_applied)'
+        fi
         ;;
     reorg)
         [ "$follow_code" -eq 0 ] && echo "  ok: follow exit 0" || { echo "  FAIL: follow exit $follow_code, wanted 0" >&2; FAILED=1; }
@@ -296,6 +398,48 @@ case "$GATE_MODE" in
         ;;
 esac
 
+if [ "$GATE_MODE" = "clean" ] || [ "$GATE_MODE" = "reorg" ] || [ "$GATE_MODE" = "long" ]; then
+    echo "==> judging the verdict instrumentation (S5a)"
+    # The never-null trio on every non-catch-up verdict: the primary, its transport cost, and
+    # its phases — valid on backlog frames too, because validation and delivery really ran.
+    UNINSTRUMENTED=$(jq -r 'select(.kind == "verdict" and .catch_up == false and
+        ((.standalone_validation_us == null) or (.delivery_us == null) or (.phases == null))) |
+        .sequence' "$FOLLOW_JSON" 2>/dev/null | wc -l)
+    if [ "$UNINSTRUMENTED" -eq 0 ]; then
+        echo "  ok: every verdict carries the S5 boundaries and phases"
+    else
+        echo "  FAIL: $UNINSTRUMENTED verdicts are missing S5 timing fields" >&2
+        FAILED=1
+    fi
+    # Latency exists only on live-tail verdicts (backlog mtime distance is history, not a wait),
+    # and a clock anomaly nulls it by design and is counted.
+    NO_LATENCY=$(jq -r 'select(.kind == "verdict" and .catch_up == false and .tail_live == true
+        and .decision_latency_us == null) | .sequence' "$FOLLOW_JSON" 2>/dev/null | wc -l)
+    ANOMALIES=$(printf '%s' "$SUMMARY" | jq -r '.latency_anomalies // 0')
+    if [ "$NO_LATENCY" -le "$ANOMALIES" ]; then
+        echo "  ok: live latency nulls ($NO_LATENCY) are within the counted anomalies ($ANOMALIES)"
+    else
+        echo "  FAIL: $NO_LATENCY live verdicts lack latency with only $ANOMALIES anomalies counted" >&2
+        FAILED=1
+    fi
+    echo "==> judging the run manifest (S5e)"
+    MANIFEST_LINE=$(grep '"kind":"run_manifest"' "$FOLLOW_JSON" 2>/dev/null | head -1 || true)
+    if [ -n "$MANIFEST_LINE" ]; then
+        echo "  ok: the follower stamped a run manifest"
+        if [ "$GATE_MODE" = "long" ]; then
+            # A cohort is code-freeze evidence only if its binary can say what it was built
+            # from: a null commit or a dirty tree makes the record unattributable, so long
+            # requires the build to have been stamped (export PS_BUILD_COMMIT/PS_BUILD_DIRTY/
+            # PS_CARGO_LOCK_SHA256 before cargo build — the runbook's build step does).
+            check "$MANIFEST_LINE" "the manifest pins a commit from a clean tree" \
+                '.provenance.build_commit != null and .provenance.build_dirty == false'
+        fi
+    else
+        echo "  FAIL: no run_manifest line in $FOLLOW_JSON" >&2
+        FAILED=1
+    fi
+fi
+
 echo "==> judging the batch record"
 if [ "$GATE_MODE" = "epoch" ]; then
     # A two-epoch corpus is *not* continuous, and the batch CLI exits non-zero for exactly that
@@ -324,6 +468,10 @@ case "$GATE_MODE" in
         # is the conclusion, which is what the axes above assert.
         check "$BATCH" "batch replayed the reorg rather than past it" ".reorgs_applied + .reverts_applied >= 1"
         check "$BATCH" "batch reached the end of the corpus" ".complete == true and .closed == true"
+        ;;
+    long)
+        check "$BATCH" "batch reached the end of the corpus" ".complete == true and .closed == true"
+        echo "  observed: batch reorgs=$(printf '%s' "$BATCH" | jq -r '.reorgs_applied') reverts=$(printf '%s' "$BATCH" | jq -r '.reverts_applied')"
         ;;
     resume)
         # The corpus is one stream whichever way it is read, so a batch replay of it has to reach

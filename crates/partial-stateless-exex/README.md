@@ -193,7 +193,18 @@ variables, so the core sidecar generation path stays lean:
 | `PS_BOOTSTRAP_DIR=<dir>` | where the snapshot package and its checkpoint live (default: `$PS_SIDECAR_DIR/bootstrap`) |
 | `PS_BOOTSTRAP_EXPORT=1` | export a snapshot the first time the tracker reaches Ready |
 | `PS_BOOTSTRAP_IMPORT=1` | restore from a snapshot at startup, ahead of the persisted flat cache |
-| `PS_BOOTSTRAP_SELF_TEST=<n>` | export at the first Ready, restore a second pair in-process, and compare both pairs for the next `n` blocks (implies export) |
+| `PS_BOOTSTRAP_SELF_TEST=<n>` | export at the first Ready, restore a second pair in-process, and compare both pairs for the next `n` blocks (implies export; incompatible with `PS_STREAM_DIR`) |
+| `PS_STREAM_DIR=<dir>` | record the event stream (manifest, checkpoint + snapshot chunks, commits, lifecycle frames) into `<dir>` as a live spool `ps-replay` can follow; implies the snapshot export. A run manifest with build/host provenance is appended beside the spool as `<dir>.run-manifest.jsonl` |
+| `PS_STREAM_RESUME=1` | continue a non-empty spool as a new epoch after reading and checking every frame already in it (default: a non-empty spool is refused) |
+| `PS_STREAM_FSYNC=0\|1` | `1` selects the power-loss durability profile: every frame is fsynced before its rename and the spool directory after it (one directory sync per checkpoint burst), and snapshot packages likewise. Default `0` keeps tmp+rename — durable across a process restart only. Anything else is a startup error |
+| `PS_STREAM_PRODUCER=<name>` | producer identity stamped into the manifest (default: crate name + version) |
+| `PS_STREAM_CHUNK_BYTES=<n>` | snapshot chunk size in the spool (default: 8 MiB) |
+| `PS_STREAM_BUFFER_MAX_BYTES` / `PS_STREAM_BUFFER_MAX_FRAMES` | bounds on frames buffered while the snapshot export runs; overflow drops the buffer whole and fails the attempt (defaults: 256 MiB / 128) |
+| `PS_STREAM_MAX_SPOOL_BYTES` / `PS_STREAM_MAX_SPOOL_FRAMES` | spool ceilings; reaching one closes the stream with `End(spool_limit)` (defaults: 64 GiB / 100000) |
+| `PS_STREAM_EXPORT_RETRIES=<n>` | fresh export attempts after a genuine failure; a reorg fence does not consume one (default: 1) |
+| `PS_STREAM_EXPORT_MAX_WORKERS=<n>` | live export workers allowed at once, abandoned ones included — each holds an MDBX read transaction for its whole multiproof. At the cap a fresh attempt waits for a slot; invalid values are a startup error (default: 4) |
+| `PS_STREAM_REORG_CHECKPOINT=always\|never` | whether a branch change re-checkpoints the open stream at the block it recovered to (default: `always`; anything else is a startup error) |
+| `PS_BUILD_COMMIT` / `PS_BUILD_DIRTY` / `PS_CARGO_LOCK_SHA256` | **compile-time**, not runtime: exported before `cargo build`, read by `option_env!`, and baked into the binary so its run manifests can name their own build (`git rev-parse HEAD`, `0`/`1` tree dirtiness, `sha256sum Cargo.lock`). Unset builds stamp `null` plus a note; the long gate requires a non-null commit from a clean tree |
 
 The initial parallel-proof gate currently requires at least two distinct storage tries and 64
 total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number

@@ -20,9 +20,11 @@
 use crate::{
     driver::{
         chain_spec_for, config_for, cross_check_recovery_checkpoint, decode_accepted_head,
-        replay_commit, restore, CommitOutcome, ReplayOptions, ReplayReport, ReplayState,
+        replay_commit, restore, BlockTiming, CommitOutcome, FrameCosts, ReplayOptions,
+        ReplayReport, ReplayState,
     },
     reorg::{apply_reorg, check_shape, warn_inapplicable, ReorgOutcome},
+    spool::SpooledFrame,
     tail::{SpoolTail, TailEvent, TailFault},
 };
 use alloy_primitives::{Keccak256, B256};
@@ -61,6 +63,11 @@ pub struct FollowOptions {
     pub verdicts: Option<PathBuf>,
     /// Atomically rewritten consumer watermark, outside the spool directory.
     pub ack: Option<PathBuf>,
+    /// The power-loss profile for the ack: fsync it before its rename and its directory after.
+    ///
+    /// Off by default for the same reason the producer's `PS_STREAM_FSYNC` is: durability past a
+    /// process restart is a semantics choice with a measured price, not a free upgrade.
+    pub ack_fsync: bool,
     /// Start from the watermark the ack file records instead of from the stream's first frame.
     pub resume: bool,
     /// Label stamped into every record.
@@ -78,6 +85,7 @@ impl Default for FollowOptions {
             reexec_limits: SidecarReexecLimits::default(),
             verdicts: None,
             ack: None,
+            ack_fsync: false,
             resume: false,
             label: "unlabelled".to_string(),
         }
@@ -220,6 +228,16 @@ pub struct FollowReport {
     pub resumed_from: Option<u64>,
     /// Canonical intervals no verdict covers, in the order they opened.
     pub unverified_intervals: Vec<(u64, u64)>,
+    /// Clock readings that went backwards while deriving mtime-based latency fields.
+    ///
+    /// Counted rather than clamped: a clamped zero would enter the latency distribution as an
+    /// excellent measurement, and an anomaly is a fact about the measurement, not a sample.
+    pub latency_anomalies: u64,
+    /// Per-verdict cost of writing the verdict line — the publication half `decision_latency_us`
+    /// cannot carry, reported as its own distribution in the summary.
+    pub verdict_write_us: Vec<u64>,
+    /// Per-verdict cost of writing the ack, sampled only when one was actually written.
+    pub ack_write_us: Vec<u64>,
 }
 
 impl FollowReport {
@@ -483,6 +501,27 @@ struct Follower<'a> {
     last_needs_snapshot: Option<NeedsSnapshotReason>,
     last_verified: Option<BlockRef>,
     last_frame_at: Instant,
+    /// Read and decode costs of the frame currently being handled, for the verdict line.
+    last_frame_costs: Option<FrameCosts>,
+    /// The current frame's mtime — the producer's write instant on this host's clock, an
+    /// availability *proxy* whose derived fields are labelled `available_at_source: "mtime"`.
+    last_frame_available: Option<SystemTime>,
+    /// Read-attempt start minus availability for the current frame, when it was consumed live
+    /// and both clocks cooperated.
+    last_queue_wait_us: Option<u64>,
+    /// Whether the follower has observed the spool's live tail — an empty poll — at least once.
+    ///
+    /// Until it has, every frame it reads was sitting in the spool before this run got to it:
+    /// backlog, not live delivery. An mtime-derived wait on such a frame measures the backlog's
+    /// age, not the transport, so the latency fields stay null and the verdict line says
+    /// `tail_live: false`. This is a fact about *this run's position*, not about the frames —
+    /// a fresh (non-resume) follower re-reading an old spool gets `false` all the way through.
+    reached_tail: bool,
+    /// Whether the current frame was consumed live — read after the tail had been reached.
+    last_frame_live: bool,
+    /// Clock readings that went backwards. Counted rather than clamped: a clamped zero would
+    /// read as an excellent latency, and an anomaly is a fact about the measurement.
+    latency_anomalies: u64,
 }
 
 impl<'a> Follower<'a> {
@@ -523,6 +562,12 @@ impl<'a> Follower<'a> {
             last_needs_snapshot: None,
             last_verified: None,
             last_frame_at: Instant::now(),
+            last_frame_costs: None,
+            last_frame_available: None,
+            last_queue_wait_us: None,
+            reached_tail: false,
+            last_frame_live: false,
+            latency_anomalies: 0,
         })
     }
 
@@ -541,6 +586,7 @@ impl<'a> Follower<'a> {
                         self.last_frame_at = Instant::now();
                         let frame = *frame;
                         let sequence = frame.header.sequence;
+                        self.note_frame_costs(&frame);
                         let step = self.handle(sequence, frame.event)?;
                         match self.catch_up_until {
                             // The frame the previous run stopped at has now been re-derived, and
@@ -556,7 +602,13 @@ impl<'a> Follower<'a> {
                             _ => step,
                         }
                     }
-                    Ok(TailEvent::Idle) => self.idle(),
+                    Ok(TailEvent::Idle) => {
+                        // The one observation that separates backlog from live delivery: the
+                        // spool had nothing new, so every frame from here on arrived while this
+                        // follower was already waiting for it.
+                        self.reached_tail = true;
+                        self.idle()
+                    }
                     Err(fault) => self.tail_fault(fault)?,
                 }
             };
@@ -981,11 +1033,19 @@ impl<'a> Follower<'a> {
                 }
 
                 let before_disagreements = self.replay.disagreements.len();
+                let producer_durability_watermark = oracle.durability_watermark;
+                let costs = self.last_frame_costs.unwrap_or(FrameCosts {
+                    sequence,
+                    delivery_us: None,
+                    frame_decode_us: None,
+                    validation_open: None,
+                });
                 let outcome = replay_commit(
                     &mut state,
                     input,
                     &oracle,
                     &self.replay_options,
+                    costs,
                     &mut self.replay,
                 );
                 let new_disagreements = self.replay.disagreements.len() - before_disagreements;
@@ -1002,14 +1062,21 @@ impl<'a> Follower<'a> {
                             self.blocks_verified += 1;
                         }
                         self.last_verified = Some(block);
+                        let (queue_wait_us, decision_latency_us, available_at_source) =
+                            self.latency_fields(catch_up);
                         self.sink.verdict(Published {
                             verdict,
                             block,
                             sequence,
                             provenance,
                             disagreements: new_disagreements,
-                            replay: &self.replay,
                             catch_up,
+                            timing: attempt_timing(&self.replay, sequence),
+                            tail_live: self.last_frame_live && !catch_up,
+                            queue_wait_us,
+                            decision_latency_us,
+                            available_at_source,
+                            producer_durability_watermark,
                         })?;
                         // The producer named the block that completes the branch it moved to.
                         // Reaching that height with a different hash means the frame and the
@@ -1055,14 +1122,22 @@ impl<'a> Follower<'a> {
                             .last()
                             .cloned()
                             .unwrap_or_else(|| format!("block {} was rejected", block.number));
+                        let catch_up = self.catch_up_until.is_some();
+                        let (queue_wait_us, decision_latency_us, available_at_source) =
+                            self.latency_fields(catch_up);
                         self.sink.verdict(Published {
                             verdict: "rejected",
                             block,
                             sequence,
                             provenance,
                             disagreements: new_disagreements,
-                            replay: &self.replay,
-                            catch_up: self.catch_up_until.is_some(),
+                            catch_up,
+                            timing: attempt_timing(&self.replay, sequence),
+                            tail_live: self.last_frame_live && !catch_up,
+                            queue_wait_us,
+                            decision_latency_us,
+                            available_at_source,
+                            producer_durability_watermark,
                         })?;
                         self.sink.state(
                             "faulted",
@@ -1074,14 +1149,22 @@ impl<'a> Follower<'a> {
                     }
                     CommitOutcome::Fault(fault) => {
                         let detail = fault.to_string();
+                        let catch_up = self.catch_up_until.is_some();
+                        let (queue_wait_us, decision_latency_us, available_at_source) =
+                            self.latency_fields(catch_up);
                         self.sink.verdict(Published {
                             verdict: "fault",
                             block,
                             sequence,
                             provenance,
                             disagreements: new_disagreements,
-                            replay: &self.replay,
-                            catch_up: self.catch_up_until.is_some(),
+                            catch_up,
+                            timing: attempt_timing(&self.replay, sequence),
+                            tail_live: self.last_frame_live && !catch_up,
+                            queue_wait_us,
+                            decision_latency_us,
+                            available_at_source,
+                            producer_durability_watermark,
                         })?;
                         self.sink.state("faulted", "fault", &detail, self.last_verified)?;
                         error!(
@@ -1851,6 +1934,57 @@ impl<'a> Follower<'a> {
         Ok(self.enter_needs_snapshot(manifest, reason, &detail, scan_from, None))
     }
 
+    /// Stashes the frame's read costs and availability proxy for the verdict line it may become.
+    ///
+    /// Queue wait is the read attempt's *start* minus the file's mtime, both on this host's
+    /// clock — the wait alone, with the read and decode costs (reported as their own fields)
+    /// excluded rather than double-counted into it. The mtime lands on the producer's tmp write
+    /// — a rename before visibility — so this is a labelled proxy; a reading that goes backwards
+    /// is counted as an anomaly rather than clamped into a zero that would read as an excellent
+    /// latency. Frames consumed before the tail was reached are backlog: their mtime distance is
+    /// the backlog's age, not a wait, so the field stays null and nothing is counted.
+    fn note_frame_costs(&mut self, frame: &SpooledFrame) {
+        self.last_frame_costs = Some(FrameCosts::of(frame));
+        self.last_frame_available = frame.modified;
+        self.last_frame_live = self.reached_tail;
+        self.last_queue_wait_us = match (self.reached_tail, frame.modified) {
+            (true, Some(available)) => match frame.read_at.duration_since(available) {
+                Ok(waited) => Some(waited.as_micros() as u64),
+                Err(_) => {
+                    self.latency_anomalies += 1;
+                    None
+                }
+            },
+            _ => None,
+        };
+    }
+
+    /// The mtime-derived latency fields for one verdict, or nulls where they would mislead.
+    ///
+    /// A catch-up verdict re-derives a frame written long ago, and a backlog frame (read before
+    /// this run ever saw the live tail) predates the run itself: for both, the mtime distance is
+    /// history, not latency. Live verdicts get queue wait (captured at the read attempt) and
+    /// available-to-decision latency, computed here — after the verdict is decided, before its
+    /// record and ack are written. Publication costs are measured separately by the sink; a
+    /// record cannot carry the cost of writing itself.
+    fn latency_fields(
+        &mut self,
+        catch_up: bool,
+    ) -> (Option<u64>, Option<u64>, Option<&'static str>) {
+        if catch_up || !self.last_frame_live {
+            return (None, None, None)
+        }
+        let Some(available) = self.last_frame_available else { return (None, None, None) };
+        let latency = match SystemTime::now().duration_since(available) {
+            Ok(elapsed) => Some(elapsed.as_micros() as u64),
+            Err(_) => {
+                self.latency_anomalies += 1;
+                None
+            }
+        };
+        (self.last_queue_wait_us, latency, Some("mtime"))
+    }
+
     /// Nothing new: sleep one poll, or stop if the harness bounded the wait.
     fn idle(&mut self) -> Step {
         if self.options.idle_timeout.is_some_and(|bound| self.last_frame_at.elapsed() >= bound) {
@@ -1882,6 +2016,8 @@ impl<'a> Follower<'a> {
         if let Err(err) = self.sink.ack_state(&outcome, waiting, self.last_verified, &self.tail) {
             warn!(target: "ps_follow", error = %err, "Could not write the final ack");
         }
+        let verdict_write_us = std::mem::take(&mut self.sink.verdict_write_us);
+        let ack_write_us = std::mem::take(&mut self.sink.ack_write_us);
         FollowReport {
             outcome,
             replay: self.replay,
@@ -1903,6 +2039,9 @@ impl<'a> Follower<'a> {
             catch_up_blocks: self.catch_up_blocks,
             resumed_from: self.resumed_from,
             unverified_intervals: self.unverified_intervals,
+            latency_anomalies: self.latency_anomalies,
+            verdict_write_us,
+            ack_write_us,
         }
     }
 }
@@ -1914,15 +2053,42 @@ struct Published<'a> {
     sequence: u64,
     provenance: PayloadProvenance,
     disagreements: usize,
-    replay: &'a ReplayReport,
     /// Re-derived on the way back to a watermark rather than verified for the first time.
     catch_up: bool,
+    /// This attempt's timing entry, matched by sequence.
+    timing: Option<&'a BlockTiming>,
+    /// Whether the frame was consumed live — read after this run had observed the spool's tail.
+    /// False marks backlog: the frame predates the run, so its mtime distance is not a wait.
+    tail_live: bool,
+    /// Read-attempt start minus the frame's mtime. `None` on catch-up, on backlog, and when the
+    /// clock misbehaved.
+    queue_wait_us: Option<u64>,
+    /// Decision-ready minus the frame's mtime: delivery and validation included, the writing of
+    /// this very record and its ack excluded — a record cannot carry the cost of writing itself.
+    /// Publication costs are the sink's separately-reported distributions. Same nulls.
+    decision_latency_us: Option<u64>,
+    /// What "available" was measured from — `"mtime"` on the file spool. Named so a reader never
+    /// pools distributions taken from different clocks.
+    available_at_source: Option<&'static str>,
+    /// The producer's recorded durability watermark. Telemetry only: the consumer persists
+    /// nothing to compare it against, it regresses legitimately on a pure revert, and a bare
+    /// number cannot name its branch — so it is surfaced, never judged.
+    producer_durability_watermark: Option<u64>,
+}
+
+/// The timing entry `replay_commit` pushed for this attempt.
+///
+/// `replay_commit` finishes exactly one entry per call, so the last one is this attempt's; the
+/// sequence filter is a guard against that contract drifting, not a search.
+fn attempt_timing(replay: &ReplayReport, sequence: u64) -> Option<&BlockTiming> {
+    replay.blocks.last().filter(|timing| timing.sequence == sequence)
 }
 
 /// The follower's outputs: a JSONL verdict stream and an atomically rewritten ack file.
 struct VerdictSink {
     verdicts: Option<std::fs::File>,
     ack: Option<PathBuf>,
+    ack_fsync: bool,
     label: String,
     last_state: &'static str,
     /// Highest sequence any ack has claimed, so a catch-up cannot walk the watermark backwards.
@@ -1935,6 +2101,13 @@ struct VerdictSink {
     ack_reason: Option<&'static str>,
     ack_restored_from: Option<u64>,
     ack_target: Option<BlockRef>,
+    /// Per-verdict cost of serializing and writing the verdict line, in file order.
+    ///
+    /// The publication half `decision_latency_us` cannot carry: the line is already written when
+    /// the cost is known. Reported as a distribution in the run summary instead.
+    verdict_write_us: Vec<u64>,
+    /// Per-verdict cost of writing the ack, sampled only when one was actually written.
+    ack_write_us: Vec<u64>,
 }
 
 impl VerdictSink {
@@ -1952,6 +2125,7 @@ impl VerdictSink {
         Ok(Self {
             verdicts,
             ack: options.ack.clone(),
+            ack_fsync: options.ack_fsync,
             label: options.label.clone(),
             last_state: "starting",
             ack_high_water: None,
@@ -1960,19 +2134,37 @@ impl VerdictSink {
             ack_reason: None,
             ack_restored_from: None,
             ack_target: None,
+            verdict_write_us: Vec::new(),
+            ack_write_us: Vec::new(),
         })
     }
 
-    /// One verdict line per block. The S5 timing boundaries are laid as `null` rather than
-    /// guessed: `delivery_us` and `observed_verdict_latency_us` are measurement disciplines this
-    /// phase does not claim.
+    /// One verdict line per block, carrying the S5 boundaries: the validation primary and its
+    /// disjoint phases from the attempt's timing entry, delivery as transport cost beside them,
+    /// and the mtime-proxied latency fields with their source named.
+    ///
+    /// The write of the line itself and of the ack after it are timed into the sink's own
+    /// publication-cost samples — they cannot land in this record, which is already written when
+    /// they finish, and pretending `decision_latency_us` covered them would misname its endpoint.
     fn verdict(&mut self, published: Published<'_>) -> eyre::Result<()> {
-        let Published { verdict, block, sequence, provenance, disagreements, replay, catch_up } =
-            published;
+        let Published {
+            verdict,
+            block,
+            sequence,
+            provenance,
+            disagreements,
+            catch_up,
+            timing,
+            tail_live,
+            queue_wait_us,
+            decision_latency_us,
+            available_at_source,
+            producer_durability_watermark,
+        } = published;
         self.last_state = "streaming";
-        let timing = replay.blocks.last().filter(|timing| timing.number == block.number);
+        let write_started = Instant::now();
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "verdict",
             "label": self.label,
@@ -1982,17 +2174,40 @@ impl VerdictSink {
             "verdict": verdict,
             "payload_provenance": provenance.as_str(),
             "disagreements": disagreements,
-            "admission_us": timing.map(|timing| timing.admission_us),
-            "transition_us": timing.map(|timing| timing.transition_us),
-            "delivery_us": serde_json::Value::Null,
-            "observed_verdict_latency_us": serde_json::Value::Null,
+            "admission_us": timing.and_then(|timing| timing.admission_us),
+            "transition_us": timing.and_then(|timing| timing.transition_us),
+            "standalone_validation_us": timing.map(|timing| timing.standalone_validation_us),
+            "delivery_us": timing.and_then(|timing| timing.delivery_us),
+            "queue_wait_us": queue_wait_us,
+            "decision_latency_us": decision_latency_us,
+            "available_at_source": available_at_source,
+            "producer_durability_watermark": producer_durability_watermark,
+            "oracle_compare_us": timing.and_then(|timing| timing.oracle_compare_us),
+            "mutation_check_us": timing.and_then(|timing| timing.mutation_check_us),
+            "unattributed_validation_us": timing.map(|timing| timing.unattributed_validation_us),
+            "phases": timing.map(|timing| timing.phases),
+            "derived": timing.map(|timing| timing.derived),
+            "details": timing.and_then(|timing| timing.details.as_deref()),
             // A verdict this run re-derived on its way back to a watermark a previous run left.
             // Labelled rather than withheld: the line is real evidence that the two runs agreed
             // on the block, and a reader aggregating live throughput has to be able to skip it.
             "catch_up": catch_up,
+            // Read after this run had already observed the spool's tail. False is backlog: a
+            // frame that predates the run, whose mtime-derived fields are null by construction.
+            "tail_live": tail_live,
             "observed_at_ms": now_ms(),
         }))?;
-        self.write_ack(sequence, Some(block), "streaming")
+        self.verdict_write_us.push(write_started.elapsed().as_micros() as u64);
+        // Sampled only when an ack will actually be written; timing a no-op would fill the
+        // distribution with zeros that read as free publication.
+        if self.ack.is_some() && !self.suppress_ack {
+            let ack_started = Instant::now();
+            self.write_ack(sequence, Some(block), "streaming")?;
+            self.ack_write_us.push(ack_started.elapsed().as_micros() as u64);
+            Ok(())
+        } else {
+            self.write_ack(sequence, Some(block), "streaming")
+        }
     }
 
     /// One line per state transition, so the record shows *when* verdicts stopped.
@@ -2019,7 +2234,7 @@ impl VerdictSink {
         // block the previous run had already refused to stand on.
         self.write_ack(last_sequence, last_verified, "needs_snapshot")?;
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "state",
             "label": self.label,
@@ -2056,7 +2271,7 @@ impl VerdictSink {
             _ => None,
         };
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "state",
             "label": self.label,
@@ -2074,13 +2289,15 @@ impl VerdictSink {
     /// A recovery checkpoint compared against the pair this follower already holds, and skipped.
     fn skimmed(&mut self, block: BlockRef, sequence: u64) -> eyre::Result<()> {
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "skimmed",
             "label": self.label,
             "block": block.number,
             "block_hash": format!("{:?}", block.hash),
             "sequence": sequence,
+            // The unified name; `timestamp_ms` stays one release so nothing parsing v1 breaks.
+            "observed_at_ms": now_ms(),
             "timestamp_ms": now_ms(),
         }))
     }
@@ -2097,13 +2314,14 @@ impl VerdictSink {
         detail: &str,
     ) -> eyre::Result<()> {
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "scan_refused",
             "label": self.label,
             "sequence": sequence,
             "frame": frame,
             "detail": detail,
+            "observed_at_ms": now_ms(),
             "timestamp_ms": now_ms(),
         }))
     }
@@ -2122,7 +2340,7 @@ impl VerdictSink {
         last_verified: Option<BlockRef>,
     ) -> eyre::Result<()> {
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "lifecycle",
             "label": self.label,
@@ -2149,7 +2367,7 @@ impl VerdictSink {
     ) -> eyre::Result<()> {
         self.last_state = state;
         self.write(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "standalone_follow_v1",
             "kind": "state",
             "label": self.label,
@@ -2228,9 +2446,33 @@ impl VerdictSink {
             "observed_at_ms": now_ms(),
         });
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, record.to_string())?;
-        std::fs::rename(&temporary, path)?;
+        if self.ack_fsync {
+            // §4.4's crash-durable recipe, on the one file a restart trusts: tmp, fsync, rename,
+            // parent-directory fsync. Without it the ack is durable across a process restart
+            // only, which is exactly what exit gate 8's wording scopes.
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(record.to_string().as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            std::fs::File::open(durable_parent_of(path))?.sync_all()?;
+        } else {
+            std::fs::write(&temporary, record.to_string())?;
+            std::fs::rename(&temporary, path)?;
+        }
         Ok(())
+    }
+}
+
+/// The directory whose fsync makes a rename of `path` durable.
+///
+/// A bare relative path like `ack.json` has an *empty* parent, and skipping the directory sync on
+/// it would quietly drop the one step §4.4's recipe exists for — so the empty parent resolves to
+/// `"."`, the working directory the rename actually landed in.
+fn durable_parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
@@ -2247,5 +2489,20 @@ const fn kind_of(event: &StreamEvent) -> FrameKind {
         StreamEvent::Reorg(_) => FrameKind::Reorg,
         StreamEvent::Reset(_) => FrameKind::Reset,
         StreamEvent::End(_) => FrameKind::End,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::durable_parent_of;
+    use std::path::Path;
+
+    /// The defect this pins down: a bare relative ack path has an empty parent, and an empty
+    /// parent silently skipped the directory fsync that makes the rename durable.
+    #[test]
+    fn a_bare_relative_ack_path_still_names_a_directory_to_sync() {
+        assert_eq!(durable_parent_of(Path::new("ack.json")), Path::new("."));
+        assert_eq!(durable_parent_of(Path::new("out/ack.json")), Path::new("out"));
+        assert_eq!(durable_parent_of(Path::new("/tmp/ack.json")), Path::new("/tmp"));
     }
 }

@@ -2,10 +2,13 @@
 //!
 //! A file spool and a socket carry the **same frame bytes**. That is not tidiness: a recorded
 //! corpus in a format the live path never uses would be a corpus that proves nothing about the
-//! live path, and a live failure would be unreproducible by construction. So this crate defines
-//! bytes and nothing else — there is no producer and no consumer here, and no filesystem or
-//! socket code. What it exports is an envelope, seven frame kinds covering the six events S3 and
-//! S4 need, and one structural guarantee.
+//! live path, and a live failure would be unreproducible by construction. So the format modules
+//! define bytes and nothing else — there is no producer and no consumer here, and no filesystem
+//! or socket code. What they export is an envelope, seven frame kinds covering the six events S3
+//! and S4 need, and one structural guarantee. The one deliberate exception sits beside the format
+//! rather than in it: [`provenance`] collects a best-effort run manifest, framed by nothing and
+//! carried by no frame, and lives here only because this is the one crate both ends of the stream
+//! already share.
 //!
 //! **The structural guarantee is the oracle split.** A commit frame carries the recording
 //! producer's own outcome for its block, and that outcome must never become an input to the
@@ -32,6 +35,7 @@
 pub mod event;
 pub mod frame;
 pub mod oracle;
+pub mod provenance;
 
 pub use event::{
     BlockRef, Checkpoint, CommitFrame, CommitInput, End, EndKind, Manifest, ManifestError, Reorg,
@@ -44,6 +48,7 @@ pub use frame::{
     FORMAT_VERSION, FRAME_HEADER_BYTES, FRAME_MAGIC,
 };
 pub use oracle::{CommitOracle, RecordedVerdict};
+pub use provenance::{BuildStamp, RunProvenance};
 
 /// Decodes one frame into the event its kind names.
 ///
