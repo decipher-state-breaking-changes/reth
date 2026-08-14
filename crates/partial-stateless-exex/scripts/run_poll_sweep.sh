@@ -100,14 +100,21 @@ for ms in (200, 25, 5):
         m = re.search(rf"{name}.*?([\d.]+)$", timing, re.M)
         return float(m.group(1)) if m else None
     user, system = clock("User time"), clock("System time")
-    # /usr/bin/time prints h:mm:ss past an hour and m:ss.cs below one; both parse here.
-    wall_match = re.search(
-        r"Elapsed \(wall clock\)[^:]*:\s*(?:(\d+):)?(\d+):([\d.]+)$", timing, re.M
-    )
+    # The Elapsed header itself contains colons ("(h:mm:ss or m:ss)"), so the value is taken as
+    # the line's last token and split: h:mm:ss past an hour, m:ss.cs below one.
     wall = None
-    if wall_match:
-        hours = int(wall_match.group(1)) if wall_match.group(1) else 0
-        wall = hours * 3600 + int(wall_match.group(2)) * 60 + float(wall_match.group(3))
+    for line in timing.splitlines():
+        if line.strip().startswith("Elapsed (wall clock)"):
+            parts = line.rsplit(" ", 1)[-1].split(":")
+            try:
+                wall = float(parts[-1])
+            except ValueError:
+                break
+            if len(parts) >= 2:
+                wall += int(parts[-2]) * 60
+            if len(parts) == 3:
+                wall += int(parts[-3]) * 3600
+            break
     cores = (user + system) / wall if user is not None and system is not None and wall else None
     ratio_p50 = (pct(qw, 0.95) / pct(val, 0.50)) if qw and val else None
     ratio_p95 = (pct(qw, 0.95) / pct(val, 0.95)) if qw and val else None
