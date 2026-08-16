@@ -214,7 +214,7 @@ def render_rb7(result, lines):
         for key, count in (ledger.get(axis) or {}).items():
             rows.append([axis, key, str(count)])
     rows.append(["attempts", "started", str(ledger.get("attempts_started", 0))])
-    rows.append(["causes", "with a lifecycle origin", str(ledger.get("origin_anchored", 0))])
+    rows.append(["causes", "owning a measurement window", str(ledger.get("measurable", 0))])
     lines.extend(table(rows, ["axis", "value", "causes"]))
 
     intervals = rb7["intervals"]
@@ -263,8 +263,22 @@ def render_rb7(result, lines):
     if rb7.get("per_cause"):
         lines.append("### Per cause")
         lines.append("")
+        # Only the causes that owned a measurement window get a row. A cold start arms one
+        # re-checkpoint per warm-up block, and sixty identical "superseded, 0 attempts" rows
+        # would bury the causes a reader came here for. The count is stated instead.
+        churn = [row for row in rb7["per_cause"] if not row.get("measurable", True)]
+        if churn:
+            lines.append(
+                f"{len(churn)} cause(s) were superseded before attempting an export and are "
+                f"omitted below — arming churn, one per block while a cold cache warms, each "
+                f"replaced by the successor that carried the same need. They are counted in "
+                f"`by_state` above."
+            )
+            lines.append("")
         rows = []
         for row in rb7["per_cause"]:
+            if not row.get("measurable", True):
+                continue
             measured = row["intervals"]
             rows.append([
                 str(row["cause_id"]),

@@ -390,9 +390,33 @@ class Rb7CauseLedgerTest(AnalyzerCase):
         rb7 = self.run_analyzer(producer_events=self.file(log))["producer_events"]
         self.assertEqual(rb7["causes"]["total"], 1)
         self.assertEqual(rb7["causes"]["by_origin"], {"initial": 1})
-        self.assertEqual(rb7["causes"]["origin_anchored"], 0)
+        self.assertEqual(rb7["causes"]["measurable"], 0)
         self.assertNotIn("detection_to_export_start_us", rb7["intervals"])
         self.assertEqual(rb7["intervals"]["export_duration_us"]["p50"], 4_000.0)
+
+    def test_arming_churn_is_counted_but_does_not_dilute_the_denominator(self):
+        # A cold cache arms one re-checkpoint per warm-up block; the first live run saw sixty of
+        # them before its export. Each was superseded by the successor carrying the same need, so
+        # none is a recovery that failed to be measured — and reading the one real interval as
+        # "1 of 61" would say sixty recoveries went unmeasured.
+        log = []
+        for cause in range(1, 4):
+            log.append(event("recheckpoint_armed", cause, cause * 100, cause,
+                             cause="discontinuity", armed=True))
+        log += [
+            event("export_started", 3, 400, 4, attempt=1, block=10),
+            event("export_completed", 3, 900, 9, attempt=1, block=10, export_us=480),
+            event("checkpoint_published", 3, 950, 9, attempt=1, block=10,
+                  announce_to_complete_us=40),
+        ]
+        rb7 = self.run_analyzer(producer_events=self.file(log))["producer_events"]
+        ledger = rb7["causes"]
+        self.assertEqual(ledger["total"], 3)
+        self.assertEqual(ledger["by_state"], {"published": 1, "superseded": 2})
+        self.assertEqual(ledger["measurable"], 1)
+        start = rb7["intervals"]["detection_to_export_start_us"]
+        self.assertEqual((start["count"], start["population"]), (1, 1))
+        self.assertEqual([row["cause_id"] for row in rb7["per_cause"] if row["measurable"]], [3])
 
     def test_only_the_highest_epoch_is_reduced(self):
         log = [

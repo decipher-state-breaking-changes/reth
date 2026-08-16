@@ -492,7 +492,17 @@ def rb7_report(path, arrivals, warnings):
                 samples[(name, unit)].append(value)
                 row["intervals"][name] = value
 
-        if origin is not None:
+        # A cause superseded before it ever attempted an export never owned a measurement
+        # window: the one-slot arming semantics mean its successor carries the same recovery
+        # need, so counting it as a missed sample would multiply one need by however many times
+        # it was re-armed. A cold-start warm-up arms one per block — sixty of them on a real
+        # run — and none of those is a recovery that failed to be measured. They stay in
+        # `by_state` where they are the truth about what the producer did.
+        measurable = origin is not None and (
+            cause["attempts"] or cause["state"] not in ("superseded", "not_armed")
+        )
+        row["measurable"] = bool(measurable)
+        if measurable:
             reachable["detection_to_export_start_us"] += 1
             reachable["detection_to_publication_us"] += 1
             reachable["detection_to_first_winning_us"] += 1
@@ -586,7 +596,9 @@ def rb7_report(path, arrivals, warnings):
             "by_origin": dict(sorted(by_origin.items())),
             "by_state": dict(sorted(by_state.items())),
             "attempts_started": attempts_started,
-            "origin_anchored": reachable["detection_to_export_start_us"],
+            # Causes that owned a measurement window, which is what the detection-anchored
+            # intervals are a fraction of. `total` minus this is the arming churn.
+            "measurable": reachable["detection_to_export_start_us"],
             "first_winning": dict(sorted(winning_outcomes.items())),
         },
         "intervals": intervals,
