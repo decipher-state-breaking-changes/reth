@@ -161,6 +161,10 @@ pub struct StreamRecorder {
     /// [`write_manifest`](Self::write_manifest), which is the first moment the two can be
     /// compared — and the comparison happens before anything is appended.
     resumed_from: Option<Manifest>,
+    /// Epoch of the manifest this producer wrote; `0` until
+    /// [`write_manifest`](Self::write_manifest) runs. The producer event log stamps it on every
+    /// line, because frame sequences alone cannot name which manifest they continue.
+    epoch: u64,
     /// Highest block whose cache state the producer has written to durable storage.
     ///
     /// Held here rather than passed in per commit because it is producer state that no coordinated
@@ -256,6 +260,7 @@ impl StreamRecorder {
             frames: existing.as_ref().map_or(0, |survey| survey.frames),
             bytes: existing.as_ref().map_or(0, |survey| survey.bytes),
             resumed_from: existing.map(|survey| survey.manifest),
+            epoch: 0,
             durable_block: None,
             fsync,
             defer_dir_sync: false,
@@ -263,6 +268,23 @@ impl StreamRecorder {
             frame_fsync_us: 0,
             dir_syncs: 0,
         }))
+    }
+
+    /// The spool directory frames are written into.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Epoch of the manifest this producer wrote; `0` before
+    /// [`write_manifest`](Self::write_manifest).
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The sequence the next written frame will take. The frame written last, if any, holds
+    /// `current_sequence() - 1`.
+    pub const fn current_sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Records that the producer's cache is durable through `block`.
@@ -291,6 +313,7 @@ impl StreamRecorder {
             frames: 0,
             bytes: 0,
             resumed_from: None,
+            epoch: 0,
             durable_block: None,
             fsync: false,
             defer_dir_sync: false,
@@ -422,6 +445,7 @@ impl StreamRecorder {
                 self.dir.display()
             ))
         }
+        self.epoch = manifest.epoch;
         self.write_event(&StreamEvent::Manifest(manifest));
         Ok(())
     }
@@ -437,9 +461,11 @@ impl StreamRecorder {
         checkpoint: &TrustedCheckpoint,
         accepted_head: Option<&SealedHeader>,
         package: &[u8],
-    ) {
+    ) -> Option<CheckpointPublication> {
         if self.poisoned || self.ended {
-            return
+            // A poisoned or closed recorder no-ops silently here, so publication must be judged
+            // from this return and never from the caller having made the call.
+            return None
         }
         let mut accepted_head_rlp = Vec::new();
         if let Some(header) = accepted_head {
@@ -476,7 +502,7 @@ impl StreamRecorder {
             Ok(encoded) => encoded,
             Err(err) => {
                 self.poison("checkpoint", &eyre::eyre!("{err}"));
-                return
+                return None
             }
         };
 
@@ -514,24 +540,26 @@ impl StreamRecorder {
                     checkpoint.block_number, self.max_spool_bytes, self.max_spool_frames
                 ),
             );
-            return
+            return None
         }
 
         // One directory fsync behind the whole burst — checkpoint, chunks, buffered flush —
         // rather than one per frame. The batch is durable when its last rename is.
+        let burst_started = Instant::now();
+        let announce_sequence = self.sequence;
         self.defer_dir_sync = self.fsync;
         self.write_body(kind, checkpoint_body);
         for (index, slice) in package.chunks(self.chunk_bytes.max(1)).enumerate() {
             if self.poisoned {
                 self.finish_dir_sync_batch();
-                return
+                return None
             }
             let chunk = SnapshotChunk { index: index as u32, bytes: slice.to_vec() };
             self.write_event(&StreamEvent::SnapshotChunk(chunk));
         }
         if self.poisoned {
             self.finish_dir_sync_batch();
-            return
+            return None
         }
         // Flush what accumulated while the export ran — same order, fresh contiguous sequences —
         // and only then write through directly.
@@ -545,7 +573,7 @@ impl StreamRecorder {
         }
         self.finish_dir_sync_batch();
         if self.poisoned {
-            return
+            return None
         }
         self.phase = SpoolPhase::Streaming;
         self.stream_opened = true;
@@ -560,21 +588,38 @@ impl StreamRecorder {
             reopened = flushed > 0,
             "Wrote the checkpoint and its snapshot; the commit stream continues behind it"
         );
+        Some(CheckpointPublication {
+            announce_sequence,
+            chunks: chunk_count,
+            flushed_commits: flushed as u64,
+            announce_to_complete_us: burst_started.elapsed().as_micros() as u64,
+        })
     }
 
     /// Records one canonical block: buffered while the export runs, written once the stream is
-    /// open.
+    /// open. Returns what actually happened to the frame, because the three outcomes are not
+    /// interchangeable to a caller reporting publication — a buffered commit has no publication
+    /// time yet, and a dropped one never will.
     ///
     /// The durability watermark is filled in here rather than by the caller, because it is the
     /// recorder's own bookkeeping and a caller that had to remember it would eventually forget.
-    pub fn write_commit(&mut self, input: CommitInput, mut oracle: CommitOracle) {
+    pub fn write_commit(
+        &mut self,
+        input: CommitInput,
+        mut oracle: CommitOracle,
+    ) -> CommitDisposition {
         if !self.wants_commit_material() {
-            return
+            return CommitDisposition::Dropped
         }
         oracle.durability_watermark = self.durable_block;
         let block = input.block;
         let provenance = input.payload_provenance;
         let buffered = matches!(self.phase, SpoolPhase::Buffering { .. });
+        let sequence_before = self.sequence;
+        let buffered_before = match &self.phase {
+            SpoolPhase::Buffering { frames, .. } => frames.len(),
+            _ => 0,
+        };
         self.emit(&StreamEvent::Commit(Box::new(CommitFrame::new(input, oracle))));
         info!(
             target: "partial_stateless_stream",
@@ -587,6 +632,16 @@ impl StreamRecorder {
             spool_bytes = self.bytes,
             "Recorded a commit frame"
         );
+        // Judged from what moved, not from the phase the call entered under: a poisoned write
+        // advances nothing, and a buffer overflow inside this very emit drops the frame whole.
+        if self.sequence > sequence_before && !self.poisoned {
+            CommitDisposition::Published { sequence: sequence_before }
+        } else if matches!(&self.phase, SpoolPhase::Buffering { frames, .. } if frames.len() > buffered_before)
+        {
+            CommitDisposition::Buffered
+        } else {
+            CommitDisposition::Dropped
+        }
     }
 
     /// Records an abandoned branch. The winning branch follows as ordinary commits.
@@ -767,6 +822,42 @@ impl StreamRecorder {
              hole. The corpus ends without an End frame, which is how a reader will know"
         );
     }
+}
+
+/// What a published checkpoint burst looked like on disk.
+///
+/// Returned by [`StreamRecorder::write_checkpoint`] so the producer event log records
+/// publication from an observable rather than from the call having been made — a poisoned or
+/// closed recorder no-ops that call silently.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointPublication {
+    /// Sequence of the checkpoint announce frame.
+    pub announce_sequence: u64,
+    /// Snapshot chunk frames written behind the announce.
+    pub chunks: u64,
+    /// Buffered commits flushed behind the chunks; zero on a write-through re-checkpoint.
+    pub flushed_commits: u64,
+    /// Wall time from the announce write to the last frame of the burst.
+    pub announce_to_complete_us: u64,
+}
+
+/// What actually became of one commit handed to [`StreamRecorder::write_commit`].
+///
+/// The distinction exists for publication reporting: "the recorder was called" is not "the frame
+/// is on disk", and an event stamped from the former would date a publication that has not
+/// happened — or never will.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDisposition {
+    /// Written through to the open stream, at this announce sequence.
+    Published {
+        /// The frame's own sequence.
+        sequence: u64,
+    },
+    /// Held in the export buffer; it reaches disk when the checkpoint flushes, or never.
+    Buffered,
+    /// Dropped: no phase accepts frames here (pre-export idle, poisoned, ended, or the buffer
+    /// overflowed under this very frame).
+    Dropped,
 }
 
 impl Drop for StreamRecorder {

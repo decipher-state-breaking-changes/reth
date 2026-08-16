@@ -55,9 +55,13 @@ fn a_restore_records_the_checkpoint_it_came_from() {
     run(&dir, false);
 
     let ack = read_ack(&dir);
-    assert_eq!(ack["ack_version"], 2);
+    assert_eq!(ack["ack_version"], 3);
     assert_eq!(ack["restored_from_sequence"], 1);
     assert_eq!(ack["epoch"], 1);
+    assert!(
+        ack["recovery"].is_null(),
+        "no rewind was in flight, so the recovery transaction is absent"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -243,6 +247,130 @@ fn a_resume_with_nothing_above_the_end_stops_where_the_last_run_did() {
 
     assert!(matches!(resumed.outcome, partial_stateless_replay::FollowOutcome::Ended { .. }));
     assert_eq!(resumed.restores_reset, 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A recovery block that exists but does not parse is a refusal, never a silent `None`: it was
+/// written by a run whose pair needs its window replayed, and resuming without the window would
+/// rebuild a different pair under the same watermark.
+#[test]
+fn a_malformed_recovery_block_in_the_ack_is_refused() {
+    let dir = spool_dir("resume-malformed-recovery");
+    let end = one_epoch(&dir);
+
+    fs::write(
+        ack_path(&dir),
+        serde_json::json!({
+            "ack_version": 3,
+            "last_sequence": end - 1,
+            "state": "restored",
+            "epoch": 1,
+            "restored_from_sequence": 1,
+            // No replay_until: half a window is not a smaller window, it is not a window.
+            "recovery": { "checkpoint_sequence": 1, "chunks_end": end - 1, "replay_from": 0 },
+        })
+        .to_string(),
+    )
+    .expect("writable");
+
+    let options = FollowOptions { ack: Some(ack_path(&dir)), resume: true, ..options() };
+    let error = follow(&dir, &options).expect_err("fail closed on a half-written window");
+    assert!(error.to_string().contains("no readable replay_until"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The ack's window is checked against the spool before it is believed: a window whose boundary
+/// is not the checkpoint the ack itself points at was not written against this spool.
+#[test]
+fn a_recovery_window_that_contradicts_its_checkpoint_is_refused() {
+    let dir = spool_dir("resume-contradictory-recovery");
+    let end = one_epoch(&dir);
+
+    fs::write(
+        ack_path(&dir),
+        serde_json::json!({
+            "ack_version": 3,
+            "last_sequence": end - 1,
+            "state": "restored",
+            "epoch": 1,
+            "restored_from_sequence": 1,
+            "recovery": {
+                "checkpoint_sequence": 1,
+                "chunks_end": end - 1,
+                "replay_from": 0,
+                // The window's boundary must be the checkpoint's own announce sequence.
+                "replay_until": 2,
+            },
+        })
+        .to_string(),
+    )
+    .expect("writable");
+
+    let options = FollowOptions { ack: Some(ack_path(&dir)), resume: true, ..options() };
+    let error = follow(&dir, &options).expect_err("a contradictory window cannot be acted on");
+    assert!(error.to_string().contains("not written against this spool"), "{error}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A resumed rewind window holds commits only, and the consumer enforces it: a reorg frame
+/// inside the window is refused as a protocol violation and the rewind aborts into a reset —
+/// it is never *applied* mid-replay, whatever a doctored ack or spool claims.
+#[test]
+fn a_reorg_frame_inside_a_resumed_rewind_window_is_refused() {
+    let dir = spool_dir("resume-reorg-in-window");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    let reorg_at = next;
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![partial_stateless_stream::BlockRef {
+                number: ANCHOR_BLOCK + 1,
+                hash: alloy_primitives::B256::repeat_byte(0xa1),
+            }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    let recovery_checkpoint = next;
+    next = write_checkpoint(&dir, next, &fixture);
+    let chunks_end = next - 1;
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    fs::write(
+        ack_path(&dir),
+        serde_json::json!({
+            "ack_version": 3,
+            "last_sequence": recovery_checkpoint,
+            "state": "restored",
+            "epoch": 1,
+            "restored_from_sequence": recovery_checkpoint,
+            "recovery": {
+                "checkpoint_sequence": recovery_checkpoint,
+                "chunks_end": chunks_end,
+                "replay_from": reorg_at,
+                "replay_until": recovery_checkpoint,
+            },
+        })
+        .to_string(),
+    )
+    .expect("writable");
+
+    let options = FollowOptions { ack: Some(ack_path(&dir)), resume: true, ..options() };
+    let report = follow(&dir, &options).expect("follows");
+
+    assert_eq!(
+        report.last_needs_snapshot,
+        Some(partial_stateless_replay::NeedsSnapshotReason::ProtocolViolation),
+        "the reorg inside the window was refused, not applied"
+    );
+    assert_eq!(report.reorgs_applied, 0, "nothing was undone mid-rewind");
+    assert_eq!(report.rewind_replayed_commits, 0);
+    assert!(report.restores_reset >= 1, "the aborted rewind is an explicit reset");
     let _ = fs::remove_dir_all(&dir);
 }
 

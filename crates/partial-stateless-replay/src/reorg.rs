@@ -42,14 +42,20 @@ pub(crate) struct VerifiedHistory {
 
 impl VerifiedHistory {
     /// Starts a history at the checkpoint a pair was restored from.
-    pub(crate) fn restored_at(block: BlockRef, state_root: B256) -> Self {
+    pub(crate) fn restored_at(block: BlockRef, state_root: B256, cache_root: B256) -> Self {
         let mut entries = VecDeque::with_capacity(HISTORY_DEPTH);
-        entries.push_back(VerifiedBlock { number: block.number, hash: block.hash, state_root });
+        entries.push_back(VerifiedBlock {
+            number: block.number,
+            hash: block.hash,
+            state_root,
+            cache_root,
+        });
         Self { entries }
     }
 
-    /// Records a block this consumer validated, with the state root it derived for it.
-    pub(crate) fn record(&mut self, block: BlockRef, state_root: B256) {
+    /// Records a block this consumer validated, with the state root it derived for it and the
+    /// flat cache root its pair committed behind it.
+    pub(crate) fn record(&mut self, block: BlockRef, state_root: B256, cache_root: B256) {
         if self.entries.len() == HISTORY_DEPTH {
             self.entries.pop_front();
         }
@@ -57,12 +63,24 @@ impl VerifiedHistory {
             number: block.number,
             hash: block.hash,
             state_root,
+            cache_root,
         });
     }
 
     /// The newest block this consumer stands behind.
     pub(crate) fn tip(&self) -> Option<BlockRef> {
         self.entries.back().map(|entry| BlockRef { number: entry.number, hash: entry.hash })
+    }
+
+    /// The full entry this consumer verified at exactly `block`, if it is still within the
+    /// retained depth. This is what a *late* recovery checkpoint is cross-checked against: by
+    /// the time it arrives the pair has moved past its anchor, so the current fingerprint can no
+    /// longer answer for height H — only the record made when H was verified can.
+    pub(crate) fn entry_at(&self, block: BlockRef) -> Option<&VerifiedBlock> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.number == block.number && entry.hash == block.hash)
     }
 
     /// Drops everything above `number`, which an applied undo has just left the chain.
@@ -282,11 +300,15 @@ pub(crate) fn check_shape(reorg: &Reorg) -> Result<(), String> {
 
 /// One block this consumer validated, and what it derived for it.
 #[derive(Debug, Clone, Copy)]
-struct VerifiedBlock {
-    number: u64,
-    hash: B256,
+pub(crate) struct VerifiedBlock {
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
     /// Computed here, not read from the frame. This is the whole reason the type exists.
-    state_root: B256,
+    pub(crate) state_root: B256,
+    /// The flat cache root the pair committed behind this block — the one field a late recovery
+    /// checkpoint needs that nothing else retains per height. An undo restores exactly the value
+    /// recorded here, so the entry stays valid across depth-1 cycles at its height.
+    pub(crate) cache_root: B256,
 }
 
 /// Reports a reorg the driver could not apply, in the one place both drivers agree on the wording.
@@ -446,7 +468,8 @@ mod tests {
             SealedHeader::new(header, block.hash),
             retain,
         );
-        state.history.record(block, state_root);
+        let cache_root = state.pair.fingerprint().cache_root;
+        state.history.record(block, state_root, cache_root);
         block
     }
 

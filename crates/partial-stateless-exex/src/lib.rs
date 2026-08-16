@@ -22,6 +22,7 @@ pub mod rebuild;
 pub mod recorder;
 
 mod benchmark;
+mod producer_events;
 mod sidecar_create;
 mod sidecar_io;
 mod sidecar_reexec;
@@ -558,6 +559,28 @@ struct BootstrapGate {
     retries_left: u32,
     /// Monotonic attempt counter, naming each attempt's own export directory.
     attempt: u32,
+    /// Cause of the export `export_pending` is armed for. A branch change writes commits through
+    /// and publishes its checkpoint at the tail; every other cause buffers behind the checkpoint,
+    /// because no consumer can cross a discontinuity from commits alone.
+    pending_cause: RecheckpointCause,
+    /// Cause of the most recently spawned attempt, read when that attempt fails.
+    attempt_cause: RecheckpointCause,
+    /// Monotonic id allocator for causes. Zero is the initial export; every lifecycle event that
+    /// arms or re-arms an export allocates the next id, and the id rides every producer event
+    /// the cause goes on to generate — detection, attempts, fencing, publication, first commit —
+    /// so overlapping retries and back-to-back reorgs stay attributable offline.
+    cause_counter: u64,
+    /// The id of the cause `pending_cause` belongs to.
+    pending_cause_id: u64,
+    /// The id of the cause the in-flight (or last spawned) attempt belongs to.
+    attempt_cause_id: u64,
+    /// Set by a reorg/revert so the next recorded commit stamps a
+    /// `first_winning_commit_published` event — the freshness endpoint of a recovery.
+    first_winning_commit_pending: bool,
+    /// The cause id that armed `first_winning_commit_pending`, stamped into that event.
+    first_winning_commit_cause: u64,
+    /// The out-of-band lifecycle event log, present exactly when a stream is recorded.
+    events: Option<producer_events::ProducerEvents>,
     /// Whether the accepted-head wait has been logged, so a rare condition does not log per block.
     waiting_for_accepted_head_logged: bool,
     /// Workers alive right now, the abandoned ones included.
@@ -582,6 +605,14 @@ impl BootstrapGate {
             job: ExportJob::Idle,
             retries_left: options.stream_export_retries,
             attempt: 0,
+            pending_cause: RecheckpointCause::Initial,
+            attempt_cause: RecheckpointCause::Initial,
+            cause_counter: 0,
+            pending_cause_id: 0,
+            attempt_cause_id: 0,
+            first_winning_commit_pending: false,
+            first_winning_commit_cause: 0,
+            events: None,
             waiting_for_accepted_head_logged: false,
             live_workers: Arc::new(AtomicUsize::new(0)),
             max_workers: options.stream_export_max_workers,
@@ -591,6 +622,21 @@ impl BootstrapGate {
 
     const fn wants_sidecar(&self) -> bool {
         self.shadow.is_some()
+    }
+
+    /// Allocates the next cause id, the correlation key that travels from a detection event
+    /// through the export attempts it arms to the checkpoint and first commit it produces.
+    fn begin_cause(&mut self) -> u64 {
+        self.cause_counter += 1;
+        self.cause_counter
+    }
+
+    /// Appends one producer lifecycle event, when a stream is being recorded.
+    fn emit_event(&mut self, kind: &str, fields: serde_json::Value) {
+        let attempt = self.attempt;
+        if let Some(events) = self.events.as_mut() {
+            events.emit(kind, attempt, fields);
+        }
     }
 
     /// Whether a fresh export may spawn, counting what the fence cannot stop: abandoned workers
@@ -614,6 +660,38 @@ impl BootstrapGate {
         }
         self.worker_cap_logged = false;
         true
+    }
+}
+
+/// How often the notification loop polls an in-flight export for completion, so a finished
+/// checkpoint publishes on its own clock instead of the next block's.
+const EXPORT_COMPLETION_TICK_MS: u64 = 500;
+
+/// Why a snapshot export is (or will be) armed, which decides the publication ordering.
+///
+/// After a reorg or revert the pair recovered in place, so every winning-branch commit is
+/// independently verifiable by a consumer holding the retained generation — those commits write
+/// through and the recovery checkpoint publishes behind them. Every other cause keeps the
+/// checkpoint-first ordering: the initial export opens the stream, and a discontinuity (rebuild,
+/// cold reset, or a mid-branch `Reset` frame) can only be crossed by restoring a checkpoint
+/// anchored above it, never by replaying commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecheckpointCause {
+    /// The stream-opening bootstrap export.
+    Initial,
+    /// A reorg or revert recovered in place; commits stay independently applicable.
+    BranchChange,
+    /// A rebuild, cold reset, or mid-branch reset broke stream continuity.
+    Discontinuity,
+}
+
+impl RecheckpointCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::BranchChange => "branch_change",
+            Self::Discontinuity => "discontinuity",
+        }
     }
 }
 
@@ -709,6 +787,9 @@ where
             options.config.account_window,
             options.config.storage_window,
         )?;
+        // After the manifest, so the log carries the epoch frames are actually written under.
+        gate.events =
+            Some(producer_events::ProducerEvents::beside_spool(recorder.dir(), recorder.epoch()));
     }
     // A rebuild that keeps failing is almost always a persistent condition — pruned history, or a
     // provider that cannot reach far enough back — and retrying it every block would spend the
@@ -720,11 +801,43 @@ where
         // cannot tell an error return from reth dropping the future at shutdown — both run the
         // destructor — so an unclassified propagation would close a crashed producer's stream as
         // an orderly `Shutdown`.
-        let notification = match ctx.notifications.try_next().await {
-            Ok(Some(notification)) => notification,
-            Ok(None) => break,
-            Err(err) => {
-                return Err(fail_producer(recorder.as_mut(), err, "the notification stream failed"))
+        // While an export is in flight, completion must publish on its own clock: waiting for the
+        // next notification would quantize checkpoint publication to block cadence, and a quiet
+        // chain (or a pure revert with nothing behind it) would hold a finished checkpoint
+        // unpublished indefinitely. `try_next` on the notification channel is cancel-safe, so the
+        // timeout drops nothing.
+        let notification = if matches!(gate.job, ExportJob::InFlight { .. }) {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(EXPORT_COMPLETION_TICK_MS),
+                ctx.notifications.try_next(),
+            )
+            .await
+            {
+                Err(_tick) => {
+                    poll_export_job(&options, &mut gate, &mut recorder.as_mut());
+                    continue
+                }
+                Ok(Ok(Some(notification))) => notification,
+                Ok(Ok(None)) => break,
+                Ok(Err(err)) => {
+                    return Err(fail_producer(
+                        recorder.as_mut(),
+                        err,
+                        "the notification stream failed",
+                    ))
+                }
+            }
+        } else {
+            match ctx.notifications.try_next().await {
+                Ok(Some(notification)) => notification,
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(fail_producer(
+                        recorder.as_mut(),
+                        err,
+                        "the notification stream failed",
+                    ))
+                }
             }
         };
         match &notification {
@@ -789,12 +902,25 @@ where
                     "Chain reorg detected — recovering the coordinated pair at the common ancestor"
                 );
 
+                let cause_id = gate.begin_cause();
+                gate.emit_event(
+                    "reorg_detected",
+                    serde_json::json!({
+                        "abandoned_from": *old.range().start(),
+                        "abandoned_to": *old.range().end(),
+                        "winning_tip": tip_block,
+                        "ancestor_hash": ancestor_hash.map(|hash| format!("{hash:?}")),
+                        "cause_id": cause_id,
+                    }),
+                );
                 // Fenced before the recovery runs. Whatever H an in-flight export chose, it
                 // chose it on the branch this notification is abandoning.
                 interrupt_export(
                     &options,
                     &mut gate,
                     &mut recorder.as_mut(),
+                    RecheckpointCause::BranchChange,
+                    cause_id,
                     "the chain reorged under the export",
                 );
 
@@ -815,6 +941,8 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, Some(new)));
                 }
+                gate.first_winning_commit_pending = true;
+                gate.first_winning_commit_cause = cause_id;
                 // Started here, before a single winning block applies, because the checkpoint a
                 // consumer needs is the one authenticated at the *common ancestor* — the exact
                 // block the plan requires a recovery snapshot to name. One block later the pair
@@ -865,10 +993,22 @@ where
                     "Chain reverted — recovering the coordinated pair at the new tip"
                 );
 
+                let cause_id = gate.begin_cause();
+                gate.emit_event(
+                    "revert_detected",
+                    serde_json::json!({
+                        "reverted_from": *old.range().start(),
+                        "reverted_to": *old.range().end(),
+                        "new_tip_hash": new_tip_hash.map(|hash| format!("{hash:?}")),
+                        "cause_id": cause_id,
+                    }),
+                );
                 interrupt_export(
                     &options,
                     &mut gate,
                     &mut recorder.as_mut(),
+                    RecheckpointCause::BranchChange,
+                    cause_id,
                     "the chain reverted under the export",
                 );
 
@@ -886,6 +1026,10 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, None));
                 }
+                // Nothing replaces the reverted blocks, so the "first winning commit" after a
+                // pure revert is simply the next committed block — still the freshness endpoint.
+                gate.first_winning_commit_pending = true;
+                gate.first_winning_commit_cause = cause_id;
                 maybe_start_export(&ctx, &options, &pair, &mut gate, recorder.as_mut());
 
                 // A pair that could not be rebuilt still describes the reverted branch, and
@@ -1350,11 +1494,15 @@ where
                 "Cache continuity broken"
             );
             // Whatever the export was going to checkpoint, it is not the generation this pair is
-            // about to become.
+            // about to become. A discontinuity cause keeps the checkpoint-first ordering: the
+            // consumer this Reset strands can only continue from a checkpoint above it.
+            let cause_id = gate.begin_cause();
             interrupt_export(
                 options,
                 gate,
                 &mut recorder,
+                RecheckpointCause::Discontinuity,
+                cause_id,
                 "the pair was rebuilt or reset under the export",
             );
             // The consumer has to be told, or it would keep applying commits from a pair whose
@@ -1527,8 +1675,45 @@ where
 
     // After the transition, so the fingerprints describe the generation this block produced rather
     // than the one it displaced, and before the bootstrap gate, which touches only its own shadow.
-    if let Some(recorder) = recorder.as_deref_mut() {
-        record_commit(recorder, options, pair, block, sidecar.as_ref(), tapped);
+    let commit_recorded = recorder
+        .as_deref_mut()
+        .map(|recorder| record_commit(recorder, options, pair, block, sidecar.as_ref(), tapped));
+    match commit_recorded {
+        Some(CommitRecordingOutcome::Reset) => {
+            // The commit became a Reset, which discontinues the stream. A recovery checkpoint
+            // anchored below a Reset can never carry a consumer across it, so an in-flight export
+            // is fenced here and re-armed at the current tip (policy permitting) — the same
+            // treatment every other discontinuity gets, and the guarantee behind the invariant
+            // that a published late checkpoint's replay window holds Commit frames only.
+            let cause_id = gate.begin_cause();
+            interrupt_export(
+                options,
+                gate,
+                &mut recorder,
+                RecheckpointCause::Discontinuity,
+                cause_id,
+                "a reset discontinued the stream under the export",
+            );
+        }
+        // Only an actually-published frame is a publication: a commit that landed in a
+        // discontinuity export's buffer has no publication time yet, and stamping one from the
+        // recorder's stale sequence is exactly what the typed disposition exists to prevent.
+        // The pending flag survives a buffered or dropped commit and resolves at the first
+        // frame that really reaches the open stream.
+        Some(CommitRecordingOutcome::Recorded(recorder::CommitDisposition::Published {
+            sequence,
+        })) if gate.first_winning_commit_pending => {
+            gate.first_winning_commit_pending = false;
+            gate.emit_event(
+                "first_winning_commit_published",
+                serde_json::json!({
+                    "block": block.number(),
+                    "sequence": sequence,
+                    "cause_id": gate.first_winning_commit_cause,
+                }),
+            );
+        }
+        _ => {}
     }
 
     advance_bootstrap_gate(ctx, options, pair, gate, recorder, block, sidecar.as_ref())
@@ -1551,7 +1736,7 @@ fn record_commit(
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
     sidecar: Option<&PartialStatelessSidecar>,
     tapped: Option<payload_tap::TappedPayload>,
-) {
+) -> CommitRecordingOutcome {
     let Some(sidecar) = sidecar else {
         // A block that published no sidecar cannot be replayed by anything, so recording it would
         // add a frame no consumer could use and cost the stream its contiguity claim.
@@ -1559,7 +1744,7 @@ fn record_commit(
             ResetReason::Gap,
             format!("block {} produced no sidecar to record", block.number()),
         );
-        return
+        return CommitRecordingOutcome::Reset
     };
     let sidecar_bytes = match bincode::serialize(sidecar) {
         Ok(bytes) => bytes,
@@ -1568,7 +1753,7 @@ fn record_commit(
                 ResetReason::Gap,
                 format!("block {} sidecar failed to serialize: {err}", block.number()),
             );
-            return
+            return CommitRecordingOutcome::Reset
         }
     };
     let (payload_json, payload_provenance) = match tapped {
@@ -1630,7 +1815,17 @@ fn record_commit(
         coordinated_fingerprint: fingerprint,
         lifecycle_fingerprint: lifecycle,
     };
-    recorder.write_commit(input, oracle);
+    CommitRecordingOutcome::Recorded(recorder.write_commit(input, oracle))
+}
+
+/// What one canonical block became on the stream: a commit frame with its typed disposition, or
+/// the Reset that discontinued the stream instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitRecordingOutcome {
+    /// A commit frame was handed to the recorder; the disposition says where it landed.
+    Recorded(recorder::CommitDisposition),
+    /// The block could not be recorded and a Reset frame took its place.
+    Reset,
 }
 
 /// Logs one block's payload provenance, and drops the payload.
@@ -1990,6 +2185,16 @@ fn fail_export_attempt(
     if gate.retries_left > 0 {
         gate.retries_left -= 1;
         gate.export_pending = true;
+        // `pending_cause` is left as it was: a retry re-runs the same kind of attempt.
+        gate.emit_event(
+            "export_failed",
+            serde_json::json!({
+                "why": why,
+                "retries_left": gate.retries_left,
+                "stream_ended": false,
+                "cause_id": gate.attempt_cause_id,
+            }),
+        );
         warn!(
             target: "partial_stateless",
             why,
@@ -1997,18 +2202,59 @@ fn fail_export_attempt(
             "Snapshot export attempt failed; a fresh H will be chosen at the next Ready"
         );
     } else {
-        if let Some(recorder) = recorder.as_mut() {
+        // A write-through re-checkpoint that ran out of retries leaves a stream that is complete
+        // and contiguous on disk — only the recovery checkpoint is missing. Closing it with
+        // `End(ExportFailure)` would discard a healthy record to report a telemetry-grade
+        // failure, so the failure is reported out of band and the stream stays open. The
+        // checkpoint-first causes keep the `End`: their buffered branch is gone with the attempt,
+        // and a spool that cannot be restored from should say so terminally.
+        let opened = recorder.as_ref().is_some_and(|recorder| recorder.stream_opened());
+        let write_through_attempt = opened && gate.attempt_cause == RecheckpointCause::BranchChange;
+        if !write_through_attempt && let Some(recorder) = recorder.as_mut() {
             recorder.write_end(
                 EndKind::ExportFailure,
                 format!("snapshot export failed with no retries left: {why}"),
             );
         }
-        error!(
-            target: "partial_stateless",
-            why,
-            "Snapshot export failed with no retries left; this stream records no commits"
+        gate.emit_event(
+            "export_failed",
+            serde_json::json!({
+                "why": why,
+                "retries_left": 0,
+                "stream_ended": !write_through_attempt,
+                "cause_id": gate.attempt_cause_id,
+            }),
         );
+        if write_through_attempt {
+            error!(
+                target: "partial_stateless",
+                why,
+                "Snapshot re-checkpoint failed with no retries left; the live stream stays open \
+                 without a fresh recovery checkpoint"
+            );
+        } else {
+            error!(
+                target: "partial_stateless",
+                why,
+                "Snapshot export failed with no retries left; this stream records no commits"
+            );
+        }
     }
+}
+
+/// Whether an export runs behind a live stream, commits writing through ahead of its checkpoint.
+///
+/// True only for a branch change on an already-open stream: the pair recovered in place, so a
+/// consumer holding the retained generation can verify every winning-branch commit without the
+/// checkpoint, which then publishes at the stream tail. The stream-opening export and every
+/// discontinuity keep the checkpoint-first ordering — commits alone cannot carry a consumer
+/// across either.
+fn export_writes_through(
+    cause: RecheckpointCause,
+    recorder: Option<&recorder::StreamRecorder>,
+) -> bool {
+    cause == RecheckpointCause::BranchChange &&
+        recorder.is_some_and(recorder::StreamRecorder::stream_opened)
 }
 
 /// Abandons whatever export is armed or running, and decides whether to arm a fresh one.
@@ -2028,6 +2274,8 @@ fn interrupt_export(
     options: &RunOptions,
     gate: &mut BootstrapGate,
     recorder: &mut Option<&mut recorder::StreamRecorder>,
+    cause: RecheckpointCause,
+    cause_id: u64,
     why: &str,
 ) {
     match std::mem::replace(&mut gate.job, ExportJob::Idle) {
@@ -2040,6 +2288,17 @@ fn interrupt_export(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Abandoning a snapshot export the chain moved under; its files are left where \
                  nothing will promote them"
+            );
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            // The fenced attempt belongs to the cause that armed it, not to the incoming one.
+            gate.emit_event(
+                "export_fenced",
+                serde_json::json!({
+                    "why": why,
+                    "elapsed_ms": elapsed_ms,
+                    "cause_id": gate.attempt_cause_id,
+                    "fenced_by_cause_id": cause_id,
+                }),
             );
         }
         // Terminal until now: one stream, one checkpoint. Reopening it is what lets the producer
@@ -2057,6 +2316,11 @@ fn interrupt_export(
     let opened = recorder.as_ref().is_some_and(|recorder| recorder.stream_opened());
     gate.export_pending = options.bootstrap_export &&
         (!opened || options.reorg_checkpoint == ReorgCheckpointPolicy::Always);
+    // The cause travels with the armed export: it is what decides whether the next attempt's
+    // commits buffer behind its checkpoint or write through ahead of it. Its id travels too,
+    // so the attempt this arms is attributable to this exact lifecycle event.
+    gate.pending_cause = cause;
+    gate.pending_cause_id = cause_id;
     gate.waiting_for_accepted_head_logged = false;
     if !gate.export_pending {
         info!(
@@ -2103,6 +2367,18 @@ fn complete_export(
         wall_ms = started.elapsed().as_millis() as u64,
         "Off-task snapshot export completed; the pair kept advancing throughout"
     );
+    gate.emit_event(
+        "export_completed",
+        serde_json::json!({
+            "block": finished.checkpoint.block_number,
+            "block_hash": format!("{:?}", finished.checkpoint.block_hash),
+            "package_bytes": finished.package_bytes,
+            "proof_targets": finished.proof_targets,
+            "export_us": finished.elapsed_us,
+            "wall_ms": started.elapsed().as_millis() as u64,
+            "cause_id": gate.attempt_cause_id,
+        }),
+    );
 
     // Written from the file rather than from the in-memory package, so the stream carries exactly
     // the bytes an operator would ship and a mismatch between the two cannot hide here. The
@@ -2119,8 +2395,30 @@ fn complete_export(
                 return
             }
         };
-        if let Some(recorder) = recorder.as_mut() {
-            recorder.write_checkpoint(&finished.checkpoint, Some(&accepted_head), &package);
+        let publication = recorder.as_mut().and_then(|recorder| {
+            recorder.write_checkpoint(&finished.checkpoint, Some(&accepted_head), &package)
+        });
+        // Judged from the recorder's answer, never from the call having been made: a poisoned or
+        // closed recorder no-ops the write silently.
+        match publication {
+            Some(publication) => gate.emit_event(
+                "checkpoint_published",
+                serde_json::json!({
+                    "block": finished.checkpoint.block_number,
+                    "announce_sequence": publication.announce_sequence,
+                    "chunks": publication.chunks,
+                    "flushed_commits": publication.flushed_commits,
+                    "announce_to_complete_us": publication.announce_to_complete_us,
+                    "cause_id": gate.attempt_cause_id,
+                }),
+            ),
+            None => gate.emit_event(
+                "checkpoint_publication_skipped",
+                serde_json::json!({
+                    "block": finished.checkpoint.block_number,
+                    "cause_id": gate.attempt_cause_id,
+                }),
+            ),
         }
     }
     gate.job = ExportJob::Finished;
@@ -2165,6 +2463,10 @@ fn maybe_start_export<Node>(
     gate.export_pending = false;
     gate.waiting_for_accepted_head_logged = false;
     gate.attempt += 1;
+    let cause = gate.pending_cause;
+    gate.attempt_cause = cause;
+    gate.attempt_cause_id = gate.pending_cause_id;
+    let write_through = export_writes_through(cause, recorder.as_deref());
 
     let capture_started = Instant::now();
     let state = CacheState::from_cache(&pair.cache);
@@ -2211,16 +2513,43 @@ fn maybe_start_export<Node>(
         // directory, unpromoted and inert.
         let _ = tx.send(result);
     });
-    info!(
-        target: "partial_stateless",
-        block = ready.anchor.block_number,
-        block_hash = ?ready.anchor.block_hash,
-        attempt = gate.attempt,
-        cache_capture_us,
-        provider_open_us,
-        "Snapshot export started off-task; frames buffer until its checkpoint lands"
+    if write_through {
+        info!(
+            target: "partial_stateless",
+            block = ready.anchor.block_number,
+            block_hash = ?ready.anchor.block_hash,
+            attempt = gate.attempt,
+            cause = cause.as_str(),
+            cache_capture_us,
+            provider_open_us,
+            "Snapshot export started off-task; commits write through and its checkpoint will \
+             publish at the stream tail"
+        );
+    } else {
+        info!(
+            target: "partial_stateless",
+            block = ready.anchor.block_number,
+            block_hash = ?ready.anchor.block_hash,
+            attempt = gate.attempt,
+            cause = cause.as_str(),
+            cache_capture_us,
+            provider_open_us,
+            "Snapshot export started off-task; frames buffer until its checkpoint lands"
+        );
+    }
+    gate.emit_event(
+        "export_started",
+        serde_json::json!({
+            "block": ready.anchor.block_number,
+            "block_hash": format!("{:?}", ready.anchor.block_hash),
+            "cause": cause.as_str(),
+            "cause_id": gate.attempt_cause_id,
+            "write_through": write_through,
+            "cache_capture_us": cache_capture_us,
+            "provider_open_us": provider_open_us,
+        }),
     );
-    if let Some(recorder) = recorder {
+    if !write_through && let Some(recorder) = recorder {
         recorder.begin_buffering();
     }
     gate.job = ExportJob::InFlight { rx, accepted_head, attempt_dir, started: Instant::now() };
@@ -3414,8 +3743,9 @@ mod tests {
     /// what own an attempt's outcome, and the blocking task itself is just a sender.
     mod export_job {
         use super::super::{
-            bootstrap_io, fail_export_attempt, poll_export_job, recorder::StreamRecorder,
-            remove_stale_attempt_dirs, BootstrapGate, EndKind, ExportJob, RunOptions, WorkerSlot,
+            bootstrap_io, export_writes_through, fail_export_attempt, poll_export_job,
+            recorder::StreamRecorder, remove_stale_attempt_dirs, BootstrapGate, EndKind, ExportJob,
+            RecheckpointCause, RunOptions, WorkerSlot,
         };
         use crate::CacheConfig;
         use alloy_primitives::B256;
@@ -3448,6 +3778,14 @@ mod tests {
                 job,
                 retries_left,
                 attempt: 1,
+                pending_cause: RecheckpointCause::Initial,
+                attempt_cause: RecheckpointCause::Initial,
+                cause_counter: 0,
+                pending_cause_id: 0,
+                attempt_cause_id: 0,
+                first_winning_commit_pending: false,
+                first_winning_commit_cause: 0,
+                events: None,
                 waiting_for_accepted_head_logged: false,
                 live_workers: Arc::new(AtomicUsize::new(0)),
                 max_workers: 4,
@@ -3619,7 +3957,15 @@ mod tests {
             let (tx, rx) = mpsc::sync_channel(1);
             let mut gate = gate_with(in_flight(rx, bootstrap.join("export-attempt-1")), 1);
             let mut holder = Some(&mut recorder);
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(
                 matches!(gate.job, ExportJob::Idle),
@@ -3676,7 +4022,15 @@ mod tests {
 
             let mut gate = gate_with(in_flight(rx, attempt_dir), 1);
             let mut holder = Some(&mut recorder);
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(
                 !options.bootstrap_dir.join(bootstrap_io::PACKAGE_FILE).exists(),
@@ -3699,7 +4053,16 @@ mod tests {
             let mut gate = gate_with(ExportJob::Finished, 0);
             let mut holder = None;
 
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(matches!(gate.job, ExportJob::Idle));
             assert!(gate.export_pending);
@@ -3727,7 +4090,15 @@ mod tests {
 
             let mut gate = gate_with(ExportJob::Idle, 1);
             let mut holder = Some(&mut recorder);
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(
                 !recorder.take_buffer_overflow(),
@@ -3753,7 +4124,15 @@ mod tests {
 
             let mut gate = gate_with(ExportJob::Idle, 1);
             let mut holder = Some(&mut recorder);
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(gate.export_pending, "the stream has no checkpoint yet, so one is still owed");
             let _ = fs::remove_dir_all(&spool);
@@ -3785,7 +4164,15 @@ mod tests {
 
             let mut gate = gate_with(ExportJob::Finished, 1);
             let mut holder = Some(&mut recorder);
-            super::super::interrupt_export(&options, &mut gate, &mut holder, "the chain reorged");
+            let cause_id = gate.begin_cause();
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::BranchChange,
+                cause_id,
+                "the chain reorged",
+            );
 
             assert!(!gate.export_pending);
             assert!(recorder.wants_commit_material(), "the open stream keeps taking frames");
@@ -3860,6 +4247,154 @@ mod tests {
             assert!(!gate.export_pending, "no further attempt is armed");
             assert_eq!(spool_kinds(&spool), vec![FrameKind::Manifest, FrameKind::End]);
             assert_eq!(last_end_kind(&spool), EndKind::ExportFailure);
+            let _ = fs::remove_dir_all(&spool);
+        }
+
+        fn opened_recorder(spool: &Path) -> StreamRecorder {
+            let mut recorder = StreamRecorder::for_tests(spool, 8);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
+            recorder.begin_buffering();
+            let checkpoint = TrustedCheckpoint {
+                block_number: 25_737_234,
+                block_hash: B256::with_last_byte(0x11),
+                state_root: B256::with_last_byte(0x22),
+                cache_root: B256::with_last_byte(0x33),
+                cache_policy_id: B256::with_last_byte(0x44),
+            };
+            recorder
+                .write_checkpoint(&checkpoint, None, &[7u8; 32])
+                .expect("the opening checkpoint publishes");
+            assert!(recorder.stream_opened());
+            recorder
+        }
+
+        /// The cause gate, three ways: only a branch change on an already-open stream writes
+        /// commits through ahead of its checkpoint. The initial export and every discontinuity
+        /// keep the checkpoint-first ordering, because commits alone cannot carry a consumer
+        /// across either.
+        #[test]
+        fn only_a_branch_change_on_an_open_stream_writes_through() {
+            let spool = temp_dir("write-through-spool");
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
+            assert!(
+                !export_writes_through(RecheckpointCause::BranchChange, Some(&recorder)),
+                "a reorg before the first checkpoint still buffers: nothing is restorable yet"
+            );
+
+            let recorder = opened_recorder(&temp_dir("write-through-open-spool"));
+            assert!(export_writes_through(RecheckpointCause::BranchChange, Some(&recorder)));
+            assert!(
+                !export_writes_through(RecheckpointCause::Discontinuity, Some(&recorder)),
+                "a rebuild/reset export keeps checkpoint-first ordering on an open stream"
+            );
+            assert!(!export_writes_through(RecheckpointCause::Initial, Some(&recorder)));
+            assert!(
+                !export_writes_through(RecheckpointCause::BranchChange, None),
+                "no recorder, no stream to write through"
+            );
+            let _ = fs::remove_dir_all(&spool);
+        }
+
+        /// A write-through re-checkpoint that exhausts its retries leaves a stream that is
+        /// complete and contiguous on disk; closing it with `End(ExportFailure)` would discard a
+        /// healthy record over a telemetry-grade failure. The checkpoint-first causes keep the
+        /// terminal `End`.
+        #[test]
+        fn a_failed_write_through_recheckpoint_leaves_the_stream_open() {
+            let spool = temp_dir("wt-fail-spool");
+            let mut recorder = opened_recorder(&spool);
+            let mut gate = gate_with(ExportJob::Idle, 0);
+            gate.attempt_cause = RecheckpointCause::BranchChange;
+            let mut holder = Some(&mut recorder);
+            fail_export_attempt(&mut gate, &mut holder, "test failure");
+
+            assert!(
+                recorder.wants_commit_material(),
+                "the live stream stays open without its fresh recovery checkpoint"
+            );
+            assert!(
+                !spool_kinds(&spool).contains(&FrameKind::End),
+                "no End frame closes a healthy write-through stream"
+            );
+
+            let discontinuity_spool = temp_dir("wt-fail-discontinuity-spool");
+            let mut recorder = opened_recorder(&discontinuity_spool);
+            let mut gate = gate_with(ExportJob::Idle, 0);
+            gate.attempt_cause = RecheckpointCause::Discontinuity;
+            let mut holder = Some(&mut recorder);
+            fail_export_attempt(&mut gate, &mut holder, "test failure");
+
+            assert_eq!(
+                last_end_kind(&discontinuity_spool),
+                EndKind::ExportFailure,
+                "a failed checkpoint-first attempt still closes terminally: the spool cannot be \
+                 restored across its discontinuity"
+            );
+            let _ = fs::remove_dir_all(&spool);
+            let _ = fs::remove_dir_all(&discontinuity_spool);
+        }
+
+        /// The fence carries its cause to the attempt it re-arms: a reorg's replacement export
+        /// writes through, a discontinuity's buffers.
+        #[test]
+        fn interrupt_export_arms_the_cause_it_was_given() {
+            let bootstrap = temp_dir("cause-bootstrap");
+            let options = options_with_bootstrap_dir(&bootstrap);
+            let mut gate = gate_with(ExportJob::Finished, 1);
+            let mut holder = None;
+
+            let cause_id = gate.begin_cause();
+
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::Discontinuity,
+                cause_id,
+                "a reset discontinued the stream under the export",
+            );
+
+            assert_eq!(gate.pending_cause, RecheckpointCause::Discontinuity);
+            let _ = fs::remove_dir_all(&bootstrap);
+        }
+
+        /// Publication is the recorder's answer, not the call: a closed recorder no-ops
+        /// `write_checkpoint` silently, and the event log must not report a checkpoint that was
+        /// never written.
+        #[test]
+        fn write_checkpoint_reports_publication_only_when_it_wrote() {
+            let spool = temp_dir("publication-spool");
+            let mut recorder = StreamRecorder::for_tests(&spool, 8);
+            recorder
+                .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+                .expect("a fresh spool takes a manifest");
+            recorder.begin_buffering();
+            recorder.write_reset(partial_stateless_stream::ResetReason::Gap, "buffered frame");
+            let checkpoint = TrustedCheckpoint {
+                block_number: 25_737_234,
+                block_hash: B256::with_last_byte(0x11),
+                state_root: B256::with_last_byte(0x22),
+                cache_root: B256::with_last_byte(0x33),
+                cache_policy_id: B256::with_last_byte(0x44),
+            };
+
+            let publication = recorder
+                .write_checkpoint(&checkpoint, None, &[7u8; 100])
+                .expect("an open recorder publishes");
+            assert_eq!(publication.announce_sequence, 1, "manifest holds sequence 0");
+            assert_eq!(publication.chunks, 2, "100 bytes over 64-byte chunks");
+            assert_eq!(publication.flushed_commits, 1, "the buffered reset flushed behind it");
+
+            recorder.write_end(EndKind::Shutdown, "closing");
+            assert!(
+                recorder.write_checkpoint(&checkpoint, None, &[7u8; 100]).is_none(),
+                "a closed recorder reports no publication"
+            );
             let _ = fs::remove_dir_all(&spool);
         }
 

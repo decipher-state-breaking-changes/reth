@@ -19,9 +19,9 @@
 
 use crate::{
     driver::{
-        chain_spec_for, config_for, cross_check_recovery_checkpoint, decode_accepted_head,
-        replay_commit, restore, BlockTiming, CommitOutcome, FrameCosts, ReplayOptions,
-        ReplayReport, ReplayState,
+        chain_spec_for, config_for, consumer_is_at, cross_check_recovery_checkpoint,
+        decode_accepted_head, replay_commit, restore, BlockTiming, CommitOutcome, FrameCosts,
+        ReplayOptions, ReplayReport, ReplayState,
     },
     reorg::{apply_reorg, check_shape, warn_inapplicable, ReorgOutcome},
     spool::SpooledFrame,
@@ -209,6 +209,11 @@ pub struct FollowReport {
     pub restores_continuous: u64,
     /// Restores that landed anywhere else — sound again, with an interval nothing validated.
     pub restores_reset: u64,
+    /// Commits verified for the first time out of the spool inside completed rewind windows.
+    /// A subset of `blocks_verified`, broken out so the recovery share is visible.
+    pub rewind_replayed_commits: u64,
+    /// Rewind windows refused for exceeding the bound; each degraded to an explicit reset.
+    pub rewind_windows_refused: u64,
     /// Winning branches that reached the tip the reorg announced.
     pub winning_branches_completed: u64,
     /// Winning branches that did not, with nothing valid taking their place.
@@ -314,6 +319,10 @@ enum Phase {
         /// `None` when the discontinuity named none — a reset, an epoch change, a delivery fault
         /// — in which case any checkpoint that verifies is an explicit reset by definition.
         target_ancestor: Option<BlockRef>,
+        /// The tip the reorg that opened this recovery said its branch would reach. Carried so
+        /// the restore can keep checking arrival; without it a checkpoint published mid-branch
+        /// would leave the branch's completion checked by nothing.
+        announced_tip: Option<BlockRef>,
         /// The epoch this request belongs to, so a later one supersedes it rather than racing it.
         epoch: u64,
     },
@@ -337,15 +346,74 @@ impl Phase {
 struct Supersession {
     /// The block a checkpoint now has to land on to be a continuous recovery, if any still does.
     target: Option<BlockRef>,
+    /// The tip the operative announcement said its branch would reach, carried with the target:
+    /// a reset or epoch change withdraws it, a later reorg replaces it with its own.
+    tip: Option<BlockRef>,
     /// The next epoch's manifest, once it has been checked to be this stream's successor.
     adopt: Option<Manifest>,
+    /// Sequence of the last announcement in the window, when one superseded the target. The
+    /// rewind window starts after it: commits below the last announcement belong to a branch
+    /// that was withdrawn.
+    at: Option<u64>,
+}
+
+/// The largest commit window a recovery will replay from the spool rather than skip.
+///
+/// Far above the real shape — a 195 s export at one block per 12 s is about 17 commits — so the
+/// bound only fires on a pathological spool, and it degrades to the explicit reset the same
+/// checkpoint would have produced before rewinds existed, never to an unbounded replay.
+const MAX_REWIND_FRAMES: u64 = 4_096;
+
+/// The commit frames a rewound recovery replays: sequences `[from, until)`, with `until` the
+/// installed checkpoint's announce frame.
+#[derive(Debug, Clone, Copy)]
+struct RewindWindow {
+    from: u64,
+    until: u64,
+}
+
+/// A rewind in progress: the pair is restored at the ancestor and the winning branch is being
+/// replayed from the spool.
+#[derive(Debug, Clone, Copy)]
+struct ActiveRewind {
+    /// The installed checkpoint's announce sequence; reaching it again completes the rewind.
+    until: u64,
+    /// First frame past the installed checkpoint's chunks — the live edge to hop to.
+    resume_at: u64,
+    /// Disagreement count at install; any growth during the replay downgrades the recovery from
+    /// continuous to an explicit reset.
+    disagreements_before: usize,
+    /// Commits replayed inside the window so far.
+    replayed: u64,
+}
+
+/// The rewound window a previous run's ack carried beside its restore point.
+///
+/// Not a dirty flag but the pair's reconstruction recipe: a rewound restore's state is the
+/// checkpoint *plus* the window below it, so any resume of that restore point has to replay the
+/// window again before the frames past the chunks make sense. All-or-nothing by design — no
+/// mid-window progress is persisted — and the record stays on the ack for the life of the
+/// restore point, superseded only by the next restore.
+#[derive(Debug, Clone, Copy)]
+struct AckRewind {
+    checkpoint_sequence: u64,
+    chunks_end: u64,
+    replay_from: u64,
+    replay_until: u64,
 }
 
 struct PendingRecovery {
     /// The block a continuous recovery has to land on, after supersession.
     target: Option<BlockRef>,
+    /// The tip the operative announcement promised, so the restored pair still checks that the
+    /// winning branch arrives instead of forgetting the promise across the outage.
+    tip: Option<BlockRef>,
     /// Commit frames that went by between the discontinuity and the checkpoint.
     skipped: u64,
+    /// The window those commits sit in, when they are replayable: a target was named and the
+    /// window is within bounds. Whether the replay actually runs is judged at restore time,
+    /// when the checkpoint's own block is in hand.
+    rewind: Option<RewindWindow>,
 }
 
 /// What a recovery restore is entitled to claim.
@@ -386,6 +454,10 @@ struct SkimPhase {
     manifest: Manifest,
     state: Box<ReplayState>,
     checkpoint: Checkpoint,
+    /// Carried through the skim untouched. At the ancestor it equals what the checkpoint would
+    /// re-derive; behind a late checkpoint the pair has advanced, and resetting it to the
+    /// checkpoint's child would gap the very next commit.
+    expected_child: Option<(u64, B256)>,
     pending_tip: Option<BlockRef>,
     received: u32,
     accumulated: u64,
@@ -413,6 +485,9 @@ struct Ack {
     epoch: u64,
     /// The checkpoint frame its pair came from. Absent in version 1 acks.
     restored_from_sequence: Option<u64>,
+    /// The rewind transaction the previous run had open, when it died mid-window. Absent on
+    /// version 1 and 2 acks and on any run that was not rewinding.
+    recovery: Option<AckRewind>,
 }
 
 /// Reads an ack file, or reports that there is nothing to resume from.
@@ -458,6 +533,28 @@ fn read_ack(path: &Path) -> eyre::Result<Option<Ack>> {
         restored_from_sequence: value
             .get("restored_from_sequence")
             .and_then(serde_json::Value::as_u64),
+        // A recovery block that exists but does not parse is refused, not treated as absent: it
+        // was written by a run that needed its window replayed, and resuming without the window
+        // would rebuild a different pair under the same watermark.
+        recovery: match value.get("recovery").filter(|value| !value.is_null()) {
+            None => None,
+            Some(recovery) => {
+                let field = |name: &str| {
+                    recovery.get(name).and_then(serde_json::Value::as_u64).ok_or_else(|| {
+                        eyre::eyre!(
+                            "the ack at {} carries a recovery window with no readable {name}",
+                            path.display()
+                        )
+                    })
+                };
+                Some(AckRewind {
+                    checkpoint_sequence: field("checkpoint_sequence")?,
+                    chunks_end: field("chunks_end")?,
+                    replay_from: field("replay_from")?,
+                    replay_until: field("replay_until")?,
+                })
+            }
+        },
     }))
 }
 
@@ -497,6 +594,17 @@ struct Follower<'a> {
     /// What the scan that found the next checkpoint was looking for, so the restore can say
     /// whether it got it.
     pending_recovery: Option<PendingRecovery>,
+    /// The rewind replay in progress, when a recovery restored at the exact ancestor and its
+    /// winning branch is being re-read from the spool.
+    rewind_active: Option<ActiveRewind>,
+    /// A rewind recorded by the previous run's ack, resumed all-or-nothing: the whole window
+    /// replays again after the restore.
+    resume_rewind: Option<AckRewind>,
+    /// Commits verified inside completed rewind windows. These count in `blocks_verified` too;
+    /// this counter is what makes the recovery share visible beside the total.
+    rewind_replayed_commits: u64,
+    /// Rewind windows refused for exceeding [`MAX_REWIND_FRAMES`]; each degraded to a reset.
+    rewind_windows_refused: u64,
     unverified_intervals: Vec<(u64, u64)>,
     last_needs_snapshot: Option<NeedsSnapshotReason>,
     last_verified: Option<BlockRef>,
@@ -558,6 +666,10 @@ impl<'a> Follower<'a> {
             resumed_from: None,
             resume_watermark: None,
             pending_recovery: None,
+            rewind_active: None,
+            resume_rewind: None,
+            rewind_replayed_commits: 0,
+            rewind_windows_refused: 0,
             unverified_intervals: Vec::new(),
             last_needs_snapshot: None,
             last_verified: None,
@@ -586,6 +698,9 @@ impl<'a> Follower<'a> {
                         self.last_frame_at = Instant::now();
                         let frame = *frame;
                         let sequence = frame.header.sequence;
+                        if self.rewind_boundary(sequence) {
+                            continue
+                        }
                         self.note_frame_costs(&frame);
                         let step = self.handle(sequence, frame.event)?;
                         match self.catch_up_until {
@@ -605,8 +720,13 @@ impl<'a> Follower<'a> {
                     Ok(TailEvent::Idle) => {
                         // The one observation that separates backlog from live delivery: the
                         // spool had nothing new, so every frame from here on arrived while this
-                        // follower was already waiting for it.
-                        self.reached_tail = true;
+                        // follower was already waiting for it. Armed only once a pair has been
+                        // restored — a follower started against a pre-checkpoint spool also
+                        // observes an empty poll, and arming there is exactly the startup
+                        // mislabeling both 1,001-block preflights had to hand-exclude.
+                        if self.restores > 0 {
+                            self.reached_tail = true;
+                        }
                         self.idle()
                     }
                     Err(fault) => self.tail_fault(fault)?,
@@ -682,12 +802,12 @@ impl<'a> Follower<'a> {
             .tail
             .read_at(restored_from, FrameKind::Checkpoint)
             .map_err(|fault| eyre::eyre!("the ack's checkpoint did not read back: {fault}"))?;
-        if !matches!(frame.event, StreamEvent::Checkpoint(_)) {
+        let StreamEvent::Checkpoint(checkpoint) = frame.event else {
             return Err(eyre::eyre!(
                 "the frame at sequence {restored_from} is named Checkpoint but decoded as \
                  something else"
             ))
-        }
+        };
         self.resumed_from = Some(restored_from);
         self.tail.skip_to(restored_from);
         // Identity is already established — `verify_epoch_chain` read it from the spool's own
@@ -695,6 +815,45 @@ impl<'a> Follower<'a> {
         // be checked against, which is the whole reason the chain is walked before this point.
         self.phase = Phase::AwaitingCheckpoint { manifest };
         self.catch_up_until = Some(ack.last_sequence);
+        // A rewound restore point carries its window on the ack, and a resume of it replays the
+        // window all-or-nothing: restore at the checkpoint, then re-read the *whole* recorded
+        // range. No mid-window progress was persisted, deliberately — re-deriving is this
+        // format's restart philosophy, and the acks written below the checkpoint's sequence were
+        // dropped by the monotonic guard anyway. The window is checked against the spool before
+        // it is believed: an ack that names a different boundary than the checkpoint it points
+        // at was not written against this spool.
+        if let Some(recovery) = ack.recovery {
+            if recovery.checkpoint_sequence != restored_from {
+                return Err(eyre::eyre!(
+                    "the ack's recovery window names checkpoint sequence {}, but the ack \
+                     restored from {restored_from}; the file contradicts itself",
+                    recovery.checkpoint_sequence
+                ))
+            }
+            let chunks_end = restored_from + u64::from(checkpoint.snapshot_chunks);
+            if recovery.replay_until != restored_from ||
+                recovery.chunks_end != chunks_end ||
+                recovery.replay_from >= recovery.replay_until ||
+                recovery.replay_from < manifest_at
+            {
+                return Err(eyre::eyre!(
+                    "the ack's recovery window [{}, {}) with chunks through {} does not describe \
+                     the checkpoint at sequence {restored_from} with chunks through {chunks_end}; \
+                     the ack was not written against this spool",
+                    recovery.replay_from,
+                    recovery.replay_until,
+                    recovery.chunks_end
+                ))
+            }
+            info!(
+                target: "ps_follow",
+                replay_from = recovery.replay_from,
+                replay_until = recovery.replay_until,
+                "The ack's restore point is a rewound recovery; the whole window replays again \
+                 after the restore"
+            );
+            self.resume_rewind = Some(recovery);
+        }
         // Checked only against a watermark a verdict wrote. A run that stopped waiting for a
         // snapshot will re-hit whatever stopped it before it gets this far, and that is not a
         // divergence — it is the same refusal, reached the same way, which is what makes a
@@ -779,7 +938,8 @@ impl<'a> Follower<'a> {
         // named rather than merely counted.
         self.last_verified = ack.block;
         // No target: an epoch boundary names no block, so whatever it restores from is a reset.
-        self.pending_recovery = Some(PendingRecovery { target: None, skipped: 0 });
+        self.pending_recovery =
+            Some(PendingRecovery { target: None, tip: None, skipped: 0, rewind: None });
         self.resumed_from = Some(next_at);
         self.tail.skip_to(next_at);
         self.phase = Phase::AwaitingManifest;
@@ -1004,6 +1164,24 @@ impl<'a> Follower<'a> {
     ) -> eyre::Result<Step> {
         let StreamingPhase { manifest, mut state, expected_child, announced, mut pending_tip } =
             phase;
+        // The rewind window's contract, enforced rather than assumed: the producer's fencing
+        // makes a published late checkpoint's window Commit-only, but an independent validator
+        // refuses a spool that breaks the promise instead of acting on whatever sits there —
+        // a reorg frame inside a window would otherwise be *applied*, mid-replay, as though the
+        // chain had moved. The scan cannot deliver these shapes from a healthy spool; a resumed
+        // ack against a doctored one can.
+        if self.rewind_active.is_some() && !matches!(event, StreamEvent::Commit(_)) {
+            return Ok(self.enter_needs_snapshot(
+                manifest,
+                NeedsSnapshotReason::ProtocolViolation,
+                &format!(
+                    "a {} frame sits inside a rewind window, which holds only commits",
+                    kind_of(&event).as_str()
+                ),
+                sequence + 1,
+                None,
+            ))
+        }
         match event {
             StreamEvent::Commit(commit) => {
                 let (input, oracle) = commit.split();
@@ -1056,14 +1234,23 @@ impl<'a> Follower<'a> {
                         // apart and labelled in the record, because a resumed run that added them
                         // to its own total would report the same work twice.
                         let catch_up = self.catch_up_until.is_some();
+                        // First-time verification replayed out of the spool during a recovery
+                        // rewind: counted in `blocks_verified` — excluding it would hide both
+                        // the verified blocks and the recovery's cost — with the live-latency
+                        // fields null, because a re-read frame's mtime distance measures the
+                        // outage, not the transport.
+                        let recovery_replay = self.rewind_active.is_some();
                         if catch_up {
                             self.catch_up_blocks += 1;
                         } else {
                             self.blocks_verified += 1;
                         }
+                        if let Some(rewind) = self.rewind_active.as_mut() {
+                            rewind.replayed += 1;
+                        }
                         self.last_verified = Some(block);
                         let (queue_wait_us, decision_latency_us, available_at_source) =
-                            self.latency_fields(catch_up);
+                            self.latency_fields(catch_up || recovery_replay);
                         self.sink.verdict(Published {
                             verdict,
                             block,
@@ -1071,8 +1258,9 @@ impl<'a> Follower<'a> {
                             provenance,
                             disagreements: new_disagreements,
                             catch_up,
+                            recovery_replay,
                             timing: attempt_timing(&self.replay, sequence),
-                            tail_live: self.last_frame_live && !catch_up,
+                            tail_live: self.last_frame_live && !catch_up && !recovery_replay,
                             queue_wait_us,
                             decision_latency_us,
                             available_at_source,
@@ -1105,9 +1293,14 @@ impl<'a> Follower<'a> {
                             manifest,
                             state,
                             expected_child: None,
-                            // Consumed: the producer publishes a checkpoint before the winning
-                            // branch's commits or not at all.
-                            announced: None,
+                            // Preserved across commits: under write-through publication the
+                            // recovery checkpoint arrives *behind* the winning branch, and this
+                            // expectation is what lets the follower skim it there instead of
+                            // refusing it as unannounced. It resolves at the matching skim, is
+                            // replaced by the next lifecycle event, and is counted — not failed —
+                            // if the stream ends first, because `never` publishes no checkpoint
+                            // at all.
+                            announced,
                             pending_tip,
                         };
                         Ok(Step::Continue)
@@ -1123,8 +1316,9 @@ impl<'a> Follower<'a> {
                             .cloned()
                             .unwrap_or_else(|| format!("block {} was rejected", block.number));
                         let catch_up = self.catch_up_until.is_some();
+                        let recovery_replay = self.rewind_active.is_some();
                         let (queue_wait_us, decision_latency_us, available_at_source) =
-                            self.latency_fields(catch_up);
+                            self.latency_fields(catch_up || recovery_replay);
                         self.sink.verdict(Published {
                             verdict: "rejected",
                             block,
@@ -1132,8 +1326,9 @@ impl<'a> Follower<'a> {
                             provenance,
                             disagreements: new_disagreements,
                             catch_up,
+                            recovery_replay,
                             timing: attempt_timing(&self.replay, sequence),
-                            tail_live: self.last_frame_live && !catch_up,
+                            tail_live: self.last_frame_live && !catch_up && !recovery_replay,
                             queue_wait_us,
                             decision_latency_us,
                             available_at_source,
@@ -1145,13 +1340,24 @@ impl<'a> Follower<'a> {
                             &detail,
                             self.last_verified,
                         )?;
+                        // Reinstalled so the final report reads the truth off the phase — a
+                        // fault with a recovery expectation still pending is still a pending
+                        // expectation.
+                        self.phase = Phase::Streaming {
+                            manifest,
+                            state,
+                            expected_child: None,
+                            announced,
+                            pending_tip,
+                        };
                         Ok(Step::Done(FollowOutcome::Faulted { detail }))
                     }
                     CommitOutcome::Fault(fault) => {
                         let detail = fault.to_string();
                         let catch_up = self.catch_up_until.is_some();
+                        let recovery_replay = self.rewind_active.is_some();
                         let (queue_wait_us, decision_latency_us, available_at_source) =
-                            self.latency_fields(catch_up);
+                            self.latency_fields(catch_up || recovery_replay);
                         self.sink.verdict(Published {
                             verdict: "fault",
                             block,
@@ -1159,8 +1365,9 @@ impl<'a> Follower<'a> {
                             provenance,
                             disagreements: new_disagreements,
                             catch_up,
+                            recovery_replay,
                             timing: attempt_timing(&self.replay, sequence),
-                            tail_live: self.last_frame_live && !catch_up,
+                            tail_live: self.last_frame_live && !catch_up && !recovery_replay,
                             queue_wait_us,
                             decision_latency_us,
                             available_at_source,
@@ -1174,6 +1381,13 @@ impl<'a> Follower<'a> {
                             readiness = state.pair.readiness.state().label(),
                             "The pair can go no further; no further verdict will be published"
                         );
+                        self.phase = Phase::Streaming {
+                            manifest,
+                            state,
+                            expected_child: None,
+                            announced,
+                            pending_tip,
+                        };
                         Ok(Step::Done(FollowOutcome::Faulted { detail }))
                     }
                 }
@@ -1206,9 +1420,18 @@ impl<'a> Follower<'a> {
                 // them is a live disagreement detector; the bytes are read for their digest and
                 // dropped, because installing would replace derived state with state this
                 // consumer has no reason to prefer.
-                Some(ancestor) => {
-                    self.begin_skim(manifest, state, checkpoint, ancestor, pending_tip, sequence)
-                }
+                Some(ancestor) => self.begin_skim(
+                    StreamingPhase {
+                        manifest,
+                        state,
+                        expected_child,
+                        announced: None,
+                        pending_tip,
+                    },
+                    checkpoint,
+                    ancestor,
+                    sequence,
+                ),
                 // Unannounced: the grammar has no mid-stream checkpoint without a reset or reorg
                 // in front of it. Fail closed — and let the recovery scan re-examine this very
                 // frame, so a producer's recovery grammar still converges. The violation stays
@@ -1270,14 +1493,17 @@ impl<'a> Follower<'a> {
                     // Bound to this follower's own branch: the ancestor is a block it verified,
                     // so a checkpoint at that exact block resumes it with no gap, and the branch
                     // this reorg interrupted was withdrawn by a statement it could authenticate.
+                    // The winning tip travels into the recovery with the target: the branch's
+                    // completion is still owed a check after the restore.
                     ReorgOutcome::Unrecoverable { ancestor, depth, detail } => {
                         warn_inapplicable(ancestor, depth, &detail, true);
-                        Ok(self.enter_needs_snapshot(
+                        Ok(self.enter_needs_snapshot_carrying(
                             manifest,
                             NeedsSnapshotReason::SnapshotRequired,
                             &detail,
                             sequence + 1,
                             Some(ancestor),
+                            found.winning_tip,
                         ))
                     }
                     // Well-formed, but about a branch this follower never held. The ancestor is
@@ -1354,13 +1580,12 @@ impl<'a> Follower<'a> {
     /// is a transport fault the pair this follower holds says nothing about.
     fn begin_skim(
         &mut self,
-        manifest: Manifest,
-        state: Box<ReplayState>,
+        phase: StreamingPhase,
         checkpoint: Checkpoint,
         ancestor: BlockRef,
-        pending_tip: Option<BlockRef>,
         sequence: u64,
     ) -> eyre::Result<Step> {
+        let StreamingPhase { manifest, state, expected_child, pending_tip, .. } = phase;
         if let Err(err) = checkpoint.validate_declared(DEFAULT_MAX_SNAPSHOT_BYTES) {
             return Ok(self.enter_needs_snapshot(
                 manifest,
@@ -1381,38 +1606,50 @@ impl<'a> Follower<'a> {
                  recovered to. One of the two undid the reorg wrongly"
             );
             self.replay.disagreements.push((checkpoint.block, disagreement));
-            // The operator-trusted checkpoint source is the authority on what is canonical here —
-            // it is the same authority this follower bootstrapped under — so the run continues
-            // from its checkpoint rather than from a generation it contradicts. Recorded as
-            // non-agreeing, and re-entered through the scan so the restore is classified: it will
-            // be an explicit reset, because a disputed ancestor cannot anchor a continuous claim.
-            // The announced tip is let go with it; the reset already says the run has a hole.
-            return Ok(self.enter_needs_snapshot(
-                manifest,
-                NeedsSnapshotReason::SnapshotRequired,
-                "the recovery checkpoint disagrees with the recovered generation",
-                sequence,
-                None,
-            ))
+            if consumer_is_at(&state, ancestor) {
+                // The operator-trusted checkpoint source is the authority on what is canonical
+                // here — it is the same authority this follower bootstrapped under — so the run
+                // continues from its checkpoint rather than from a generation it contradicts.
+                // Recorded as non-agreeing, and re-entered through the scan so the restore is
+                // classified: it will be an explicit reset, because a disputed ancestor cannot
+                // anchor a continuous claim. The announced tip is let go with it; the reset
+                // already says the run has a hole.
+                return Ok(self.enter_needs_snapshot(
+                    manifest,
+                    NeedsSnapshotReason::SnapshotRequired,
+                    "the recovery checkpoint disagrees with the recovered generation",
+                    sequence,
+                    None,
+                ))
+            }
+            // Late: this follower verified every block past the ancestor for itself, against
+            // canonical headers and its own roots, and that chain outranks a late cross-check.
+            // Installing would rewind the pair below commits it already stands behind. The
+            // disagreement above already fails the run's agreement claim; validation continues,
+            // the expectation is dropped, and the chunks are still read off the stream for their
+            // declared digest — a transport fault stays a separate finding.
+            self.replay.late_skim_mismatches += 1;
+        } else {
+            self.checkpoints_skimmed += 1;
+            info!(
+                target: "ps_follow",
+                block = checkpoint.block.number,
+                chunks = checkpoint.snapshot_chunks,
+                "The producer's recovery checkpoint agrees with the generation this follower \
+                 recovered to; its snapshot is checked and not installed"
+            );
+            // Recorded with its sequence, because agreeing with a checkpoint is not the same as
+            // having shown its snapshot would restore anything — and the offline proof that it
+            // would needs to be told which frame to install.
+            self.sink.skimmed(checkpoint.block, sequence, self.catch_up_until.is_some())?;
         }
-        self.checkpoints_skimmed += 1;
-        info!(
-            target: "ps_follow",
-            block = checkpoint.block.number,
-            chunks = checkpoint.snapshot_chunks,
-            "The producer's recovery checkpoint agrees with the generation this follower \
-             recovered to; its snapshot is checked and not installed"
-        );
-        // Recorded with its sequence, because agreeing with a checkpoint is not the same as
-        // having shown its snapshot would restore anything — and the offline proof that it would
-        // needs to be told which frame to install.
-        self.sink.skimmed(checkpoint.block, sequence)?;
         if checkpoint.snapshot_chunks == 0 {
             return self.finish_skim(
                 SkimPhase {
                     manifest,
                     state,
                     checkpoint,
+                    expected_child,
                     pending_tip,
                     received: 0,
                     accumulated: 0,
@@ -1425,6 +1662,7 @@ impl<'a> Follower<'a> {
             manifest,
             state,
             checkpoint,
+            expected_child,
             pending_tip,
             received: 0,
             accumulated: 0,
@@ -1444,6 +1682,7 @@ impl<'a> Follower<'a> {
             manifest,
             state,
             checkpoint,
+            expected_child,
             pending_tip,
             received,
             accumulated,
@@ -1480,6 +1719,7 @@ impl<'a> Follower<'a> {
                 manifest,
                 state,
                 checkpoint,
+                expected_child,
                 pending_tip,
                 received,
                 accumulated,
@@ -1488,14 +1728,32 @@ impl<'a> Follower<'a> {
             return Ok(Step::Continue)
         }
         self.finish_skim(
-            SkimPhase { manifest, state, checkpoint, pending_tip, received, accumulated, digest },
+            SkimPhase {
+                manifest,
+                state,
+                checkpoint,
+                expected_child,
+                pending_tip,
+                received,
+                accumulated,
+                digest,
+            },
             sequence,
         )
     }
 
     /// Checks what the skim accumulated against what the checkpoint declared, and resumes.
     fn finish_skim(&mut self, phase: SkimPhase, sequence: u64) -> eyre::Result<Step> {
-        let SkimPhase { manifest, state, checkpoint, pending_tip, accumulated, digest, .. } = phase;
+        let SkimPhase {
+            manifest,
+            state,
+            checkpoint,
+            expected_child,
+            pending_tip,
+            accumulated,
+            digest,
+            ..
+        } = phase;
         let digest = if checkpoint.snapshot_chunks == 0 { B256::ZERO } else { digest.finalize() };
         if checkpoint.snapshot_chunks > 0 &&
             (digest != checkpoint.snapshot_digest || accumulated != checkpoint.snapshot_bytes)
@@ -1512,13 +1770,12 @@ impl<'a> Follower<'a> {
                 None,
             ))
         }
-        self.phase = Phase::Streaming {
-            manifest,
-            state,
-            expected_child: Some((checkpoint.block.number + 1, checkpoint.block.hash)),
-            announced: None,
-            pending_tip,
-        };
+        // The child constraint entered the skim untouched and leaves it untouched. At the
+        // ancestor it is already `(checkpoint.block + 1, checkpoint.block.hash)` from the undo
+        // that announced this checkpoint; behind a late one, the pair has advanced and resetting
+        // it to the checkpoint's child would refuse the very next commit as a gap.
+        self.phase =
+            Phase::Streaming { manifest, state, expected_child, announced: None, pending_tip };
         Ok(Step::Continue)
     }
 
@@ -1581,10 +1838,90 @@ impl<'a> Follower<'a> {
             Ok(state) => {
                 self.restores += 1;
                 let expected_child = Some((checkpoint.block.number + 1, checkpoint.block.hash));
+                let resume_rewind = self.resume_rewind.take();
+                let pending = self.pending_recovery.take();
+                // The tip the interrupted reorg promised, still owed a check after the restore.
+                // A checkpoint at the tip itself completes the branch; one at or above its
+                // height settles the question the reset classification already answers; below
+                // it, the expectation rides into the streaming phase as `pending_tip`.
+                let carried_tip =
+                    pending.as_ref().and_then(|pending| pending.tip).and_then(|tip| {
+                        if checkpoint.block == tip {
+                            self.winning_branches_completed += 1;
+                            None
+                        } else if checkpoint.block.number >= tip.number {
+                            None
+                        } else {
+                            Some(tip)
+                        }
+                    });
+                // A rewind runs when the checkpoint landed exactly on the target with its
+                // winning-branch commits below it in the spool — or when a previous run's ack
+                // recorded one mid-flight, which replays whole. Classification then waits for
+                // the replay: continuous is a claim about those commits, and they have not been
+                // verified yet.
+                let window = match (&resume_rewind, &pending) {
+                    (Some(ack), _) => {
+                        Some(RewindWindow { from: ack.replay_from, until: ack.replay_until })
+                    }
+                    (None, Some(recovery)) if recovery.target == Some(checkpoint.block) => {
+                        recovery.rewind
+                    }
+                    _ => None,
+                };
+                if let Some(window) = window {
+                    let resume_at = checkpoint_sequence + 1 + u64::from(checkpoint.snapshot_chunks);
+                    self.rewind_active = Some(ActiveRewind {
+                        until: window.until,
+                        resume_at,
+                        disagreements_before: self.replay.disagreements.len(),
+                        replayed: 0,
+                    });
+                    self.sink.set_rewind(Some(AckRewind {
+                        checkpoint_sequence,
+                        chunks_end: resume_at.saturating_sub(1),
+                        replay_from: window.from,
+                        replay_until: window.until,
+                    }));
+                    info!(
+                        target: "ps_follow",
+                        block = checkpoint.block.number,
+                        restores = self.restores,
+                        replay_from = window.from,
+                        replay_until = window.until,
+                        "Restored at the exact ancestor; the winning branch replays from the \
+                         spool before the live edge resumes"
+                    );
+                    self.sink.restored(
+                        checkpoint.block,
+                        None,
+                        self.last_verified,
+                        checkpoint_sequence,
+                        manifest.epoch,
+                        true,
+                    )?;
+                    self.tail.skip_to(window.from);
+                    self.phase = Phase::Streaming {
+                        manifest,
+                        state: Box::new(state),
+                        expected_child,
+                        announced: None,
+                        pending_tip: carried_tip,
+                    };
+                    return Ok(Step::Continue)
+                }
+                // The deferred skip count lands here for the candidate the scan could not judge:
+                // the checkpoint anchored somewhere other than the target, so the window's
+                // commits really were skipped, not replayed.
+                if let Some(recovery) = &pending &&
+                    recovery.rewind.is_some()
+                {
+                    self.commits_skipped_in_recovery += recovery.skipped;
+                }
                 // Decided by the scan that found this checkpoint, because only the scan knows
                 // what was asked for and what went by in between. The first restore of a stream
                 // is neither: nothing preceded it to be continuous with.
-                let class = self.pending_recovery.take().map(|pending| {
+                let class = pending.map(|pending| {
                     let continuous =
                         pending.target == Some(checkpoint.block) && pending.skipped == 0;
                     if continuous {
@@ -1610,6 +1947,10 @@ impl<'a> Follower<'a> {
                     }
                     None => {}
                 }
+                // This restore's pair is the checkpoint alone, so any window a previous restore
+                // point carried on the ack is superseded here, before the ack that names the new
+                // restore point is written.
+                self.sink.set_rewind(None);
                 info!(
                     target: "ps_follow",
                     block = checkpoint.block.number,
@@ -1623,13 +1964,14 @@ impl<'a> Follower<'a> {
                     self.last_verified,
                     checkpoint_sequence,
                     manifest.epoch,
+                    false,
                 )?;
                 self.phase = Phase::Streaming {
                     manifest,
                     state: Box::new(state),
                     expected_child,
                     announced: None,
-                    pending_tip: None,
+                    pending_tip: carried_tip,
                 };
                 Ok(Step::Continue)
             }
@@ -1640,6 +1982,57 @@ impl<'a> Follower<'a> {
                 checkpoint_sequence + 1,
                 None,
             )),
+        }
+    }
+
+    /// Hops over the installed checkpoint when a rewind replay reaches it again, and settles the
+    /// recovery's classification: continuous when every rewound commit agreed, an explicit reset
+    /// when one disagreed. Returns whether the frame at `sequence` was consumed by the hop.
+    fn rewind_boundary(&mut self, sequence: u64) -> bool {
+        let Some(rewind) = self.rewind_active else { return false };
+        if sequence < rewind.until {
+            return false
+        }
+        self.rewind_active = None;
+        self.tail.skip_to(rewind.resume_at);
+        let clean = self.replay.disagreements.len() == rewind.disagreements_before;
+        if clean {
+            self.restores_continuous += 1;
+        } else {
+            self.restores_reset += 1;
+        }
+        self.rewind_replayed_commits += rewind.replayed;
+        // The ack's recovery window is deliberately *not* cleared here: it is the restore
+        // point's reconstruction recipe, not a dirty flag. A resume of this restore point — a
+        // kill one frame from now included — has to replay the window to rebuild the same pair,
+        // and an ack that named the checkpoint without the window would gap at the first live
+        // commit past the chunks. The next restore supersedes it.
+        info!(
+            target: "ps_follow",
+            replayed = rewind.replayed,
+            continuous = clean,
+            resume_at = rewind.resume_at,
+            "The rewound winning branch is fully replayed; resuming at the live edge"
+        );
+        true
+    }
+
+    /// Abandons a rewind that cannot finish — a fault, a fresh discontinuity — as the explicit
+    /// reset it now is. The ack's recovery window stays: a resume replays it and re-hits the
+    /// same discontinuity the same way, which is what makes a restart a repetition rather than
+    /// a way past a refusal. The next restore supersedes the window.
+    fn abort_rewind(&mut self, why: &str) {
+        if let Some(rewind) = self.rewind_active.take() {
+            self.restores_reset += 1;
+            self.rewind_replayed_commits += rewind.replayed;
+            warn!(
+                target: "ps_follow",
+                replayed = rewind.replayed,
+                until = rewind.until,
+                why,
+                "A rewind replay stopped before its window closed; the recovery is an explicit \
+                 reset"
+            );
         }
     }
 
@@ -1657,8 +2050,31 @@ impl<'a> Follower<'a> {
         scan_from: u64,
         target_ancestor: Option<BlockRef>,
     ) -> Step {
+        self.enter_needs_snapshot_carrying(
+            manifest,
+            reason,
+            detail,
+            scan_from,
+            target_ancestor,
+            None,
+        )
+    }
+
+    /// [`Self::enter_needs_snapshot`] with the winning tip an interrupting reorg announced, so
+    /// the eventual restore keeps checking the branch's arrival. Only a recovery whose target
+    /// came from an authenticated reorg carries one; every other discontinuity names no branch.
+    fn enter_needs_snapshot_carrying(
+        &mut self,
+        manifest: Manifest,
+        reason: NeedsSnapshotReason,
+        detail: &str,
+        scan_from: u64,
+        target_ancestor: Option<BlockRef>,
+        announced_tip: Option<BlockRef>,
+    ) -> Step {
         self.needs_snapshot_entries += 1;
         self.last_needs_snapshot = Some(reason);
+        self.abort_rewind("a discontinuity interrupted the rewind");
         if self.catch_up_until.take().is_some() {
             // The resumed run re-hit whatever stopped the previous one before reaching its
             // watermark. Expected, and not a divergence — but the catch-up is over, so this run
@@ -1687,7 +2103,14 @@ impl<'a> Follower<'a> {
         ) {
             warn!(target: "ps_follow", error = %err, "Could not record the state transition");
         }
-        self.phase = Phase::NeedsSnapshot { manifest, reason, scan_from, target_ancestor, epoch };
+        self.phase = Phase::NeedsSnapshot {
+            manifest,
+            reason,
+            scan_from,
+            target_ancestor,
+            announced_tip,
+            epoch,
+        };
         Step::Continue
     }
 
@@ -1717,22 +2140,23 @@ impl<'a> Follower<'a> {
     fn supersede_target(
         &mut self,
         target: Option<BlockRef>,
+        tip: Option<BlockRef>,
         current: &Manifest,
         scan_from: u64,
         checkpoint_at: u64,
     ) -> eyre::Result<Supersession> {
         let mut adopt = None;
-        let mut latest: Option<(u64, Option<BlockRef>)> = None;
+        let mut latest: Option<(u64, Option<BlockRef>, Option<BlockRef>)> = None;
         for kind in [FrameKind::Reorg, FrameKind::Reset, FrameKind::Manifest] {
             let found = self
                 .tail
                 .last_before(kind, scan_from, checkpoint_at)
                 .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
             let Some(sequence) = found else { continue };
-            if latest.is_some_and(|(seen, _)| seen >= sequence) {
+            if latest.is_some_and(|(seen, _, _)| seen >= sequence) {
                 continue
             }
-            let announced = match kind {
+            let (announced, announced_tip) = match kind {
                 FrameKind::Reorg => {
                     let frame = self
                         .tail
@@ -1748,10 +2172,10 @@ impl<'a> Follower<'a> {
                     // could name any block as the ancestor, and a checkpoint landing there would
                     // then be reported as a continuous recovery of a branch nobody described.
                     match check_shape(&reorg) {
-                        Ok(()) => Some(reorg.common_ancestor),
+                        Ok(()) => (Some(reorg.common_ancestor), reorg.winning_tip),
                         Err(detail) => {
                             self.refuse_in_scan(sequence, "reorg", &detail)?;
-                            None
+                            (None, None)
                         }
                     }
                 }
@@ -1773,15 +2197,15 @@ impl<'a> Follower<'a> {
                         Ok(()) => adopt = Some(next),
                         Err(err) => self.refuse_in_scan(sequence, "manifest", &err.to_string())?,
                     }
-                    None
+                    (None, None)
                 }
                 // A reset names no block, so nothing after it can be continuous with anything.
-                _ => None,
+                _ => (None, None),
             };
-            latest = Some((sequence, announced));
+            latest = Some((sequence, announced, announced_tip));
         }
         match latest {
-            Some((sequence, announced)) => {
+            Some((sequence, announced, announced_tip)) => {
                 info!(
                     target: "ps_follow",
                     sequence,
@@ -1790,9 +2214,14 @@ impl<'a> Follower<'a> {
                     epoch_changed = adopt.is_some(),
                     "A later announcement supersedes the recovery target"
                 );
-                Ok(Supersession { target: announced, adopt })
+                Ok(Supersession {
+                    target: announced,
+                    tip: announced_tip,
+                    adopt,
+                    at: Some(sequence),
+                })
             }
-            None => Ok(Supersession { target, adopt }),
+            None => Ok(Supersession { target, tip, adopt, at: None }),
         }
     }
 
@@ -1827,8 +2256,14 @@ impl<'a> Follower<'a> {
     /// closed stream, not a recovery, and preferring it would let anything appended to a dead
     /// spool restart verdicts.
     fn scan_for_recovery(&mut self) -> eyre::Result<Step> {
-        let Phase::NeedsSnapshot { manifest, reason, scan_from, target_ancestor, epoch } =
-            std::mem::replace(&mut self.phase, Phase::AwaitingManifest)
+        let Phase::NeedsSnapshot {
+            manifest,
+            reason,
+            scan_from,
+            target_ancestor,
+            announced_tip,
+            epoch,
+        } = std::mem::replace(&mut self.phase, Phase::AwaitingManifest)
         else {
             return Err(eyre::eyre!("the recovery scan ran outside NeedsSnapshot"))
         };
@@ -1849,26 +2284,55 @@ impl<'a> Follower<'a> {
                 .tail
                 .count_commits_between(self.tail.next_sequence(), found)
                 .map_err(|fault| eyre::eyre!("the recovery scan failed: {fault}"))?;
-            self.commits_skipped_in_recovery += skipped;
             // The last word between the request and the checkpoint is the operative one: a second
             // reorg during the outage moves the block a snapshot has to be authenticated at, and
             // a reset withdraws the request. Without this, a stale target would let a checkpoint
             // that answers a superseded question be reported as continuous recovery.
-            let superseded = self.supersede_target(target_ancestor, &manifest, scan_from, found)?;
+            let superseded =
+                self.supersede_target(target_ancestor, announced_tip, &manifest, scan_from, found)?;
             let target = superseded.target;
+            let tip = superseded.tip;
             // A new epoch's frames are read under the new epoch's identity. It was checked to be
             // this stream's successor before it got here, so adopting it is not a change of
             // subject — it is the same producer saying where its restart begins.
             let manifest = superseded.adopt.unwrap_or(manifest);
+            // The commits between the last announcement (or the scan's own position) and the
+            // checkpoint are replayable from the spool when the checkpoint lands exactly on the
+            // target — under write-through publication they are the winning branch itself. Their
+            // counting is deferred to the restore for exactly that candidate shape: rewound
+            // commits are verified, not skipped. Every other shape counts them here, as it
+            // always did.
+            let window_from = superseded.at.map_or(self.tail.next_sequence(), |at| at + 1);
+            let candidate = target.is_some() && skipped > 0;
+            let rewind = if candidate && found.saturating_sub(window_from) <= MAX_REWIND_FRAMES {
+                Some(RewindWindow { from: window_from, until: found })
+            } else {
+                if candidate {
+                    self.rewind_windows_refused += 1;
+                    warn!(
+                        target: "ps_follow",
+                        frames = found.saturating_sub(window_from),
+                        bound = MAX_REWIND_FRAMES,
+                        "The rewind window exceeds the bound; the restore degrades to an \
+                         explicit reset instead of replaying it"
+                    );
+                }
+                None
+            };
+            if rewind.is_none() {
+                self.commits_skipped_in_recovery += skipped;
+            }
             // Classified where the checkpoint itself is in hand, which is `restore_pair`; what
             // the scan knows and it does not is what was asked for and what went by in between.
-            self.pending_recovery = Some(PendingRecovery { target, skipped });
+            self.pending_recovery = Some(PendingRecovery { target, tip, skipped, rewind });
             info!(
                 target: "ps_follow",
                 checkpoint_sequence = found,
                 skipped_commits = skipped,
+                rewindable = rewind.is_some(),
                 epoch,
-                "A recovery checkpoint appeared; skipped commits are recorded, never verified"
+                "A recovery checkpoint appeared; skipped commits are recorded, never verified, \
+                 unless the checkpoint lands on the target and the window replays"
             );
             self.tail.skip_to(found);
             self.phase = Phase::AwaitingCheckpoint { manifest };
@@ -1889,6 +2353,15 @@ impl<'a> Follower<'a> {
                 ))
             };
             self.check_end_numbering(&end.reason, end.last_sequence, end_at)?;
+            // The branch a reorg promised never arrived and nothing valid took its place: the
+            // stream closed while the recovery that would have delivered it was still owed.
+            if announced_tip.is_some() {
+                self.winning_branches_incomplete += 1;
+                warn!(
+                    target: "ps_follow",
+                    "The stream ended while a recovery still owed the winning branch's tip"
+                );
+            }
             if let Some(trailing) = checkpoint_at {
                 warn!(
                     target: "ps_follow",
@@ -1907,7 +2380,14 @@ impl<'a> Follower<'a> {
             return Ok(Step::Done(FollowOutcome::Ended { kind: end.kind, before_checkpoint: false }))
         }
 
-        self.phase = Phase::NeedsSnapshot { manifest, reason, scan_from, target_ancestor, epoch };
+        self.phase = Phase::NeedsSnapshot {
+            manifest,
+            reason,
+            scan_from,
+            target_ancestor,
+            announced_tip,
+            epoch,
+        };
         Ok(self.idle())
     }
 
@@ -2012,9 +2492,22 @@ impl<'a> Follower<'a> {
     }
 
     fn into_report(mut self, outcome: FollowOutcome) -> FollowReport {
+        // A run that stops mid-rewind counts the reset here; the ack's recovery transaction is
+        // deliberately *not* cleared with it — the file already on disk is what lets the resumed
+        // run replay the whole window again.
+        if let Some(rewind) = self.rewind_active.take() {
+            self.restores_reset += 1;
+            self.rewind_replayed_commits += rewind.replayed;
+        }
         let waiting = matches!(self.phase, Phase::NeedsSnapshot { .. });
         if let Err(err) = self.sink.ack_state(&outcome, waiting, self.last_verified, &self.tail) {
             warn!(target: "ps_follow", error = %err, "Could not write the final ack");
+        }
+        // Read off the final phase rather than instrumented at every exit, so End, fault, and
+        // idle-timeout all count it the same way: a reorg announced a recovery checkpoint that
+        // never arrived. Legal under `never`; a gate failure under `always`.
+        if matches!(&self.phase, Phase::Streaming { announced: Some(_), .. }) {
+            self.replay.recovery_checkpoints_pending_at_end += 1;
         }
         let verdict_write_us = std::mem::take(&mut self.sink.verdict_write_us);
         let ack_write_us = std::mem::take(&mut self.sink.ack_write_us);
@@ -2032,6 +2525,8 @@ impl<'a> Follower<'a> {
             checkpoints_skimmed: self.checkpoints_skimmed,
             restores_continuous: self.restores_continuous,
             restores_reset: self.restores_reset,
+            rewind_replayed_commits: self.rewind_replayed_commits,
+            rewind_windows_refused: self.rewind_windows_refused,
             winning_branches_completed: self.winning_branches_completed,
             winning_branches_incomplete: self.winning_branches_incomplete,
             winning_branches_superseded: self.winning_branches_superseded,
@@ -2055,6 +2550,9 @@ struct Published<'a> {
     disagreements: usize,
     /// Re-derived on the way back to a watermark rather than verified for the first time.
     catch_up: bool,
+    /// Verified for the first time out of the spool during a recovery rewind. Counted in
+    /// `blocks_verified` and the delivered population; live-latency fields are null.
+    recovery_replay: bool,
     /// This attempt's timing entry, matched by sequence.
     timing: Option<&'a BlockTiming>,
     /// Whether the frame was consumed live — read after this run had observed the spool's tail.
@@ -2101,6 +2599,10 @@ struct VerdictSink {
     ack_reason: Option<&'static str>,
     ack_restored_from: Option<u64>,
     ack_target: Option<BlockRef>,
+    /// The rewound window behind the current restore point, carried on every ack for that
+    /// restore point's life. Its presence is what a resume acts on; no mid-window progress is
+    /// ever written beside it.
+    ack_rewind: Option<AckRewind>,
     /// Per-verdict cost of serializing and writing the verdict line, in file order.
     ///
     /// The publication half `decision_latency_us` cannot carry: the line is already written when
@@ -2134,9 +2636,17 @@ impl VerdictSink {
             ack_reason: None,
             ack_restored_from: None,
             ack_target: None,
+            ack_rewind: None,
             verdict_write_us: Vec::new(),
             ack_write_us: Vec::new(),
         })
+    }
+
+    /// Replaces the ack's recovery window. Set at a rewind install, cleared at the next
+    /// windowless install — never in between, because the window is the restore point's
+    /// reconstruction recipe and outlives the replay that first ran it.
+    fn set_rewind(&mut self, rewind: Option<AckRewind>) {
+        self.ack_rewind = rewind;
     }
 
     /// One verdict line per block, carrying the S5 boundaries: the validation primary and its
@@ -2154,6 +2664,7 @@ impl VerdictSink {
             provenance,
             disagreements,
             catch_up,
+            recovery_replay,
             timing,
             tail_live,
             queue_wait_us,
@@ -2192,6 +2703,10 @@ impl VerdictSink {
             // Labelled rather than withheld: the line is real evidence that the two runs agreed
             // on the block, and a reader aggregating live throughput has to be able to skip it.
             "catch_up": catch_up,
+            // A first-time verification replayed out of the spool during a recovery rewind —
+            // part of `blocks_verified` and the delivered population, unlike catch-up, with the
+            // live-latency fields null like it.
+            "recovery_replay": recovery_replay,
             // Read after this run had already observed the spool's tail. False is backlog: a
             // frame that predates the run, whose mtime-derived fields are null by construction.
             "tail_live": tail_live,
@@ -2257,6 +2772,7 @@ impl VerdictSink {
         last_verified: Option<BlockRef>,
         checkpoint_sequence: u64,
         epoch: u64,
+        rewind: bool,
     ) -> eyre::Result<()> {
         self.last_state = "streaming";
         // The one field version 1 could not carry, and the reason a restart had to guess. With it
@@ -2278,7 +2794,11 @@ impl VerdictSink {
             "state": "streaming",
             "reason": "restored",
             "detail": format!("restored at block {}", block.number),
+            // Null at a rewind install on purpose: continuous is a claim about the window's
+            // commits, and they have not replayed yet. The completion log line carries the
+            // eventual answer; the counters carry it into the report.
             "classification": class.map(RecoveryClass::as_str),
+            "rewind": rewind,
             "unverified_from": unverified.map(|(from, _)| from),
             "unverified_to": unverified.map(|(_, to)| to),
             "last_verified": last_verified.map(|block| block.number),
@@ -2287,7 +2807,7 @@ impl VerdictSink {
     }
 
     /// A recovery checkpoint compared against the pair this follower already holds, and skipped.
-    fn skimmed(&mut self, block: BlockRef, sequence: u64) -> eyre::Result<()> {
+    fn skimmed(&mut self, block: BlockRef, sequence: u64, catch_up: bool) -> eyre::Result<()> {
         self.write(serde_json::json!({
             "schema_version": 2,
             "benchmark": "standalone_follow_v1",
@@ -2296,6 +2816,9 @@ impl VerdictSink {
             "block": block.number,
             "block_hash": format!("{:?}", block.hash),
             "sequence": sequence,
+            // A resumed run re-encounters and re-records the skims of its catch-up range; the
+            // label is what keeps a combined-JSONL reader from counting them twice.
+            "catch_up": catch_up,
             // The unified name; `timestamp_ms` stays one release so nothing parsing v1 breaks.
             "observed_at_ms": now_ms(),
             "timestamp_ms": now_ms(),
@@ -2431,8 +2954,10 @@ impl VerdictSink {
         self.ack_high_water = Some(last_sequence);
         let record = serde_json::json!({
             // Version 1 had five fields and no way to say where the pair came from, so a restart
-            // had to guess a checkpoint. Guessing is what this version exists to remove.
-            "ack_version": 2,
+            // had to guess a checkpoint. Version 2 removed the guessing; version 3 adds the
+            // all-or-nothing recovery window, present for as long as the current restore point
+            // is a rewound one — it is the recipe that rebuilds that pair, not a dirty flag.
+            "ack_version": 3,
             "label": self.label,
             "last_sequence": last_sequence,
             "block": block.map(|block| block.number),
@@ -2443,6 +2968,12 @@ impl VerdictSink {
             "restored_from_sequence": self.ack_restored_from,
             "target_ancestor": self.ack_target.map(|block| block.number),
             "target_ancestor_hash": self.ack_target.map(|block| format!("{:?}", block.hash)),
+            "recovery": self.ack_rewind.map(|rewind| serde_json::json!({
+                "checkpoint_sequence": rewind.checkpoint_sequence,
+                "chunks_end": rewind.chunks_end,
+                "replay_from": rewind.replay_from,
+                "replay_until": rewind.replay_until,
+            })),
             "observed_at_ms": now_ms(),
         });
         let temporary = path.with_extension("tmp");

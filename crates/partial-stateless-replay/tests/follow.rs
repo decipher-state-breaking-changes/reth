@@ -429,8 +429,13 @@ fn a_reset_during_the_scan_withdraws_the_recovery_target() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A target-matching checkpoint above gap commits now *attempts* to replay them from the spool
+/// — continuous recovery is earned by verifying the window, not by counting it. These commits
+/// cannot verify (their parent is not the ancestor), so the rewind aborts into the explicit
+/// reset the old contract produced directly, with the attempted commit refused rather than
+/// skipped.
 #[test]
-fn commits_in_the_recovery_gap_downgrade_a_continuous_recovery_to_a_reset() {
+fn an_unreplayable_gap_window_aborts_the_rewind_into_a_reset() {
     let dir = spool_dir("reorg-gap-commits");
     write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
     let fixture = fixture();
@@ -446,7 +451,9 @@ fn commits_in_the_recovery_gap_downgrade_a_continuous_recovery_to_a_reset() {
         }),
     );
     next += 1;
-    // Winning-branch commits that went by while the follower was waiting: verified by nothing.
+    // Winning-branch commits that went by while the follower was waiting. The rewind reads the
+    // first one back and refuses it — its parent is not the ancestor — which is the delivery
+    // gap that downgrades the recovery.
     for number in 0..2 {
         write_frame(
             &dir,
@@ -461,11 +468,202 @@ fn commits_in_the_recovery_gap_downgrade_a_continuous_recovery_to_a_reset() {
 
     let report = follow(&dir, &options()).expect("follows");
 
-    assert_eq!(report.commits_skipped_in_recovery, 2);
+    assert_eq!(
+        report.restores, 3,
+        "the bootstrap install, the rewind install, then the reset install after the abort"
+    );
     assert_eq!(
         report.restores_continuous, 0,
-        "blocks went by that this follower never verified, so the recovery has a hole in it"
+        "no window replayed to completion, so nothing may claim continuity"
     );
+    assert_eq!(report.restores_reset, 2, "the aborted rewind and the reset install");
+    assert_eq!(
+        report.commits_skipped_in_recovery, 1,
+        "the commit behind the abort was skipped; the attempted one was refused, not skipped"
+    );
+    assert_eq!(report.rewind_replayed_commits, 0);
+    assert!(!report.continuous());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The rewind window's Commit-only contract, enforced by the consumer rather than assumed of
+/// the producer: the recovery scan supersedes on Reorg/Reset/Manifest, so a stray snapshot
+/// chunk is the shape that survives into the replay — and the replay must refuse it as a
+/// protocol violation instead of acting on whatever sits there. The rewind aborts into the
+/// explicit reset, and the next checkpoint restores with no continuity claim.
+#[test]
+fn a_non_commit_frame_inside_a_rewind_window_is_a_protocol_violation() {
+    let dir = spool_dir("rewind-window-non-commit");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    write_frame(
+        &dir,
+        next,
+        FrameKind::SnapshotChunk,
+        &StreamEvent::SnapshotChunk(partial_stateless_stream::SnapshotChunk {
+            index: 0,
+            bytes: vec![0xff],
+        }),
+    );
+    next += 1;
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Commit,
+        &commit_frame(ANCHOR_BLOCK + 1, fixture.checkpoint.block.hash),
+    );
+    next += 1;
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(
+        report.last_needs_snapshot,
+        Some(NeedsSnapshotReason::ProtocolViolation),
+        "the stray frame was refused, not consumed"
+    );
+    assert_eq!(
+        report.restores, 3,
+        "the bootstrap install, the rewind install, then the reset install after the refusal"
+    );
+    assert_eq!(report.restores_continuous, 0);
+    assert_eq!(report.restores_reset, 2, "the aborted rewind and the reset install");
+    assert_eq!(report.rewind_replayed_commits, 0, "nothing inside the window was acted on");
+    assert!(!report.continuous());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The winning tip an unrecoverable reorg announced survives the trip through `NeedsSnapshot`:
+/// the restored pair still expects the branch to arrive, and a stream that ends first leaves
+/// the branch counted as incomplete rather than silently forgotten.
+#[test]
+fn an_unrecoverable_reorg_carries_the_winning_tip_through_recovery() {
+    let dir = spool_dir("recovery-carries-tip");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: Some(BlockRef { number: ANCHOR_BLOCK + 5, hash: B256::repeat_byte(0x77) }),
+        }),
+    );
+    next += 1;
+    // The recovery checkpoint lands exactly on the target with nothing in between — a
+    // continuous restore — but the announced branch above it never arrives before the End.
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 2);
+    assert_eq!(report.restores_continuous, 1, "the checkpoint landed on the exact target");
+    assert_eq!(report.restores_reset, 0);
+    assert_eq!(
+        report.winning_branches_incomplete, 1,
+        "the tip promised before the outage is still owed after the restore"
+    );
+    assert!(!report.continuous(), "an undelivered branch is a hole, restore or no restore");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A recovery checkpoint at or above the announced tip's height settles the branch question:
+/// the reset classification already says what the interval was worth, and carrying the tip
+/// past a pair that already stands at that height would demand a block the stream owes nobody.
+#[test]
+fn a_recovery_checkpoint_at_or_above_the_tip_settles_the_branch() {
+    let dir = spool_dir("recovery-tip-settled");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: Some(BlockRef { number: ANCHOR_BLOCK + 5, hash: B256::repeat_byte(0x77) }),
+        }),
+    );
+    next += 1;
+    let above = fixture_at(ANCHOR_BLOCK + 40);
+    next = write_checkpoint(&dir, next, &above);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 2);
+    assert_eq!(report.restores_reset, 1, "not the target, so an explicit reset");
+    assert_eq!(
+        report.winning_branches_incomplete, 0,
+        "a pair standing above the announced height owes the branch nothing further"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An export retried at a fresher anchor publishes a checkpoint whose block is *not* the target
+/// ancestor. That checkpoint installs as an explicit reset with no rewind — the interval up to
+/// it was verified by nothing — and the deferred gap count lands with it.
+#[test]
+fn a_retry_anchored_checkpoint_installs_as_a_reset_without_rewind() {
+    let dir = spool_dir("reorg-retry-anchor");
+    write_frame(&dir, 0, FrameKind::Manifest, &StreamEvent::Manifest(manifest()));
+    let fixture = fixture();
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(
+        &dir,
+        next,
+        FrameKind::Reorg,
+        &StreamEvent::Reorg(partial_stateless_stream::Reorg {
+            common_ancestor: fixture.checkpoint.block,
+            abandoned: vec![BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::repeat_byte(0xa1) }],
+            winning_tip: None,
+        }),
+    );
+    next += 1;
+    for number in 0..2 {
+        write_frame(
+            &dir,
+            next,
+            FrameKind::Commit,
+            &commit_frame(ANCHOR_BLOCK + 1 + number, B256::repeat_byte(0xb2)),
+        );
+        next += 1;
+    }
+    // The recovery checkpoint anchors two blocks above the ancestor the reorg named.
+    let fresher = fixture_at(ANCHOR_BLOCK + 2);
+    next = write_checkpoint(&dir, next, &fresher);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let report = follow(&dir, &options()).expect("follows");
+
+    assert_eq!(report.restores, 2, "the bootstrap install and the retry-anchored install");
+    assert_eq!(report.restores_continuous, 0);
+    assert_eq!(report.restores_reset, 1, "the retry anchor is an explicit reset, not a rewind");
+    assert_eq!(
+        report.commits_skipped_in_recovery, 2,
+        "the deferred count lands at the restore once the anchor is known not to match"
+    );
+    assert_eq!(report.rewind_replayed_commits, 0);
+    assert_eq!(report.rewind_windows_refused, 0);
     assert!(!report.continuous());
     let _ = fs::remove_dir_all(&dir);
 }

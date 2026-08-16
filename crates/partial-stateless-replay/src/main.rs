@@ -35,6 +35,17 @@ fn main() -> eyre::Result<()> {
         .init();
 
     let mode = parse_args()?;
+    if let Mode::InspectReady { dir } = &mode {
+        let readiness = partial_stateless_replay::inspect_ready(dir)?;
+        println!("{}", serde_json::to_string(&readiness)?);
+        // 0 ready; 2 pending (absence — a polling gate keeps waiting); 3 invalid (structural
+        // contradiction — waiting cannot fix it, and a gate must fail fast rather than time out).
+        std::process::exit(match readiness.state {
+            "ready" => 0,
+            "pending" => 2,
+            _ => 3,
+        });
+    }
     let Mode::Batch(Args { dir, options, json, label }) = mode else {
         let Mode::Follow { dir, options } = mode else { unreachable!() };
         return run_follow(&dir, &options)
@@ -163,6 +174,8 @@ fn write_record(
         "reorgs_inapplicable": report.reorgs_inapplicable,
         "epoch_transitions": report.epoch_transitions,
         "checkpoints_skimmed": report.checkpoints_skimmed,
+        "late_skim_mismatches": report.late_skim_mismatches,
+        "recovery_checkpoints_pending_at_end": report.recovery_checkpoints_pending_at_end,
         "skipped_awaiting_resync": report.skipped_awaiting_resync,
         "winning_branch_incomplete": report.winning_branch_incomplete,
         "winning_branches_superseded": report.winning_branches_superseded,
@@ -309,8 +322,12 @@ fn write_follow_summary(
         "reorgs_applied": report.reorgs_applied,
         "reverts_applied": report.reverts_applied,
         "checkpoints_skimmed": report.checkpoints_skimmed,
+        "late_skim_mismatches": report.replay.late_skim_mismatches,
+        "recovery_checkpoints_pending_at_end": report.replay.recovery_checkpoints_pending_at_end,
         "restores_continuous": report.restores_continuous,
         "restores_reset": report.restores_reset,
+        "rewind_replayed_commits": report.rewind_replayed_commits,
+        "rewind_windows_refused": report.rewind_windows_refused,
         "winning_branches_completed": report.winning_branches_completed,
         "winning_branches_incomplete": report.winning_branches_incomplete,
         "winning_branches_superseded": report.winning_branches_superseded,
@@ -386,13 +403,30 @@ struct Args {
 
 enum Mode {
     Batch(Args),
-    Follow { dir: PathBuf, options: FollowOptions },
+    Follow {
+        dir: PathBuf,
+        options: FollowOptions,
+    },
+    /// Structural readiness inspection, for the gate's follower-start precondition.
+    /// Exit 0 ready, 2 not ready yet, 1 on I/O-shaped errors — the gate polls on 2.
+    InspectReady {
+        dir: PathBuf,
+    },
 }
 
 fn parse_args() -> eyre::Result<Mode> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.iter().any(|arg| arg == "--follow") {
         return parse_follow_args(raw)
+    }
+    if let Some(position) = raw.iter().position(|arg| arg == "--inspect-ready") {
+        let dir = raw
+            .get(position + 1)
+            .filter(|arg| !arg.starts_with("--"))
+            .map(PathBuf::from)
+            .or_else(|| raw.iter().find(|arg| !arg.starts_with("--")).map(PathBuf::from))
+            .ok_or_else(|| eyre::eyre!("--inspect-ready needs a spool directory"))?;
+        return Ok(Mode::InspectReady { dir })
     }
     let mut args = raw.into_iter();
     let mut dir = None;

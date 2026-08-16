@@ -157,6 +157,16 @@ pub struct ReplayReport {
     /// Checkpoints the producer published after a reorg this driver had already applied itself,
     /// verified against the pair's own state and then skipped rather than installed.
     pub checkpoints_skimmed: u64,
+    /// Late recovery checkpoints that disagreed with this consumer's own verified history.
+    ///
+    /// Recorded and *not* installed: the consumer verified every block past the ancestor itself,
+    /// and its own chain outranks a late cross-check. The disagreement still fails the run's
+    /// agreement claim; this counter is what makes the no-install path visible beside it.
+    pub late_skim_mismatches: u64,
+    /// Recovery expectations still open when the stream ended: a reorg/revert announced a
+    /// checkpoint that never arrived. Legal under `PS_STREAM_REORG_CHECKPOINT=never`; under
+    /// `always` a clean end with one of these is a gate failure.
+    pub recovery_checkpoints_pending_at_end: u64,
     /// Winning branches the producer announced and did not deliver in full, with nothing valid
     /// taking their place. A branch replaced by a later reorg is counted as superseded instead.
     pub winning_branch_incomplete: u64,
@@ -1017,26 +1027,44 @@ fn finish_collection_if_complete(
                      recovered to. One of the two undid the reorg wrongly"
                 );
                 report.disagreements.push((checkpoint.block, disagreement));
-                // Recorded, and then the checkpoint is installed rather than skipped — the same
-                // answer the follower gives. Carrying on from a generation the operator-trusted
-                // checkpoint source contradicts would make every later block a comparison against
-                // disputed state, and a reader could not tell an independent second finding from
-                // the first one cascading. Installing isolates the finding to the block it is
-                // about; the interval it covers is an explicit reset, never a continuous recovery.
-                let state = restore(&manifest, &checkpoint, &chunks)?;
-                report.resyncs.push(ResyncRecord {
-                    at_sequence: checkpoint_sequence,
-                    block: checkpoint.block.number,
-                    continuous: false,
-                    unverified: None,
-                    commits_skipped: 0,
-                });
-                return Ok(BatchPhase::Live {
-                    manifest,
-                    state: Box::new(state),
-                    announced: None,
-                    pending_tip,
-                })
+                if consumer_is_at(&state, ancestor) {
+                    // Recorded, and then the checkpoint is installed rather than skipped — the
+                    // same answer the follower gives. Carrying on from a generation the
+                    // operator-trusted checkpoint source contradicts would make every later block
+                    // a comparison against disputed state, and a reader could not tell an
+                    // independent second finding from the first one cascading. Installing
+                    // isolates the finding to the block it is about; the interval it covers is an
+                    // explicit reset, never a continuous recovery.
+                    let state = restore(&manifest, &checkpoint, &chunks)?;
+                    report.resyncs.push(ResyncRecord {
+                        at_sequence: checkpoint_sequence,
+                        block: checkpoint.block.number,
+                        continuous: false,
+                        unverified: None,
+                        commits_skipped: 0,
+                    });
+                    return Ok(BatchPhase::Live {
+                        manifest,
+                        state: Box::new(state),
+                        announced: None,
+                        pending_tip,
+                    })
+                }
+                // Late: this replay verified every block past the ancestor for itself, and its
+                // own chain outranks the cross-check. Installing here would rewind the pair to a
+                // height below commits it already stands behind and turn every remaining frame
+                // into a refusal cascade. The disagreement above already fails the run's
+                // agreement claim; validation continues — and the chunks are still checked
+                // against their declaration, exactly as on the agreeing path: a transport fault
+                // is a separate finding, and a mismatch is when hiding one would be easiest.
+                report.late_skim_mismatches += 1;
+                if let Err(err) = checkpoint.reassemble(&chunks) {
+                    report.failures.push(format!(
+                        "the recovery checkpoint at sequence {checkpoint_sequence} did not \
+                         reassemble: {err}"
+                    ));
+                }
+                return Ok(BatchPhase::Live { manifest, state, announced: None, pending_tip })
             }
             report.checkpoints_skimmed += 1;
             // The bytes are checked even though the package is not installed: a chunk sequence
@@ -1118,17 +1146,20 @@ fn finish_phase(phase: BatchPhase, report: &mut ReplayReport) {
                 checkpoint.snapshot_chunks
             ));
         }
-        BatchPhase::Live { pending_tip: Some(tip), .. } => {
-            report.winning_branch_incomplete += 1;
-            warn!(
-                target: "ps_replay",
-                tip = tip.number,
-                "The corpus ends before the winning branch reached the tip the reorg announced"
-            );
+        BatchPhase::Live { pending_tip, announced, .. } => {
+            if let Some(tip) = pending_tip {
+                report.winning_branch_incomplete += 1;
+                warn!(
+                    target: "ps_replay",
+                    tip = tip.number,
+                    "The corpus ends before the winning branch reached the tip the reorg announced"
+                );
+            }
+            if announced.is_some() {
+                report.recovery_checkpoints_pending_at_end += 1;
+            }
         }
-        BatchPhase::AwaitingManifest |
-        BatchPhase::AwaitingCheckpoint { .. } |
-        BatchPhase::Live { .. } => {}
+        BatchPhase::AwaitingManifest | BatchPhase::AwaitingCheckpoint { .. } => {}
     }
 }
 
@@ -1158,6 +1189,26 @@ fn note_supersession(
 /// consumer by undoing one block — so a mismatch is two implementations disagreeing about the same
 /// chain, which is exactly the kind of defect a recorded corpus exists to surface.
 pub(crate) fn cross_check_recovery_checkpoint(
+    state: &ReplayState,
+    checkpoint: &Checkpoint,
+    ancestor: BlockRef,
+) -> Result<(), Disagreement> {
+    if consumer_is_at(state, ancestor) {
+        return cross_check_at_ancestor(state, checkpoint, ancestor)
+    }
+    cross_check_against_history(state, checkpoint)
+}
+
+/// Whether the consumer's verified tip is exactly `ancestor` — the position in which a recovery
+/// checkpoint's fields can be answered by the live pair. Once the pair has advanced past it (a
+/// checkpoint published behind write-through commits, or an export retried at a fresher anchor),
+/// only the per-height verified history can answer.
+pub(crate) fn consumer_is_at(state: &ReplayState, ancestor: BlockRef) -> bool {
+    state.history.tip() == Some(ancestor)
+}
+
+/// The original comparison: the pair still sits at the ancestor, so its own fingerprint answers.
+fn cross_check_at_ancestor(
     state: &ReplayState,
     checkpoint: &Checkpoint,
     ancestor: BlockRef,
@@ -1198,6 +1249,57 @@ pub(crate) fn cross_check_recovery_checkpoint(
             field: "recovery_checkpoint_accepted_head",
             recorded: format!("{announced_head:?}"),
             replayed: format!("{held_head:?}"),
+        })
+    }
+    Ok(())
+}
+
+/// The late comparison: the checkpoint binds by its own block, and every field is judged against
+/// the record this consumer made when it verified that exact block. The disagreement field names
+/// are the same strings the at-ancestor comparison uses, so a mismatch reads identically in
+/// either position.
+fn cross_check_against_history(
+    state: &ReplayState,
+    checkpoint: &Checkpoint,
+) -> Result<(), Disagreement> {
+    let Some(entry) = state.history.entry_at(checkpoint.block) else {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_block",
+            recorded: format!("{:?}", checkpoint.block),
+            replayed: "not among the blocks this consumer verified within its retained history"
+                .to_string(),
+        })
+    };
+    if checkpoint.cache_policy_id != state.config.cache_policy_id() {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_policy",
+            recorded: format!("{:?}", checkpoint.cache_policy_id),
+            replayed: format!("{:?}", state.config.cache_policy_id()),
+        })
+    }
+    if entry.state_root != checkpoint.state_root {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_state_root",
+            recorded: format!("{:?}", checkpoint.state_root),
+            replayed: format!("{:?}", Some(entry.state_root)),
+        })
+    }
+    if entry.cache_root != checkpoint.cache_root {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_cache_root",
+            recorded: format!("{:?}", checkpoint.cache_root),
+            replayed: format!("{:?}", entry.cache_root),
+        })
+    }
+    // A well-formed checkpoint's accepted head is its own block's header, so at height H the
+    // check degenerates to the block hash this consumer verified — and a headless checkpoint
+    // still fails closed here.
+    let announced_head = decode_accepted_head(checkpoint).map(|header| header.hash());
+    if announced_head != Some(entry.hash) {
+        return Err(Disagreement {
+            field: "recovery_checkpoint_accepted_head",
+            recorded: format!("{announced_head:?}"),
+            replayed: format!("{:?}", Some(entry.hash)),
         })
     }
     Ok(())
@@ -1263,7 +1365,11 @@ pub(crate) fn restore(
         "Restored a coordinated pair from the recorded checkpoint, with no database"
     );
     Ok(ReplayState {
-        history: VerifiedHistory::restored_at(checkpoint.block, checkpoint.state_root),
+        history: VerifiedHistory::restored_at(
+            checkpoint.block,
+            checkpoint.state_root,
+            checkpoint.cache_root,
+        ),
         pair: CoordinatedPair {
             cache: restored.cache,
             trie_cache: restored.trie_cache,
@@ -1482,8 +1588,10 @@ pub(crate) fn replay_commit(
     state.pair.commit_transition(displaced, &block_ctx, admitted.block.clone_sealed_header(), true);
     // Recorded from this replay's own execution, before the oracle is consulted, so that a reorg
     // arriving later authenticates its target against what this process verified rather than
-    // against what the producer said about it.
-    state.history.record(input.block, outcome.state_root);
+    // against what the producer said about it. The cache root rides along because a late
+    // recovery checkpoint can only be judged against the record made at its height.
+    let committed_cache_root = state.pair.fingerprint().cache_root;
+    state.history.record(input.block, outcome.state_root, committed_cache_root);
     timer.pair_commit_us = Some(commit_started.elapsed().as_micros() as u64);
     // The verdict is committed; everything after this line is the harness checking itself.
     timer.close_validation();
