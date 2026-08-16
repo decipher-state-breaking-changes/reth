@@ -603,6 +603,32 @@ if [ "$GATE_MODE" = "reorg" ] && [ "${GATE_FORCE_RESTORE:-0}" = "1" ]; then
     fi
 fi
 
+# The report is generated, never hand-curated: both preflights were written up by hand and both
+# pooled the restore backlog into the live latency table. The analyzer emits one stable JSON and
+# the renderer consumes only that, so every number in result.md exists in distributions.json
+# beside it. A failure here fails the gate — a run whose evidence cannot be rendered is a run
+# whose evidence nobody will read.
+echo "==> analyzing and rendering"
+SCRIPT_DIR=$(dirname "$0")
+ANALYZE_ARGS=()
+for candidate in "$OUT_DIR/follow.jsonl" "$OUT_DIR/follow-resumed.jsonl" "$OUT_DIR/follow-epoch.jsonl"; do
+    [ -s "$candidate" ] && ANALYZE_ARGS+=(--follow "$candidate")
+done
+[ -s "$BATCH_JSON" ] && ANALYZE_ARGS+=(--batch "$BATCH_JSON")
+EVENTS_FILE="$(dirname "$SPOOL_DIR")/$(basename "$SPOOL_DIR").producer-events.jsonl"
+[ -s "$EVENTS_FILE" ] && ANALYZE_ARGS+=(--producer-events "$EVENTS_FILE")
+PRODUCER_MANIFEST="$(dirname "$SPOOL_DIR")/$(basename "$SPOOL_DIR").run-manifest.jsonl"
+[ -s "$PRODUCER_MANIFEST" ] && ANALYZE_ARGS+=(--producer-manifest "$PRODUCER_MANIFEST")
+if python3 "$SCRIPT_DIR/analyze_follow_bench.py" "${ANALYZE_ARGS[@]}" --phases \
+        --json "$OUT_DIR/distributions.json" > "$OUT_DIR/distributions.txt" 2>&1 &&
+   python3 "$SCRIPT_DIR/render_follow_report.py" "$OUT_DIR/distributions.json" \
+        --out "$OUT_DIR/result.md"; then
+    echo "  ok: $OUT_DIR/distributions.json and $OUT_DIR/result.md"
+else
+    echo "  FAIL: the analyzer/renderer chain failed; see $OUT_DIR/distributions.txt" >&2
+    FAILED=1
+fi
+
 echo "==> results in $OUT_DIR"
 if [ "$FAILED" -ne 0 ]; then
     echo "==> GATE FAILED ($GATE_MODE)" >&2

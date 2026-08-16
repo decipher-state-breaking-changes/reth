@@ -22,20 +22,33 @@ Contract (current epoch only — earlier epochs belong to producers that already
 Quiesced means: no armed cause without an attempt, no attempt in flight, no failed cause with
 retries left. Exit 0 quiesced, 1 pending, 2 usage/parse error.
 
-Also importable: `reduce_events(lines)` returns the per-cause state dict for the RB7 analyzer.
+Also importable, and the RB7 analyzer's front end:
+  - `reduce_events(lines)` — the per-cause state dict above
+  - `assemble_causes(lines)` — the same log keyed by (epoch, cause_id) and
+    (epoch, cause_id, attempt), every lifecycle stamp attached where it belongs, so an
+    interval between two of them can be measured without re-parsing the log
 """
 
 import json
 import sys
 
 TERMINAL = ("published", "skipped", "fenced", "failed_final", "not_armed", "superseded")
+PENDING = ("armed", "in_flight", "retrying")
+#: Detection events open a cause with a branch change behind it; everything else opens with its
+#: arming line. The distinction is the RB7 denominator's first column.
+DETECTION_KINDS = {"reorg_detected": "reorg", "revert_detected": "revert"}
 
 
-def reduce_events(lines):
-    """Returns (epoch, {cause_id: state}) for the highest epoch in the log.
+def load_epoch_events(lines):
+    """Parses the log, returns (epoch, [events]) for the highest epoch it contains.
 
-    States: armed, in_flight, retrying, published, skipped, fenced, failed_final,
-    not_armed, superseded.
+    Earlier epochs belong to producers that already exited; their causes cannot become pending
+    again, and their monotonic stamps come from a different process origin.
+
+    Each returned event carries a `mono_run` index. The monotonic clock is per-process, so two
+    producer runs sharing one epoch number would otherwise let an interval be measured across a
+    clock reset. A stamp that runs backwards opens a new run index, and an interval whose ends
+    disagree on it is refused rather than reported.
     """
     events = []
     for line in lines:
@@ -44,13 +57,38 @@ def reduce_events(lines):
             continue
         events.append(json.loads(line))
     if not events:
-        return None, {}
+        return None, []
     epoch = max(event.get("epoch", 1) for event in events)
+    epoch_events = [event for event in events if event.get("epoch", 1) == epoch]
+    mono_run = 0
+    highest = -1
+    for event in epoch_events:
+        mono = event.get("mono_elapsed_us")
+        if mono is not None:
+            if mono < highest:
+                mono_run += 1
+                highest = mono
+            else:
+                highest = max(highest, mono)
+        event["mono_run"] = mono_run
+    return epoch, epoch_events
+
+
+def reduce_events(lines):
+    """Returns (epoch, {cause_id: state}) for the highest epoch in the log.
+
+    States: armed, in_flight, retrying, published, skipped, fenced, failed_final,
+    not_armed, superseded.
+    """
+    epoch, events = load_epoch_events(lines)
+    return epoch, reduce_states(events)
+
+
+def reduce_states(events):
+    """The state machine itself, over already-loaded events of one epoch."""
     causes = {}
     armed_slot = None
     for event in events:
-        if event.get("epoch", 1) != epoch:
-            continue
         kind = event.get("kind")
         cause = event.get("cause_id")
         if kind == "recheckpoint_armed":
@@ -78,6 +116,89 @@ def reduce_events(lines):
             causes[cause] = "skipped"
         elif kind == "export_fenced":
             causes[cause] = "fenced"
+    return causes
+
+
+def assemble_causes(lines):
+    """Returns (epoch, {cause_id: cause}) with every lifecycle stamp attached to its cause.
+
+    A cause is the RB7 unit of account: one branch change (or one arming, for the causes that
+    have no detection event of their own) with the attempts it armed, the checkpoint it
+    published, and the first winning commit it freed. Attempts nest under it keyed by the
+    envelope's attempt counter, so a retry's export duration is its own sample rather than an
+    average smeared over the cause.
+
+    Every stamp is `{mono_us, wall_ms, mono_run, ...event fields}`. Which clock an interval may
+    use is a property of its two ends, not of this function: both ends inside the producer can
+    difference `mono_us` (same `mono_run`), and an end that lives in another process has only
+    `wall_ms`.
+    """
+    epoch, events = load_epoch_events(lines)
+    states = reduce_states(events)
+    causes = {}
+
+    def slot(cause_id):
+        return causes.setdefault(
+            cause_id,
+            {
+                "cause_id": cause_id,
+                # cause 0 is the stream-opening export: it is never armed and never detected.
+                "origin_kind": "initial" if cause_id == 0 else "armed",
+                "detection": None,
+                "armed": None,
+                "attempts": {},
+                "published": None,
+                "skipped": None,
+                "first_winning": None,
+                "first_winning_unmeasured": None,
+            },
+        )
+
+    def stamp(event):
+        out = {
+            "mono_us": event.get("mono_elapsed_us"),
+            "wall_ms": event.get("observed_at_ms"),
+            "mono_run": event.get("mono_run", 0),
+            "attempt": event.get("attempt"),
+        }
+        for key, value in event.items():
+            if key not in ("schema_version", "benchmark", "kind", "epoch", "mono_run",
+                           "mono_elapsed_us", "observed_at_ms", "attempt", "cause_id"):
+                out[key] = value
+        return out
+
+    for event in events:
+        kind = event.get("kind")
+        cause_id = event.get("cause_id")
+        if cause_id is None:
+            continue
+        cause = slot(cause_id)
+        if kind in DETECTION_KINDS:
+            cause["origin_kind"] = DETECTION_KINDS[kind]
+            cause["detection"] = stamp(event)
+        elif kind == "recheckpoint_armed":
+            cause["armed"] = stamp(event)
+        elif kind in ("export_started", "export_completed", "export_failed", "export_fenced"):
+            attempt = cause["attempts"].setdefault(
+                event.get("attempt"),
+                {"attempt": event.get("attempt"), "started": None, "completed": None,
+                 "failed": None, "fenced": None},
+            )
+            attempt[kind.removeprefix("export_")] = stamp(event)
+        elif kind == "checkpoint_published":
+            cause["published"] = stamp(event)
+        elif kind == "checkpoint_publication_skipped":
+            cause["skipped"] = stamp(event)
+        elif kind == "first_winning_commit_published":
+            cause["first_winning"] = stamp(event)
+        elif kind == "first_winning_commit_unmeasured":
+            cause["first_winning_unmeasured"] = stamp(event)
+
+    for cause_id, cause in causes.items():
+        cause["state"] = states.get(cause_id, "unknown")
+        cause["attempts"] = [
+            attempt for _, attempt in sorted(cause["attempts"].items(), key=lambda kv: kv[0] or 0)
+        ]
     return epoch, causes
 
 
@@ -91,9 +212,7 @@ def main():
     except (OSError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
-    pending = {
-        cause: state for cause, state in causes.items() if state in ("armed", "in_flight", "retrying")
-    }
+    pending = {cause: state for cause, state in causes.items() if state in PENDING}
     print(
         json.dumps(
             {

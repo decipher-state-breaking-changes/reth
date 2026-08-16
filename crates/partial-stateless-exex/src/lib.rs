@@ -3984,6 +3984,17 @@ mod tests {
             assert_eq!(events[1]["cause_id"], cause_id);
             assert_eq!(events[1]["cause"], "discontinuity");
             assert_eq!(events[1]["armed"], true);
+            // The RB7 ingest (`scripts/analyze_follow_bench.py`) keys every cause, attempt and
+            // interval on these envelope fields. Renaming one here would not fail anything on
+            // this side of the language boundary — it would silently empty a table in the
+            // report — so the contract is asserted where the names are written.
+            for event in &events {
+                for key in
+                    ["kind", "epoch", "cause_id", "attempt", "mono_elapsed_us", "observed_at_ms"]
+                {
+                    assert!(event.get(key).is_some(), "{key} is missing from {event}");
+                }
+            }
             let _ = fs::remove_dir_all(&dir);
         }
 
