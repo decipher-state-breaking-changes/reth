@@ -631,6 +631,22 @@ impl BootstrapGate {
         self.cause_counter
     }
 
+    /// Closes an armed first-winning-commit measurement without a publication.
+    ///
+    /// Every armed measurement terminates in exactly one event — published or unmeasured —
+    /// because a pending flag that silently outlives its cause gets resolved by whatever
+    /// unrelated commit publishes next, stamping the old cause id onto a block that has
+    /// nothing to do with its branch. No-op when nothing is pending.
+    fn abandon_first_winning(&mut self, reason: &str) {
+        if std::mem::replace(&mut self.first_winning_commit_pending, false) {
+            let cause_id = self.first_winning_commit_cause;
+            self.emit_event(
+                "first_winning_commit_unmeasured",
+                serde_json::json!({ "cause_id": cause_id, "reason": reason }),
+            );
+        }
+    }
+
     /// Appends one producer lifecycle event, when a stream is being recorded.
     fn emit_event(&mut self, kind: &str, fields: serde_json::Value) {
         let attempt = self.attempt;
@@ -941,6 +957,9 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, Some(new)));
                 }
+                // A branch change that lands while an earlier first-winning measurement is
+                // still armed supersedes it: that branch's first commit never published.
+                gate.abandon_first_winning("superseded_by_branch_change");
                 gate.first_winning_commit_pending = true;
                 gate.first_winning_commit_cause = cause_id;
                 // Started here, before a single winning block applies, because the checkpoint a
@@ -1028,6 +1047,7 @@ where
                 }
                 // Nothing replaces the reverted blocks, so the "first winning commit" after a
                 // pure revert is simply the next committed block — still the freshness endpoint.
+                gate.abandon_first_winning("superseded_by_branch_change");
                 gate.first_winning_commit_pending = true;
                 gate.first_winning_commit_cause = cause_id;
                 maybe_start_export(&ctx, &options, &pair, &mut gate, recorder.as_mut());
@@ -1496,6 +1516,7 @@ where
             // Whatever the export was going to checkpoint, it is not the generation this pair is
             // about to become. A discontinuity cause keeps the checkpoint-first ordering: the
             // consumer this Reset strands can only continue from a checkpoint above it.
+            gate.abandon_first_winning("discontinuity");
             let cause_id = gate.begin_cause();
             interrupt_export(
                 options,
@@ -1685,6 +1706,7 @@ where
             // is fenced here and re-armed at the current tip (policy permitting) — the same
             // treatment every other discontinuity gets, and the guarantee behind the invariant
             // that a published late checkpoint's replay window holds Commit frames only.
+            gate.abandon_first_winning("stream_reset");
             let cause_id = gate.begin_cause();
             interrupt_export(
                 options,
@@ -1712,6 +1734,20 @@ where
                     "cause_id": gate.first_winning_commit_cause,
                 }),
             );
+        }
+        // A commit that did not reach the open stream terminates the measurement rather than
+        // deferring it: the frame is either behind a checkpoint-first export (its availability
+        // endpoint is that checkpoint's publication, not any later commit) or gone. Leaving the
+        // flag armed would stamp the old cause id onto the next unrelated published commit.
+        Some(CommitRecordingOutcome::Recorded(recorder::CommitDisposition::Buffered))
+            if gate.first_winning_commit_pending =>
+        {
+            gate.abandon_first_winning("buffered_behind_checkpoint");
+        }
+        Some(CommitRecordingOutcome::Recorded(recorder::CommitDisposition::Dropped))
+            if gate.first_winning_commit_pending =>
+        {
+            gate.abandon_first_winning("not_published");
         }
         _ => {}
     }
@@ -2321,6 +2357,17 @@ fn interrupt_export(
     // so the attempt this arms is attributable to this exact lifecycle event.
     gate.pending_cause = cause;
     gate.pending_cause_id = cause_id;
+    // Every cause announces its own arming, discontinuities included — they have no detection
+    // event of their own, and without this line an armed-but-never-attempted cause would be
+    // invisible to the event-log reducer that judges quiescence.
+    gate.emit_event(
+        "recheckpoint_armed",
+        serde_json::json!({
+            "cause": cause.as_str(),
+            "cause_id": cause_id,
+            "armed": gate.export_pending,
+        }),
+    );
     gate.waiting_for_accepted_head_logged = false;
     if !gate.export_pending {
         info!(
@@ -3744,8 +3791,8 @@ mod tests {
     mod export_job {
         use super::super::{
             bootstrap_io, export_writes_through, fail_export_attempt, poll_export_job,
-            recorder::StreamRecorder, remove_stale_attempt_dirs, BootstrapGate, EndKind, ExportJob,
-            RecheckpointCause, RunOptions, WorkerSlot,
+            producer_events, recorder::StreamRecorder, remove_stale_attempt_dirs, BootstrapGate,
+            EndKind, ExportJob, RecheckpointCause, RunOptions, WorkerSlot,
         };
         use crate::CacheConfig;
         use alloy_primitives::B256;
@@ -3889,6 +3936,54 @@ mod tests {
             assert!(dir.join("export-attempt-notes").exists(), "a word suffix is not ours");
             assert!(dir.join("export-attempt-").exists(), "an empty suffix is not ours");
             assert!(dir.join("export-attempt-1a").exists(), "a mixed suffix is not ours");
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Every interrupt announces the cause it arms (`recheckpoint_armed`), and an armed
+        /// first-winning measurement terminates in exactly one event — here, `unmeasured`,
+        /// because the branch change supersedes it. Without the announcement, an
+        /// armed-but-never-attempted discontinuity cause is invisible to the quiesce reducer;
+        /// without the termination, the stale pending flag stamps the old cause id onto the
+        /// next unrelated published commit.
+        #[test]
+        fn an_interrupt_announces_its_cause_and_terminates_a_pending_measurement() {
+            let dir = temp_dir("interrupt-events");
+            let spool = dir.join("spool");
+            fs::create_dir_all(&spool).expect("spool dir");
+            let options = options_with_bootstrap_dir(&dir);
+            let mut gate = gate_with(ExportJob::Idle, 1);
+            gate.events = Some(producer_events::ProducerEvents::beside_spool(&spool, 1));
+            gate.first_winning_commit_pending = true;
+            gate.first_winning_commit_cause = 7;
+
+            gate.abandon_first_winning("superseded_by_branch_change");
+            assert!(!gate.first_winning_commit_pending);
+            // Idempotent: a second call must not invent a second termination.
+            gate.abandon_first_winning("superseded_by_branch_change");
+
+            let cause_id = gate.begin_cause();
+            let mut holder: Option<&mut StreamRecorder> = None;
+            super::super::interrupt_export(
+                &options,
+                &mut gate,
+                &mut holder,
+                RecheckpointCause::Discontinuity,
+                cause_id,
+                "a discontinuity with no export in flight",
+            );
+
+            let raw = fs::read_to_string(dir.join("spool.producer-events.jsonl"))
+                .expect("the events file exists");
+            let events: Vec<serde_json::Value> =
+                raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(events.len(), 2, "one termination, one arming — nothing else");
+            assert_eq!(events[0]["kind"], "first_winning_commit_unmeasured");
+            assert_eq!(events[0]["cause_id"], 7);
+            assert_eq!(events[0]["reason"], "superseded_by_branch_change");
+            assert_eq!(events[1]["kind"], "recheckpoint_armed");
+            assert_eq!(events[1]["cause_id"], cause_id);
+            assert_eq!(events[1]["cause"], "discontinuity");
+            assert_eq!(events[1]["armed"], true);
             let _ = fs::remove_dir_all(&dir);
         }
 

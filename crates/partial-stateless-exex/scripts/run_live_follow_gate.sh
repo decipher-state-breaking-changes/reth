@@ -118,6 +118,25 @@ FOLLOW_JSON="$OUT_DIR/follow.jsonl"
 ACK_FILE="$OUT_DIR/ack.json"
 BATCH_JSON="$OUT_DIR/batch.jsonl"
 
+# One invocation, one run. A stale follow.jsonl would satisfy the live-verdict watcher and the
+# summary greps with a run that already happened, and a stale ack would turn a fresh phase into
+# an accidental resume. The one deliberate exception is epoch mode, whose *input* is the
+# previous invocation's ack and whose own phase writes a separate file — only that file must
+# be fresh there.
+if [ "$GATE_MODE" = "epoch" ]; then
+    if [ -e "$OUT_DIR/follow-epoch.jsonl" ]; then
+        echo "error: $OUT_DIR/follow-epoch.jsonl already exists; a previous epoch crossing was already judged here" >&2
+        exit 64
+    fi
+else
+    for stale in "$FOLLOW_JSON" "$ACK_FILE" "$BATCH_JSON" "$OUT_DIR/follow-resumed.jsonl"; do
+        if [ -e "$stale" ]; then
+            echo "error: $stale already exists; give the gate a fresh OUT_DIR — stale outputs corrupt the watcher and the summary selection" >&2
+            exit 64
+        fi
+    done
+fi
+
 # The truncated run must terminate on its own: the follower deliberately waits forever by
 # default, because it cannot tell a killed producer from a quiet chain.
 if [ "$GATE_MODE" = "truncated" ] && ! printf '%s\n' "$@" | grep -q -- '--idle-timeout-secs'; then
@@ -240,27 +259,25 @@ if [ "$GATE_MODE" = "long" ]; then
         if [ "$signaled" -eq 0 ] && [ "$LIVE_VERDICTS" -ge "$GATE_MIN_BLOCKS" ]; then
             # Quiesce before the SIGTERM: a producer stopped inside a recovery-checkpoint export
             # loses that checkpoint (write-through commits are on disk, the checkpoint is not),
-            # and the skim assertions below would fail a run the chain behaved normally in. The
-            # producer event log names the export lifecycle; wait until the last export_started
-            # has a matching completion, fencing, or failure. Scoped to the *current* epoch — a
-            # resumed spool's log carries earlier epochs, and one unmatched start from a run that
-            # was killed mid-export would otherwise hold this gate hostage forever — and bounded
-            # by GATE_QUIESCE_SECS, after which the SIGTERM proceeds and the assertions judge
+            # and the skim assertions below would fail a run the chain behaved normally in.
+            # Judged by the event-log reducer, not by grep counts: a failed attempt with retries
+            # left *counts* as settled but the cause is still pending, and a SIGTERM inside that
+            # gap loses the checkpoint the retry owes. Current epoch only, bounded by
+            # GATE_QUIESCE_SECS, after which the SIGTERM proceeds and the assertions judge
             # whatever the interrupted export left behind.
             EVENTS_FILE="$(dirname "$SPOOL_DIR")/$(basename "$SPOOL_DIR").producer-events.jsonl"
             if [ -f "$EVENTS_FILE" ]; then
-                current_epoch=$(tail -n 1 "$EVENTS_FILE" 2>/dev/null | grep -o '"epoch":[0-9]*' | head -1 | cut -d: -f2)
-                epoch_filter="\"epoch\":${current_epoch:-1}[,}]"
-                started=$(grep '"kind":"export_started"' "$EVENTS_FILE" 2>/dev/null | grep -cE "$epoch_filter" || true)
-                settled=$(grep -E '"kind":"(checkpoint_published|checkpoint_publication_skipped|export_fenced|export_failed)"' "$EVENTS_FILE" 2>/dev/null | grep -cE "$epoch_filter" || true)
-                if [ "${started:-0}" -gt "${settled:-0}" ]; then
+                QUIESCE_STATE=$(python3 "$(dirname "$0")/producer_event_state.py" "$EVENTS_FILE" 2>&1) && quiesced=0 || quiesced=$?
+                if [ "$quiesced" -eq 1 ]; then
                     QUIESCE_DEADLINE=${QUIESCE_DEADLINE:-$(( $(date +%s) + ${GATE_QUIESCE_SECS:-600} ))}
                     if [ "$(date +%s)" -lt "$QUIESCE_DEADLINE" ]; then
-                        echo "==> $LIVE_VERDICTS live verdicts, but an epoch-${current_epoch:-1} export is in flight (${started:-0} started, ${settled:-0} settled); waiting to quiesce before SIGTERM"
+                        echo "==> $LIVE_VERDICTS live verdicts, but a recovery cause is still pending; waiting to quiesce before SIGTERM: $QUIESCE_STATE"
                         sleep "${GATE_WATCH_SECS:-15}"
                         continue
                     fi
-                    echo "warning: an export never settled within ${GATE_QUIESCE_SECS:-600}s; proceeding with SIGTERM" >&2
+                    echo "warning: a recovery cause never settled within ${GATE_QUIESCE_SECS:-600}s; proceeding with SIGTERM: $QUIESCE_STATE" >&2
+                elif [ "$quiesced" -ne 0 ]; then
+                    echo "warning: the producer-event reducer failed ($QUIESCE_STATE); proceeding without a quiesce judgement" >&2
                 fi
             fi
             signaled=1
@@ -332,7 +349,7 @@ check "$SUMMARY" "no late recovery checkpoint contradicted the recovered generat
 # The rewind bound exists for pathological spools; a healthy gate run never hits it.
 check "$SUMMARY" "no rewind window was refused for its size" \
     "(.rewind_windows_refused // 0) == 0"
-if [ "${GATE_EXPECT_RECHECKPOINT:-0}" = "1" ]; then
+if [ "${GATE_EXPECT_RECHECKPOINT:-1}" = "1" ]; then
     # Under PS_STREAM_REORG_CHECKPOINT=always every applied reorg owes a checkpoint before the
     # stream closes; one still pending at End means the quiesce failed or the producer lost it.
     check "$SUMMARY" "no recovery checkpoint was still pending when the stream closed" \
@@ -393,7 +410,7 @@ case "$GATE_MODE" in
                 FAILED=1
             fi
         fi
-        if [ "${GATE_EXPECT_RECHECKPOINT:-0}" = "1" ]; then
+        if [ "${GATE_EXPECT_RECHECKPOINT:-1}" = "1" ]; then
             check "$SUMMARY" "every applied reorg/revert had its recovery checkpoint skimmed" \
                 '.checkpoints_skimmed >= (.reorgs_applied + .reverts_applied)'
         fi
@@ -407,7 +424,7 @@ case "$GATE_MODE" in
         # NeedsSnapshot" above is now asserting *through* a real chain reorganisation.
         check "$SUMMARY" "at least one reorg or revert was applied in place" \
             '.reorgs_applied + .reverts_applied >= 1'
-        if [ "${GATE_EXPECT_RECHECKPOINT:-0}" = "1" ]; then
+        if [ "${GATE_EXPECT_RECHECKPOINT:-1}" = "1" ]; then
             # The producer re-checkpoints at the common ancestor. The follower does not install
             # it — it already recovered — but it compares it field by field, which makes the
             # producer's own recovery a live cross-implementation check rather than an assertion.
@@ -427,7 +444,7 @@ case "$GATE_MODE" in
         # watermark the killed run left. Anything at or below it was re-derived, and re-derived
         # lines say so.
         NEW_BELOW=$(jq -r --argjson at "$KILLED_AT_SEQUENCE" \
-            'select(.kind == "verdict" and .catch_up == false and .sequence <= $at) | .sequence' \
+            'select(.kind == "verdict" and .catch_up == false and (.recovery_replay // false) == false and .sequence <= $at) | .sequence' \
             "$FOLLOW_JSON" | wc -l)
         if [ "$NEW_BELOW" -eq 0 ]; then
             echo "  ok: no new verdict was published below the watermark (sequence $KILLED_AT_SEQUENCE)"

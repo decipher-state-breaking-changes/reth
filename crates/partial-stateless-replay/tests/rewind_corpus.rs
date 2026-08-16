@@ -9,10 +9,17 @@
 //! edge behind it. Every frame that reaches admission is a producer-recorded one; only the
 //! ordering is constructed.
 //!
-//! Corpus-gated: set `PS_REWIND_FIXTURE_SPOOL` to a recorded spool directory (a linear capture
-//! like `s2-capture/stream` — manifest, checkpoint, chunks, commits). Unset, the tests skip
-//! loudly rather than fail, because the corpus is measured in hundreds of megabytes and lives
-//! beside the bench runs, not in the repository.
+//! Corpus-gated and `#[ignore]`d: the corpus is measured in hundreds of megabytes and lives
+//! beside the bench runs, not in the repository, so a default `cargo test` reports these as
+//! ignored — never as passed-without-running. To run them:
+//!
+//! ```text
+//! PS_REWIND_FIXTURE_SPOOL=/data/bench-runs/s2-capture/stream \
+//!     cargo test -p partial-stateless-replay --release --test rewind_corpus \
+//!     -- --ignored --test-threads=1
+//! ```
+//!
+//! With the env var missing at actual run time, the tests panic rather than skip.
 
 mod common;
 
@@ -73,91 +80,79 @@ fn commit_block(event: &StreamEvent) -> (BlockRef, B256) {
 
 /// Builds the spliced spool once per process and shares it read-only across the tests; each
 /// test brings its own ack path, and the follower never writes into the spool.
-fn spliced() -> Option<&'static Spliced> {
-    static BUILT: OnceLock<Option<Spliced>> = OnceLock::new();
-    BUILT
-        .get_or_init(|| {
-            let source = match std::env::var("PS_REWIND_FIXTURE_SPOOL") {
-                Ok(path) if !path.is_empty() => PathBuf::from(path),
-                _ => {
-                    eprintln!(
-                        "skipping rewind-corpus tests: PS_REWIND_FIXTURE_SPOOL is not set \
-                         (point it at a recorded linear spool such as s2-capture/stream)"
-                    );
-                    return None
-                }
-            };
-            let dir = std::env::temp_dir().join(format!("ps-rewind-corpus-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).expect("temp dir");
+fn spliced() -> &'static Spliced {
+    static BUILT: OnceLock<Spliced> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let source = match std::env::var("PS_REWIND_FIXTURE_SPOOL") {
+            Ok(path) if !path.is_empty() => PathBuf::from(path),
+            _ => panic!(
+                "PS_REWIND_FIXTURE_SPOOL is not set; these #[ignore]d tests only run \
+                     against a recorded linear spool such as s2-capture/stream"
+            ),
+        };
+        let dir = std::env::temp_dir().join(format!("ps-rewind-corpus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
 
-            let manifest = read_event(&source, 0, FrameKind::Manifest);
-            let checkpoint_event = read_event(&source, 1, FrameKind::Checkpoint);
-            let StreamEvent::Checkpoint(checkpoint) = &checkpoint_event else {
-                panic!("the source spool's sequence 1 is not a checkpoint")
-            };
-            let anchor = checkpoint.block;
-            let chunks = u64::from(checkpoint.snapshot_chunks);
-            let commits_from = 2 + chunks;
-            let needed = WINDOW_COMMITS + LIVE_COMMITS;
-            let commits: Vec<StreamEvent> = (0..needed)
-                .map(|index| read_event(&source, commits_from + index, FrameKind::Commit))
-                .collect();
-            let (first, first_parent) = commit_block(&commits[0]);
-            assert_eq!(first_parent, anchor.hash, "the first commit is the checkpoint's child");
-            let (tip, _) = commit_block(&commits[WINDOW_COMMITS as usize - 1]);
+        let manifest = read_event(&source, 0, FrameKind::Manifest);
+        let checkpoint_event = read_event(&source, 1, FrameKind::Checkpoint);
+        let StreamEvent::Checkpoint(checkpoint) = &checkpoint_event else {
+            panic!("the source spool's sequence 1 is not a checkpoint")
+        };
+        let anchor = checkpoint.block;
+        let chunks = u64::from(checkpoint.snapshot_chunks);
+        let commits_from = 2 + chunks;
+        let needed = WINDOW_COMMITS + LIVE_COMMITS;
+        let commits: Vec<StreamEvent> = (0..needed)
+            .map(|index| read_event(&source, commits_from + index, FrameKind::Commit))
+            .collect();
+        let (first, first_parent) = commit_block(&commits[0]);
+        assert_eq!(first_parent, anchor.hash, "the first commit is the checkpoint's child");
+        let (tip, _) = commit_block(&commits[WINDOW_COMMITS as usize - 1]);
 
-            // The write-through ordering: bootstrap pair, a reorg back to the anchor announcing
-            // the recorded branch as the winner, the branch itself, and the recovery checkpoint
-            // published at the tail — the same checkpoint, because the pair recovered to the
-            // same block.
-            write_event(&dir, 0, &manifest);
-            write_event(&dir, 1, &checkpoint_event);
-            for index in 0..chunks {
-                write_event(
-                    &dir,
-                    2 + index,
-                    &read_event(&source, 2 + index, FrameKind::SnapshotChunk),
-                );
-            }
-            let mut next = 2 + chunks;
-            write_event(
-                &dir,
-                next,
-                &StreamEvent::Reorg(Reorg {
-                    common_ancestor: anchor,
-                    abandoned: vec![BlockRef {
-                        number: first.number,
-                        hash: B256::repeat_byte(0xa1),
-                    }],
-                    winning_tip: Some(tip),
-                }),
-            );
+        // The write-through ordering: bootstrap pair, a reorg back to the anchor announcing
+        // the recorded branch as the winner, the branch itself, and the recovery checkpoint
+        // published at the tail — the same checkpoint, because the pair recovered to the
+        // same block.
+        write_event(&dir, 0, &manifest);
+        write_event(&dir, 1, &checkpoint_event);
+        for index in 0..chunks {
+            write_event(&dir, 2 + index, &read_event(&source, 2 + index, FrameKind::SnapshotChunk));
+        }
+        let mut next = 2 + chunks;
+        write_event(
+            &dir,
+            next,
+            &StreamEvent::Reorg(Reorg {
+                common_ancestor: anchor,
+                abandoned: vec![BlockRef { number: first.number, hash: B256::repeat_byte(0xa1) }],
+                winning_tip: Some(tip),
+            }),
+        );
+        next += 1;
+        for commit in commits.iter().take(WINDOW_COMMITS as usize) {
+            write_event(&dir, next, commit);
             next += 1;
-            for commit in commits.iter().take(WINDOW_COMMITS as usize) {
-                write_event(&dir, next, commit);
-                next += 1;
-            }
-            let recovery_checkpoint = next;
-            write_event(&dir, next, &checkpoint_event);
+        }
+        let recovery_checkpoint = next;
+        write_event(&dir, next, &checkpoint_event);
+        next += 1;
+        for index in 0..chunks {
+            write_event(&dir, next, &read_event(&source, 2 + index, FrameKind::SnapshotChunk));
             next += 1;
-            for index in 0..chunks {
-                write_event(&dir, next, &read_event(&source, 2 + index, FrameKind::SnapshotChunk));
-                next += 1;
-            }
-            for commit in commits.iter().skip(WINDOW_COMMITS as usize) {
-                write_event(&dir, next, commit);
-                next += 1;
-            }
-            let end = next;
-            write_event(
-                &dir,
-                end,
-                &common::end_frame(end, partial_stateless_stream::EndKind::Shutdown),
-            );
-            Some(Spliced { dir, recovery_checkpoint, end })
-        })
-        .as_ref()
+        }
+        for commit in commits.iter().skip(WINDOW_COMMITS as usize) {
+            write_event(&dir, next, commit);
+            next += 1;
+        }
+        let end = next;
+        write_event(
+            &dir,
+            end,
+            &common::end_frame(end, partial_stateless_stream::EndKind::Shutdown),
+        );
+        Spliced { dir, recovery_checkpoint, end }
+    })
 }
 
 fn run(spool: &Path, ack: &Path, resume: bool, max_blocks: Option<u64>) -> FollowReport {
@@ -174,8 +169,9 @@ fn ack_json(path: &Path) -> serde_json::Value {
 /// continuous, the rewound commits count as first verifications, and the branch tip announced
 /// before the outage completes *inside* the window.
 #[test]
+#[ignore = "needs PS_REWIND_FIXTURE_SPOOL; see the module header"]
 fn a_clean_rewind_replay_is_a_continuous_recovery() {
-    let Some(spliced) = spliced() else { return };
+    let spliced = spliced();
     let ack = spliced.dir.join("ack-clean.json");
     let _ = fs::remove_file(&ack);
 
@@ -205,8 +201,9 @@ fn a_clean_rewind_replay_is_a_continuous_recovery() {
 /// restore replays it whole, and the commits the killed run never reached are first-verified
 /// by the resumed one.
 #[test]
+#[ignore = "needs PS_REWIND_FIXTURE_SPOOL; see the module header"]
 fn a_kill_inside_the_window_resumes_and_replays_it_whole() {
-    let Some(spliced) = spliced() else { return };
+    let spliced = spliced();
     let ack = spliced.dir.join("ack-kill.json");
     let _ = fs::remove_file(&ack);
 
@@ -230,7 +227,7 @@ fn a_kill_inside_the_window_resumes_and_replays_it_whole() {
         resumed.blocks_verified,
         WINDOW_COMMITS + LIVE_COMMITS,
         "the whole window re-verifies — all-or-nothing, no mid-window progress to trust — and \
-         the analyzer dedupes re-published blocks by (block, hash)"
+         the analyzer dedupes re-published frames by their sequence"
     );
     assert_eq!(resumed.catch_up_blocks, 0, "the install ack's watermark is the checkpoint itself");
 }
@@ -241,8 +238,9 @@ fn a_kill_inside_the_window_resumes_and_replays_it_whole() {
 /// shape that used to gap: a recovery record cleared at completion left the ack pointing at a
 /// checkpoint whose first live commit is not its child.
 #[test]
+#[ignore = "needs PS_REWIND_FIXTURE_SPOOL; see the module header"]
 fn a_resume_after_the_rewind_completed_replays_the_window_as_catch_up() {
-    let Some(spliced) = spliced() else { return };
+    let spliced = spliced();
     let ack = spliced.dir.join("ack-after.json");
     let _ = fs::remove_file(&ack);
 

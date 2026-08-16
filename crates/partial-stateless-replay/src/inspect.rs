@@ -119,7 +119,18 @@ pub fn inspect_ready(dir: &Path) -> eyre::Result<SpoolReadiness> {
         Err(fault) => return Ok(SpoolReadiness::invalid(Some(epoch), fault.to_string())),
     };
     let Some(checkpoint_at) = checkpoint_at else {
-        return Ok(SpoolReadiness::pending(Some(epoch), "the current epoch has no checkpoint yet"))
+        // No checkpoint yet — but an epoch that already closed will never get one, and polling
+        // through the deadline would report the producer's giving-up as a timeout.
+        return Ok(match tail.scan_for(FrameKind::End, manifest_at + 1) {
+            Ok(Some(end_at)) => SpoolReadiness::invalid(
+                Some(epoch),
+                format!("the epoch closed at sequence {end_at} before any checkpoint"),
+            ),
+            Ok(None) => {
+                SpoolReadiness::pending(Some(epoch), "the current epoch has no checkpoint yet")
+            }
+            Err(fault) => SpoolReadiness::invalid(Some(epoch), fault.to_string()),
+        })
     };
     // An End below the checkpoint means this epoch closed without one; whatever sits above the
     // End belongs to no epoch a follower may start into. The producer that would write a fresh
@@ -228,4 +239,211 @@ pub fn inspect_ready(dir: &Path) -> eyre::Result<SpoolReadiness> {
         chunks: Some(checkpoint.snapshot_chunks),
         reason: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use alloy_rlp::Encodable;
+    use partial_stateless_stream::{
+        encode_event, BlockRef, Checkpoint, End, EndKind, Manifest, StreamEvent,
+    };
+    use reth_primitives_traits::SealedHeader;
+    use std::{fs, path::PathBuf};
+
+    /// The classifications the gate acts on: `pending` keeps polling, `invalid` fails fast.
+    /// The CLI maps these one-to-one onto exit codes 0/2/3.
+    fn spool(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ps-inspect-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write(dir: &std::path::Path, sequence: u64, event: &StreamEvent) {
+        let kind = match event {
+            StreamEvent::Manifest(_) => FrameKind::Manifest,
+            StreamEvent::Checkpoint(_) => FrameKind::Checkpoint,
+            StreamEvent::SnapshotChunk(_) => FrameKind::SnapshotChunk,
+            StreamEvent::End(_) => FrameKind::End,
+            _ => unreachable!("these tests write no other kinds"),
+        };
+        let bytes = encode_event(sequence, event, &FrameLimits::default()).expect("encodes");
+        fs::write(dir.join(format!("{sequence:012}_{}.frame", kind.as_str())), bytes)
+            .expect("writes");
+    }
+
+    fn manifest(epoch: u64, first_sequence: u64) -> Manifest {
+        Manifest {
+            chain_id: 1,
+            genesis_hash: B256::repeat_byte(0x11),
+            cache_policy_id: B256::repeat_byte(0x22),
+            account_window: 60,
+            storage_window: 30,
+            epoch,
+            producer: "inspect-test".to_string(),
+            first_sequence,
+        }
+    }
+
+    /// A structurally complete checkpoint: the accepted head's hash, number, and state root
+    /// agree with the declaration, and `describe` computes the real chunk digest — inspection
+    /// checks structure, never restorability, so no trie fixture is needed.
+    fn checkpoint(package: &[u8], chunk_bytes: usize) -> (Checkpoint, Vec<StreamEvent>) {
+        let header = alloy_consensus::Header { number: 7, ..Default::default() };
+        let sealed = SealedHeader::seal_slow(header.clone());
+        let mut accepted_head_rlp = Vec::new();
+        header.encode(&mut accepted_head_rlp);
+        let mut checkpoint = Checkpoint {
+            block: BlockRef { number: 7, hash: sealed.hash() },
+            state_root: sealed.state_root,
+            cache_root: B256::repeat_byte(0x33),
+            cache_policy_id: B256::repeat_byte(0x22),
+            accepted_head_rlp,
+            snapshot_bytes: 0,
+            snapshot_chunks: 0,
+            snapshot_digest: B256::ZERO,
+        };
+        let chunks = checkpoint
+            .chunk(package, chunk_bytes)
+            .into_iter()
+            .map(StreamEvent::SnapshotChunk)
+            .collect();
+        (checkpoint, chunks)
+    }
+
+    #[test]
+    fn an_empty_spool_is_pending() {
+        let dir = spool("empty");
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert!(!readiness.ready);
+        assert_eq!(readiness.state, "pending");
+        assert_eq!(readiness.reason.as_deref(), Some("no manifest yet"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manifest_alone_is_pending() {
+        let dir = spool("manifest-only");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(readiness.state, "pending");
+        assert_eq!(readiness.epoch, Some(1));
+        assert!(readiness.reason.unwrap().contains("no checkpoint yet"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The case the file-existence probe waved through: a resumed spool holds a previous
+    /// epoch's checkpoint, and the *current* epoch has none yet.
+    #[test]
+    fn a_previous_epochs_checkpoint_does_not_vouch_for_the_current_one() {
+        let dir = spool("stale-epoch");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        let (checkpoint, chunks) = checkpoint(b"snapshot bytes", 8);
+        write(&dir, 1, &StreamEvent::Checkpoint(checkpoint));
+        let mut next = 2;
+        for chunk in &chunks {
+            write(&dir, next, chunk);
+            next += 1;
+        }
+        write(
+            &dir,
+            next,
+            &StreamEvent::End(End {
+                kind: EndKind::Shutdown,
+                reason: "test".into(),
+                last_sequence: next - 1,
+            }),
+        );
+        write(&dir, next + 1, &StreamEvent::Manifest(manifest(2, next + 2)));
+
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(readiness.state, "pending");
+        assert_eq!(readiness.epoch, Some(2), "judged against the current epoch, not epoch 1");
+        assert!(readiness.reason.unwrap().contains("no checkpoint yet"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_chunk_is_pending_and_a_corrupt_one_is_invalid() {
+        let dir = spool("chunks");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        let (checkpoint, chunks) = checkpoint(b"twelve bytes!", 8);
+        assert_eq!(chunks.len(), 2, "the fixture spans two chunks");
+        write(&dir, 1, &StreamEvent::Checkpoint(checkpoint));
+        write(&dir, 2, &chunks[0]);
+
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(readiness.state, "pending", "an unwritten chunk is the producer mid-burst");
+        assert!(readiness.reason.unwrap().contains("not written yet"));
+
+        // The second chunk arrives with the wrong bytes: present, complete, and wrong is
+        // corruption, and waiting cannot fix it.
+        let StreamEvent::SnapshotChunk(chunk) = &chunks[1] else { unreachable!() };
+        let mut corrupt = chunk.clone();
+        corrupt.bytes[0] ^= 0xff;
+        write(&dir, 3, &StreamEvent::SnapshotChunk(corrupt));
+
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(readiness.state, "invalid");
+        assert!(readiness.reason.unwrap().contains("hashed to"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_manifest_chain_is_invalid() {
+        let dir = spool("broken-chain");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        // Epoch 3 after epoch 1: not this stream's successor.
+        write(&dir, 1, &StreamEvent::Manifest(manifest(3, 2)));
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(readiness.state, "invalid");
+        assert!(readiness.reason.unwrap().contains("manifest chain broken"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_epoch_closed_before_its_checkpoint_is_invalid() {
+        let dir = spool("closed-early");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        write(
+            &dir,
+            1,
+            &StreamEvent::End(End {
+                kind: EndKind::ExportFailure,
+                reason: "test".into(),
+                last_sequence: 0,
+            }),
+        );
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert_eq!(
+            readiness.state, "invalid",
+            "the producer already gave up; polling cannot fix it"
+        );
+        assert!(readiness.reason.unwrap().contains("before any checkpoint"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_complete_current_epoch_is_ready() {
+        let dir = spool("ready");
+        write(&dir, 0, &StreamEvent::Manifest(manifest(1, 1)));
+        let (checkpoint, chunks) = checkpoint(b"snapshot bytes", 8);
+        let declared = chunks.len() as u32;
+        write(&dir, 1, &StreamEvent::Checkpoint(checkpoint));
+        let mut next = 2;
+        for chunk in &chunks {
+            write(&dir, next, chunk);
+            next += 1;
+        }
+
+        let readiness = inspect_ready(&dir).expect("inspects");
+        assert!(readiness.ready);
+        assert_eq!(readiness.state, "ready");
+        assert_eq!(readiness.checkpoint_sequence, Some(1));
+        assert_eq!(readiness.chunks, Some(declared));
+        assert_eq!(readiness.reason, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
