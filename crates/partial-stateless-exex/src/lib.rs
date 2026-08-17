@@ -781,7 +781,17 @@ where
 {
     // Resolve the cache file path: datadir/partial_stateless_cache.bin
     let cache_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
-    let cache_path = cache_dir.as_ref().join("partial_stateless_cache.bin");
+    // The windows are part of the name because the file's contents mean nothing without them:
+    // the format carries no policy of its own, and the loader attaches whatever policy the running
+    // process holds. A cache filled under a 240-block storage window and reloaded under a 30-block
+    // one would hold entries a genuine 30-block peer evicted long ago, and nothing downstream
+    // would object — the anchors it produces are internally consistent, so the arm would report a
+    // hit ratio belonging to neither window. A name cannot go stale against what it describes, and
+    // a run whose windows changed simply finds no file and starts cold.
+    let cache_path = cache_dir.as_ref().join(format!(
+        "partial_stateless_cache-a{}-s{}.bin",
+        config.account_window, config.storage_window
+    ));
     let options = RunOptions::from_env(config)?;
     options.log_summary(&cache_path);
 
@@ -1242,8 +1252,10 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
             Ok(loaded_cache) => {
                 let cache_block = loaded_cache.current_block();
 
-                // Validation: Gap Tolerance based on config.account_window
-                let max_allowed_gap = config.account_window;
+                // Gap tolerance is the *larger* window, not the account one: the cache is only
+                // fully stale once the longer of the two has gone by, and under a sweep arm the
+                // storage window can be the longer one.
+                let max_allowed_gap = config.max_window();
                 if cache_block <= head_block && head_block - cache_block <= max_allowed_gap {
                     info!(
                         target: "partial_stateless",

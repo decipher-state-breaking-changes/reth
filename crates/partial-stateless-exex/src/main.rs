@@ -18,7 +18,10 @@ use reth_ethereum::node::{builder::NodeHandleFor, EthereumNode};
 
 fn main() -> eyre::Result<()> {
     reth_ethereum::cli::Cli::parse_args().run(async move |builder, _| {
-        let config = CacheConfig::default();
+        // Read before the node starts and fatal when it is wrong. The windows decide the cache
+        // policy identifier every peer compares anchors under, so a mistyped variable must stop
+        // the run rather than quietly produce an arm labelled with a window it never ran.
+        let config = CacheConfig::from_env()?;
 
         let handle: NodeHandleFor<EthereumNode> = builder
             .node(EthereumNode::default())
