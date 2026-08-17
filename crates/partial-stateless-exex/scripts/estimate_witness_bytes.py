@@ -323,11 +323,14 @@ def apply_rule(rows: list[dict], baseline: tuple[int, int]) -> dict:
         key=lambda r: r["account_window"],
     )
     knee = None
+    knee_status = "too few windows share the baseline's ratio to look for one"
     if len(diagonal) >= 3:
+        knee_status = "still paying at the widest window in this grid — the grid is the limit, not the curve"
         for previous, nxt in zip(diagonal, diagonal[1:]):
             gain = previous["estimated_bytes_total"] - nxt["estimated_bytes_total"]
             if gain < KNEE_MARGINAL_FRACTION * base["estimated_bytes_total"]:
                 knee = previous
+                knee_status = "found"
                 break
 
     return {
@@ -337,6 +340,8 @@ def apply_rule(rows: list[dict], baseline: tuple[int, int]) -> dict:
         "decision": [chosen["account_window"], chosen["storage_window"]],
         "decision_is_baseline": chosen is base,
         "knee": [knee["account_window"], knee["storage_window"]] if knee else None,
+        "knee_status": knee_status,
+        "ratio_windows": [[r["account_window"], r["storage_window"]] for r in diagonal],
         "thresholds": {
             "bytes_fraction": QUALIFY_BYTES_FRACTION,
             "memory_factor": QUALIFY_MEMORY_FACTOR,
@@ -415,7 +420,14 @@ def render(models, rows, rule, fit_paths, check_paths) -> str:
         + (
             f"{rule['knee'][0]}/{rule['knee'][1]}"
             if rule["knee"]
-            else "not reached, or too few windows share the baseline's ratio to look for one"
+            else rule["knee_status"]
+        )
+        + (
+            ""
+            if rule["knee"]
+            else " ["
+            + " -> ".join(f"{a}/{s}" for a, s in rule["ratio_windows"])
+            + "]"
         )
     )
     out.append("")
