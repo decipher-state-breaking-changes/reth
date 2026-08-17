@@ -15,6 +15,7 @@
 use alloy_consensus::{proofs, SignableTransaction, TxLegacy};
 use alloy_primitives::{Address, Signature, TxKind, B256, U256};
 use alloy_rpc_types_engine::ExecutionData;
+use partial_stateless::PartialStatelessSidecar;
 use reth_ethereum_primitives::{Block, TransactionSigned};
 use reth_primitives_traits::SealedBlock;
 
@@ -99,6 +100,89 @@ impl Mutation {
         let sealed = SealedBlock::seal_slow(block);
         let hash = sealed.hash();
         Ok(ExecutionData::from_block_unchecked(hash, &sealed.into_block()))
+    }
+}
+
+/// One way to make a recorded payload invalid *after* it has been executed.
+///
+/// Kept apart from [`Mutation`] because the two carry opposite claims, and a single list would
+/// make each one's success look like the other one's failure. An admission mutation is evidence
+/// that a block was refused *before* the validator touched any state, so admitting one is the
+/// failure. A transition mutation has to be admitted — well formed, consensus-legal against the
+/// parent, every signature recoverable — and is evidence only if the refusal comes from a rule
+/// that cannot be evaluated without executing the block. Refusing one early proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionMutation {
+    /// The header commits to a receipts root the block's own execution does not produce.
+    ///
+    /// One bit, flipped in the one header field that no amount of inspection can check: the
+    /// receipts root is a commitment to the *result* of running every transaction. Everything
+    /// else a recorded block carries — the transactions root, the gas limit, the base fee, the
+    /// signatures — can be and is checked before execution, which is exactly why none of them
+    /// reaches the rule this one does.
+    ReceiptsRoot,
+}
+
+impl TransitionMutation {
+    /// Every transition-level mutation, deliberately not part of [`Mutation::ALL`].
+    pub const ALL: [Self; 1] = [Self::ReceiptsRoot];
+
+    /// The rejection class this mutation must produce.
+    ///
+    /// Namespaced away from the admission classes (`payload`, `consensus`, `sender_recovery`)
+    /// because it is not one of them: those name the phase that refused a block, and this one
+    /// names a phase the recorded oracle has no vocabulary for — the producer's recording never
+    /// contains a block that reached execution and failed.
+    pub const fn expected_class(&self) -> &'static str {
+        match self {
+            Self::ReceiptsRoot => "transition:post_execution",
+        }
+    }
+
+    /// Stable name for the run log.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReceiptsRoot => "receipts_root",
+        }
+    }
+
+    /// Derives the payload, re-sealed and re-announced so admission has nothing to object to.
+    pub fn apply(&self, payload: &ExecutionData) -> eyre::Result<ExecutionData> {
+        let mut block: Block = payload
+            .clone()
+            .try_into_block::<TransactionSigned>()
+            .map_err(|err| eyre::eyre!("recorded payload does not decode into a block: {err}"))?;
+
+        match self {
+            Self::ReceiptsRoot => block.header.receipts_root.0[0] ^= 0x01,
+        }
+
+        let sealed = SealedBlock::seal_slow(block);
+        let hash = sealed.hash();
+        Ok(ExecutionData::from_block_unchecked(hash, &sealed.into_block()))
+    }
+
+    /// Rebinds a recorded sidecar to the block hash [`Self::apply`] produced.
+    ///
+    /// Two fields, and both of them load-bearing. The validator's prefilter compares
+    /// `sidecar.block_hash` against the block's own hash, and the cache-context check then
+    /// compares `next_cache_anchor.block_hash` against that same `sidecar.block_hash`. Rebinding
+    /// only the first trades one pre-execution refusal for another and the mutation still never
+    /// reaches the rule it exists to exercise — which is a failure that reads exactly like a
+    /// success, since the block was, after all, refused.
+    ///
+    /// Nothing else moves. The witness proves state under the *parent* root, the miss targets and
+    /// their commitment describe that same parent state, and the cache roots are over cache
+    /// contents rather than over any header — so re-sealing the block leaves all of them true.
+    pub fn rebind_sidecar(
+        &self,
+        sidecar: &PartialStatelessSidecar,
+        block_hash: B256,
+    ) -> PartialStatelessSidecar {
+        let mut rebound = sidecar.clone();
+        rebound.block_hash = block_hash;
+        rebound.next_cache_anchor.block_hash = block_hash;
+        rebound
     }
 }
 
@@ -207,6 +291,45 @@ mod tests {
             proofs::calculate_transaction_root(&mutated_block.body.transactions)
         );
         assert!(applies_to_every_block());
+    }
+
+    /// The transition mutation is only reachable if the payload it produces is *well formed*:
+    /// a stale announcement would be refused as `payload` and the EVM would never run.
+    #[test]
+    fn the_receipts_root_mutation_announces_what_it_produced() {
+        let payload = payload_of(&block());
+        let mutated = TransitionMutation::ReceiptsRoot.apply(&payload).expect("mutation applies");
+        let mutated_block =
+            mutated.clone().try_into_block::<TransactionSigned>().expect("mutated payload decodes");
+        assert_eq!(
+            SealedBlock::seal_slow(mutated_block.clone()).hash(),
+            mutated.payload.block_hash(),
+            "the mutation must announce the hash of what it produced"
+        );
+        assert_ne!(
+            mutated_block.header.receipts_root,
+            block().header.receipts_root,
+            "the field under test must actually differ"
+        );
+        assert_eq!(mutated_block.header.number(), block().header.number);
+        assert_eq!(mutated_block.header.gas_limit(), block().header.gas_limit);
+        assert_eq!(mutated_block.header.transactions_root, block().header.transactions_root);
+    }
+
+    /// The two lists are separate on purpose, and a mutation that leaked from one into the other
+    /// would be judged under the wrong expectation entirely.
+    #[test]
+    fn the_transition_list_is_disjoint_from_the_admission_list() {
+        assert_eq!(TransitionMutation::ALL.len(), 1);
+        assert_eq!(TransitionMutation::ReceiptsRoot.expected_class(), "transition:post_execution");
+        assert_eq!(TransitionMutation::ReceiptsRoot.as_str(), "receipts_root");
+        for mutation in Mutation::ALL {
+            assert_ne!(
+                mutation.expected_class(),
+                TransitionMutation::ReceiptsRoot.expected_class(),
+                "an admission class must never name the post-execution one"
+            );
+        }
     }
 
     /// The classes are what a recorded oracle compares, so they are pinned rather than derived.

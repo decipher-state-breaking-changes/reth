@@ -29,6 +29,15 @@ use std::{collections::HashMap, fmt, mem, time::Instant};
 
 pub type SidecarReexecLimits = SidecarWitnessCheckLimits;
 
+/// The message every post-execution consensus rejection carries.
+///
+/// A block can be refused a dozen ways before the EVM runs and exactly one way after it — the
+/// receipts and logs it actually produced against the ones its header committed to. Nothing in an
+/// `eyre` chain distinguishes the two but the text, so a test that means to prove the *late*
+/// refusal has to match on it. Exported so the match is against a symbol: renaming this breaks
+/// the test rather than quietly widening what it accepts.
+pub const POST_EXECUTION_REJECTION: &str = "post-execution consensus validation failed";
+
 /// Controls whether a successfully verified transition replaces the caller's trie cache.
 ///
 /// Builder-side preflights only need the verification result. Discarding their transactional
@@ -303,7 +312,7 @@ where
             &execution_output.result,
             Some((execution_receipts_root, execution_logs_bloom)),
         )
-        .map_err(|err| eyre!("post-execution consensus validation failed: {err}"))?;
+        .map_err(|err| eyre!("{POST_EXECUTION_REJECTION}: {err}"))?;
     let post_execution_consensus_us = post_execution_start.elapsed().as_micros() as u64;
 
     let execution_requests_hash = execution_output.result.requests.requests_hash();

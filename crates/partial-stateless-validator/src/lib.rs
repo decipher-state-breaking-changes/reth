@@ -33,6 +33,6 @@ pub use coordination::{
 pub use reexec::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, NoRootOracle,
     PostStateRootOracle, SidecarReexecLimits, SidecarValidationOutcome, TimedValidation,
-    TrieCacheDisposition, ValidatorRules,
+    TrieCacheDisposition, ValidatorRules, POST_EXECUTION_REJECTION,
 };
 pub use timings::{AdmissionSource, AdmissionTimings, PayloadProvenance, ValidationPhaseTimings};

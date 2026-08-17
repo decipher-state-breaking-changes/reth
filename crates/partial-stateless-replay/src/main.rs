@@ -1,7 +1,8 @@
 //! `ps-replay` — replays a recorded partial-stateless stream with no state database.
 //!
 //! ```text
-//! ps-replay <spool-dir> [--limit N] [--no-mutations] [--json <path>] [--label <name>]
+//! ps-replay <spool-dir> [--limit N] [--no-mutations] [--mutations-transition [N]]
+//!           [--json <path>] [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
 //!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--json <path>] [--label <name>]
 //! ```
@@ -64,6 +65,7 @@ fn main() -> eyre::Result<()> {
         reconstructed = report.reconstructed,
         absent = report.absent,
         mutations_checked = report.mutations_checked,
+        transition_mutations_checked = report.transition_mutations_checked,
         admission_us = report.admission_us,
         transition_us = report.transition_us,
         elapsed_ms,
@@ -150,6 +152,8 @@ fn write_record(
         "failures": report.failures.len(),
         "mutations_checked": report.mutations_checked,
         "mutation_failures": report.mutation_failures.len(),
+        "transition_mutations_checked": report.transition_mutations_checked,
+        "transition_mutation_us": report.transition_mutation_us,
         "admission_us": report.admission_us,
         "transition_us": report.transition_us,
         "standalone_validation_us": report.standalone_validation_us,
@@ -440,6 +444,21 @@ fn parse_args() -> eyre::Result<Mode> {
                 options.limit = Some(raw.parse()?);
             }
             "--no-mutations" => options.mutations = false,
+            // Off unless asked for, and bounded when it is: it executes an extra, deliberately
+            // invalid block per commit, which is a coverage cost and never a measurement.
+            "--mutations-transition" => {
+                let budget = match args.clone().next() {
+                    Some(next) if next.parse::<usize>().is_ok() => {
+                        args.next();
+                        next.parse()?
+                    }
+                    _ => 5,
+                };
+                if budget == 0 {
+                    eyre::bail!("--mutations-transition needs a positive block count");
+                }
+                options.mutations_transition = Some(budget);
+            }
             "--force-restore-at" => {
                 let raw = args
                     .next()
@@ -457,6 +476,7 @@ fn parse_args() -> eyre::Result<Mode> {
             "-h" | "--help" => {
                 println!(
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
+                     [--mutations-transition [N]] \
                      [--force-restore-at <sequence>] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \

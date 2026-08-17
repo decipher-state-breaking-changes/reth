@@ -639,6 +639,11 @@ impl<'a> Follower<'a> {
             replay_options: ReplayOptions {
                 limit: None,
                 mutations: options.mutations,
+                // Never here. A transition mutation executes a whole extra block, and a follower
+                // is measuring the wall-clock distance between a frame landing and its verdict —
+                // the one place where the cost of proving something would be counted as the cost
+                // of doing it. It belongs to the offline gate, which measures nothing.
+                mutations_transition: None,
                 frame_limits: options.frame_limits,
                 reexec_limits: options.reexec_limits.clone(),
                 // An offline forensic switch; a live follower has a producer to ask instead.

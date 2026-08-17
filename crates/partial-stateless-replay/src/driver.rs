@@ -11,7 +11,7 @@ use crate::{
         block_label, compare_accepted, compare_readiness_watermark, compare_rejected, Disagreement,
         WatermarkComparison,
     },
-    mutate::Mutation,
+    mutate::{Mutation, TransitionMutation},
     reorg::{apply_reorg, warn_inapplicable, ReorgOutcome, VerifiedHistory},
     spool::SpoolIter,
 };
@@ -28,6 +28,7 @@ use partial_stateless_validator::{
     timings::{AdmissionTimings, ValidationPhaseTimings},
     verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedPair, PayloadProvenance,
     SidecarReexecLimits, TrieCacheDisposition, UntrustedAdmission, ValidatorRules,
+    POST_EXECUTION_REJECTION,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -46,6 +47,16 @@ pub struct ReplayOptions {
     /// On by default, because a replay of a mainnet corpus without it proves the accept path only
     /// and reads as though it proved more.
     pub mutations: bool,
+    /// Drive this many recorded commits through a transition-level negative frame as well.
+    ///
+    /// `None` — the default — is off, and deliberately so. A transition mutation executes a
+    /// second, deliberately invalid block against the full EVM, so it costs about what the honest
+    /// commit costs; leaving it on would put that cost inside the very measurement a cohort run
+    /// exists to take. It is a coverage switch for an offline gate, not a profile.
+    ///
+    /// Bounded rather than boolean for the same reason: the rule it exercises is the same rule on
+    /// every block, so the fifth block proves what the five-hundredth would.
+    pub mutations_transition: Option<usize>,
     /// Bounds on frame decoding.
     pub frame_limits: FrameLimits,
     /// Bounds on sidecar witness decoding.
@@ -65,6 +76,7 @@ impl Default for ReplayOptions {
         Self {
             limit: None,
             mutations: true,
+            mutations_transition: None,
             frame_limits: FrameLimits::default(),
             reexec_limits: SidecarReexecLimits::default(),
             force_restore_at: None,
@@ -91,6 +103,14 @@ pub struct ReplayReport {
     pub mutations_checked: u64,
     /// Negative frames that produced the wrong class, or none at all.
     pub mutation_failures: Vec<String>,
+    /// Transition-level negative frames driven through a full execution.
+    pub transition_mutations_checked: u64,
+    /// What those cost, in microseconds.
+    ///
+    /// Reported apart from `transition_us` and never added to it. The honest transition time is
+    /// the number every latency population is built from, and a mutation is not a validation of
+    /// anything the corpus contains.
+    pub transition_mutation_us: u64,
     /// Total admission wall time across every commit, in microseconds.
     pub admission_us: u64,
     /// Total transition wall time across every commit, in microseconds.
@@ -1515,6 +1535,47 @@ pub(crate) fn replay_commit(
         timer.mutation_check_us = Some(mutations_started.elapsed().as_micros() as u64);
     }
 
+    // Deliberately *not* folded into `timer`: every field on it feeds a latency population, and
+    // the cost of executing a block nobody sent belongs in none of them. The budget is spent on
+    // the first commits the corpus offers rather than sampled across it — the rule is the same
+    // rule on every block, and an offline gate that has proved it five times has proved it.
+    if options.mutations_transition.is_some_and(|blocks| {
+        // The budget counts blocks, and each one carries every transition mutation there is —
+        // written as a product so adding a second kind widens the coverage rather than silently
+        // halving the number of blocks that get any.
+        report.transition_mutations_checked < (blocks * TransitionMutation::ALL.len()) as u64
+    }) && input.payload_provenance.is_load_bearing()
+    {
+        let started = Instant::now();
+        let compromised = check_transition_mutations(
+            &admission,
+            &mut state.pair,
+            ValidatorRules::new(&state.evm_config, &state.consensus),
+            state.config.cache_policy_id(),
+            &options.reexec_limits,
+            &payload,
+            &sidecar,
+            report,
+            &label,
+        );
+        report.transition_mutation_us += started.elapsed().as_micros() as u64;
+        if compromised {
+            // Cannot happen, and therefore the one case where continuing is worse than stopping.
+            // `TrieCacheDisposition::Discard` withholds the trie generation, but the flat cache is
+            // advanced by the transition itself — so a mutation that was wrongly accepted has
+            // already moved the pair onto a block that does not exist, and every verdict after it
+            // would be measured against that state. The failure is already recorded; this makes it
+            // terminal rather than contagious.
+            timer.finish("fault", report);
+            return CommitOutcome::Fault(fail_applied_block(
+                &mut state.pair,
+                input.block,
+                "a transition mutation moved the pair; it may have advanced on an invalid block"
+                    .to_string(),
+            ))
+        }
+    }
+
     // The parent comes from the pair and never from the frame. A producer that supplied the parent
     // would be choosing the timestamp, gas limit, and base fee its own block is measured against.
     let admitted = match admission.admit(payload, state.pair.accepted_parent()) {
@@ -1642,6 +1703,143 @@ pub(crate) fn replay_commit(
 fn fail_applied_block(pair: &mut CoordinatedPair, block: BlockRef, detail: String) -> ReplayFault {
     pair.readiness.abandon_block(block.number);
     ReplayFault::TransitionFailed { block, detail }
+}
+
+/// Derives a transition-level negative frame and drives it through a full execution.
+///
+/// The opposite claim to [`check_mutations`], and it needs the opposite setup. An admission
+/// mutation is evidence that a block was refused before the validator touched anything. This one
+/// has to be *admitted* — well formed, consensus-legal against the parent, every signature
+/// recoverable — and is evidence only if what refuses it is a rule that cannot be evaluated
+/// without executing the block. Until this ran, no test in this repository had ever reached one:
+/// the recorded corpus contains no such block, and every manufactured one was stopped earlier.
+///
+/// The probe is assembled, not cloned. `CoordinatedPair` is deliberately not `Clone` — its caches
+/// are the generation this run is standing on, not a value to copy — so the fork is a cloned
+/// readiness tracker over the pair's own caches, driven with `TrieCacheDisposition::Discard`. The
+/// readiness tracker is the one part a failed transition really does move (`admit_block` puts it
+/// in `Applying`, and `fail_applied_block` then latches it terminally blocked), which is exactly
+/// why the probe needs its own. The caches need no copy because a failed transition leaves both
+/// at the parent generation — the invariant `fail_applied_block` documents, and the one the
+/// fingerprint comparison below exists to check rather than to assume.
+///
+/// Returns whether the pair moved. `Discard` covers the trie cache only — the flat cache is
+/// advanced by the transition itself — so an accepted mutation is not merely a coverage failure
+/// but a corrupted validator, and the caller stops rather than carrying it into the next commit.
+#[expect(clippy::too_many_arguments)]
+fn check_transition_mutations<C>(
+    admission: &UntrustedAdmission<'_, ChainSpec, C>,
+    pair: &mut CoordinatedPair,
+    rules: ValidatorRules<'_, EthEvmConfig<ChainSpec>, C>,
+    cache_policy_id: alloy_primitives::B256,
+    reexec_limits: &SidecarReexecLimits,
+    payload: &alloy_rpc_types_engine::ExecutionData,
+    sidecar: &PartialStatelessSidecar,
+    report: &mut ReplayReport,
+    label: &str,
+) -> bool
+where
+    C: reth_consensus::FullConsensus<reth_ethereum_primitives::EthPrimitives>
+        + reth_consensus::Consensus<
+            alloy_consensus::Block<reth_ethereum_primitives::TransactionSigned>,
+        > + ?Sized,
+{
+    let mut compromised = false;
+    for mutation in TransitionMutation::ALL {
+        let mutated = match mutation.apply(payload) {
+            Ok(mutated) => mutated,
+            Err(err) => {
+                report
+                    .mutation_failures
+                    .push(format!("{label}/{}: could not derive: {err}", mutation.as_str()));
+                continue
+            }
+        };
+        let mutated_sidecar = mutation.rebind_sidecar(sidecar, mutated.payload.block_hash());
+        report.transition_mutations_checked += 1;
+
+        // Admission is the *precondition* here, not the test. A mutation refused this early has
+        // told us nothing about the rule it was built for, so it is reported as a coverage
+        // failure rather than as a rejection.
+        let admitted = match admission.admit(mutated, pair.accepted_parent()) {
+            Ok(admitted) => admitted,
+            Err(err) => {
+                report.mutation_failures.push(format!(
+                    "{label}/{}: refused as {} before the block could be executed: {err}",
+                    mutation.as_str(),
+                    err.class()
+                ));
+                continue
+            }
+        };
+
+        let before = (pair.fingerprint(), pair.lifecycle_fingerprint());
+
+        let mut probe_readiness = pair.readiness.clone();
+        let block_ctx = block_context(&admitted.block);
+        if let BlockAdmission::Rejected(reason) = admit_block(&mut probe_readiness, &block_ctx) {
+            report.mutation_failures.push(format!(
+                "{label}/{}: the readiness tracker refused it before execution: {reason:?}",
+                mutation.as_str()
+            ));
+            continue
+        }
+
+        let outcome = verify_and_apply_sidecar(
+            rules,
+            &admitted.block,
+            &mut pair.cache,
+            &mutated_sidecar,
+            cache_policy_id,
+            reexec_limits,
+            &mut pair.trie_cache,
+            TrieCacheDisposition::Discard,
+        );
+        match outcome {
+            Ok(_) => {
+                report.mutation_failures.push(format!(
+                    "{label}/{}: the transition accepted a block that must have been refused as {}",
+                    mutation.as_str(),
+                    mutation.expected_class()
+                ));
+                compromised = true;
+            }
+            Err(err) => {
+                let detail = format!("{err:#}");
+                if !detail.contains(POST_EXECUTION_REJECTION) {
+                    report.mutation_failures.push(format!(
+                        "{label}/{}: refused, but not by the post-execution rule it exists to \
+                         reach: {detail}",
+                        mutation.as_str()
+                    ));
+                }
+            }
+        }
+
+        // The probe ends where a real failed commit ends: terminally blocked, watermark frozen at
+        // the parent. Asserted rather than assumed, because a probe that quietly stayed usable
+        // would mean the driver's own fault path leaves a tracker that lies about what it holds.
+        probe_readiness.abandon_block(block_ctx.number);
+        if !probe_readiness.is_blocked() {
+            report.mutation_failures.push(format!(
+                "{label}/{}: the probe's readiness survived a failed transition",
+                mutation.as_str()
+            ));
+        }
+
+        // And the pair the honest commit is about to use has to be untouched by all of it: the
+        // same cache generation, reached by applying the same blocks. Both fingerprints, because
+        // they answer different questions and a mutation could move either one.
+        let after = (pair.fingerprint(), pair.lifecycle_fingerprint());
+        if after != before {
+            report.mutation_failures.push(format!(
+                "{label}/{}: the mutation moved the real pair: {before:?} -> {after:?}",
+                mutation.as_str()
+            ));
+            compromised = true;
+        }
+    }
+    compromised
 }
 
 /// Derives negative frames from a recorded payload and checks the class each must produce.
