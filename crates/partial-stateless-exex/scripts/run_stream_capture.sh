@@ -50,6 +50,7 @@ PS_BOOTSTRAP_DIR="${RUN_DIR}/bootstrap" \
 PS_SIDECAR_DIR="${RUN_DIR}/sidecars" \
 nohup "${BINARY}" node \
   --datadir "${DATADIR}" --authrpc.jwtsecret "${JWT}" \
+  --db.read-transaction-timeout 0 \
   --minimal --http --http.api eth,net,web3,debug,trace \
   --authrpc.addr 127.0.0.1 --authrpc.port 8551 \
   --ws --ws.addr 127.0.0.1 --ws.port 8546 --ws.api eth,trace,debug,net --ws.origins localhost \

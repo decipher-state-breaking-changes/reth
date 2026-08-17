@@ -916,7 +916,9 @@ def self_check_rb7():
     assert ledger["by_origin"] == {"initial": 1, "reorg": 2, "revert": 1}
     assert ledger["by_state"] == {"failed_final": 1, "fenced": 1, "published": 2}
     assert ledger["attempts_started"] == 5, "the retry is its own attempt"
-    assert ledger["origin_anchored"] == 3, "the stream-opening export was caused by nothing"
+    assert ledger["measurable"] == 3, (
+        "the stream-opening export was caused by nothing, so it owns no measurement window"
+    )
     assert ledger["first_winning"] == {
         "published": 1, "unmeasured:superseded_by_branch_change": 1, "none": 2
     }

@@ -646,7 +646,7 @@ class RendererTest(unittest.TestCase):
         result["producer_events"] = {
             "epoch": 1,
             "causes": {"total": 1, "by_origin": {"reorg": 1}, "by_state": {"fenced": 1},
-                       "attempts_started": 1, "origin_anchored": 1, "first_winning": {"none": 1}},
+                       "attempts_started": 1, "measurable": 1, "first_winning": {"none": 1}},
             "intervals": {},
             "per_cause": [{"cause_id": 1, "origin_kind": "reorg", "state": "fenced",
                            "attempts": 1, "intervals": {}}],

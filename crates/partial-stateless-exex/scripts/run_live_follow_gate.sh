@@ -76,6 +76,18 @@
 #     GATE_REQUIRE_LIVE=1   long only: fail unless live (tail_live) verdicts >= GATE_MIN_BLOCKS.
 #     GATE_WATCH_SECS=N     long only: watcher poll interval (default 15).
 #     GATE_MIN_BLOCKS=N     minimum verified blocks (default 100 clean, 6000 long, 1 truncated).
+#     GATE_PHASE=capture    run only the online half: everything up to the follower's exit, then
+#                           stop. The datadir is free the moment this returns, so the node that
+#                           owns it can be restarted before the offline half runs. Writes
+#                           <out>/gate-capture.env, which is the judge's input.
+#     GATE_PHASE=judge      run only the offline half against an existing capture: batch
+#                           re-replay, every assertion, the forced restore, the analyzer and the
+#                           renderer. Opens no database and needs no producer. Refuses a bar or a
+#                           policy switch that disagrees with the capture's own.
+#     GATE_ALLOW_REJUDGE_OVERRIDE=1
+#                           judge only: re-judge an archived capture under a different bar on
+#                           purpose, and say so in the log.
+#     GATE_PHASE=all        (default) both halves back to back, as before.
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -88,6 +100,10 @@ OUT_DIR=$2
 shift 2
 
 GATE_MODE=${GATE_MODE:-clean}
+# Kept before the defaults below so `judge` can tell "the operator asked for this bar" from
+# "the mode's default filled it in": judging a 300-verdict capture under long's default of 6000
+# would fail a run that met the target it was actually given.
+GATE_MIN_BLOCKS_REQUESTED=${GATE_MIN_BLOCKS:-}
 case "$GATE_MODE" in
     clean|reorg) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-100} ;;
     long) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-6000} ;;
@@ -95,6 +111,22 @@ case "$GATE_MODE" in
     truncated) GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS:-1} ;;
     *)
         echo "error: GATE_MODE must be clean, reorg, resume, epoch, long or truncated, not '$GATE_MODE'" >&2
+        exit 64
+        ;;
+esac
+
+# Two halves, because the offline one has no business holding the datadir hostage. Everything up
+# to the follower's exit needs the producer alive and writing; everything after it reads files
+# and nothing else. On a long run the batch re-replay and the forced restore take tens of
+# minutes — 56 of them after a 2,890-block reorg run — and whatever holds the datadir next then
+# has to backfill that whole gap at full speed with an ExEx building a multiproof per block,
+# which is how MDBX times a reader out and panics it. Split the halves and the node goes back up
+# first.
+GATE_PHASE=${GATE_PHASE:-all}
+case "$GATE_PHASE" in
+    all|capture|judge) ;;
+    *)
+        echo "error: GATE_PHASE must be all, capture or judge, not '$GATE_PHASE'" >&2
         exit 64
         ;;
 esac
@@ -123,7 +155,22 @@ BATCH_JSON="$OUT_DIR/batch.jsonl"
 # an accidental resume. The one deliberate exception is epoch mode, whose *input* is the
 # previous invocation's ack and whose own phase writes a separate file — only that file must
 # be fresh there.
-if [ "$GATE_MODE" = "epoch" ]; then
+CAPTURE_ENV="$OUT_DIR/gate-capture.env"
+if [ "$GATE_PHASE" = "judge" ]; then
+    # Mirror image: the capture's outputs are this phase's *input* and must be present, while the
+    # judge's own must not — a second judge over the first one's batch record would be asserting
+    # on a replay that already happened.
+    if [ ! -s "$CAPTURE_ENV" ]; then
+        echo "error: $CAPTURE_ENV is missing; GATE_PHASE=judge reads what GATE_PHASE=capture left" >&2
+        exit 64
+    fi
+    for stale in "$BATCH_JSON" "$OUT_DIR/batch-forced.jsonl"; do
+        if [ -e "$stale" ]; then
+            echo "error: $stale already exists; this capture has already been judged" >&2
+            exit 64
+        fi
+    done
+elif [ "$GATE_MODE" = "epoch" ]; then
     if [ -e "$OUT_DIR/follow-epoch.jsonl" ]; then
         echo "error: $OUT_DIR/follow-epoch.jsonl already exists; a previous epoch crossing was already judged here" >&2
         exit 64
@@ -136,6 +183,58 @@ else
         fi
     done
 fi
+
+# ==== the online half: the producer is alive from here to the follower's exit ================
+if [ "$GATE_PHASE" = "judge" ]; then
+    # Everything the assertions below read out of the run, restored from the capture rather than
+    # from this process — which never started a follower.
+    # shellcheck disable=SC1090
+    . "$CAPTURE_ENV"
+    if [ "${CAPTURE_SCHEMA:-0}" != "1" ]; then
+        echo "error: $CAPTURE_ENV is schema '${CAPTURE_SCHEMA:-}', which this gate cannot read" >&2
+        exit 64
+    fi
+    if [ "$CAPTURE_GATE_MODE" != "$GATE_MODE" ]; then
+        echo "error: the capture was taken under GATE_MODE=$CAPTURE_GATE_MODE, not $GATE_MODE" >&2
+        exit 64
+    fi
+    if [ "$CAPTURE_SPOOL_DIR" != "$SPOOL_DIR" ]; then
+        echo "error: the capture was taken against $CAPTURE_SPOOL_DIR, not $SPOOL_DIR" >&2
+        exit 64
+    fi
+    FOLLOW_JSON=$CAPTURE_FOLLOW_JSON
+    follow_code=$CAPTURE_FOLLOW_CODE
+    LIVE_VERDICTS=$CAPTURE_LIVE_VERDICTS
+    KILLED_AT_SEQUENCE=$CAPTURE_KILLED_AT_SEQUENCE
+    ACK_EPOCH_BEFORE=$CAPTURE_ACK_EPOCH_BEFORE
+    # The capture's bar and policy switches carry over, and an environment variable that disagrees
+    # with them stops the run. A gate whose standard can be chosen after the numbers are known is
+    # not a gate: splitting it in two must not turn "how many blocks did it have to verify" into a
+    # question answered at judging time. Re-judging an archive under a different bar is a real need
+    # and a separate, named act.
+    reject_override() { # <name> <requested> <captured>
+        [ -z "$2" ] && return 0
+        [ "$2" = "$3" ] && return 0
+        if [ "${GATE_ALLOW_REJUDGE_OVERRIDE:-0}" = "1" ]; then
+            echo "warning: re-judging with $1=$2 where the capture was taken under $3" >&2
+            return 0
+        fi
+        echo "error: $1=$2 differs from the capture's $1=$3." >&2
+        echo "       The capture was judged against its own bar; changing it now would be" >&2
+        echo "       choosing the standard after seeing the run. Set" >&2
+        echo "       GATE_ALLOW_REJUDGE_OVERRIDE=1 to re-judge an archived capture deliberately." >&2
+        exit 64
+    }
+    reject_override GATE_MIN_BLOCKS "${GATE_MIN_BLOCKS_REQUESTED:-}" "$CAPTURE_MIN_BLOCKS"
+    reject_override GATE_EXPECT_RECHECKPOINT "${GATE_EXPECT_RECHECKPOINT:-}" "$CAPTURE_EXPECT_RECHECKPOINT"
+    reject_override GATE_REQUIRE_LIVE "${GATE_REQUIRE_LIVE:-}" "$CAPTURE_REQUIRE_LIVE"
+    reject_override GATE_FORCE_RESTORE "${GATE_FORCE_RESTORE:-}" "$CAPTURE_FORCE_RESTORE"
+    GATE_MIN_BLOCKS=${GATE_MIN_BLOCKS_REQUESTED:-$CAPTURE_MIN_BLOCKS}
+    GATE_EXPECT_RECHECKPOINT=${GATE_EXPECT_RECHECKPOINT:-$CAPTURE_EXPECT_RECHECKPOINT}
+    GATE_REQUIRE_LIVE=${GATE_REQUIRE_LIVE:-$CAPTURE_REQUIRE_LIVE}
+    GATE_FORCE_RESTORE=${GATE_FORCE_RESTORE:-$CAPTURE_FORCE_RESTORE}
+    echo "==> judging the capture in $OUT_DIR (mode: $GATE_MODE, follow exit $follow_code, verdicts: $FOLLOW_JSON)"
+else
 
 # The truncated run must terminate on its own: the follower deliberately waits forever by
 # default, because it cannot tell a killed producer from a quiet chain.
@@ -300,6 +399,33 @@ else
         --json "$FOLLOW_JSON" --ack "$ACK_FILE" --label "s3-live-gate-$GATE_MODE" "$@" || follow_code=$?
 fi
 echo "==> follow exit code: $follow_code (0 clean end, 1 disagreement/fault, 2 NeedsSnapshot, 3 ended before checkpoint, 4 idle timeout)"
+fi
+# ==== end of the online half =================================================================
+
+if [ "$GATE_PHASE" = "capture" ]; then
+    # Written to a temporary file and renamed, which is what makes "whole" true rather than
+    # intended: a judge that found a half-written record would restore a run state nobody
+    # captured, and every value here is one the assertions cannot re-derive from files.
+    {
+        echo "CAPTURE_SCHEMA=1"
+        printf 'CAPTURE_GATE_MODE=%q\n' "$GATE_MODE"
+        printf 'CAPTURE_SPOOL_DIR=%q\n' "$SPOOL_DIR"
+        printf 'CAPTURE_FOLLOW_JSON=%q\n' "$FOLLOW_JSON"
+        printf 'CAPTURE_FOLLOW_CODE=%q\n' "$follow_code"
+        printf 'CAPTURE_LIVE_VERDICTS=%q\n' "$LIVE_VERDICTS"
+        printf 'CAPTURE_KILLED_AT_SEQUENCE=%q\n' "${KILLED_AT_SEQUENCE:-}"
+        printf 'CAPTURE_ACK_EPOCH_BEFORE=%q\n' "${ACK_EPOCH_BEFORE:-}"
+        printf 'CAPTURE_MIN_BLOCKS=%q\n' "$GATE_MIN_BLOCKS"
+        printf 'CAPTURE_EXPECT_RECHECKPOINT=%q\n' "${GATE_EXPECT_RECHECKPOINT:-1}"
+        printf 'CAPTURE_REQUIRE_LIVE=%q\n' "${GATE_REQUIRE_LIVE:-0}"
+        printf 'CAPTURE_FORCE_RESTORE=%q\n' "${GATE_FORCE_RESTORE:-0}"
+    } > "$CAPTURE_ENV.tmp"
+    mv -f "$CAPTURE_ENV.tmp" "$CAPTURE_ENV"
+    echo "==> capture complete: $CAPTURE_ENV"
+    echo "    the datadir is free — restart the node that owns it, then judge with:"
+    echo "    GATE_MODE=$GATE_MODE GATE_PHASE=judge $0 $SPOOL_DIR $OUT_DIR"
+    exit 0
+fi
 
 echo "==> batch re-replay of the same spool (the live stream and the corpus are the same bytes)"
 batch_code=0
