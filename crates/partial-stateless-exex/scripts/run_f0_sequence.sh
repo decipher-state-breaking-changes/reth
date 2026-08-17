@@ -126,6 +126,10 @@ say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown}"
 # The canonical profile of the runbook's §3, in full and explicitly — including the two switches
 # whose absence made both 1,001-verdict preflights measure the re-executing baseline instead, and
 # the two that must be absent rather than merely unset in this shell.
+# No comments inside the continuation below. A `\` joins the next line whole, so a comment line
+# after one ends the command there — `env` then runs with assignments and no command, prints the
+# environment, and the *remaining* lines start a producer carrying none of these settings. That is
+# a producer that records nothing, and it looks like a slow one rather than a broken one.
 start_producer() { # <arm-dir> <fsync>
     local arm=$1 fsync=$2
     mkdir -p "$arm"/{spool,bootstrap,sidecars,out}
@@ -141,6 +145,7 @@ start_producer() { # <arm-dir> <fsync>
     PS_STREAM_DIR="$arm/spool" \
     PS_BOOTSTRAP_DIR="$arm/bootstrap" \
     PS_SIDECAR_DIR="$arm/sidecars" \
+    PS_SHADOW_OUTPUT="$arm/access-shadow.jsonl" \
     nohup "$PRODUCER_BIN" "${NODE_FLAGS[@]}" > "$arm/producer.out" 2>&1 &
     local pid=$!
     echo "$pid" > "$arm/producer.pid"
