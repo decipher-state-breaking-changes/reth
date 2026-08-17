@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W5.2 + W5.3 — score the cache windows offline, then estimate what each one would cost to carry.
+# Score the cache windows offline, then estimate what each one would cost to carry.
 #
 #     run_window_sweep.sh <fixtures-dir> <out-dir> [producer.out ...]
 #

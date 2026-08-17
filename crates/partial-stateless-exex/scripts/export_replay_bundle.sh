@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages a recorded spool for replay on another machine, and writes the exact commands the
-# operator runs there. The F2 two-machine replay: `standalone_validation_us` is the CPU/memory
+# operator runs there. For the two-machine replay: `standalone_validation_us` is the CPU/memory
 # side of the cost and `delivery_us` the storage side, and a second host separates them only if
 # it demonstrably replayed the same bytes with the same build — which is what the hash manifest
 # and the pinned commit in the command sheet are for.
@@ -27,7 +27,7 @@ fi
 
 SPOOL_DIR=$(cd "$1" && pwd)
 BUNDLE_DIR=$2
-LABEL=${3:-f2-second-host}
+LABEL=${3:-second-host}
 mkdir -p "$BUNDLE_DIR"
 
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -35,7 +35,7 @@ COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | head -1)
 if [ -n "$DIRTY" ] || [ "$COMMIT" = "unknown" ]; then
     echo "error: the working tree is dirty or not a git checkout; a bundle must pin a commit" >&2
-    echo "       (the archive's build-provenance rule: commit first, then package)" >&2
+    echo "       (the build-provenance rule this evidence rests on: commit first, then package)" >&2
     exit 1
 fi
 
@@ -116,7 +116,7 @@ VERIFY
 chmod +x "$BUNDLE_DIR/verify_corpus.sh"
 
 cat > "$BUNDLE_DIR/RUN-ON-SECOND-HOST.md" <<RUNMD
-# F2 corpus replay — second host
+# Corpus replay — second host
 
 Everything below is paste-ready. The corpus is the evidence, so the order is: verify the copy,
 pin the build, prove the isolation, then replay. Send back the files in the last section.
@@ -152,7 +152,7 @@ no provider or database path and carries the keccak and secp256k1 build profile.
 ## 3. Replay
 
 \`\`\`bash
-OUT=\$HOME/f2-replay
+OUT=\$HOME/corpus-replay
 mkdir -p "\$OUT"
 target/release/ps-replay /path/to/copied/spool \\
     --no-mutations \\
@@ -161,7 +161,7 @@ target/release/ps-replay /path/to/copied/spool \\
 echo "exit: \$?"
 \`\`\`
 
-\`--no-mutations\` because F2 is a timing replay: the mutation sweep quadruples admission calls
+\`--no-mutations\` because this is a timing replay: the mutation sweep quadruples admission calls
 and is coverage work, not measurement. The run must end \`agreed/continuous/complete\` (exit 0).
 
 ## 4. Send back

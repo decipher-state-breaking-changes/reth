@@ -1,21 +1,22 @@
 //! The live consumer: verdicts on a stream a producer is still writing.
 //!
-//! This is the S3 exit-gate behaviour as a state machine. The follower verifies the manifest's
-//! identity before it accepts anything, the checkpoint and its snapshot before it accepts a
-//! commit, and exactly `H + 1` as the first commit — and it never hides a delivery violation as
-//! a drop. A gap, a duplicate claim on a sequence, an undecodable frame, an epoch change, a
-//! producer reset, or a reorg frame all take it to `NeedsSnapshot`: verdicts stop, and only a
-//! fresh checkpoint that verifies end to end restarts them at its own `H′ + 1`.
+//! This is the live-equivalence gate's behaviour as a state machine. The follower verifies the
+//! manifest's identity before it accepts anything, the checkpoint and its snapshot before it
+//! accepts a commit, and exactly `H + 1` as the first commit — and it never hides a delivery
+//! violation as a drop. A gap, a duplicate claim on a sequence, an undecodable frame, an epoch
+//! change, a producer reset, or a reorg frame all take it to `NeedsSnapshot`: verdicts stop, and
+//! only a fresh checkpoint that verifies end to end restarts them at its own `H′ + 1`.
 //!
 //! **`NeedsSnapshot` waits for the producer; it does not synthesize recovery.** Today's producer
 //! writes one checkpoint per stream, so in a live run the state is effectively terminal — the
-//! machinery below is proven against synthetic spools carrying a mid-stream second checkpoint,
-//! and the producer-side re-checkpoint that would exercise it live is S4's recovery protocol.
+//! machinery below is proven against synthetic spools carrying a mid-stream second checkpoint, and
+//! the producer-side re-checkpoint that would exercise it live is the deep-reorg recovery protocol
+//! on the producer.
 //!
-//! **A quiet spool is not a dead producer.** The follower cannot tell "no new block yet" from
-//! "the producer was killed" by looking at files; an `End` frame is how a producer says it
-//! stopped, and its absence is what "cut" means. So the default is to wait forever, and a harness
-//! that killed the producer on purpose passes `idle_timeout` and judges the spool offline.
+//! **A quiet spool is not a dead producer.** The follower cannot tell "no new block yet" from "the
+//! producer was killed" by looking at files; an `End` frame is how a producer says it stopped, and
+//! its absence is what "cut" means. So the default is to wait forever, and a harness that killed
+//! the producer on purpose passes `idle_timeout` and judges the spool offline.
 
 use crate::{
     driver::{
@@ -98,7 +99,7 @@ impl Default for FollowOptions {
 /// detected as delivery faults, and the last three are violations only a consumer can see. This
 /// lives in the follow driver rather than in the cache readiness state machine because every
 /// trigger is a fact about *delivery* — the pair itself is still sound at its last verified
-/// block. S4's deep-reorg recovery is what lifts it into the standalone state machine, once
+/// block. Deep-reorg recovery is what lifts it into the standalone state machine, once
 /// `target_ancestor` means something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeedsSnapshotReason {
@@ -1191,9 +1192,9 @@ impl<'a> Follower<'a> {
             StreamEvent::Commit(commit) => {
                 let (input, oracle) = commit.split();
                 let block = input.block;
-                // Captured before `replay_commit` consumes the input: the S3 claim is that the
-                // validator consumed the *recorded* Engine payload, and provenance is how each
-                // verdict line proves which kind of payload it was measured against.
+                // Captured before `replay_commit` consumes the input: the equivalence claim is
+                // that the validator consumed the *recorded* Engine payload, and provenance is how
+                // each verdict line proves which kind of payload it was measured against.
                 let provenance = input.payload_provenance;
 
                 // Exactly H + 1, checked on the frame itself before anything is decoded. The
@@ -2654,9 +2655,9 @@ impl VerdictSink {
         self.ack_rewind = rewind;
     }
 
-    /// One verdict line per block, carrying the S5 boundaries: the validation primary and its
-    /// disjoint phases from the attempt's timing entry, delivery as transport cost beside them,
-    /// and the mtime-proxied latency fields with their source named.
+    /// One verdict line per block, carrying the standalone timing boundaries: the validation
+    /// primary and its disjoint phases from the attempt's timing entry, delivery as transport cost
+    /// beside them, and the mtime-proxied latency fields with their source named.
     ///
     /// The write of the line itself and of the ack after it are timed into the sink's own
     /// publication-cost samples — they cannot land in this record, which is already written when
@@ -2983,9 +2984,10 @@ impl VerdictSink {
         });
         let temporary = path.with_extension("tmp");
         if self.ack_fsync {
-            // §4.4's crash-durable recipe, on the one file a restart trusts: tmp, fsync, rename,
-            // parent-directory fsync. Without it the ack is durable across a process restart
-            // only, which is exactly what exit gate 8's wording scopes.
+            // The crash-durable write recipe, on the one file a restart trusts: write a tmp
+            // file, fsync it, rename over the target, then fsync the parent directory. Without
+            // the last two steps the ack survives a process restart but not a power loss, and
+            // only the fsync profile claims the stronger property.
             use std::io::Write as _;
             let mut file = std::fs::File::create(&temporary)?;
             file.write_all(record.to_string().as_bytes())?;
@@ -3003,8 +3005,8 @@ impl VerdictSink {
 /// The directory whose fsync makes a rename of `path` durable.
 ///
 /// A bare relative path like `ack.json` has an *empty* parent, and skipping the directory sync on
-/// it would quietly drop the one step §4.4's recipe exists for — so the empty parent resolves to
-/// `"."`, the working directory the rename actually landed in.
+/// it would quietly drop the one step that makes the rename itself durable — so the empty parent
+/// resolves to `"."`, the working directory the rename actually landed in.
 fn durable_parent_of(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,

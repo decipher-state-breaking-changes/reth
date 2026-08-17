@@ -14,7 +14,7 @@ What it refuses to do:
 
   - print a latency percentile without the phase label and the sample count it came from
   - print a pooled p99 (the analyzer does not emit one, and this does not invent one)
-  - hide a warning, an unclassified verdict, or an RB7 cause that never reached its endpoint —
+  - hide a warning, an unclassified verdict, or a recovery cause that never reached its endpoint —
     coverage is a row in the table, not a footnote
   - silently render a JSON whose `schema_version` it does not know
 
@@ -200,7 +200,7 @@ def render_rb7(result, lines):
     rb7 = result.get("producer_events")
     if not rb7:
         return
-    lines.append("## RB7 — recovery lifecycle")
+    lines.append("## Recovery lifecycle")
     lines.append("")
     ledger = rb7["causes"]
     lines.append(

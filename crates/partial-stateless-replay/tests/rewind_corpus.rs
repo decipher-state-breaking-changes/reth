@@ -14,7 +14,7 @@
 //! ignored — never as passed-without-running. To run them:
 //!
 //! ```text
-//! PS_REWIND_FIXTURE_SPOOL=/data/bench-runs/s2-capture/stream \
+//! PS_REWIND_FIXTURE_SPOOL=<recorded-spool-dir> \
 //!     cargo test -p partial-stateless-replay --release --test rewind_corpus \
 //!     -- --ignored --test-threads=1
 //! ```

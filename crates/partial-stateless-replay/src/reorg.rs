@@ -1,7 +1,8 @@
 //! Applying a recorded reorg to a standalone pair, with no database behind it.
 //!
-//! The producer writes a [`Reorg`] frame before the winning branch's commits, and until S4 both
-//! drivers refused it: the batch replay warned and kept going, the follower stopped publishing.
+//! The producer writes a [`Reorg`] frame before the winning branch's commits, and before this
+//! module existed both drivers refused it: the batch replay warned and kept going, the follower
+//! stopped publishing.
 //! Neither is what the corpus promises. A depth-1 reorg is exactly the one this pair can undo by
 //! itself — the retained generation is the block it gave back — so this module binds the frame to
 //! what the consumer verified for itself and, when the two agree, performs the undo.

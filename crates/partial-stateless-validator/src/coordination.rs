@@ -2,14 +2,14 @@
 //!
 //! One value cache and one trie cache advance together or not at all, authenticated by a readiness
 //! tracker. This module owns that state and the operations that are protocol rather than policy:
-//! taking its fingerprint, retaining and restoring the one previous trie generation a depth-1
-//! reorg needs, and reporting whether a block may be applied.
+//! taking its fingerprint, retaining and restoring the one previous trie generation a depth-1 reorg
+//! needs, and reporting whether a block may be applied.
 //!
 //! What is deliberately *not* here is every fallback that needs a state database. A full node that
 //! cannot undo one block rebuilds from canonical state or cold-resets and rewarms; a standalone
-//! validator can do neither, and per the Phase 4b plan must instead request a snapshot at the exact
-//! common ancestor. Keeping those fallbacks on the caller's side of the boundary is what makes the
-//! difference explicit rather than a branch this module could accidentally grow.
+//! validator can do neither: it must instead request a snapshot at the exact common ancestor.
+//! Keeping those fallbacks on the caller's side of the boundary is what makes the difference
+//! explicit rather than a branch this module could accidentally grow.
 //!
 //! Logging state lives with the caller too. [`CoordinatedPair`] carries protocol state only, so the
 //! ExEx wraps it to add the last readiness label its run log reports on.

@@ -220,8 +220,8 @@ fn a_first_commit_that_is_not_h_plus_one_is_a_gap() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A reorg frame is fail-closed in follow mode: applying it is S4, and verdicts past an
-/// unapplied reorg would describe a branch the producer left.
+/// A reorg frame is fail-closed in this follow path: applying one is the recovery module's job,
+/// and verdicts past an unapplied reorg would describe a branch the producer left.
 #[test]
 fn a_malformed_reorg_frame_is_a_protocol_violation_with_no_target() {
     // A frame that abandons no block is not a reorg, so it names no ancestor a snapshot could be

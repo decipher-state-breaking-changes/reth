@@ -3,8 +3,8 @@
 //! The sequence per commit is the standalone path in full, from bytes: decode the Engine payload,
 //! admit it against the pair's *own* accepted parent, and only then run the transition. Nothing is
 //! taken from the frame that a live validator would not have. In particular the parent header is
-//! read from the pair rather than from the commit, which is the rule S1b established and the one a
-//! replay is most tempted to break, because the frame is right there and it is correct.
+//! read from the pair rather than from the commit — the rule the standalone path is built on, and
+//! the one a replay is most tempted to break, because the frame is right there and it is correct.
 
 use crate::{
     compare::{
@@ -117,7 +117,8 @@ pub struct ReplayReport {
     pub transition_us: u64,
     /// Total standalone-validation wall time across every attempt, in microseconds.
     ///
-    /// The S5 primary boundary: frame bytes already in memory through the committed verdict.
+    /// The primary standalone boundary: frame bytes already in memory through the committed
+    /// verdict.
     /// Accumulated for every attempt, including rejected and faulted ones, whose entries record
     /// the cost of the attempt up to where it stopped.
     pub standalone_validation_us: u64,
@@ -137,8 +138,8 @@ pub struct ReplayReport {
     pub watermarks_unrecorded: u64,
     /// Commits whose recorded readiness watermark differed from this replay's own.
     ///
-    /// A counter and not a disagreement, deliberately: both sides record the watermark and
-    /// nothing ever compared them before S5, so whether the equality holds is what corpus runs
+    /// A counter and not a disagreement, deliberately: both sides record the watermark and nothing
+    /// compared them until this counter existed, so whether the equality holds is what corpus runs
     /// establish first. Promotion into the disagreement set waits on those runs coming back
     /// all-zero.
     pub watermark_mismatches: u64,
@@ -299,10 +300,10 @@ pub struct BlockTiming {
     /// The cache transition wall clock: witness materialization, execution, root, retention,
     /// anchor. `null` when the transition never ran.
     pub transition_us: Option<u64>,
-    /// The S5 primary: frame bytes already in memory through the committed verdict, as one wall
-    /// measurement — never a sum of parts. Excludes the oracle comparison and the mutation
-    /// checks, which are harness work. On a rejected or faulted attempt this is the cost up to
-    /// where the attempt stopped.
+    /// The primary standalone boundary: frame bytes already in memory through the committed
+    /// verdict, as one wall measurement — never a sum of parts. Excludes the oracle comparison and
+    /// the mutation checks, which are harness work. On a rejected or faulted attempt this is the
+    /// cost up to where the attempt stopped.
     pub standalone_validation_us: u64,
     /// Statting and reading the frame file into memory. Transport cost, outside the primary.
     pub delivery_us: Option<u64>,
@@ -407,8 +408,9 @@ impl PhaseLeaves {
 pub struct DerivedTimings {
     /// The four admission phases together — the value v1 published as `admission_us`.
     pub admission_total_us: Option<u64>,
-    /// The pre-S5 in-process primary: deserialize + context check + self-consistency +
-    /// materialize + provider setup + EVM. Kept so a v2 record still yields the old metric.
+    /// The older in-process primary the paired ExEx benchmark published: deserialize + context
+    /// check + self-consistency + materialize + provider setup + EVM. Kept so a v2 record still
+    /// yields that metric.
     pub state_access_execution_us: Option<u64>,
     /// Deserialize + witness checks/materialization + EVM + hashing + sparse-trie root.
     pub execution_core_us: Option<u64>,
@@ -2032,7 +2034,7 @@ mod tests {
         assert_eq!(timing.oracle_compare_us, Some(20_000));
     }
 
-    /// The pre-S5 in-process primary must stay derivable from a v2 record: the six components it
+    /// The older in-process primary must stay derivable from a v2 record: the six components it
     /// sums are all published leaves, with the sidecar decode standing where `deserialize_us`
     /// stood in the paired schema.
     #[test]
@@ -2081,7 +2083,8 @@ mod tests {
         assert!(timing.details.is_none());
     }
 
-    /// The leak S1 recorded and this boundary closes: a post-execution rejection preserved both
+    /// The leak this boundary closes, found while extracting the standalone path: a
+    /// post-execution rejection preserved both
     /// caches but left readiness in transient `Applying`, which only the ExEx's fail-stop made
     /// safe. A standalone driver outlives the rejection, so the stop must be explicit, terminal,
     /// and observable — and it must not have touched what the rejection promised to preserve.

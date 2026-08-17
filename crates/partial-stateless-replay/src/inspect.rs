@@ -1,8 +1,9 @@
 //! Structural readiness inspection of a spool, for the gate's follower-start precondition.
 //!
 //! Both 1,001-block preflights started their follower against an empty pre-checkpoint spool and
-//! burned their raw latency tails on the mislabeled startup backlog. The runbook rule — "the
-//! follower starts only after the checkpoint exists" — is enforced here as a *structural* check
+//! burned their raw latency tails on the mislabeled startup backlog. The operating rule that came
+//! out of that — "the follower starts only after the checkpoint exists" — is enforced here as a
+//! *structural* check
 //! rather than a file-existence probe, because a resumed spool holds previous epochs' checkpoint
 //! files and a name glob would wave the gate through on one of those.
 //!

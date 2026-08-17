@@ -1,6 +1,6 @@
 //! Consumption of the Engine's captured access set, and its comparison against re-execution.
 //!
-//! Stages 3 and 4 of B3. In `shadow` mode the builder re-executes every block and additionally
+//! In `shadow` mode the builder re-executes every block and additionally
 //! consumes the artifact the Engine published for it, comparing the two access sets key by key;
 //! nothing it produces changes, because the comparison exists only to decide whether the artifact
 //! may be *relied* on. In `on` mode it is relied on: [`simulation_from_artifact`] replaces the
@@ -147,7 +147,8 @@ pub fn record_shadow_comparison(
 
 /// Rebuilds a block's simulation result from a captured artifact, without re-executing it.
 ///
-/// This is the whole point of B3: the Engine already produced every field below, and the only
+/// This is the whole point of engine-access reuse: the Engine already produced every field below,
+/// and the only
 /// work left is moving them. Returns `None` if the artifact's execution output is missing or of
 /// an unexpected type, which the caller must treat as a miss and re-execute -- never as an empty
 /// result, since a silently empty output would produce a wrong sidecar rather than a slow one.

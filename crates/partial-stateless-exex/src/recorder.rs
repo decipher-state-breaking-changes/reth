@@ -28,8 +28,8 @@
 //! ask, and it is not a shortcut: the whole spool is read and checked first, because appending to
 //! a corpus this producer has not verified would put its own frames behind someone else's.
 //!
-//! What this module is not: a live delivery path. It writes files, and S3d is where a consumer
-//! reads them without sharing the datadir.
+//! What this module is not: a live delivery path. It writes files; `partial-stateless-replay`'s
+//! follow mode is what reads them without sharing the datadir.
 
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
@@ -79,7 +79,8 @@ const MAX_SPOOL_FRAMES_VAR: &str = "PS_STREAM_MAX_SPOOL_FRAMES";
 
 /// Default export buffer byte bound.
 ///
-/// Measured: the S2 capture's commits averaged 3.32 MiB and a 156 s export spans ~13 blocks, so
+/// Measured: the recorded mainnet capture's commits averaged 3.32 MiB and a 156 s export spans
+/// ~13 blocks, so
 /// the buffer's ordinary load is ~45 MiB. 256 MiB is enough headroom for the widest blocks without
 /// being a number that competes with the snapshot copies for the process's memory.
 const DEFAULT_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -1030,7 +1031,7 @@ fn frame_file_name(sequence: u64, kind: FrameKind) -> String {
 /// crash can leave a complete prefix and nothing else — which is exactly the guarantee a sequence
 /// numbered spool needs, because a prefix is a valid truncated stream.
 ///
-/// With `fsync` — the power-loss profile — the file is synced *before* the rename, per §4.4's
+/// With `fsync` — the power-loss profile — the file is synced *before* the rename, giving the full
 /// crash-durable recipe: tmp, fsync, rename, parent-directory fsync. The directory half is the
 /// caller's, because a checkpoint's burst wants one sync behind the batch, not one per frame.
 /// Returns the microseconds the file sync cost; zero on the default profile.
@@ -1427,7 +1428,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The grammar S4's recovery protocol depends on, as a filesystem assertion: a reorg is
+    /// The grammar the reorg-recovery protocol depends on, as a filesystem assertion: a reorg is
     /// written through the open stream, the commits behind it wait for the checkpoint that makes
     /// them restorable, and the sequences stay contiguous across the whole shape.
     #[test]

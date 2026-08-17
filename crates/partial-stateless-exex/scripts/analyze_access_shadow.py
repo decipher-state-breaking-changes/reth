@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decide the B3 stage-3 gate from an access-shadow JSONL.
+"""Decide the engine-access reuse gate from an access-shadow JSONL.
 
 The gate is not "no misses". Artifacts cannot exist for backfilled blocks, for notifications
 replayed from the WAL after a restart, or for a sibling already evicted, and the builder falls

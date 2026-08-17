@@ -243,7 +243,8 @@ pub struct HistoricalSimulation {
     pub lowest_block_number: Option<u64>,
     /// Receipts, requests, gas, and the resulting bundle state.
     ///
-    /// Shared rather than owned so that B3's artifact path can hand the Engine's own output
+    /// Shared rather than owned so that the engine-access artifact path can hand the Engine's own
+    /// output
     /// through without copying the bundle. Every consumer reads through it, so the `Arc` costs
     /// nothing here and saves a full `BundleState` clone on the reuse path.
     pub output: Arc<BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>>,

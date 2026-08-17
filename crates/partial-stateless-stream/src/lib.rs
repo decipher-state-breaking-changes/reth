@@ -1,14 +1,14 @@
 //! One event format for recording, deterministic replay, and live delivery.
 //!
 //! A file spool and a socket carry the **same frame bytes**. That is not tidiness: a recorded
-//! corpus in a format the live path never uses would be a corpus that proves nothing about the
-//! live path, and a live failure would be unreproducible by construction. So the format modules
-//! define bytes and nothing else — there is no producer and no consumer here, and no filesystem
-//! or socket code. What they export is an envelope, seven frame kinds covering the six events S3
-//! and S4 need, and one structural guarantee. The one deliberate exception sits beside the format
-//! rather than in it: [`provenance`] collects a best-effort run manifest, framed by nothing and
-//! carried by no frame, and lives here only because this is the one crate both ends of the stream
-//! already share.
+//! corpus in a format the live path never uses would be a corpus that proves nothing about the live
+//! path, and a live failure would be unreproducible by construction. So the format modules define
+//! bytes and nothing else — there is no producer and no consumer here, and no filesystem or socket
+//! code. What they export is an envelope, seven frame kinds covering the six events the live
+//! follower and its reorg recovery need, and one structural guarantee. The one deliberate exception
+//! sits beside the format rather than in it: [`provenance`] collects a best-effort run manifest,
+//! framed by nothing and carried by no frame, and lives here only because this is the one crate
+//! both ends of the stream already share.
 //!
 //! **The structural guarantee is the oracle split.** A commit frame carries the recording
 //! producer's own outcome for its block, and that outcome must never become an input to the
@@ -17,8 +17,8 @@
 //! `partial-stateless-validator`, and the reverse dependency cannot be added — it would be a cycle
 //! cargo refuses to build. No code inside the validator can name a `CommitOracle` on any branch,
 //! and no future change can quietly make one nameable. A decoded commit hands back a
-//! [`CommitInput`] and a [`CommitOracle`] as two values, and the validator's entry points take
-//! only the first. It is the same technique the database-free claim rests on: make the wrong thing
+//! [`CommitInput`] and a [`CommitOracle`] as two values, and the validator's entry points take only
+//! the first. It is the same technique the database-free claim rests on: make the wrong thing
 //! unnameable rather than merely unreached.
 //!
 //! What this crate does not decide: whether the checkpoint it carries is trustworthy, which chain

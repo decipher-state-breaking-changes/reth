@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build-profile guard for the standalone database-free validator (Phase 4b, S0-S1).
+# Build-profile guard for the standalone database-free validator.
 #
 # Three invariants, all of which have to hold for the standalone claim to mean anything, and none
 # of which any test can observe:
@@ -15,13 +15,13 @@
 #   2. The keccak features the production binary runs are actually selected. Building one package
 #      selects only that package's dependency graph, so a package that does not declare these is
 #      silently built without them. That defect invalidated every absolute benchmark number in the
-#      archive before 2026-08-06 (plan section 1), and a new standalone package is a fresh chance
-#      to reintroduce it -- S3 builds this package as its own binary, which is exactly the build
-#      that would not inherit anything from the ExEx.
+#      benchmark history before 2026-08-06, and a new standalone package is a fresh chance to
+#      reintroduce it -- the standalone validator is built as its own binary, which is exactly the
+#      build that would not inherit anything from the ExEx.
 #
-#   3. The signature-recovery backend the production binary runs is actually selected. Since S1
-#      this package recovers senders itself, and without `secp256k1` on reth-primitives-traits the
-#      recovery silently falls back to the pure-Rust k256 path. It was missing until S1 and nothing
+#   3. The signature-recovery backend the production binary runs is actually selected. This
+#      package recovers senders itself, and without `secp256k1` on reth-primitives-traits the
+#      recovery silently falls back to the pure-Rust k256 path. It was missing at first and nothing
 #      showed it, because partial-stateless-exex pulls the feature in through the node graph and a
 #      graph check on the ExEx would have passed. Same shape of defect as invariant 2, on a
 #      different hot path.

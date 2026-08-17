@@ -8,8 +8,8 @@
 //! Everything is best-effort by design. A missing `/proc` entry, an unreadable binary, or an
 //! unset compile-time commit yields `null` plus a note saying why — never a guess and never a
 //! panic — because the record's job is to make a run attributable, and an honest gap is
-//! attributable while a fabricated value is not. The archive's precedent is the missing
-//! cargo-feature list that hid a build-profile defect across every early benchmark: provenance
+//! attributable while a fabricated value is not. The precedent is this project's own: a missing
+//! cargo-feature list hid a build-profile defect across every early benchmark, because provenance
 //! that is not collected automatically ends up not collected.
 
 use alloy_primitives::keccak256;
@@ -69,7 +69,8 @@ pub struct RunProvenance {
     pub cpu_model: Option<String>,
     /// Logical CPUs available to this process.
     pub cpu_count: Option<u64>,
-    /// The cpufreq governor of cpu0, which §3.6 requires a manifest to name.
+    /// The cpufreq governor of cpu0. Recorded because a measured run is only comparable against
+    /// another run at the same governor, so the manifest has to name it rather than assume it.
     pub governor: Option<String>,
     /// Installed memory in kilobytes.
     pub total_memory_kb: Option<u64>,

@@ -39,10 +39,10 @@ use std::{
 /// - `probe`: the above, plus the price of the unconditional branch-hash box, which means
 ///   allocating, copying, and freeing one per branch node.
 ///
-/// All of them answer structural questions that move with cache size rather than with the block.
-/// A.16 measured the census at 8.94 ms, the probe at 9.11 ms, and the walk's descents at 0.49 ms —
-/// together 4.7% of raw validation, enough to make a default-on run incomparable to one without
-/// them and to distort the phase this workstream is trying to reduce.
+/// All of them answer structural questions that move with cache size rather than with the block. A
+/// 300-sample run measured the census at 8.94 ms, the probe at 9.11 ms, and the walk's descents at
+/// 0.49 ms — together 4.7% of raw validation, enough to make a default-on run incomparable to one
+/// without them and to distort the phase this workstream is trying to reduce.
 fn shape_diagnostics() -> ShapeDiagnostics {
     static LEVEL: OnceLock<ShapeDiagnostics> = OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("PS_TRIE_SHAPE_DIAGNOSTICS").as_deref() {

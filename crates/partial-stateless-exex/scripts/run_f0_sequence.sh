@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# The F0 sequence, unattended: the reorg gate, then the fsync durability arm, then the W4
-# transition-mutation gate if it exists yet.
+# The final-profile dress rehearsal, unattended: the reorg gate, then the fsync durability arms,
+# then the transition-mutation gate if a recorded spool exists for it.
 #
 #     nohup bash crates/partial-stateless-exex/scripts/run_f0_sequence.sh \
-#         > /data/bench-runs/f0-sequence.log 2>&1 &
-#     tail -f /data/bench-runs/f0-sequence.log
+#         > <log-dir>/f0-sequence.log 2>&1 &
+#     tail -f <log-dir>/f0-sequence.log
 #
 # Tracked, because a run's profile is part of its provenance: a cohort whose producer environment
 # lives in an untracked file beside the results cannot be reproduced from the commit it names.
@@ -25,24 +25,35 @@
 #     SKIP_ABBA=1            stop after phase 1
 #     ALLOW_POWERSAVE=1      run without the performance governor (the numbers are then not
 #                            comparable with any run that had it)
+#
+# Host paths — every one of these is outside the repository, so every one is overridable and the
+# two that have no defensible default are required:
+#     BASE=<dir>             where this run's arms and results go (default: ./f0-<timestamp>)
+#     PRODUCER_BIN, REPLAY_BIN
+#                            the two stamped binaries (default: this checkout's release build)
+#     NODE_DATADIR=<dir>     the node datadir all three phases take turns holding (required)
+#     NODE_JWT=<file>        the engine JWT secret (required)
+#     RESTORE_VANILLA=<file> optional script the cleanup runs to put the ordinary node back
 set -uo pipefail
 
-BASE=${BASE:-/data/bench-runs/f0-$(date +%Y%m%d-%H%M)}
-REPO=${REPO:-/data/reth}
+REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
+BASE=${BASE:-$PWD/f0-$(date +%Y%m%d-%H%M)}
 SCRIPTS="$REPO/crates/partial-stateless-exex/scripts"
-PRODUCER_BIN=${PRODUCER_BIN:-/data/rust/target/release/reth-partial-stateless}
-REPLAY_BIN=${REPLAY_BIN:-/data/rust/target/release/ps-replay}
+PRODUCER_BIN=${PRODUCER_BIN:-$REPO/target/release/reth-partial-stateless}
+REPLAY_BIN=${REPLAY_BIN:-$REPO/target/release/ps-replay}
+NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may take over}
+NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
 ABBA_BLOCKS=${ABBA_BLOCKS:-300}
     # MDBX times a reader out at 5 minutes by default and the ExEx dies with it: its sidecar
     # multiproof runs inside a read transaction, and a node backfilling a gap at full speed holds
     # one open far longer than a node following the tip. 0 disables the timeout.
 NODE_FLAGS=(
-    node --datadir /data/reth_data --minimal --http
+    node --datadir "$NODE_DATADIR" --minimal --http
     --db.read-transaction-timeout 0
     --http.api "eth,net,web3,debug,trace"
     --authrpc.addr 127.0.0.1 --authrpc.port 8551
-    --authrpc.jwtsecret /data/secrets/jwt.hex
+    --authrpc.jwtsecret "$NODE_JWT"
     --ws --ws.addr 127.0.0.1 --ws.port 8546
     --ws.api eth,trace,debug,net --ws.origins "localhost"
 )
@@ -53,7 +64,9 @@ RESULTS="$BASE/RESULTS.txt"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 record() { echo "$*" >> "$RESULTS"; say "RESULT: $*"; }
 
-RESTORE_VANILLA=${RESTORE_VANILLA:-/data/bench-runs/w1-smoke/restore-vanilla.sh}
+# Optional and host-specific: whatever brings the operator's ordinary node back up after this
+# run hands the datadir over. Unset means the cleanup only stops the producer.
+RESTORE_VANILLA=${RESTORE_VANILLA:-}
 CLEANED=0
 cleanup() {
     [ "$CLEANED" = 1 ] && return
@@ -123,7 +136,7 @@ say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown}"
 # --- helpers ------------------------------------------------------------------------------
 
 # Starts a producer against a fresh arm directory. Echoes its pid.
-# The canonical profile of the runbook's §3, in full and explicitly — including the two switches
+# The canonical producer profile, in full and explicitly — including the two switches
 # whose absence made both 1,001-verdict preflights measure the re-executing baseline instead, and
 # the two that must be absent rather than merely unset in this shell.
 # No comments inside the continuation below. A `\` joins the next line whole, so a comment line
@@ -178,9 +191,9 @@ gate_verdict() { # <arm-dir> -> PASSED | FAILED | UNKNOWN
 
 # --- phase 1: the reorg gate ---------------------------------------------------------------
 #
-# The one claim W1 still owes. GATE_MODE=reorg fails on zero reorgs by design, and has no
-# watcher of its own — the follower ends when it consumes the producer's End — so the wait and
-# the stop are here. GATE_FORCE_RESTORE=1 adds the offline half: skimming proves the two
+# The one claim only a live reorg can settle. GATE_MODE=reorg fails on zero reorgs by design, and
+# has no watcher of its own — the follower ends when it consumes the producer's End — so the wait
+# and the stop are here. GATE_FORCE_RESTORE=1 adds the offline half: skimming proves the two
 # implementations agree about the block, installing the checkpoint proves the snapshot behind it
 # would rebootstrap a validator that has nothing to recover with.
 
@@ -206,8 +219,9 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
         if ! kill -0 "$GATE_PID" 2>/dev/null; then ARMED=gate_exited; break; fi
         if [ "$(count '"kind":"lifecycle"')" -ge 1 ]; then
             say "reorg applied — $(grep '"kind":"lifecycle"' "$J" | tail -1 | cut -c1-160)"
-            # Under W1 the winning branch publishes first and the recovery checkpoint lands at
-            # the stream tail a minute or two later; both halves before anything is stopped.
+            # The producer publishes the winning branch first and lands the recovery checkpoint
+            # at the stream tail a minute or two later; wait for both halves before stopping
+            # anything.
             SKIM_BY=$(( $(date +%s) + 600 ))
             while [ "$(count '"kind":"skimmed"')" -lt 1 ] && [ "$(date +%s)" -lt "$SKIM_BY" ]; do
                 sleep 15
@@ -291,7 +305,7 @@ report=$ARM/out/result.md"
     done
 fi
 
-# --- phase 3: the W4 transition-mutation gate -----------------------------------------------
+# --- phase 3: the transition-mutation gate --------------------------------------------------
 #
 # `TransitionMutation::ReceiptsRoot` rebinds the mutated sidecar to the re-sealed block hash and
 # drives recorded blocks through a full EVM execution to a post-execution rejection. Corpus-gated
@@ -299,17 +313,17 @@ fi
 # reports success without having run anything. It needs no producer, so it goes last, with the
 # node already back on the datadir, and runs against this session's own recording.
 
-say "=== phase 3: W4 transition-mutation gate ==="
-W4_SPOOL=${W4_SPOOL:-$BASE/reorg/spool}
-[ -d "$W4_SPOOL" ] || W4_SPOOL=$(ls -d "$BASE"/fsync-*/spool 2>/dev/null | head -1)
-if [ "${SKIP_W4:-0}" != 1 ] && [ -d "${W4_SPOOL:-}" ]; then
-    ( cd "$REPO" && PS_MUTATION_FIXTURE_SPOOL="$W4_SPOOL" \
+say "=== phase 3: transition-mutation gate ==="
+MUTATION_SPOOL=${MUTATION_SPOOL:-$BASE/reorg/spool}
+[ -d "$MUTATION_SPOOL" ] || MUTATION_SPOOL=$(ls -d "$BASE"/fsync-*/spool 2>/dev/null | head -1)
+if [ "${SKIP_MUTATIONS:-0}" != 1 ] && [ -d "${MUTATION_SPOOL:-}" ]; then
+    ( cd "$REPO" && PS_MUTATION_FIXTURE_SPOOL="$MUTATION_SPOOL" \
         cargo test --release -p partial-stateless-replay --test transition_mutations \
-        -- --ignored --test-threads=1 > "$BASE/w4-mutations.log" 2>&1 )
-    record "phase3 W4: $([ $? -eq 0 ] && echo PASSED || echo FAILED) \
-spool=$W4_SPOOL log=$BASE/w4-mutations.log"
+        -- --ignored --test-threads=1 > "$BASE/mutations.log" 2>&1 )
+    record "phase3 mutations: $([ $? -eq 0 ] && echo PASSED || echo FAILED) \
+spool=$MUTATION_SPOOL log=$BASE/mutations.log"
 else
-    record "phase3 W4: SKIPPED (no recorded spool at ${W4_SPOOL:-<none>})"
+    record "phase3 mutations: SKIPPED (no recorded spool at ${MUTATION_SPOOL:-<none>})"
 fi
 
 # --- summary --------------------------------------------------------------------------------

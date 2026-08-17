@@ -293,8 +293,8 @@ mod tests {
     }
 
     /// `last_sequence` names the frame before the End, and the reader holds it to that. The
-    /// off-by-one this catches — an End carrying its *own* sequence — was the recorder's actual
-    /// defect before S3.
+    /// off-by-one this catches — an End carrying its *own* sequence — was a real recorder defect,
+    /// found before the live follower shipped.
     #[test]
     fn an_end_frame_that_misnames_its_predecessor_is_refused() {
         let dir = spool_dir("end-off-by-one");

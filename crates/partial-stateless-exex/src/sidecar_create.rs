@@ -1215,7 +1215,8 @@ where
     // The same canonical post-execution validation the two stateless paths run, applied to the
     // full-DB output so the differential compares three consensus verdicts rather than three
     // subsets of one. Only this side can still fail it: the validator core rejects a disagreeing
-    // Partial or Weak block before returning. On B3's reuse path the output is the Engine's own,
+    // Partial or Weak block before returning. On the artifact-reuse path the output is the
+    // Engine's own,
     // which already passed this — redundant there, and the only check of the historical execution
     // on every other block.
     let historical_receipts_with_bloom =

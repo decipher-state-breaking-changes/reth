@@ -1,14 +1,14 @@
 //! The delta-driven retention path must equal the full rebuild, block after block.
 //!
-//! Retention is the largest validator phase, and history A.8 measured where it goes: preparing
-//! the retained key sets is 23% of it, and almost all of that work re-derives sets that a block
-//! barely moved. The optimization is therefore to patch those sets from the value cache's undo
-//! record instead of rebuilding them — which is only sound if the patched result is
+//! Retention is the largest validator phase, and a live build-parity run measured where it goes:
+//! preparing the retained key sets is 23% of it, and almost all of that work re-derives sets that a
+//! block barely moved. The optimization is therefore to patch those sets from the value cache's
+//! undo record instead of rebuilding them — which is only sound if the patched result is
 //! indistinguishable from the rebuilt one on every path, including the ones a reorg takes.
 //!
 //! These tests run both implementations over the same block sequence and compare them after every
-//! block. The full rebuild is the specification; the incremental path has no independent
-//! definition of correct.
+//! block. The full rebuild is the specification; the incremental path has no independent definition
+//! of correct.
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use partial_stateless::{

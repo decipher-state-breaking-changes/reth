@@ -148,7 +148,7 @@ impl Manifest {
 
 /// The operator-trusted checkpoint, and the header of the snapshot that follows it.
 ///
-/// Carries the accepted-head header, which the S1b work identified as missing: a pair restored
+/// Carries the accepted-head header, which the standalone bring-up found missing: a pair restored
 /// from a snapshot has no header for its own anchor, so it cannot check the parent-dependent
 /// consensus rules on its first child and must wait a block to become useful. The header is
 /// installable only because everything about it is checked against the rest of this struct — its
@@ -189,9 +189,9 @@ pub struct SnapshotChunk {
 
 /// Default ceiling on a declared snapshot package.
 ///
-/// The S2-0 run's package was 121.8 MiB, so 2 GiB — the same bound the restore path applies to
-/// its own proof — leaves an order of magnitude of headroom while keeping a corrupt or hostile
-/// declaration from becoming a 16 EiB allocation.
+/// The first recorded mainnet capture's package was 121.8 MiB, so 2 GiB — the same bound the
+/// restore path applies to its own proof — leaves an order of magnitude of headroom while keeping a
+/// corrupt or hostile declaration from becoming a 16 EiB allocation.
 pub const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Ceiling on the declared chunk count.

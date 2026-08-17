@@ -1,9 +1,10 @@
 //! What a batch replay does with the lifecycle events the corpus carries.
 //!
-//! Until S4 the driver replayed past a reorg it had not applied and reported every block after it
-//! as a refusal — one real mainnet reorg turned 78 winning-branch commits into 78 failures and 78
-//! disagreements. The events are now part of the grammar: a reorg the pair can undo is undone, one
-//! it cannot is a single typed stop, and only a checkpoint restarts verification.
+//! Before reorg recovery landed, the driver replayed past a reorg it had not applied and reported
+//! every block after it as a refusal — one real mainnet reorg turned 78 winning-branch commits into
+//! 78 failures and 78 disagreements. The events are now part of the grammar: a reorg the pair can
+//! undo is undone, one it cannot is a single typed stop, and only a checkpoint restarts
+//! verification.
 //!
 //! These spools cannot carry a commit that passes mainnet admission, so what they pin is the
 //! lifecycle around the commits rather than the commits. The recorded mainnet corpus is where the

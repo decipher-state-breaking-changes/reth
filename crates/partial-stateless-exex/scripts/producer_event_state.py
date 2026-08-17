@@ -22,7 +22,7 @@ Contract (current epoch only — earlier epochs belong to producers that already
 Quiesced means: no armed cause without an attempt, no attempt in flight, no failed cause with
 retries left. Exit 0 quiesced, 1 pending, 2 usage/parse error.
 
-Also importable, and the RB7 analyzer's front end:
+Also importable, and the recovery-lifecycle analyzer's front end:
   - `reduce_events(lines)` — the per-cause state dict above
   - `assemble_causes(lines)` — the same log keyed by (epoch, cause_id) and
     (epoch, cause_id, attempt), every lifecycle stamp attached where it belongs, so an
@@ -35,7 +35,7 @@ import sys
 TERMINAL = ("published", "skipped", "fenced", "failed_final", "not_armed", "superseded")
 PENDING = ("armed", "in_flight", "retrying")
 #: Detection events open a cause with a branch change behind it; everything else opens with its
-#: arming line. The distinction is the RB7 denominator's first column.
+#: arming line. The distinction is the recovery-lifecycle denominator's first column.
 DETECTION_KINDS = {"reorg_detected": "reorg", "revert_detected": "revert"}
 
 
@@ -122,7 +122,8 @@ def reduce_states(events):
 def assemble_causes(lines):
     """Returns (epoch, {cause_id: cause}) with every lifecycle stamp attached to its cause.
 
-    A cause is the RB7 unit of account: one branch change (or one arming, for the causes that
+    A cause is the recovery-lifecycle unit of account: one branch change (or one arming, for
+    the causes that
     have no detection event of their own) with the attempts it armed, the checkpoint it
     published, and the first winning commit it freed. Attempts nest under it keyed by the
     envelope's attempt counter, so a retry's export duration is its own sample rather than an

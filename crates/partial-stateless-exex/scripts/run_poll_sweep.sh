@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The S5c transport-wait measurement: three sequential follower arms against the SAME live
-# producer, at --poll-ms 200 / 25 / 5, each measuring live-tail verdicts. What it decides is
-# whether a Unix socket is worth building at all — history's rule is that the decision waits on
-# the measured delivery term, and this is that measurement.
+# The transport-wait measurement: three sequential follower arms against the SAME live producer,
+# at --poll-ms 200 / 25 / 5, each measuring live-tail verdicts. What it decides is whether a Unix
+# socket is worth building at all — the standing rule is that such a decision waits on the measured
+# delivery term, and this is that measurement.
 #
 # The population is the whole point. The first arm starts fresh: everything it reads down to the
 # live tail is backlog (`tail_live: false` in the records) and is excluded from the analysis; its
@@ -137,7 +137,7 @@ print(f"  or follower cores-used > 0.50                     -> measured: "
       f"{f'{cores:.2f}' if cores is not None else 'n/a'}")
 if ratio is not None and cores is not None:
     verdict = "BUILD the hybrid socket" if (ratio > 0.10 or cores > 0.5) else \
-              "CLOSE the socket as measured-not-needed (B1/V3 precedent)"
+              "CLOSE the socket as measured-not-needed"
     print(f"  -> {verdict}")
 print("\nraw live/backlog/catch-up records are in the arm-*.jsonl files (tail_live labels the")
 print("population); the verdict is reproducible under any other threshold from the same records.")

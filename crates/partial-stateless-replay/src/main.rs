@@ -10,8 +10,8 @@
 //! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
 //! whole point of running it is that a disagreement is a result rather than a diagnostic.
 //!
-//! Follow mode consumes the spool while a producer is still writing it — the S3 live consumer —
-//! and its exit codes are states, not just errors: `0` a cleanly ended, fully agreeing stream;
+//! Follow mode consumes the spool while a producer is still writing it — the live consumer — and
+//! its exit codes are states, not just errors: `0` a cleanly ended, fully agreeing stream;
 //! `1` a disagreement, fault, or fault-kind end; `2` the run timed out waiting in
 //! `NeedsSnapshot` (recovery never came); `3` the stream ended before any checkpoint; `4` the
 //! run timed out waiting for frames. Without `--idle-timeout-secs` the follower waits forever,

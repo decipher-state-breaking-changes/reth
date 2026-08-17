@@ -1004,7 +1004,8 @@ def build_admission_section(accepted):
 
     Admission phases are nullable, and a null is not a zero: it says the caller was handed a block
     that had already cleared that stage. Averaging nulls as zeros would report a validator that
-    skips admission as one that admits for free, which is the reporting defect B3's telemetry had
+    skips admission as one that admits for free, which is the reporting defect the engine-access
+    telemetry had
     to be corrected for. A run driven by a reth node is entirely `recovered` and gets one line
     saying so, rather than a table of zeros that looks like a measurement.
     """

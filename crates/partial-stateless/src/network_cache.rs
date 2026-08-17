@@ -1174,9 +1174,10 @@ impl BlockCacheUndo {
 /// Every cache entry's leaf digest, held in the key order the cache root hashes them in.
 ///
 /// The root used to sort the whole cache and rehash every leaf on every block, but a block moves
-/// about 4.6% of the entries (history A.13) — so all but that fraction of both terms was
-/// recomputing an answer that had not changed. Holding the digests in order turns the root into one
-/// pass over already-ordered bytes and charges the leaf hashing to the block that moved the entry.
+/// about 4.6% of the entries as measured over 300 live samples — so all but that fraction of both
+/// terms was recomputing an answer that had not changed. Holding the digests in order turns the
+/// root into one pass over already-ordered bytes and charges the leaf hashing to the block that
+/// moved the entry.
 ///
 /// `BTreeMap` rather than a sorted `Vec`: at this composition the three containers land within 2%
 /// of each other and all of them clear the budget, so the choice was made on correctness surface

@@ -744,7 +744,7 @@ mod tests {
         PartialExecutionWitness, PartialExecutionWitnessState, WitnessResult, WitnessTargets,
     };
 
-    /// The check S1a delegates to catches what the comparisons it replaced could not.
+    /// The delegated post-execution check catches what the comparisons it replaced could not.
     ///
     /// The three ad-hoc equality checks that used to run in the benchmark caller compared gas used,
     /// the receipts root, and the requests hash — and nothing else. A header carrying a correct

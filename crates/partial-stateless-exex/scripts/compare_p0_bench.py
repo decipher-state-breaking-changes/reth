@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two structured P0 builder benchmark runs.
+"""Compare two structured builder benchmark runs.
 
 Two join modes, because the environment decides which one is available:
 
@@ -7,11 +7,11 @@ Two join modes, because the environment decides which one is available:
 comparison and needs both runs to have seen the same blocks, which requires either concurrent runs
 or a replayable datadir.
 
-`non-overlapping` is for the single live datadir in plan section 3.6, where the control and the
-candidate necessarily cover different blocks. There is no per-block pairing to be had, so the
-comparison is between two distributions and the workload difference between the ranges is reported
-next to the timing difference. Section 5.2 states the rule this mode exists to enforce: a timing
-difference smaller than the workload difference is not evidence.
+`non-overlapping` is for a single live datadir, where the control and the candidate necessarily
+cover different blocks. There is no per-block pairing to be had, so the comparison is between two
+distributions and the workload difference between the ranges is reported next to the timing
+difference. The rule this mode exists to enforce: a timing difference smaller than the workload
+difference is not evidence.
 """
 
 import argparse
@@ -192,7 +192,7 @@ def compare_block_identical(control, candidate, warmup, samples, candidate_sourc
         )
 
     lines = [
-        "# P0 block-identical builder comparison", "",
+        "# Block-identical builder comparison", "",
         f"Joined samples: **{len(hashes)}**",
         f"Candidate proof-source filter: **{candidate_source or 'any'}**",
         "Witness commitment mismatches: **0**", "",
@@ -296,7 +296,7 @@ def compare_self_check(records, warmup, samples):
     low, high = bootstrap_adjusted_ratio(first, second)
     separable = low > 1.0 or high < 1.0
     return "\n".join([
-        "# P0 self-check (A/A)", "",
+        "# Self-check (A/A)", "",
         "One run split in half. Both halves are the same configuration, so a result other than",
         "1.0 measures time order and page-cache drift rather than any change.", "",
         f"- First half: blocks {workload_span(first)[0]}--{workload_span(first)[1]}",
@@ -335,7 +335,7 @@ def _one_ordering(control, candidate, warmup, samples, ordering):
         )
 
     lines = [
-        f"# P0 non-overlapping builder comparison ({ordering})", "",
+        f"# Non-overlapping builder comparison ({ordering})", "",
         "The two runs cover different blocks, so nothing here is a paired measurement. Read the",
         "timing table only against the workload table below it.", "",
         f"- Control samples: **{len(control_selected)}**, blocks {control_span[0]}--{control_span[1]}",
@@ -395,9 +395,9 @@ def _one_ordering(control, candidate, warmup, samples, ordering):
     control_normalized = _per_node(control_selected)
     candidate_normalized = _per_node(candidate_selected)
 
-    # The gate instead uses the adjustment already established in history A.8: fit the control's
-    # own cost model, evaluate it at the candidate's composition, and compare the candidate with
-    # what the control would have cost on the candidate's blocks.
+    # The gate instead uses the adjustment an earlier build-parity run established: fit the
+    # control's own cost model, evaluate it at the candidate's composition, and compare the
+    # candidate with what the control would have cost on the candidate's blocks.
     fit = fit_cost_model(control_selected)
     adjusted = adjusted_ratio(fit, candidate_selected)
     low, high = bootstrap_adjusted_ratio(control_selected, candidate_selected)
@@ -411,9 +411,10 @@ def _one_ordering(control, candidate, warmup, samples, ordering):
         "  drew the larger blocks. The composition-adjusted comparison below is the gate.",
         "",
         "## Composition-adjusted initial proof", "",
-        "This section models the initial multiproof, so it answers B1. For B2 read",
-        "`snapshot_us` and `builder_total_us` in the timing table against the workload table;",
-        "the snapshot scales with cache size, which is not one of the inputs modelled here.",
+        "This section models the initial multiproof, so it answers the proof-generation question",
+        "only. For the parent-cache snapshot read `snapshot_us` and `builder_total_us` in the",
+        "timing table against the workload table; the snapshot scales with cache size, which is",
+        "not one of the inputs modelled here.",
         "",
         f"- Control model: **{fit.intercept / 1000:.2f} ms + "
         f"{fit.proof_nodes:.3f} us/node + {fit.storage_tries:.3f} us/storage trie**, "
@@ -435,8 +436,9 @@ def _one_ordering(control, candidate, warmup, samples, ordering):
 class CostModel:
     """Ordinary least squares for initial-proof cost against the two inputs that drive it.
 
-    Two predictors rather than one because B1 changes how storage tries are walked, so a model
-    that only knows the total node count cannot tell a wider block from a deeper one.
+    Two predictors rather than one because parallel proof generation changes how storage tries are
+    walked, so a model that only knows the total node count cannot tell a wider block from a deeper
+    one.
     """
 
     def __init__(self, intercept, proof_nodes, storage_tries, r_squared):
@@ -550,7 +552,7 @@ def _evidence_verdict(timing_ratio, workload_ratios, fit, adjusted, low, high):
     ]
     if timing_change <= workload_change:
         lines.append(
-            "- **The raw table is not evidence.** Section 5.2: a timing difference smaller than "
+            "- **The raw table is not evidence.** A timing difference smaller than "
             "the workload difference does not distinguish the change from the blocks it ran on. "
             "Read the adjusted result instead."
         )
@@ -561,7 +563,8 @@ def _evidence_verdict(timing_ratio, workload_ratios, fit, adjusted, low, high):
         lines.append(
             f"- **The adjustment is weak: control model R-squared is {fit.r_squared:.2f}.** The "
             "model explains too little of the per-block variation to carry an adoption decision; "
-            "history A.8 declined a 0.19 fit for the same reason. Treat the interval below as "
+            "an earlier build-parity run declined a 0.19 fit for the same reason. Treat the "
+            "interval below as "
             "descriptive and get a block-identical comparison before adopting."
         )
     if high != high:

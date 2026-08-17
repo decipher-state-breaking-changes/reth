@@ -5,13 +5,13 @@
 //! the gas-limit ramp, sender recovery. None of them reaches a rule that needs the block's own
 //! execution, so until this suite existed the post-execution boundary — the receipts root and
 //! logs bloom the EVM actually produces, compared with the ones the header committed to — had no
-//! end-to-end evidence at all. It was the last open correctness gap in the ledger.
+//! end-to-end evidence at all.
 //!
 //! Corpus-gated and `#[ignore]`d, for the same reason the rewind suite is: a real transition needs
 //! a real witness, and witnesses live beside the bench runs rather than in the repository. To run:
 //!
 //! ```text
-//! PS_MUTATION_FIXTURE_SPOOL=/data/bench-runs/f0-20260816-2301/fsync-4A/spool \
+//! PS_MUTATION_FIXTURE_SPOOL=<recorded-spool-dir> \
 //!     cargo test -p partial-stateless-replay --release --test transition_mutations \
 //!     -- --ignored --test-threads=1
 //! ```
@@ -92,7 +92,7 @@ fn a_wrong_receipts_root_is_refused_after_the_block_has_executed() {
 
 /// The mutation must be invisible to everything the run measures.
 ///
-/// Not a nicety: the driver's per-block timings are what every latency population in the paper is
+/// Not a nicety: the driver's per-block timings are what every reported latency population is
 /// built from, and a coverage switch that inflated them would make the evidence for one claim the
 /// noise in another. Compared against a control replay of the same commits with the switch off —
 /// the verdicts, the sequence, and the honest counters all have to be identical.

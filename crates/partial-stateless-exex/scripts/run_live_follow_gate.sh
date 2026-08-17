@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The S3 live equivalence gate, consumer side.
+# The live equivalence gate, consumer side.
 #
 # Runs `ps-replay --follow` against a spool a producer is writing RIGHT NOW, re-replays the very
 # same spool in batch mode, and then ASSERTS on both runs' aggregate records — exit codes alone
@@ -46,7 +46,7 @@
 #                           the batch pass must report closed=false. Judged offline, separately
 #                           from the success gate. Adds --idle-timeout-secs 60 unless one is
 #                           passed.
-#     GATE_MODE=long        the S5 cohort run: clean's assertions minus the reorg-zero
+#     GATE_MODE=long        the multi-hour cohort run: clean's assertions minus the reorg-zero
 #                           requirement, because a run held open for many hours will legitimately
 #                           meet reorgs (roughly hourly at best) and clean would fail on the first
 #                           one. Reorg/revert counts are reported as observations; when any
@@ -481,8 +481,9 @@ if [ "${GATE_EXPECT_RECHECKPOINT:-1}" = "1" ]; then
     check "$SUMMARY" "no recovery checkpoint was still pending when the stream closed" \
         "(.recovery_checkpoints_pending_at_end // 0) == 0"
 fi
-# Counter-first until the F1 cohort confirms it at scale; the gate holds it to zero meanwhile.
-# 424/424 both-recorded comparisons agreed on the s3/s4 corpora (72 s4 commits carried none).
+# Counter-first until a full-scale cohort confirms it; the gate holds it to zero meanwhile.
+# 424/424 both-recorded comparisons agreed on the live-follower and reorg-recovery corpora (72 of
+# the reorg-recovery commits carried none).
 check "$SUMMARY" "the readiness watermarks agreed wherever both sides recorded one" \
     "(.watermark_mismatches // 0) == 0"
 if [ "$GATE_MODE" != "epoch" ]; then
@@ -618,16 +619,16 @@ case "$GATE_MODE" in
 esac
 
 if [ "$GATE_MODE" = "clean" ] || [ "$GATE_MODE" = "reorg" ] || [ "$GATE_MODE" = "long" ]; then
-    echo "==> judging the verdict instrumentation (S5a)"
+    echo "==> judging the verdict instrumentation"
     # The never-null trio on every non-catch-up verdict: the primary, its transport cost, and
     # its phases — valid on backlog frames too, because validation and delivery really ran.
     UNINSTRUMENTED=$(jq -r 'select(.kind == "verdict" and .catch_up == false and
         ((.standalone_validation_us == null) or (.delivery_us == null) or (.phases == null))) |
         .sequence' "$FOLLOW_JSON" 2>/dev/null | wc -l)
     if [ "$UNINSTRUMENTED" -eq 0 ]; then
-        echo "  ok: every verdict carries the S5 boundaries and phases"
+        echo "  ok: every verdict carries the timing boundaries and phases"
     else
-        echo "  FAIL: $UNINSTRUMENTED verdicts are missing S5 timing fields" >&2
+        echo "  FAIL: $UNINSTRUMENTED verdicts are missing timing fields" >&2
         FAILED=1
     fi
     # Latency exists only on live-tail verdicts (backlog mtime distance is history, not a wait),
@@ -641,7 +642,7 @@ if [ "$GATE_MODE" = "clean" ] || [ "$GATE_MODE" = "reorg" ] || [ "$GATE_MODE" = 
         echo "  FAIL: $NO_LATENCY live verdicts lack latency with only $ANOMALIES anomalies counted" >&2
         FAILED=1
     fi
-    echo "==> judging the run manifest (S5e)"
+    echo "==> judging the run manifest"
     MANIFEST_LINE=$(grep '"kind":"run_manifest"' "$FOLLOW_JSON" 2>/dev/null | head -1 || true)
     if [ -n "$MANIFEST_LINE" ]; then
         echo "  ok: the follower stamped a run manifest"
@@ -649,7 +650,7 @@ if [ "$GATE_MODE" = "clean" ] || [ "$GATE_MODE" = "reorg" ] || [ "$GATE_MODE" = 
             # A cohort is code-freeze evidence only if its binary can say what it was built
             # from: a null commit or a dirty tree makes the record unattributable, so long
             # requires the build to have been stamped (export PS_BUILD_COMMIT/PS_BUILD_DIRTY/
-            # PS_CARGO_LOCK_SHA256 before cargo build — the runbook's build step does).
+            # PS_CARGO_LOCK_SHA256 before cargo build).
             check "$MANIFEST_LINE" "the manifest pins a commit from a clean tree" \
                 '.provenance.build_commit != null and .provenance.build_dirty == false'
         fi

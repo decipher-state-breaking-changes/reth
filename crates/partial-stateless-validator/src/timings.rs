@@ -401,8 +401,8 @@ pub struct ValidationPhaseTimings {
     /// is handed a block its Engine has already decoded, layout-checked, and sender-recovered, so
     /// these read `None` — the work was done, elsewhere, and is nobody's cost here. A standalone
     /// validator admits untrusted input and does all of it itself. Collapsing that to `0` would
-    /// report a validator that skips admission as one that admits for free, which is exactly the
-    /// coverage gap B3's telemetry had to be corrected for.
+    /// report a validator that skips admission as one that admits for free — the same reporting
+    /// defect the engine-access artifact telemetry had to be corrected for.
     pub admission: AdmissionTimings,
     pub context_check_us: u64,
     pub witness_self_consistency_us: u64,

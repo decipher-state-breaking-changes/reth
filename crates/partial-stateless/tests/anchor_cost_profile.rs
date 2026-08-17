@@ -210,11 +210,12 @@ fn profile_next_cache_anchor_cost() {
     assert!(total > 0, "profile measured nothing");
 }
 
-/// Composition and per-block delta of the 2026-08-09 A.13 run, over its 300 accepted samples.
+/// Composition and per-block delta of the 2026-08-09 cache-composition run, over its 300 accepted
+/// samples.
 ///
 /// Different from the constants above, and deliberately not merged with them: the gate the leaf
-/// digest index is judged against is normalized on A.13, and the anchor split above is a different
-/// measurement on a different run. Averaging the two would leave neither reproducible.
+/// digest index is judged against is normalized on that run, and the anchor split above is a
+/// different measurement on a different run. Averaging the two would leave neither reproducible.
 mod measured {
     pub const ACCOUNTS: u32 = 18_657;
     pub const STORAGE: u32 = 46_426;

@@ -50,7 +50,7 @@ def bootstrap_mean_ci(values, iterations=10000, seed=0xB3, confidence=0.95):
 
 
 def build_artifact_section(selected):
-    """B3 artifact delivery and reuse, over the records that can actually answer for it.
+    """Engine-access artifact delivery and reuse, over the records that can actually answer for it.
 
     Delivery and reuse are reported as separate rates. They differ by the sampled blocks, which
     are delivered and deliberately re-executed to keep the differential oracle alive, so reading
@@ -79,7 +79,7 @@ def build_artifact_section(selected):
             return []
         reused = sum(1 for r in legacy if r.get("artifact_reused"))
         return [
-            "## Engine access artifact (B3)", "",
+            "## Engine access artifact", "",
             f"- Artifact reused: **{reused}/{len(legacy)}** ({reused / len(legacy):.2%})",
             "- Artifact delivered, sampling, and fallback cause: **not recorded** "
             f"(pre-schema-{ARTIFACT_SCHEMA} records)", "",
@@ -88,7 +88,7 @@ def build_artifact_section(selected):
             "if delivery is the question.", "",
         ]
 
-    lines = ["## Engine access artifact (B3)", ""]
+    lines = ["## Engine access artifact", ""]
     if legacy:
         lines.extend([
             f"**Mixed records: {len(legacy)} of {len(selected)} accepted records predate the "

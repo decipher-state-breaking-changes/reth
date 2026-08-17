@@ -7,7 +7,7 @@ questions and are never mixed into one population:
   --follow PATH            live follower JSONL; repeatable, in timeline order (a killed run's
                            file first, its resumed run's file second)
   --batch PATH             batch replay JSONL; repeatable
-  --producer-events PATH   the producer's out-of-band lifecycle log; reduced to the RB7 cause
+  --producer-events PATH   the producer's out-of-band lifecycle log; reduced to the recovery cause
                            ledger and its interval distributions (joined to --follow by frame
                            sequence, so pass both when the producer↔follower leg matters)
   --producer-manifest PATH the producer's run-manifest JSON, copied into the report verbatim
@@ -50,8 +50,8 @@ Abandonment is read from the follower's own lifecycle records first (they name t
 blocks by number *and hash*, which is what catches a pure revert); the same-height supersession
 rule remains as the fallback batch records need.
 
-RB7 (recovery lifecycle) is reported over the *whole* detected-cause denominator: every cause the
-producer opened appears in the ledger with how it ended — published, fenced by a later branch
+The recovery lifecycle is reported over the *whole* detected-cause denominator: every cause the
+producer opened appears in the table with how it ended — published, fenced by a later branch
 change, out of retries, skipped by policy, or still pending when the log stopped — so a thin
 interval sample reads as the coverage it is. Producer-internal intervals difference the monotonic
 clock; the producer→follower leg is the only cross-clock one, is reported in its own unit, and a
@@ -422,7 +422,7 @@ def follower_arrivals(verdicts):
     """`{sequence: earliest observed_at_ms}` — when the follower first decided that frame.
 
     Earliest, not latest: a resumed run re-publishing the same sequence is re-derivation, and
-    the RB7 endpoint is the first decision the frame ever received.
+    the recovery endpoint is the first decision the frame ever received.
     """
     arrivals = {}
     for verdict in verdicts:
@@ -436,7 +436,7 @@ def follower_arrivals(verdicts):
 
 
 def rb7_report(path, arrivals, warnings):
-    """RB7: the recovery lifecycle as intervals, over the full detected-cause denominator.
+    """The recovery lifecycle as intervals, over the full detected-cause denominator.
 
     Every cause the producer opened is accounted for — published, fenced, out of retries,
     skipped by policy, or still pending at the log's end — so an interval's sample count is
@@ -735,7 +735,7 @@ def analyze(args):
     if args.producer_events:
         if follow_arrivals is None:
             warnings.append(
-                "no --follow input: the RB7 producer→follower interval is not measurable"
+                "no --follow input: the producer→follower interval is not measurable"
             )
         result["producer_events"] = rb7_report(args.producer_events, follow_arrivals, warnings)
 
@@ -837,7 +837,7 @@ def self_check():
 
 
 def self_check_rb7():
-    """The RB7 ledger, against a log holding one of each way a cause can end."""
+    """The recovery-lifecycle table, against a log holding one of each way a cause can end."""
     import os
     import tempfile
 
@@ -855,8 +855,8 @@ def self_check_rb7():
         event("checkpoint_published", 0, 5_500, base + 6, attempt=1, block=10,
               announce_sequence=3, chunks=2, announce_to_complete_us=400),
         # cause 1 — a reorg that retries once, then publishes. Its winning commit publishes
-        # *ahead* of the checkpoint: that ordering is what W1 exists to produce, and the two
-        # intervals below are what proves it happened.
+        # *ahead* of the checkpoint, which is the ordering the producer's write-through export
+        # exists to produce; the two intervals below are what proves it happened.
         event("reorg_detected", 1, 10_000, base + 10, winning_tip=41, abandoned_from=40),
         event("recheckpoint_armed", 1, 10_050, base + 10, cause="branch_change", armed=True),
         event("export_started", 1, 10_500, base + 11, attempt=2, block=40, write_through=True),
@@ -939,7 +939,7 @@ def self_check_rb7():
     winning = intervals["detection_to_first_winning_us"]
     assert winning["count"] == 1 and winning["p50"] == 800.0
     assert winning["p50"] < intervals["detection_to_publication_us"]["p50"], (
-        "the winning branch publishes ahead of its recovery checkpoint — that is W1"
+        "the winning branch must publish ahead of its recovery checkpoint"
     )
     join = intervals["first_winning_to_follower_verdict_ms"]
     assert join["unit"] == "ms" and join["count"] == 1 and join["population"] == 1

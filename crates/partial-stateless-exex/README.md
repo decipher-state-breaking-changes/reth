@@ -187,7 +187,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_VALIDATION_BENCH=1` | enable in-memory DB-free Partial/Weak validation paired with same-block Vanilla Engine timing; requires `builder-verifier` |
 | `PS_BENCH_OUTPUT=<file>` | JSONL destination for paired Partial/Weak benchmark records |
 | `PS_BUILDER_BENCH_OUTPUT=<file>` | JSONL destination for per-block builder proof, snapshot, commitment, and total-cost records |
-| `PS_FORCE_PREVIOUS_CACHE_SNAPSHOT=1` | benchmark-only B2 control that recreates the old unconditional parent-cache clone |
+| `PS_FORCE_PREVIOUS_CACHE_SNAPSHOT=1` | benchmark-only control that recreates the old unconditional parent-cache clone, so its cost can be priced against the current conditional one |
 | `PS_TRIE_CACHE_DIAGNOSTICS=1` | validate retained account/storage paths and log trie shape, memory, and transition timings |
 | `PS_CANONICAL_REBUILD=1` | reach `Ready` by rebuilding the pair from canonical state at cold start and after a failed recovery, instead of warming over a policy window of live blocks (default: disabled) |
 | `PS_BOOTSTRAP_DIR=<dir>` | where the snapshot package and its checkpoint live (default: `$PS_SIDECAR_DIR/bootstrap`) |
@@ -314,8 +314,8 @@ policy window, the default paired sample warm-up is **0**. Progress reads
 
 `--canonical-rebuild on` is different: it installs a minimal whole-cache
 multiproof at Ready rather than evolving the trie through live blocks. Historical
-A.4 data shows its revealed intermediate-node set converging for about 50 more
-blocks, so the runner automatically uses 60 paired warm-up records in that mode.
+Earlier rebuild measurements showed its revealed intermediate-node set converging for about
+50 more blocks, so the runner automatically uses 60 paired warm-up records in that mode.
 An explicit `--warmup N` overrides either default. When invoking either offline
 analyzer directly, pass that run's selected value explicitly; the raw paired
 records do not encode which Ready path established the cache.
@@ -341,16 +341,17 @@ python3 crates/partial-stateless-exex/scripts/run_live_paired_bench.py \
 ```
 
 The parallel-proof setting is explicit and defaults to `off`; use
-`--parallel-initial-proof on` for the B1 candidate. The script writes the clean primary report,
+`--parallel-initial-proof on` to measure the parallel-proof candidate. The script writes the clean primary report,
 an overlap-retaining Engine report, and a structured builder report. Raw records and logs are saved
 as `paired.jsonl`, `engine.jsonl`, `builder.jsonl`, `resources.jsonl`, and
 `reth-partial-stateless.log`.
 
-### Ordinary-builder and P0 comparison benchmark
+### Ordinary-builder comparison benchmark
 
 `scripts/run_live_builder_bench.py` runs `PS_SIDECAR_ROLE=builder`, requires published sidecars,
 and fails if an ordinary builder unexpectedly creates the previous-cache snapshot. Run the same
-block replay twice with `--force-previous-cache-snapshot` off and on to isolate B2 on one binary:
+block replay twice with `--force-previous-cache-snapshot` off and on to isolate the
+previous-cache-snapshot cost on one binary:
 
 ```bash
 python3 crates/partial-stateless-exex/scripts/run_live_builder_bench.py \
@@ -366,7 +367,7 @@ python3 crates/partial-stateless-exex/scripts/run_live_builder_bench.py \
 
 Use `scripts/compare_p0_bench.py CONTROL/builder.jsonl CANDIDATE/builder.jsonl` to join the two
 runs by block hash, reject witness-commitment differences, and report paired builder, initial-proof,
-and snapshot ratios. Pass `--candidate-source parallel` when isolating B1.
+and snapshot ratios. Pass `--candidate-source parallel` when isolating the parallel initial proof.
 
 ### Transition-witness construction
 

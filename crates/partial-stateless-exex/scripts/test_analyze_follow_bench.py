@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the follow analyzer, its RB7 ingest, and the report renderer.
+"""Tests for the follow analyzer, its recovery-lifecycle ingest, and the report renderer.
 
 The analyzer's built-in `--self-check` is a smoke test the gate runs; this is the file that holds
 the attribution rules to account one at a time, including the ones that only appear when a run
@@ -8,9 +8,11 @@ clocks that disagree about which came first.
 
     python3 -m unittest test_analyze_follow_bench -v
 
-Two of these tests are regressions against real archives rather than fixtures: the I.1 and I.2
-preflights, whose distributions were originally derived by hand. They skip when the archive is not
-on this host. The equivalent command by hand is
+Two of these tests are regressions against real archives rather than fixtures: the two
+1,001-verdict standalone preflights, whose distributions were originally derived by hand. The
+archives are hundreds of megabytes and live outside the repository, so point the two environment
+variables below at them to enable those tests; unset, they skip rather than pass silently. The
+equivalent command by hand is
 
     ./analyze_follow_bench.py --follow <run>/out/follow.jsonl --batch <run>/out/batch.jsonl \
         --producer-manifest <run>/spool.run-manifest.jsonl --json /tmp/dist.json
@@ -30,11 +32,19 @@ from analyze_follow_bench import analyze, pair_by_sequence, split_populations  #
 from producer_event_state import assemble_causes, reduce_events  # noqa: E402
 from render_follow_report import render  # noqa: E402
 
-#: The Xeon preflight whose hand-derived p50 the analyzer has to reproduce exactly.
-I1_ARCHIVE = Path("/data/bench-runs/s5-preflight-1000-20260815-101319")
-I1_EXPECTED_P50_US = 497_586.0
-#: The i7/SATA preflight, same shape. Present on the second host only.
-I2_ARCHIVE = Path("/data/bench-runs/s5-preflight-1000-i7")
+#: An unset variable must not resolve to the working directory: `Path("")` is `Path(".")`, which
+#: `is_dir()` accepts, so the archive tests would run against nothing instead of skipping.
+def _archive(variable):
+    value = os.environ.get(variable, "").strip()
+    return Path(value) if value else None
+
+
+#: The NVMe-host preflight whose hand-derived p50 the analyzer has to reproduce exactly.
+#: Set PS_PREFLIGHT_ARCHIVE to its run directory to enable the regression below.
+PREFLIGHT_ARCHIVE = _archive("PS_PREFLIGHT_ARCHIVE")
+PREFLIGHT_EXPECTED_P50_US = 497_586.0
+#: The second host's preflight, same shape, from PS_PREFLIGHT_ARCHIVE_ALT.
+PREFLIGHT_ARCHIVE_ALT = _archive("PS_PREFLIGHT_ARCHIVE_ALT")
 
 
 def verdict(sequence, block, block_hash="0xaa", **fields):
@@ -659,8 +669,11 @@ class RendererTest(unittest.TestCase):
         self.assertIn("negative", body)
 
 
-@unittest.skipUnless(I1_ARCHIVE.is_dir(), f"{I1_ARCHIVE} is not on this host")
-class I1RegressionTest(unittest.TestCase):
+@unittest.skipUnless(
+    PREFLIGHT_ARCHIVE is not None and PREFLIGHT_ARCHIVE.is_dir(),
+    "set PS_PREFLIGHT_ARCHIVE to the preflight run directory",
+)
+class PreflightRegressionTest(unittest.TestCase):
     """The hand-derived preflight numbers, reproduced mechanically."""
 
     def analyze_archive(self, archive):
@@ -673,36 +686,39 @@ class I1RegressionTest(unittest.TestCase):
         )
         return analyze(args)
 
-    def test_the_primary_p50_matches_the_number_the_paper_draft_quotes(self):
-        result = self.analyze_archive(I1_ARCHIVE)
+    def test_the_primary_p50_matches_the_hand_derived_number(self):
+        result = self.analyze_archive(PREFLIGHT_ARCHIVE)
         delivered = result["follow"]["populations"]["delivered"]["metrics"]
         self.assertEqual(delivered["standalone_validation_us"]["count"], 1_001)
-        self.assertEqual(delivered["standalone_validation_us"]["p50"], I1_EXPECTED_P50_US)
+        self.assertEqual(delivered["standalone_validation_us"]["p50"], PREFLIGHT_EXPECTED_P50_US)
 
     def test_the_whole_preflight_is_one_steady_population(self):
-        populations = self.analyze_archive(I1_ARCHIVE)["follow"]["populations"]
+        populations = self.analyze_archive(PREFLIGHT_ARCHIVE)["follow"]["populations"]
         self.assertEqual(populations["phase:steady"]["verdicts"], 1_001)
         self.assertEqual(populations["catch_up"]["verdicts"], 0)
         self.assertEqual(populations["abandoned"]["verdicts"], 0)
 
     def test_every_frame_pairs_with_its_batch_replay(self):
-        paired = self.analyze_archive(I1_ARCHIVE)["paired"]
+        paired = self.analyze_archive(PREFLIGHT_ARCHIVE)["paired"]
         self.assertEqual(paired["joined"], 1_001)
         self.assertEqual((paired["follow_only"], paired["batch_only"]), (0, 0))
         self.assertEqual(paired["block_mismatched"], 0)
 
     def test_the_report_renders(self):
-        body = render(self.analyze_archive(I1_ARCHIVE))
+        body = render(self.analyze_archive(PREFLIGHT_ARCHIVE))
         self.assertIn("497,586.0", body)
         self.assertIn("## Provenance", body)
 
 
-@unittest.skipUnless(I2_ARCHIVE.is_dir(), f"{I2_ARCHIVE} is not on this host")
-class I2RegressionTest(unittest.TestCase):
-    def test_the_i7_preflight_analyzes_and_renders(self):
+@unittest.skipUnless(
+    PREFLIGHT_ARCHIVE_ALT is not None and PREFLIGHT_ARCHIVE_ALT.is_dir(),
+    "set PS_PREFLIGHT_ARCHIVE_ALT to the second host's run directory",
+)
+class AlternateHostPreflightRegressionTest(unittest.TestCase):
+    def test_the_second_host_preflight_analyzes_and_renders(self):
         args = argparse.Namespace(
-            follow=[str(I2_ARCHIVE / "out/follow.jsonl")],
-            batch=[str(I2_ARCHIVE / "out/batch.jsonl")],
+            follow=[str(PREFLIGHT_ARCHIVE_ALT / "out/follow.jsonl")],
+            batch=[str(PREFLIGHT_ARCHIVE_ALT / "out/batch.jsonl")],
             producer_events=None, producer_manifest=None,
             run=None, all_runs=False, startup_through_seq=None, phases=False,
         )

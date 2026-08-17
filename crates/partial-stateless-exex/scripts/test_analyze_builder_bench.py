@@ -67,7 +67,7 @@ class ArtifactSectionSchemaTest(unittest.TestCase):
     def test_the_pre_bump_window_is_read_from_its_fields_and_flagged(self):
         # Runs written after the delivery fields landed but before the version was raised. The
         # numbers are there; only the label is stale, and refusing them would discard the very
-        # measurements B3 rests on.
+        # measurements the engine-access claim rests on.
         records = [record(3, delivery=True) for _ in range(9)]
         records.append(
             record(

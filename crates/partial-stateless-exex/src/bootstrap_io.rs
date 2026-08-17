@@ -113,7 +113,8 @@ pub fn export_snapshot(
 ///
 /// What this does *not* move off the export: the state provider's read transaction still spans
 /// the whole multiproof, because the proof must be answered against one consistent view of the
-/// state at H. Chunking that into shorter transactions is deferred hardening, not S3.
+/// state at H. Chunking that into shorter transactions is deferred hardening rather than a
+/// requirement of the live follower.
 pub fn export_snapshot_from_state(
     dir: &Path,
     state: CacheState,
@@ -159,9 +160,9 @@ impl From<ExportedSnapshot> for FinishedExport {
 
 /// Writes a package and its checkpoint into `dir`, returning both paths and the package size.
 ///
-/// `fsync` is the power-loss profile: both files are synced before their renames and the
-/// directory once after them, per §4.4's crash-durable recipe. Off, the default profile keeps
-/// the tmp+rename guarantee only.
+/// `fsync` is the power-loss profile: both files are synced before their renames and the directory
+/// once after them, which is what makes the renames themselves durable. Off, the default profile
+/// keeps the tmp+rename guarantee only.
 pub fn write_snapshot(
     dir: &Path,
     package: &CacheSnapshotPackage,

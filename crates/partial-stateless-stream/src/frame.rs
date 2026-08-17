@@ -30,9 +30,9 @@ pub const FRAME_MAGIC: [u8; 8] = *b"PSSTREAM";
 
 /// The only format version this crate reads or writes.
 ///
-/// Deliberately a constant rather than a range. Every event kind S3 and S4 need is already in v1,
-/// so the first reason to bump this would be a change of meaning, and a reader that accepted a
-/// range would be guessing at what that change was.
+/// Deliberately a constant rather than a range. Every event kind the live follower and its reorg
+/// recovery need is already in v1, so the first reason to bump this would be a change of meaning,
+/// and a reader that accepted a range would be guessing at what that change was.
 pub const FORMAT_VERSION: u16 = 1;
 
 /// Fixed header width: magic, version, kind, flags, sequence, length, digest.
@@ -40,25 +40,25 @@ pub const FRAME_HEADER_BYTES: usize = 8 + 2 + 1 + 1 + 8 + 4 + 32;
 
 /// Default ceiling on one frame's body.
 ///
-/// Measured rather than chosen. The S2-0 run's sidecars ran to 5.57 MiB at their widest with a
-/// 2.86 MiB median, and a commit frame carries one of those beside an Engine payload, so 64 MiB
-/// leaves better than an order of magnitude of headroom over the widest block mainnet produced.
-/// The snapshot package does *not* fit and is not meant to: at 121.8 MiB it is a chunk sequence,
-/// and [`DEFAULT_SNAPSHOT_CHUNK_BYTES`] is what each of its frames is bounded by.
+/// Measured rather than chosen. The first recorded mainnet capture's sidecars ran to 5.57 MiB at
+/// their widest with a 2.86 MiB median, and a commit frame carries one of those beside an Engine
+/// payload, so 64 MiB leaves better than an order of magnitude of headroom over the widest block
+/// mainnet produced. The snapshot package does *not* fit and is not meant to: at 121.8 MiB it is a
+/// chunk sequence, and [`DEFAULT_SNAPSHOT_CHUNK_BYTES`] is what each of its frames is bounded by.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default size of one snapshot chunk body.
 ///
-/// Puts the S2-0 package at sixteen frames. Small enough that a consumer's buffer is bounded well
-/// below the package, large enough that the per-frame header is noise.
+/// Puts that capture's 121.8 MiB snapshot package at sixteen frames. Small enough that a consumer's
+/// buffer is bounded well below the package, large enough that the per-frame header is noise.
 pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 /// What a frame carries, as a stable one-byte tag.
 ///
 /// All of v1's kinds are here even though the first executable replay accepts only
 /// [`Commit`](Self::Commit). Adding [`Reorg`](Self::Reorg) or [`Reset`](Self::Reset) later would
-/// mean a second spool format for S3 and S4 to migrate across, and the migration would land
-/// exactly when the lifecycle work is hardest to reason about.
+/// mean a second spool format for the live follower and its reorg recovery to migrate across, and
+/// the migration would land exactly when the lifecycle work is hardest to reason about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]

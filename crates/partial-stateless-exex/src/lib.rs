@@ -201,7 +201,8 @@ pub struct RunOptions {
     pub validation_bench_output: Option<PathBuf>,
     /// Where per-block builder records go.
     pub builder_bench_output: Option<PathBuf>,
-    /// B2 benchmark control that recreates the old unconditional parent-cache clone.
+    /// Benchmark control that recreates the old unconditional parent-cache clone, so its cost can
+    /// be priced against the current conditional one.
     pub force_previous_cache_snapshot: bool,
     /// Whether a committed block's displaced trie generation is kept for depth-1 recovery.
     ///
@@ -450,7 +451,7 @@ impl RunOptions {
         if self.force_previous_cache_snapshot {
             warn!(
                 target: "partial_stateless",
-                "Forced previous-cache snapshot ENABLED for B2 benchmark control"
+                "Forced previous-cache snapshot ENABLED as a benchmark control"
             );
         }
         if self.sidecar_role == SidecarRole::Verifier {
@@ -973,8 +974,8 @@ where
                 gate.first_winning_commit_pending = true;
                 gate.first_winning_commit_cause = cause_id;
                 // Started here, before a single winning block applies, because the checkpoint a
-                // consumer needs is the one authenticated at the *common ancestor* — the exact
-                // block the plan requires a recovery snapshot to name. One block later the pair
+                // consumer needs is the one authenticated at the *common ancestor*, which is the
+                // only block a recovery snapshot may be named at. One block later the pair
                 // has already moved past it. The winning branch buffers behind the checkpoint
                 // from this point on.
                 maybe_start_export(&ctx, &options, &pair, &mut gate, recorder.as_mut());
@@ -1878,9 +1879,9 @@ enum CommitRecordingOutcome {
 
 /// Logs one block's payload provenance, and drops the payload.
 ///
-/// S2a's whole deliverable is that the seam delivers, so the payload is measured and released
-/// here; S2c is what starts writing it into a frame. The level is the claim: a witnessed payload
-/// is the ordinary case, and a derived one is the case where a later corpus will contain a block
+/// This is the log line for the tap itself: the payload is measured here, and [`record_commit`] is
+/// what writes it into a commit frame. The level is the claim: a witnessed payload is the ordinary
+/// case, and a derived one is the case where a later corpus will contain a block
 /// whose admission checks pass without checking anything.
 fn report_payload_tap(block_number: u64, block_hash: B256, tapped: &payload_tap::TappedPayload) {
     let stats = tapped.stats.as_ref();
@@ -2534,7 +2535,7 @@ fn maybe_start_export<Node>(
     // The snapshot's proof must be answered against the state the Ready parent names. The
     // provider is opened here and moved into the worker, so its read transaction spans the
     // multiproof — off this task, but still one long transaction; shortening it is deferred
-    // hardening, not S3.
+    // hardening rather than a requirement of the live follower.
     let provider = match ctx.provider().history_by_block_hash(ready.anchor.block_hash) {
         Ok(provider) => provider,
         Err(err) => {
@@ -3996,10 +3997,10 @@ mod tests {
             assert_eq!(events[1]["cause_id"], cause_id);
             assert_eq!(events[1]["cause"], "discontinuity");
             assert_eq!(events[1]["armed"], true);
-            // The RB7 ingest (`scripts/analyze_follow_bench.py`) keys every cause, attempt and
-            // interval on these envelope fields. Renaming one here would not fail anything on
-            // this side of the language boundary — it would silently empty a table in the
-            // report — so the contract is asserted where the names are written.
+            // The recovery-lifecycle ingest (`scripts/analyze_follow_bench.py`) keys every cause,
+            // attempt and interval on these envelope fields. Renaming one here would not fail
+            // anything on this side of the language boundary — it would silently empty a table in
+            // the report — so the contract is asserted where the names are written.
             for event in &events {
                 for key in
                     ["kind", "epoch", "cause_id", "attempt", "mono_elapsed_us", "observed_at_ms"]

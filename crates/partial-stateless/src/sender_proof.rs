@@ -1,4 +1,4 @@
-//! Sender-attached account proof for cold-EOA mempool admission (Phase 5).
+//! Sender-attached account proof for cold-EOA mempool admission.
 //!
 //! A partial-stateless validator only holds the network-level cache
 //! ([`crate::NetworkStateCache`]). Mempool admission happens *before* a block (and
@@ -36,8 +36,8 @@ pub struct SenderAccountProof {
     /// Single-account proof (`storage_proofs` is empty — EOA admission needs no storage).
     /// `info == None` with an empty `storage_root` is a non-existence proof.
     pub proof: AccountProof,
-    /// Canonical block this proof is anchored to. The `(number, hash, state_root)`
-    /// triple makes anchoring reorg-safe (same principle as the Phase 1/2 cache anchor).
+    /// Canonical block this proof is anchored to. The `(number, hash, state_root)` triple makes
+    /// anchoring reorg-safe, on the same principle as the cache anchor.
     pub anchor_block_number: u64,
     /// Hash of the anchor block header.
     pub anchor_block_hash: B256,

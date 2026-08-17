@@ -97,8 +97,8 @@ fn round_trip(sequence: u64, event: StreamEvent) -> StreamEvent {
 }
 
 /// All seven kinds are in v1, including the four the first executable replay will ignore. Adding
-/// them later would force S3 and S4 to migrate a spool format exactly when the lifecycle work is
-/// hardest to reason about.
+/// them later would force the live follower and its reorg recovery to migrate a spool format
+/// exactly when the lifecycle work is hardest to reason about.
 #[test]
 fn every_v1_event_survives_its_own_encoding() {
     let manifest = Manifest {

@@ -19,8 +19,9 @@
 //! arrive with their fork gating intact. Reth's own `ensure_well_formed_payload` is assembled from
 //! the same pieces, but it lives in `reth-ethereum-payload-builder`, which reaches the transaction
 //! pool and a state provider — this crate cannot name it. The order below is the order
-//! `reth-engine-tree` validates in, for the same reason S1a delegates rather than hand-writes: a
-//! subset that agrees with canonical rules today is a subset that disagrees after the next fork.
+//! `reth-engine-tree` validates in, for the same reason this crate delegates rather than
+//! hand-writes: a subset that agrees with canonical rules today is a subset that disagrees after
+//! the next fork.
 
 use crate::timings::{AdmissionSource, AdmissionTimings};
 use alloy_consensus::{Block as AlloyBlock, BlockHeader};
@@ -99,7 +100,7 @@ where
             timings: AdmissionTimings {
                 source: AdmissionSource::ExecutionData,
                 // Filled in by whatever read the payload off the wire; this function is handed one
-                // already parsed. S2's frame reader is what will set it.
+                // already parsed. The spool/socket frame reader is what sets it.
                 input_decode_us: None,
                 payload_validation_us: Some(payload_validation_us),
                 sender_recovery_us: Some(sender_recovery_us),
@@ -307,7 +308,7 @@ mod tests {
         assert!(admitted.timings.payload_validation_us.is_some());
         assert!(admitted.timings.pre_execution_consensus_us.is_some());
         assert!(admitted.timings.sender_recovery_us.is_some());
-        // Not this one: the payload arrived already parsed. S2's frame reader sets it.
+        // Not this one: the payload arrived already parsed. The frame reader sets it.
         assert_eq!(admitted.timings.input_decode_us, None);
     }
 
@@ -533,8 +534,8 @@ mod tests {
     #[test]
     fn an_admitted_block_is_the_type_the_execution_core_takes() {
         // Compile-time: `admit` must hand the core exactly what the recovered entry point wants,
-        // or the two halves of S1 do not join and the standalone path needs a conversion the ExEx
-        // path does not have.
+        // or admission and execution do not join, and the standalone path needs a conversion the
+        // ExEx path does not have.
         fn takes_core_block(
             _: &RecoveredBlock<
                 reth_primitives_traits::BlockTy<reth_ethereum_primitives::EthPrimitives>,

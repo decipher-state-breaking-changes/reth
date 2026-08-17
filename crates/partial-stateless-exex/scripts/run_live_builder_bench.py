@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument(
         "--force-previous-cache-snapshot",
         action="store_true",
-        help="recreate the old unconditional clone as the B2 control",
+        help="recreate the old unconditional parent-cache clone as the control",
     )
     parser.add_argument(
         "--retain-generation",

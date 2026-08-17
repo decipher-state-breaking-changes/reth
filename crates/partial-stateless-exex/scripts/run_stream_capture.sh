@@ -8,7 +8,7 @@
 # path -- none of which this corpus needs, because the A/B it feeds is standalone control against
 # candidate over the recorded frames.
 #
-# What the timeline looks like on this host, from the S2-0 measurement:
+# What the timeline looked like on the first capture host, as an order-of-magnitude guide:
 #   ~40 s   node start, ExEx WAL load
 #   ~12 min cold warm to Ready(H) at replay depth 61
 #   ~3 min  whole-cache multiproof and snapshot export, in one long MDBX read transaction
@@ -20,9 +20,12 @@ set -euo pipefail
 
 RUN_DIR="${1:?usage: run_stream_capture.sh <run-dir> [blocks]}"
 WANT_BLOCKS="${2:-40}"
-BINARY="${PS_BINARY:-/data/rust/target/release/reth-partial-stateless}"
-DATADIR="${PS_DATADIR:-/data/reth_data}"
-JWT="${PS_JWT:-/data/secrets/jwt.hex}"
+# The binary defaults to this checkout's release build; the datadir and the JWT secret are host
+# state with no in-repo default, so they must be named.
+REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+BINARY="${PS_BINARY:-$REPO_ROOT/target/release/reth-partial-stateless}"
+DATADIR="${PS_DATADIR:?set PS_DATADIR to the node datadir}"
+JWT="${PS_JWT:?set PS_JWT to the engine JWT secret}"
 
 [ -x "${BINARY}" ] || { echo "not executable: ${BINARY}" >&2; exit 2; }
 mkdir -p "${RUN_DIR}"/{sidecars,bootstrap,stream}

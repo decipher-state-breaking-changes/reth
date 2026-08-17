@@ -36,14 +36,14 @@ use std::{
 /// census walks every node and value entry, which a hash-map copy never does; the box probe
 /// allocates one box per branch node; the walk re-descends to every prune root — so they are
 /// collected only when `PS_TRIE_SHAPE_DIAGNOSTICS` asks: `1` for the census and the walk counts,
-/// `probe` to also price the branch-hash box. A.16 measured them at 8.94, 0.49, and 9.11 ms per
-/// block, so a default run leaves them off and reports zeroes rather than paying 4.7% of raw
-/// validation for numbers that move with cache size rather than with the block.
+/// `probe` to also price the branch-hash box. A 300-sample run measured them at 8.94, 0.49, and
+/// 9.11 ms per block, so a default run leaves them off and reports zeroes rather than paying 4.7%
+/// of raw validation for numbers that move with cache size rather than with the block.
 ///
 /// Three fields therefore measure the instrumentation rather than the work and sit outside their
-/// phase: `account_trie_detail.accounting_us`, `account_trie_detail.branch_hash_probe_us`, and
-/// each walk's `productive_path_us`. All three are zero unless requested. Subtract whichever are
-/// nonzero before comparing a V9 run's totals or per-entry coefficients against a V8 one.
+/// phase: `account_trie_detail.accounting_us`, `account_trie_detail.branch_hash_probe_us`, and each
+/// walk's `productive_path_us`. All three are zero unless requested. Subtract whichever are nonzero
+/// before comparing a V9 run's totals or per-entry coefficients against a V8 one.
 ///
 /// **V10 adds admission.** Every `partial`/`weak` timing block now carries an `admission` object —
 /// `source`, `input_decode_us`, `payload_validation_us`, `sender_recovery_us`,
@@ -57,7 +57,7 @@ use std::{
 ///
 /// V10 changes no V9 field and moves no work between existing phases, so a V9 run and a V10 run
 /// from an ExEx are directly comparable: the new phases are null or, for
-/// `post_execution_consensus_us`, the small cost S1a added.
+/// `post_execution_consensus_us`, the small cost the delegated post-execution check adds.
 pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 10;
 
 /// Phase instrumentation, produced by the validator core rather than by this harness.
@@ -150,16 +150,17 @@ pub struct ValidationBenchmarkRecord {
 
 /// Schema of [`BuilderBenchmarkRecord`].
 ///
-/// 4 declares the fields that make a B3 run readable: `artifact_available`, `shadow_sampled`,
-/// and `fallback_reason`. Schema 3 as specified carried only `artifact_reused`, which cannot
-/// answer what these files are read for -- a reused block looks the same either way, but a
-/// delivered-and-not-reused block is indistinguishable from a miss, and a delivery rate computed
-/// over 3 is not a low delivery rate, it is an absent field printed as zero.
+/// 4 declares the fields that make an engine-access run readable: `artifact_available`,
+/// `shadow_sampled`, and `fallback_reason`. Schema 3 as specified carried only `artifact_reused`,
+/// which cannot answer what these files are read for -- a reused block looks the same either way,
+/// but a delivered-and-not-reused block is indistinguishable from a miss, and a delivery rate
+/// computed over 3 is not a low delivery rate, it is an absent field printed as zero.
 ///
 /// The three fields were added without raising this constant, so files exist that declare 3 and
-/// carry all of 4 (B3 stages 3--5, history A.17). They are correct; only the label is stale.
-/// `analyze_builder_bench.py` therefore keys on field presence and reports the declared version
-/// rather than trusting it, and this bump only fixes files written from here on.
+/// carry all of 4 — everything written during the engine-access artifact runs of 2026-08-10/11.
+/// They are correct; only the label is stale. `analyze_builder_bench.py` therefore keys on field
+/// presence and reports the declared version rather than trusting it, and this bump only fixes
+/// files written from here on.
 pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 4;
 
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
@@ -178,7 +179,7 @@ pub struct BuilderBenchmarkRecord {
     /// Delivery, not usability: a `type_mismatch` block sets this and still re-executes. Since
     /// schema 4 (never in 3, which has no such field).
     pub artifact_available: bool,
-    /// Whether the artifact actually replaced this block's re-execution (B3 stage 4).
+    /// Whether the artifact actually replaced this block's re-execution.
     ///
     /// When true `historical_full_db_evm_us` is zero because no EVM ran here, so the two fields
     /// must be read together: a median over blocks that mixes both paths measures neither.
