@@ -285,14 +285,18 @@ fn print_hotspot(
 }
 
 fn write_csv(path: &Path, rows: &[Row]) -> Res<()> {
+    // The raw totals ride along with the percentages. A miss count is what a witness is sized
+    // from, and a percentage cannot be turned back into one without the denominator — so a CSV
+    // carrying only ratios forces every downstream reader to re-run the sweep to recover them.
     let mut out = String::from(
         "account_window,storage_window,measured_blocks,overall_hit_pct,account_hit_pct,\
-         storage_hit_pct,code_hit_pct,avg_cache_accounts,avg_cache_storage,avg_cache_codes,\
+         storage_hit_pct,code_hit_pct,acc_accessed,acc_hit,sto_accessed,sto_hit,code_accessed,\
+         code_hit,avg_cache_accounts,avg_cache_storage,avg_cache_codes,\
          avg_cache_mem_bytes,peak_cache_mem_bytes\n",
     );
     for r in rows {
         out.push_str(&format!(
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.1},{:.1},{:.1},{:.0},{}\n",
+            "{},{},{},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{},{},{:.1},{:.1},{:.1},{:.0},{}\n",
             r.account_window,
             r.storage_window,
             r.measured_blocks,
@@ -300,6 +304,12 @@ fn write_csv(path: &Path, rows: &[Row]) -> Res<()> {
             r.account_hit_pct(),
             r.storage_hit_pct(),
             r.code_hit_pct(),
+            r.acc_accessed,
+            r.acc_hit,
+            r.sto_accessed,
+            r.sto_hit,
+            r.code_accessed,
+            r.code_hit,
             r.avg_cache_accounts,
             r.avg_cache_storage,
             r.avg_cache_codes,
