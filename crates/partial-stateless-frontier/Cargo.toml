@@ -1,0 +1,63 @@
+[package]
+name = "partial-stateless-frontier"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Database-free multi-policy sidecar generator over a recorded policy replay dataset"
+
+[lib]
+name = "partial_stateless_frontier"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ps-policy-frontier"
+path = "src/main.rs"
+
+[features]
+# Same reason as `partial-stateless-replay`: this binary is built on its own, so no other
+# package's feature selection reaches it, and a build without these measures a keccak and a
+# signature backend production does not run. `check_validator_isolation.sh` runs against this
+# package and fails the build profile if they stop arriving.
+default = ["asm-keccak", "keccak-cache-global"]
+
+asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+
+[dependencies]
+partial-stateless = { path = "../partial-stateless" }
+partial-stateless-validator = { path = "../partial-stateless-validator" }
+
+# Implementation crates only where they carry no state database. The forbidden set is the
+# validator's, enforced against this package by `check_validator_isolation.sh`. That check is the
+# whole point of this package existing separately from the ExEx: an offline generator that could
+# reach a provider would be answering some of its proof requests from a database, and the sidecars
+# it produced would no longer be the ones a recorded corpus determines.
+reth-chainspec = { workspace = true, features = ["std"] }
+reth-consensus = { workspace = true, features = ["std"] }
+reth-ethereum-consensus = { workspace = true, features = ["std"] }
+reth-ethereum-primitives = { workspace = true, features = ["std"] }
+reth-evm = { workspace = true, features = ["std"] }
+reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std", "secp256k1", "rayon"] }
+reth-trie-common = { workspace = true, features = ["std"] }
+revm = { workspace = true }
+
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
+
+bincode.workspace = true
+eyre.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+# The equivalence gate builds a real parent trie and proves against it, which is the only way to
+# check that a recorded witness is sufficient for a warm-cache policy build. Dev-only, so the
+# isolation-checked normal graph is untouched.
+alloy-trie.workspace = true
+reth-trie = { workspace = true, features = ["test-utils"] }
+reth-trie-common = { workspace = true }

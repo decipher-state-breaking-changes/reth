@@ -26,11 +26,18 @@
 #      graph check on the ExEx would have passed. Same shape of defect as invariant 2, on a
 #      different hot path.
 #
-# The three packages below are checked together because the claim is about the *binary*, and the
-# binary is built from all three. `partial-stateless-stream` is where the frame format and the
-# recorded oracle live, and `partial-stateless-replay` is the standalone process itself — the first
-# thing that runs the validator core outside a reth node. A graph check that covered only the core
-# would pass while the process that runs it linked a provider.
+# The packages below are checked together because the claim is about the *binaries*, and each is
+# built from several of them. `partial-stateless-stream` is where the frame format and the recorded
+# oracle live, and `partial-stateless-replay` is the standalone process itself — the first thing
+# that runs the validator core outside a reth node. A graph check that covered only the core would
+# pass while the process that runs it linked a provider.
+#
+# `partial-stateless-frontier` is here for a sharper reason than the others. It generates every
+# cache policy's sidecars from a recorded witness, and the entire claim that a policy comparison is
+# a fact about the policies rests on every proof request being answered from that recording. A
+# provider reachable from its graph would let some requests be answered from a database instead,
+# and the sidecars it produced would no longer be the ones the corpus determines — with nothing in
+# the output to show which were which.
 #
 # Usage: check_validator_isolation.sh [package-name ...]
 
@@ -43,6 +50,7 @@ else
     partial-stateless-validator
     partial-stateless-stream
     partial-stateless-replay
+    partial-stateless-frontier
   )
 fi
 

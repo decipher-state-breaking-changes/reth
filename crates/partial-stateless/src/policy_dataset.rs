@@ -329,6 +329,17 @@ pub enum DatasetError {
         /// What the decoder said.
         detail: String,
     },
+    /// The producer tried to write different contents under an existing record identity.
+    #[error(
+        "dataset record for block {block_number} ({block_hash:?}) was produced twice with \
+         different contents"
+    )]
+    ConflictingDuplicate {
+        /// The block.
+        block_number: u64,
+        /// The hash that makes the record filename unique at that height.
+        block_hash: B256,
+    },
     /// A record's digest does not cover its body.
     #[error("record for block {block_number} has digest {recorded:?} but its body hashes to {recomputed:?}")]
     DigestMismatch {
@@ -481,6 +492,22 @@ impl PolicyDatasetWriter {
         let bytes =
             bincode::serialize(record).map_err(|err| DatasetError::Encode(err.to_string()))?;
         let path = self.blocks.join(record.file_name());
+
+        // A branch can be abandoned and later become canonical again. In that case the producer
+        // sees the exact same `(height, hash)` twice, which names the same file and must count as
+        // one physical record in `END.json`. Comparing the bytes also prevents a second observation
+        // from silently overwriting different capture material under the same block identity.
+        if path.exists() {
+            let existing = fs::read(&path).map_err(|err| io_err(&path, err))?;
+            if existing != bytes {
+                return Err(DatasetError::ConflictingDuplicate {
+                    block_number: record.body.block_number,
+                    block_hash: record.body.block_hash,
+                })
+            }
+            return Ok(path)
+        }
+
         write_atomic(&path, &bytes)?;
         self.records += 1;
         let number = record.body.block_number;
@@ -1077,8 +1104,8 @@ mod tests {
             .unwrap();
         writer.write_record(&body(11, numbered(0x0a), numbered(0xb1)).seal().unwrap()).unwrap();
 
-        // And back again. The same branch-A block is re-recorded, rewriting its own file rather
-        // than adding one — which is why the terminator counts three files, not four.
+        // And back again. The same branch-A block is re-recorded without adding another physical
+        // file or inflating the terminator's record count.
         writer
             .write_lifecycle(&LifecycleEvent::Reorg {
                 common_ancestor: 10,
@@ -1088,19 +1115,7 @@ mod tests {
         writer.write_record(&branch_a).unwrap();
         writer.write_record(&body(12, numbered(0xa1), numbered(0x0c)).seal().unwrap()).unwrap();
 
-        write_end(
-            &dir,
-            DatasetEnd {
-                kind: DatasetEndKind::BlockBudgetReached,
-                records: 4,
-                block_range: Some((10, 12)),
-                usable_range: Some((10, 12)),
-                usable_tip_hash: Some(numbered(0x0c)),
-                confirmations: CONFIRMATIONS,
-                confirmed_at_head: Some(12 + CONFIRMATIONS),
-                detail: String::new(),
-            },
-        );
+        finish_all(writer, Some((10, 12, numbered(0x0c))), "done").unwrap();
 
         let loaded = load_dataset(&dir).unwrap();
         assert_eq!(
@@ -1110,6 +1125,30 @@ mod tests {
         );
         assert_eq!(loaded.abandoned.len(), 1);
         assert_eq!(loaded.abandoned[0].body.block_hash, numbered(0xb1));
+        assert_eq!(loaded.end.records, 4, "the re-recorded branch-A block counted twice");
+    }
+
+    /// One block identity cannot conceal two different captures. Treating the later write as an
+    /// ordinary duplicate would make the result depend on which observation happened to win the
+    /// filesystem overwrite.
+    #[test]
+    fn a_duplicate_identity_with_different_contents_is_refused() {
+        let dir = temp_dir("conflicting-duplicate");
+        let mut writer = started_writer(&dir);
+        let first = body(10, numbered(0x09), numbered(0x0a)).seal().unwrap();
+        writer.write_record(&first).unwrap();
+
+        let mut conflicting = body(10, numbered(0xff), numbered(0x0a));
+        conflicting.expected_state_root = numbered(0xee);
+        let err = writer.write_record(&conflicting.seal().unwrap()).unwrap_err();
+        assert!(matches!(
+            err,
+            DatasetError::ConflictingDuplicate {
+                block_number: 10,
+                block_hash
+            } if block_hash == numbered(0x0a)
+        ));
+        assert_eq!(writer.records(), 1, "the refused duplicate changed the physical count");
     }
 
     /// A terminator can name any depth it likes; the head it recorded has to back it up.

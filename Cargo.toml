@@ -154,6 +154,7 @@ members = [
     "crates/tracing-otlp",
     "crates/partial-stateless",
     "crates/partial-stateless-exex",
+    "crates/partial-stateless-frontier",
     "crates/partial-stateless-replay",
     "crates/partial-stateless-stream",
     "crates/partial-stateless-validator",

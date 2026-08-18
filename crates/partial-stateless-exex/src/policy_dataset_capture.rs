@@ -677,12 +677,16 @@ mod tests {
     }
 
     fn record(recorder: &mut PolicyDatasetRecorder, number: u64, tag: u8) {
+        record_on(recorder, number, tag.wrapping_sub(1), tag);
+    }
+
+    fn record_on(recorder: &mut PolicyDatasetRecorder, number: u64, parent_tag: u8, tag: u8) {
         recorder
             .record(partial_stateless::PolicyDatasetRecordBody {
                 schema_version: partial_stateless::POLICY_DATASET_SCHEMA_VERSION,
                 block_number: number,
                 block_hash: B256::repeat_byte(tag),
-                parent_hash: B256::repeat_byte(tag.wrapping_sub(1)),
+                parent_hash: B256::repeat_byte(parent_tag),
                 parent_state_root: B256::ZERO,
                 expected_state_root: B256::ZERO,
                 payload_json: Some(b"{}".to_vec()),
@@ -730,6 +734,32 @@ mod tests {
         record(&mut recorder, 11, 0xb2);
         recorder.observe_head(12);
         assert!(dir.join("END.json").exists(), "the replacement never closed the dataset");
+    }
+
+    /// Re-observing a branch after leaving it rewrites no physical record and therefore cannot
+    /// inflate the terminator count the loader cross-checks against the directory.
+    #[test]
+    fn a_branch_that_wins_again_closes_and_loads_through_the_recorder() {
+        let dir = temp_dir("reorg-back-recorder");
+        let mut recorder = recorder_at(&dir, 3, 1);
+        record_on(&mut recorder, 10, 0x09, 0x0a);
+        record_on(&mut recorder, 11, 0x0a, 0xa1);
+
+        recorder.note_reorg(10, vec![(11, B256::repeat_byte(0xa1))]);
+        record_on(&mut recorder, 11, 0x0a, 0xb1);
+        recorder.note_reorg(10, vec![(11, B256::repeat_byte(0xb1))]);
+        record_on(&mut recorder, 11, 0x0a, 0xa1);
+        record_on(&mut recorder, 12, 0xa1, 0x0c);
+        recorder.observe_head(13);
+
+        let loaded = partial_stateless::load_dataset(&dir).expect("the closed dataset loads");
+        assert_eq!(loaded.end.records, 4);
+        assert_eq!(
+            loaded.records.iter().map(|record| record.body.block_hash).collect::<Vec<_>>(),
+            vec![B256::repeat_byte(0x0a), B256::repeat_byte(0xa1), B256::repeat_byte(0x0c)]
+        );
+        assert_eq!(loaded.abandoned.len(), 1);
+        assert_eq!(loaded.abandoned[0].body.block_hash, B256::repeat_byte(0xb1));
     }
 
     /// A run that stops early still leaves a usable corpus: the part the head confirms, and no

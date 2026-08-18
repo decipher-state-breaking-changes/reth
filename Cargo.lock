@@ -6514,6 +6514,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "partial-stateless-frontier"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "alloy-trie",
+ "bincode",
+ "eyre",
+ "partial-stateless",
+ "partial-stateless-validator",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-primitives-traits",
+ "reth-trie",
+ "reth-trie-common",
+ "revm",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "partial-stateless-replay"
 version = "0.1.0"
 dependencies = [

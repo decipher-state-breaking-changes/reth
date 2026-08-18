@@ -588,6 +588,67 @@ pub struct PartialExecutionWitness {
     pub headers: Vec<Bytes>,
 }
 
+/// Digest of everything about a sidecar that two hosts must agree on.
+///
+/// **Not** the hash of the serialized sidecar, and the difference matters exactly where this is
+/// used. `stats` carries wall-clock and resource measurements — how long *this* host took to build
+/// the witness, how many page faults *this* process took — and hashing those makes the digest
+/// differ between two runs that produced byte-identical protocol content. A comparison that keyed
+/// on the wire hash would report every host as disagreeing with every other.
+///
+/// So the measurement-only fields are normalized away and everything else is covered: identity,
+/// both anchors, the miss manifest, the witness body, and the witness commitment. The size fields
+/// on `stats` survive, because a witness that is a different size is a different witness.
+///
+/// The sidecar is destructured rather than field-accessed on purpose. A field added later is a
+/// compile error here, which forces a decision about whether it belongs in the digest — the
+/// alternative is a digest that silently stops covering part of what it names.
+pub fn sidecar_semantic_digest(sidecar: &PartialStatelessSidecar) -> Result<B256, String> {
+    let PartialStatelessSidecar {
+        parent_hash,
+        parent_state_root,
+        block_hash,
+        block_number,
+        cache_block,
+        cache_policy_id,
+        prev_cache_anchor,
+        next_cache_anchor,
+        cache_policy_metadata,
+        cache_miss_targets,
+        witness_commitment,
+        miss_manifest,
+        witness,
+        stats,
+    } = sidecar;
+
+    let normalized = WitnessResult {
+        computation_time_ms: None,
+        cpu_time_ms: None,
+        major_page_faults: None,
+        minor_page_faults: None,
+        ..stats.clone()
+    };
+
+    let encoded = bincode::serialize(&(
+        parent_hash,
+        parent_state_root,
+        block_hash,
+        block_number,
+        cache_block,
+        cache_policy_id,
+        prev_cache_anchor,
+        next_cache_anchor,
+        cache_policy_metadata,
+        cache_miss_targets,
+        witness_commitment,
+        miss_manifest,
+        witness,
+        &normalized,
+    ))
+    .map_err(|err| err.to_string())?;
+    Ok(keccak256(encoded))
+}
+
 /// Commit to the witness payload and the cache-miss target set it is supposed to cover.
 pub fn partial_witness_commitment(
     parent_state_root: B256,

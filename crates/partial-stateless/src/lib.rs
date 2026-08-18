@@ -64,7 +64,7 @@ pub use shared_trie::{cow_copies_taken, SharedSparseTrie};
 pub use sidecar::{
     check_next_cache_anchor, check_sidecar_context, check_sidecar_miss_targets,
     check_sidecar_self_consistency, last_n_blocks_cache_policy_id, partial_witness_commitment,
-    CacheAnchor, CacheFootprintStats, PartialExecutionWitness,
+    sidecar_semantic_digest, CacheAnchor, CacheFootprintStats, PartialExecutionWitness,
     PartialExecutionWitnessState, PartialStatelessSidecar, RootWitnessCompletenessReport,
     RootWitnessCompletenessSummary, SerializableMultiProof, SerializableStorageMultiProof,
     SidecarBenchmarkManifest, SidecarCheckError, StateTargetSet, StateTargetStats,
