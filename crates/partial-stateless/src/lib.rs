@@ -17,9 +17,11 @@ pub mod network_cache;
 pub mod participant;
 pub mod persistence;
 pub mod policy;
+pub mod policy_dataset;
 pub mod readiness;
 pub mod restore;
 pub mod shared_trie;
+pub mod transition_build;
 pub mod trie_cache;
 pub mod witness;
 
@@ -44,6 +46,11 @@ pub use network_cache::{
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
 pub use policy::{CachePolicy, EvictedStorage, LastNBlocksPolicy};
+pub use policy_dataset::{
+    load_dataset, DatasetEnd, DatasetEndKind, DatasetError, LifecycleEvent, LoadedDataset,
+    PolicyDatasetManifest, PolicyDatasetRecord, PolicyDatasetRecordBody, PolicyDatasetWriter,
+    RecordedAccessProvenance, RecordedPayloadProvenance, POLICY_DATASET_SCHEMA_VERSION,
+};
 pub use readiness::{
     BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
     ReadinessError, ReadyParent, TrustedCheckpoint,
@@ -57,10 +64,19 @@ pub use shared_trie::{cow_copies_taken, SharedSparseTrie};
 pub use sidecar::{
     check_next_cache_anchor, check_sidecar_context, check_sidecar_miss_targets,
     check_sidecar_self_consistency, last_n_blocks_cache_policy_id, partial_witness_commitment,
-    CacheAnchor, CacheFootprintStats, PartialExecutionWitness, PartialExecutionWitnessState,
-    PartialStatelessSidecar, RootWitnessCompletenessReport, RootWitnessCompletenessSummary,
-    SerializableMultiProof, SerializableStorageMultiProof, SidecarBenchmarkManifest,
-    SidecarCheckError, StateTargetSet, StateTargetStats, WitnessReductionStats, WitnessTargets,
+    CacheAnchor, CacheFootprintStats, PartialExecutionWitness,
+    PartialExecutionWitnessState, PartialStatelessSidecar, RootWitnessCompletenessReport,
+    RootWitnessCompletenessSummary, SerializableMultiProof, SerializableStorageMultiProof,
+    SidecarBenchmarkManifest, SidecarCheckError, StateTargetSet, StateTargetStats,
+    WitnessReductionStats, WitnessTargets,
+};
+pub use transition_build::{
+    assemble_sidecar, build_cache_aware_flat_transition, build_full_witness_sidecar,
+    build_policy_sidecar, decode_transition_witness, full_witness_sidecar_from_nodes,
+    generate_cache_aware_base_proof, initial_cache_aware_targets, measure_transition_witness_size,
+    BlockTransitionRef, CacheAwareBaseProof, CacheAwareFlatBuild, FullWitnessBuild, ParallelProof,
+    PolicySidecarBuild, SidecarAssembly, TransitionBuildContext, TransitionProofSource,
+    V2TargetSet,
 };
 pub use trie_cache::{
     PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation,

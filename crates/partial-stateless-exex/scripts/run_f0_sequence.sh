@@ -45,6 +45,16 @@ NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may t
 NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
 ABBA_BLOCKS=${ABBA_BLOCKS:-300}
+
+# A policy-dataset capture is a separate job that holds the datadir and spends part of every block
+# on a witness nobody measured. Unsetting it for the producer (below) keeps it out of this run's
+# processes; refusing here keeps this run from being started in a shell that was configured for it,
+# which is a different mistake with the same result.
+if [ -n "${PS_POLICY_DATASET_CAPTURE_DIR:-}" ]; then
+    echo "PS_POLICY_DATASET_CAPTURE_DIR is set; this sequence measures and cannot run beside a" >&2
+    echo "policy replay dataset capture. Unset it, or run the capture on its own." >&2
+    exit 2
+fi
     # MDBX times a reader out at 5 minutes by default and the ExEx dies with it: its sidecar
     # multiproof runs inside a read transaction, and a node backfilling a gap at full speed holds
     # one open far longer than a node following the tip. 0 disables the timeout.
@@ -146,7 +156,7 @@ say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown}"
 start_producer() { # <arm-dir> <fsync>
     local arm=$1 fsync=$2
     mkdir -p "$arm"/{spool,bootstrap,sidecars,out}
-    env -u PS_CAPTURE_DIR -u PS_VALIDATION_BENCH \
+    env -u PS_CAPTURE_DIR -u PS_VALIDATION_BENCH -u PS_POLICY_DATASET_CAPTURE_DIR \
     PS_ENGINE_ACCESS=on \
     PS_SHADOW_SAMPLE=50 \
     PS_ENGINE_PAYLOAD=on \

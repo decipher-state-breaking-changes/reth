@@ -25,6 +25,23 @@ DISABLED_DIAGNOSTICS = (
     "PS_WITNESS_BASELINE",
 )
 
+# Refused rather than unset. Everything in DISABLED_DIAGNOSTICS is a switch this launcher owns and
+# may therefore clear on the operator's behalf; a policy-dataset capture is a separate job someone
+# deliberately started, and silently turning it off would throw away hours of recording. Failing
+# instead makes the operator choose which job this shell is running.
+FORBIDDEN_ENV = ("PS_POLICY_DATASET_CAPTURE_DIR",)
+
+
+def refuse_conflicting_env():
+    """Abort if the shell is configured for a job this measurement cannot share a process with."""
+    for name in FORBIDDEN_ENV:
+        if os.environ.get(name):
+            raise SystemExit(
+                f"{name} is set; a policy replay dataset capture builds an extra full witness per "
+                "block, so a measurement started beside it would be measuring the capture. Unset "
+                "it, or run the capture on its own."
+            )
+
 
 def default_sample_warmup(canonical_rebuild):
     """Return the warm-up needed after the path that established Ready.
@@ -348,6 +365,7 @@ def build_command(reth_bin, datadir, jwtsecret, node_args):
 
 def main():
     args = parse_args()
+    refuse_conflicting_env()
     prepare_output(args.output)
     reth_bin = args.reth_bin.resolve()
     if not reth_bin.is_file():

@@ -125,6 +125,14 @@ def benchmark_environment(
     )
     env.pop("PS_VALIDATION_BENCH", None)
     env.pop("PS_BENCH_OUTPUT", None)
+    # Not popped: see run_live_paired_bench.refuse_conflicting_env. A capture is somebody's running
+    # job, and this launcher refuses to run beside it rather than quietly cancelling it.
+    if os.environ.get("PS_POLICY_DATASET_CAPTURE_DIR"):
+        raise SystemExit(
+            "PS_POLICY_DATASET_CAPTURE_DIR is set; a builder benchmark started beside a policy "
+            "replay dataset capture would be measuring the capture. Unset it, or run the capture "
+            "on its own."
+        )
     for name in DISABLED_DIAGNOSTICS:
         env.pop(name, None)
     return env

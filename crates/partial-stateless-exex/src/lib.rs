@@ -18,6 +18,7 @@ pub mod access_shadow;
 pub mod bootstrap_io;
 pub mod cold_eoa;
 pub mod payload_tap;
+pub mod policy_dataset_capture;
 pub mod rebuild;
 pub mod recorder;
 
@@ -34,14 +35,8 @@ use alloy_rlp::Encodable;
 use futures::TryStreamExt;
 pub use partial_stateless::CacheConfig;
 use partial_stateless::{
-    network_cache::NetworkStateCache,
     persistence::{load_from_file, save_to_file, CacheState},
-    policy::{CachePolicy, LastNBlocksPolicy},
-    readiness::{
-        BlockContext, BlockedReason, CacheObservation, CacheReadiness, CacheReadinessTracker,
-        ReadyParent,
-    },
-    sidecar::last_n_blocks_cache_policy_id,
+    readiness::{BlockContext, BlockedReason, CacheObservation, CacheReadiness, ReadyParent},
     CacheAnchor, PartialStatelessSidecar, PartialTrieNodeCache,
 };
 use partial_stateless_stream::{
@@ -189,6 +184,13 @@ pub struct RunOptions {
     pub verifier_wait: Duration,
     /// Where per-block accessed-state fixtures are dumped, when capture is on.
     pub capture_dir: Option<PathBuf>,
+    /// Where the policy replay dataset is captured, when that opt-in capture is on.
+    ///
+    /// `None` in every ordinary run, and that `None` is the whole contract: no full witness is
+    /// built, no payload is cloned for a dataset, and no writer exists. Resolved once here rather
+    /// than re-read per block, so a variable changed under a running node cannot turn a measured
+    /// run into a capturing one halfway through.
+    pub policy_dataset: Option<policy_dataset_capture::PolicyDatasetCaptureConfig>,
     /// Whether to compute the full-witness baseline for the reduction ratio.
     pub compute_baseline: bool,
     /// Whether to sample process CPU time and page faults around witness construction.
@@ -337,6 +339,7 @@ impl RunOptions {
                     .unwrap_or_else(|| sidecar_dir.join("validation_bench.jsonl"))
             }),
             builder_bench_output: std::env::var_os("PS_BUILDER_BENCH_OUTPUT").map(PathBuf::from),
+            policy_dataset: policy_dataset_capture::PolicyDatasetCaptureConfig::from_env()?,
             force_previous_cache_snapshot: env_flag("PS_FORCE_PREVIOUS_CACHE_SNAPSHOT"),
             retain_generation: env_flag_enabled_by_default("PS_RETAIN_GENERATION"),
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
@@ -382,6 +385,16 @@ impl RunOptions {
                 target: "partial_stateless",
                 dir = %dir.display(),
                 "Accessed-state fixture capture ENABLED (PS_CAPTURE_DIR) — run until ~300 blocks captured"
+            );
+        }
+        if let Some(dataset) = &self.policy_dataset {
+            warn!(
+                target: "partial_stateless",
+                dir = %dataset.dir.display(),
+                max_blocks = dataset.max_blocks,
+                "Policy replay dataset capture ENABLED (PS_POLICY_DATASET_CAPTURE_DIR) — a full \
+                 witness is built, validated, and written per block. This run is NOT measurement \
+                 eligible and its manifest says so"
             );
         }
         if self.compute_baseline {
@@ -488,9 +501,11 @@ impl RunOptions {
         ready_parent: Option<&'a ReadyParent>,
         retain_sidecar: bool,
         retained_generation: RetainedGenerationBytes,
+        capture_policy_dataset: bool,
     ) -> BuilderOptions<'a> {
         BuilderOptions {
             capture_dir: self.capture_dir.as_deref(),
+            capture_policy_dataset,
             sidecar_dir: &self.sidecar_dir,
             compute_baseline: self.compute_baseline,
             resource_metrics: self.resource_metrics,
@@ -801,6 +816,18 @@ where
     // Built before the first notification so a misconfigured spool fails the run at startup rather
     // than after the snapshot export has already been paid for.
     let mut recorder = recorder::StreamRecorder::from_env()?;
+    // Built here for the same reason as the spool: a capture directory that already holds records,
+    // or a conflicting benchmark variable, fails the run at startup rather than after hours of
+    // blocks. `None` in every ordinary run, and nothing in the capture path exists behind it.
+    let mut dataset = policy_dataset_capture::PolicyDatasetRecorder::open(
+        options.policy_dataset.clone(),
+        format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        option_env!("PS_BUILD_COMMIT").map(str::to_string),
+        ctx.config.chain.chain().to_string(),
+    )?;
+    if let Some(dataset) = dataset.as_mut() {
+        dataset.note_started(ctx.head.number.saturating_add(1));
+    }
     // Attempt directories are export machinery, and exports run only when a stream is being
     // recorded — a run without one has no business deleting anything under the bootstrap dir.
     if recorder.is_some() {
@@ -892,6 +919,7 @@ where
                         &mut gate,
                         &mut rebuild_failures,
                         recorder.as_mut(),
+                        dataset.as_mut(),
                         block,
                     ) {
                         // Written explicitly rather than left to the recorder's drop: the drop
@@ -968,6 +996,7 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, Some(new)));
                 }
+                note_dataset_branch_change(dataset.as_mut(), old);
                 // A branch change that lands while an earlier first-winning measurement is
                 // still armed supersedes it: that branch's first commit never published.
                 gate.abandon_first_winning("superseded_by_branch_change");
@@ -991,6 +1020,7 @@ where
                         &mut gate,
                         &mut rebuild_failures,
                         recorder.as_mut(),
+                        dataset.as_mut(),
                         block,
                     ) {
                         if let Some(recorder) = recorder.as_mut() {
@@ -1056,6 +1086,7 @@ where
                 if let Some(recorder) = recorder.as_mut() {
                     recorder.write_reorg(branch_change(old, None));
                 }
+                note_dataset_branch_change(dataset.as_mut(), old);
                 // Nothing replaces the reverted blocks, so the "first winning commit" after a
                 // pure revert is simply the next committed block — still the freshness endpoint.
                 gate.abandon_first_winning("superseded_by_branch_change");
@@ -1135,8 +1166,74 @@ where
     if let Some(recorder) = recorder.as_mut() {
         recorder.write_end(EndKind::Shutdown, "exex notification stream ended");
     }
+    // A capture that stopped short of its budget still gets a terminator, and the terminator says
+    // it stopped short. The alternative is a dataset directory that reads as incomplete forever,
+    // which is indistinguishable from one whose producer crashed.
+    if let Some(dataset) = dataset.as_mut() {
+        dataset.close(
+            partial_stateless::DatasetEndKind::ProducerShutdown,
+            "exex notification stream ended".to_string(),
+        );
+    }
 
     Ok(())
+}
+
+/// Joins one block's capture material to its payload and parent header, and records it.
+///
+/// Split out so the caller has one fallible expression to mark the dataset failed on. Inline, each
+/// `?` would be a separate exit that left the dataset without its terminator — readable as a
+/// crashed capture rather than as the refused one it is.
+fn record_dataset_block<Node>(
+    ctx: &ExExContext<Node>,
+    recorder: &mut policy_dataset_capture::PolicyDatasetRecorder,
+    material: policy_dataset_capture::PolicyDatasetMaterial,
+    payload: Option<(Option<Vec<u8>>, partial_stateless::RecordedPayloadProvenance)>,
+    block: &RecoveredBlock<BlockTy<EthPrimitives>>,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
+    Node::Provider: CanonicalOverlayFactory + BlockReader<Block = BlockTy<EthPrimitives>>,
+{
+    let (payload_json, payload_provenance) =
+        payload.unwrap_or((None, partial_stateless::RecordedPayloadProvenance::Absent));
+    // Fetched here rather than inside the builder: the parent header is the one thing a record
+    // needs that the builder never handles, and threading a second header lookup through it would
+    // put a capture-only read on the production path.
+    let parent_header = ctx
+        .provider()
+        .sealed_header_by_hash(block.parent_hash)
+        .map_err(|err| eyre::eyre!("failed to fetch parent header for the dataset: {err}"))?
+        .ok_or_else(|| {
+            eyre::eyre!("parent header {:?} not found for the dataset", block.parent_hash)
+        })?;
+    let mut parent_header_rlp = Vec::new();
+    parent_header.header().encode(&mut parent_header_rlp);
+    let body = material.into_record_body(
+        block.number(),
+        block.hash(),
+        block.parent_hash,
+        parent_header_rlp.into(),
+        payload_json,
+        payload_provenance,
+    )?;
+    recorder.record(body)
+}
+
+/// Files a branch change in the dataset's lifecycle log.
+///
+/// The abandoned records stay on disk. Deciding which of two records at one height is canonical is
+/// the offline stage's job, and it needs both the records and this event to do it — a capture that
+/// deleted the loser would leave the exclusion unauditable.
+fn note_dataset_branch_change(
+    dataset: Option<&mut policy_dataset_capture::PolicyDatasetRecorder>,
+    old: &Chain,
+) {
+    let Some(dataset) = dataset else { return };
+    let abandoned =
+        old.blocks().iter().map(|(number, block)| (*number, block.hash())).collect::<Vec<_>>();
+    let common_ancestor = old.range().start().saturating_sub(1);
+    dataset.note_reorg(common_ancestor, abandoned);
 }
 
 /// Classifies an error exit from the notification loop before it propagates.
@@ -1493,6 +1590,7 @@ where
 }
 
 /// Applies one canonical block to the live pair, and to the bootstrap gate's shadow pair.
+#[expect(clippy::too_many_arguments)]
 fn process_canonical_block<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
@@ -1500,6 +1598,7 @@ fn process_canonical_block<Node>(
     gate: &mut BootstrapGate,
     rebuild_failures: &mut u32,
     mut recorder: Option<&mut recorder::StreamRecorder>,
+    mut dataset: Option<&mut policy_dataset_capture::PolicyDatasetRecorder>,
     block: &RecoveredBlock<BlockTy<EthPrimitives>>,
 ) -> eyre::Result<()>
 where
@@ -1553,6 +1652,15 @@ where
                 recorder.write_reset(
                     reset_reason,
                     format!("block {block_number} broke cache continuity: {reason:?}"),
+                );
+            }
+            // The dataset carries no cache state, so a pair reset does not invalidate a record.
+            // It is filed anyway: an offline run that finds an unexplained discontinuity in the
+            // producer's own history should be able to see that the producer knew about it.
+            if let Some(dataset) = dataset.as_deref_mut() {
+                dataset.note_reset(
+                    block_number,
+                    format!("the producer's cache pair was reset here: {reason:?}"),
                 );
             }
             // An exact rebuild at this block's own parent is worth trying before falling back to a
@@ -1669,6 +1777,45 @@ where
                 .map_err(Into::into)
         };
 
+    // Every canonical block advances the capture's confirmation clock, including the ones after
+    // its budget is met — those cost it nothing and are the whole of what separates a corpus whose
+    // tail is reorg-exposed from one that is not. This is also where the dataset closes itself.
+    if let Some(dataset) = dataset.as_deref_mut() {
+        dataset.observe_head(block_number);
+    }
+
+    // Serialized here rather than after the build, because the stream recorder consumes `tapped`
+    // and the dataset needs the same bytes. Serialized at all only when a dataset is being
+    // captured: an ordinary run never pays for this.
+    let dataset_payload = dataset.as_ref().filter(|d| d.wants_block()).and_then(|_| {
+        tapped.as_ref().map(|tapped| {
+            let json = tapped.payload.as_ref().and_then(|payload| {
+                serde_json::to_vec(payload)
+                    .inspect_err(|err| {
+                        warn!(
+                            target: "partial_stateless",
+                            block = block_number,
+                            error = %err,
+                            "Engine payload could not be serialized for the policy replay dataset"
+                        );
+                    })
+                    .ok()
+            });
+            // Provenance describes what the record carries, never what the producer held: a
+            // payload that failed to serialize is an absent one, and the dataset refuses it.
+            let provenance = match (json.is_some(), tapped.provenance) {
+                (true, payload_tap::PayloadProvenance::Witnessed) => {
+                    partial_stateless::RecordedPayloadProvenance::Witnessed
+                }
+                (true, payload_tap::PayloadProvenance::Reconstructed) => {
+                    partial_stateless::RecordedPayloadProvenance::Reconstructed
+                }
+                _ => partial_stateless::RecordedPayloadProvenance::Absent,
+            };
+            (json, provenance)
+        })
+    });
+
     let records_commits =
         recorder.as_ref().is_some_and(|recorder| recorder.wants_commit_material());
     let report = create_sidecar_for_block(
@@ -1687,6 +1834,9 @@ where
             // only the path it wrote it to.
             gate.wants_sidecar() || records_commits,
             retained_generation,
+            // Asked for per block rather than once, so a capture stops paying for full witnesses
+            // the moment its block budget is met rather than at the end of the run.
+            dataset.as_ref().is_some_and(|recorder| recorder.wants_block()),
         ),
         parent_state_root_by_hash,
         ancestor_headers_for_range,
@@ -1698,6 +1848,7 @@ where
         sidecar_path: _sidecar_path,
         sidecar,
         displaced_trie_cache,
+        policy_dataset_material,
     } = report;
     finish_committed_transition(
         pair,
@@ -1706,6 +1857,26 @@ where
         block.clone_sealed_header(),
         options.retain_generation,
     );
+
+    // Before the stream frame, so a capture that cannot record a block fails the run on that block
+    // rather than after a commit has already claimed it. Fail-closed twice over: the dataset gets a
+    // `Failed` terminator so a later reader refuses it outright, *and* the run stops — an
+    // incomplete corpus is worse than no corpus, because it looks like a complete one, and a
+    // capture run that kept going after its dataset died would waste the operator's night proving
+    // nothing.
+    if let Some(material) = policy_dataset_material {
+        let recorder = dataset
+            .ok_or_else(|| eyre::eyre!("the builder captured dataset material with no recorder"))?;
+        match record_dataset_block(ctx, recorder, material, dataset_payload, block) {
+            Ok(()) => {}
+            Err(err) => {
+                recorder.fail(format!("block {block_number} could not be recorded: {err:#}"));
+                return Err(err.wrap_err(format!(
+                    "policy replay dataset capture failed at block {block_number}"
+                )))
+            }
+        }
+    }
 
     // After the transition, so the fingerprints describe the generation this block produced rather
     // than the one it displaced, and before the bootstrap gate, which touches only its own shadow.

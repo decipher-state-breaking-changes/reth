@@ -250,7 +250,11 @@ const fn sample_selects(interval: u64, block_number: u64) -> bool {
 }
 
 /// `PS_SHADOW_SAMPLE`: one block in this many is re-executed for comparison. 0 disables sampling.
-fn shadow_sample_interval() -> u64 {
+///
+/// Visible outside this module because the policy-dataset capture has to *refuse* a nonzero
+/// interval: a sampled block records its own re-executed access set rather than the Engine's, and
+/// a corpus that claims otherwise about 2% of its records is a corpus nobody can check.
+pub fn shadow_sample_interval() -> u64 {
     static INTERVAL: OnceLock<u64> = OnceLock::new();
     *INTERVAL.get_or_init(|| {
         let Some(raw) = std::env::var_os(SHADOW_SAMPLE_VAR) else {

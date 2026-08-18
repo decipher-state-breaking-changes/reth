@@ -175,6 +175,9 @@ variables, so the core sidecar generation path stays lean:
 | `PS_SIDECAR_DIR=<dir>` | write sidecars in `<dir>` (default: `./sidecar`) |
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
+| `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |
+| `PS_POLICY_DATASET_MAX_BLOCKS=<n>` | **usable** blocks the capture records — reorg-abandoned ones stop counting and are replaced. Required whenever `PS_POLICY_DATASET_CAPTURE_DIR` is set; there is no default |
+| `PS_POLICY_DATASET_CONFIRMATIONS=<n>` | canonical blocks the chain must advance past the recorded range before `END.json` is written (default: `96`, roughly three epochs). `0` disables the wait and leaves the tail reorg-exposed; the terminator records which was chosen |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
 | `PS_PARALLEL_INITIAL_PROOF=1` | use Reth's proof workers for eligible initial V2 multiproofs; low-width target sets and later structural deltas stay serial |
 | `PS_RESOURCE_METRICS=1` | capture process CPU time + page faults around transition-witness construction, including parallel proof workers (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) |
@@ -431,6 +434,92 @@ Re-injecting *raw blocks* would not be reproducible — re-execution needs the p
 historical state present in the node DB at that exact height. The accessed-state
 snapshot is the portable, self-contained artifact.
 
+### Capturing a policy replay dataset
+
+The fixture above answers what each block *accessed*, which is all a cache hit/miss
+sweep needs. Comparing what cache policies actually *cost* needs more: the real
+sidecar each policy would have produced for each block, which needs the parent-state
+proofs, which ordinarily needs the node database.
+
+`PS_POLICY_DATASET_CAPTURE_DIR` records the one artifact that removes that
+dependency — a **policy-neutral full transition witness** per block, proved against a
+cold cache and an empty trie, so it names no window, no anchor, and no miss set. Every
+policy's own witness is a subset of it, because every target a warm cache lets a policy
+skip is a target the cold build already proved. With it plus the block's Engine payload
+and access set, [`ps-policy-frontier`](../partial-stateless-frontier) generates and
+validates every policy's real sidecar with no database at all.
+
+```bash
+PS_ENGINE_ACCESS=on PS_ENGINE_PAYLOAD=on PS_SHADOW_SAMPLE=0 \
+PS_POLICY_DATASET_CAPTURE_DIR=/abs/path/policy-dataset \
+PS_POLICY_DATASET_MAX_BLOCKS=1200 \
+    cargo run --release -p partial-stateless-exex -- node --chain mainnet --datadir /path/to/data
+```
+
+**A capturing run is not a measurement run, and the contract says so in three places.**
+The manifest carries `measurement_eligible: false` and `capture_overhead_excluded: true`;
+startup refuses the capture alongside `PS_VALIDATION_BENCH`, `PS_BENCH_OUTPUT`,
+`PS_BUILDER_BENCH_OUTPUT`, `PS_CAPTURE_DIR`, `PS_WITNESS_BASELINE`, or
+`PS_RESOURCE_METRICS`; and the measurement launchers refuse to start while the variable
+is set rather than quietly clearing somebody's running capture. The capture builds a
+second, larger witness per block and writes it to disk, so anything measured beside it
+would be measuring the capture.
+
+The two Engine handoffs are required rather than optional, and so is `PS_SHADOW_SAMPLE=0`.
+The recorded access set has to be the one production runs on (`PS_ENGINE_ACCESS=on`), and
+the recorded payload has to be the one a consensus client actually sent
+(`PS_ENGINE_PAYLOAD=on`) — a payload derived from a block this node already accepted hands
+a later validator the answers its own admission checks exist to question. Sampling is
+refused for the same reason on the other input: it re-executes one block in
+`PS_SHADOW_SAMPLE` and records *that* block's own access set, so a corpus captured with it
+on would claim every record came from the Engine while a fraction did not. Any record whose
+provenance is not the Engine's — a sampled block, a handoff miss on a WAL replay, an
+artifact that would not downcast — fails the capture rather than being written.
+
+Nothing is lost by turning sampling off here. The capture re-executes every block
+database-free against its own witness and compares access sets before writing it, and the
+offline generator does the same again on another host. Both are stronger oracles than the
+sampled comparison they replace.
+
+Every captured block is proved before it is written: the full witness must re-execute
+the block with no database, reconstruct the header's state root, and agree with this
+node's own execution on gas, receipts root, and requests hash, and the access set the
+re-execution observes must equal the recorded one. A block that fails any of those fails
+the run, because an incomplete corpus is worse than no corpus — it looks like a complete
+one. `END.json` is written last, and a dataset without it is refused as incomplete.
+
+**Reaching the block budget is not finishing.** Writing `END.json` at the last file would
+vouch for a tip that is still reorg-exposed, so the capture then stops building witnesses
+and simply watches the chain advance `PS_POLICY_DATASET_CONFIRMATIONS` blocks past the range
+it recorded. A reorg during that wait puts it back to work: the abandoned records stay on
+disk but stop spending the budget, and the capture records replacements. The terminator
+names a `usable_range` — the part the producer actually stands behind — and the loader drops
+everything outside it, so a run that stopped early yields a shorter corpus rather than an
+overstated one.
+
+Both records at a contested height stay on disk, and the canonical set is **derived** from
+the records rather than inferred from the log: the terminator names the hash at the top of
+the usable range, and a reader walks `parent_hash` down from it. That is what makes a chain
+which leaves a branch and later returns to it readable — an accumulated list of abandoned
+hashes can only ever grow, so it would mark both branches abandoned and leave the contested
+height empty.
+
+`lifecycle.jsonl` records reorgs and resets so the exclusions can be *audited*, which is a
+separate job from deciding them. A lifecycle event that cannot be written fails the whole
+dataset rather than warning: a reorg that happened but was never logged leaves a corpus
+indistinguishable, on disk, from one where nothing happened. The loader likewise refuses a
+dataset with no log at all — every capture writes one before its first block, so its absence
+means it was lost.
+
+The capture root must be an empty or nonexistent directory. A directory with no records but
+a leftover `END.json` is the dangerous case — a capture started there and killed would read
+as complete, terminated by the previous run's verdict over this run's blocks — so it is
+refused up front. On the reading side, the loader cross-checks the terminator's own record
+count and block range against the files present, refuses a manifest from another schema
+version, and checks the confirmation claim rather than taking it: a terminator that vouches
+for a tip must record a canonical head at least `confirmations` above it, or the depth it
+names is just a number in a file.
+
 ## Outputs
 
 | Path | Contents |
@@ -439,3 +528,7 @@ snapshot is the portable, self-contained artifact.
 | `./sidecar/block_<N>_<hash>.bin` | witness sidecar (or `$PS_SIDECAR_DIR/block_<N>_<hash>.bin`) |
 | `./sidecar/block_<N>_<hash>.manifest.json` | per-block benchmark manifest |
 | `$PS_CAPTURE_DIR/accessed_<N>.bin` | captured fixture (when capture is enabled) |
+| `$PS_POLICY_DATASET_CAPTURE_DIR/manifest.json` | policy replay dataset identity, capture configuration, and the measurement disclaimer |
+| `$PS_POLICY_DATASET_CAPTURE_DIR/blocks/block_<N>_<hash>.bin` | one captured block: payload, access set, policy-neutral full witness, roots, and a record digest |
+| `$PS_POLICY_DATASET_CAPTURE_DIR/lifecycle.jsonl` | reorgs and resets seen under the capture; required, and a failed write fails the dataset |
+| `$PS_POLICY_DATASET_CAPTURE_DIR/END.json` | written last; names the usable range, its tip hash, the confirmation depth, and the head that backs it. Its absence means the capture did not finish |

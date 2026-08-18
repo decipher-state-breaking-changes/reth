@@ -56,8 +56,8 @@ check "PS_SHADOW_OUTPUT=$arm/access-shadow.jsonl"
 # The per-arm argument, which is the whole point of the fsync ABBA.
 check "PS_STREAM_FSYNC=1"
 
-echo "==> and the two that must be absent are absent"
-for absent in PS_CAPTURE_DIR PS_VALIDATION_BENCH; do
+echo "==> and the ones that must be absent are absent"
+for absent in PS_CAPTURE_DIR PS_VALIDATION_BENCH PS_POLICY_DATASET_CAPTURE_DIR; do
     if grep -q "^$absent=" "$arm/producer.out"; then
         echo "  FAIL: $absent reached the producer" >&2
         failed=1

@@ -23,6 +23,12 @@ serde_json = { workspace = true }
 bincode = { workspace = true }
 
 # utilities
+#
+# `eyre` is here for `transition_build`, which is the one module in this crate whose errors are
+# handed straight to a human running a build: every variant is a distinct construction-site
+# failure with no caller that discriminates on it, so a typed enum would be a name per string and
+# nothing else. Every consumer of this crate already links `eyre`.
+eyre.workspace = true
 thiserror.workspace = true
 tracing = { workspace = true }
 
