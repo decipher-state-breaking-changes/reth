@@ -356,6 +356,17 @@ pub enum LifecycleEvent {
         /// Blocks leaving the canonical chain, lowest first, as `(number, hash)`.
         abandoned: Vec<(u64, B256)>,
     },
+    /// A block before the corpus started could not be recorded, so the corpus starts after it.
+    ///
+    /// Only ever emitted while nothing is recorded. It cannot describe a hole, because there is
+    /// nothing yet for a hole to be in — but a reader deciding whether a corpus covers the range
+    /// it was asked for wants to see which blocks the capture let go past, and why.
+    Skipped {
+        /// The block that went unrecorded.
+        block_number: u64,
+        /// Free text for the run log. Never parsed.
+        reason: String,
+    },
     /// The producer lost continuity and the records either side cannot be joined.
     Reset {
         /// Where it happened.

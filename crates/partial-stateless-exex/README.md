@@ -470,6 +470,8 @@ PS_ENGINE_ACCESS=on \
 PS_ENGINE_PAYLOAD=on \
 PS_SHADOW_SAMPLE=0 \
 PS_SIDECAR_ROLE=builder \
+PS_HANDOFF_CAPACITY=32 \
+PS_PAYLOAD_HANDOFF_CAPACITY=32 \
 PS_POLICY_DATASET_CAPTURE_DIR=/abs/path/policy-dataset \
 PS_POLICY_DATASET_MAX_BLOCKS=1200 \
 PS_POLICY_DATASET_CONFIRMATIONS=96 \
@@ -479,6 +481,20 @@ PS_POLICY_DATASET_CONFIRMATIONS=96 \
     --authrpc.jwtsecret /path/to/jwt.hex \
     --db.read-transaction-timeout 0
 ```
+
+Both handoffs are widened from their default of 4, because a capture arrives late. The node
+spends most of a minute reaching the point where the ExEx takes its first notification, and
+the Engine taps keep handing off through their ring buffers meanwhile — so at the default the
+first block the capture sees has often already been evicted, and it has neither the payload
+nor the access set the corpus requires. 32 slots is roughly six minutes of chain at mainnet
+block times. A capture also does not fail over such a block *before its first record*: nothing
+is behind it, so the corpus simply starts later and the skip is filed in `lifecycle.jsonl`.
+After the first record the same refusal is fatal, because it would leave a hole in the middle
+of a corpus that would otherwise look complete.
+
+Run the node from somewhere other than the source tree. Some diagnostic output resolves
+against the working directory, so a capture launched from the repo leaves files in it, which
+then read as uncommitted changes the next time a build wants a clean tree.
 
 Build and hash both `reth-partial-stateless` and `ps-policy-frontier` in the same stamped
 shell before capture, then check the binaries rather than the build log: a `cargo build` run

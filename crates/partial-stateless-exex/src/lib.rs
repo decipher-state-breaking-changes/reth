@@ -1864,11 +1864,19 @@ where
     // incomplete corpus is worse than no corpus, because it looks like a complete one, and a
     // capture run that kept going after its dataset died would waste the operator's night proving
     // nothing.
+    //
+    // Both of those are statements about a corpus that has records in it. Before the first one the
+    // capture is still arriving: the node spends most of a minute getting to where the ExEx takes
+    // its first notification, and the Engine taps hand off through ring buffers that keep moving
+    // meanwhile, so the block the ExEx lands on can be one whose payload was already evicted.
+    // Nothing is wrong with the corpus then — it has not started — and killing the node over it
+    // costs the operator the run for a reason that will have passed by the next block.
     if let Some(material) = policy_dataset_material {
         let recorder = dataset
             .ok_or_else(|| eyre::eyre!("the builder captured dataset material with no recorder"))?;
         match record_dataset_block(ctx, recorder, material, dataset_payload, block) {
             Ok(()) => {}
+            Err(err) if recorder.skip_before_first_record(block_number, &format!("{err:#}")) => {}
             Err(err) => {
                 recorder.fail(format!("block {block_number} could not be recorded: {err:#}"));
                 return Err(err.wrap_err(format!(

@@ -50,6 +50,17 @@ const CONFIRMATIONS_VAR: &str = "PS_POLICY_DATASET_CONFIRMATIONS";
 /// Set to capture from a build that cannot name the commit it was built from.
 const ALLOW_UNSTAMPED_VAR: &str = "PS_POLICY_DATASET_ALLOW_UNSTAMPED";
 
+/// Blocks a capture may fail to record before its first record, before it gives up.
+///
+/// A capture starts behind: the node spends most of a minute reaching the point where the ExEx
+/// takes its first notification, and the Engine taps hand off through small ring buffers meanwhile.
+/// The block the ExEx lands on can therefore be one whose payload and access artifact were already
+/// evicted, and there is nothing wrong with the corpus in that case — it has not started. Waiting
+/// is right, and waiting forever is not: a run whose configuration means *no* block will ever
+/// qualify would otherwise build a full witness per block for a corpus that never begins. This
+/// bound is generous against the first reading and short against the second.
+const MAX_SKIPS_BEFORE_FIRST_RECORD: u64 = 64;
+
 /// Default confirmation depth: three epochs of slots.
 ///
 /// Mainnet finalizes two epochs back, so two epochs of *blocks* is the floor and this is a margin
@@ -262,6 +273,9 @@ pub struct PolicyDatasetRecorder {
     head: u64,
     /// Set once the terminator is written, so it is written exactly once.
     complete: bool,
+    /// Blocks refused before the first record landed, bounded by
+    /// [`MAX_SKIPS_BEFORE_FIRST_RECORD`].
+    skipped_before_first: u64,
 }
 
 impl PolicyDatasetRecorder {
@@ -295,6 +309,7 @@ impl PolicyDatasetRecorder {
             usable: Vec::new(),
             head: 0,
             complete: false,
+            skipped_before_first: 0,
         }))
     }
 
@@ -359,6 +374,36 @@ impl PolicyDatasetRecorder {
     }
 
     /// Records one block, and closes the dataset when the budget is met.
+    /// Decides what a block that could not be recorded means for the run.
+    ///
+    /// Returns `true` when the run should carry on. That is the case only while the corpus is
+    /// empty: a block refused then leaves nothing behind it, so the corpus starts later and is
+    /// whole. Once a record exists the same refusal would put a hole in the middle of it, and a
+    /// corpus with a hole is worse than none — it looks complete.
+    ///
+    /// The skips are counted and bounded, because "not yet" and "never" look identical from here
+    /// for as long as one is willing to wait.
+    pub fn skip_before_first_record(&mut self, block_number: u64, reason: &str) -> bool {
+        if !self.written.is_empty() || self.complete {
+            return false
+        }
+        self.skipped_before_first += 1;
+        if self.skipped_before_first > MAX_SKIPS_BEFORE_FIRST_RECORD {
+            return false
+        }
+        warn!(
+            target: "partial_stateless",
+            block = block_number,
+            skipped = self.skipped_before_first,
+            limit = MAX_SKIPS_BEFORE_FIRST_RECORD,
+            reason,
+            "Policy replay dataset has not started yet; this block cannot be recorded and the \
+             corpus will begin at a later one"
+        );
+        self.note(LifecycleEvent::Skipped { block_number, reason: reason.to_string() });
+        true
+    }
+
     pub fn record(&mut self, body: PolicyDatasetRecordBody) -> eyre::Result<()> {
         if !self.wants_block() {
             return Ok(());
@@ -886,6 +931,58 @@ mod tests {
             50,
         )
         .is_err());
+    }
+
+    /// The capture arrives after the node does, and the Engine taps keep moving while it does.
+    /// Losing the run over the first block it lands on would cost hours for a condition that has
+    /// passed by the next block.
+    #[test]
+    fn a_block_refused_before_the_corpus_starts_lets_the_run_continue() {
+        let dir = temp_dir("skip-before-start");
+        let mut recorder = recorder_at(&dir, 4, 0);
+
+        assert!(recorder.skip_before_first_record(10, "no Engine payload"));
+        assert!(recorder.skip_before_first_record(11, "no Engine payload"));
+
+        // And the corpus that follows is whole, starting where the capture actually began.
+        for number in 12..=15u64 {
+            record(&mut recorder, number, number as u8);
+        }
+        assert_eq!(recorder.settled_range().map(|(low, high, _)| (low, high)), Some((12, 15)));
+
+        let log = std::fs::read_to_string(dir.join("lifecycle.jsonl")).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| line.contains("\"skipped\"")).count(),
+            2,
+            "the skipped blocks were not filed for the reader to see: {log}"
+        );
+    }
+
+    /// The same refusal after a record exists would put a hole in the middle of the corpus, and a
+    /// corpus with a hole is worse than none: it looks complete.
+    #[test]
+    fn a_block_refused_after_the_corpus_starts_is_fatal() {
+        let dir = temp_dir("skip-after-start");
+        let mut recorder = recorder_at(&dir, 4, 0);
+        record(&mut recorder, 10, 0x0a);
+        assert!(!recorder.skip_before_first_record(11, "no Engine payload"));
+    }
+
+    /// "Not yet" and "never" look identical from inside the wait, so the wait is bounded.
+    #[test]
+    fn waiting_for_a_corpus_to_start_gives_up_eventually() {
+        let dir = temp_dir("skip-budget");
+        let mut recorder = recorder_at(&dir, 4, 0);
+        for block in 0..MAX_SKIPS_BEFORE_FIRST_RECORD {
+            assert!(
+                recorder.skip_before_first_record(block, "no Engine payload"),
+                "gave up at {block}"
+            );
+        }
+        assert!(
+            !recorder.skip_before_first_record(MAX_SKIPS_BEFORE_FIRST_RECORD, "no Engine payload"),
+            "the wait was unbounded"
+        );
     }
 
     /// A corpus that cannot name the code that produced it is not evidence, and the moment to
