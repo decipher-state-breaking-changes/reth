@@ -102,6 +102,24 @@ carried far enough past to call settled. A run that stopped early therefore yiel
 corpus rather than one whose tail the producer never vouched for, and `--samples` fails
 loudly when the confirmed range is too short instead of quietly reaching into it.
 
+`END.json` is therefore necessary but not sufficient. Treat the first short invocation of
+this binary as the dataset acceptance gate: the loader scans and verifies every record before
+sampling, then the generator must complete database-free execution, access-set comparison,
+sidecar construction, and validation for every requested arm.
+
+**Schema-1 datasets are refused, and the reason is a defect in schema 1 rather than in the
+data.** Version 1 took a record's digest over its `bincode` serialization, and a record holds
+the access set in `HashMap`s whose iteration order is seeded per process and rebuilt on
+deserialization. The digest was therefore not a function of the record: it came out one way
+when a record was written and another when it was read back, so every schema-1 capture fails
+its own integrity check. The first 1,200-block capture died exactly this way — a structurally
+valid, 96-confirmation terminator, and a load that stopped at the first populated record.
+
+Version 2 hashes an explicit, sorted, length-prefixed encoding instead, so the digest depends
+on what a record contains and nothing else. The loader rejects a schema-1 manifest outright
+rather than part-way through, because there is nothing in such a dataset it could check
+records against.
+
 ## What the output supports, and what it does not
 
 `frontier.jsonl` is one line per block; `frontier-summary.json` totals the measured

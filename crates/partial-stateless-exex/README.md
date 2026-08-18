@@ -151,7 +151,8 @@ restart.
 cargo run -p partial-stateless-exex -- node --chain mainnet --datadir /path/to/data
 ```
 
-The flat cache is persisted to `<datadir>/partial_stateless_cache.bin`, but the
+The flat cache is persisted to
+`<datadir>/partial_stateless_cache-a<A>-s<S>.bin` for the selected windows, but the
 matching sparse-trie snapshot is not yet persisted, so a non-empty persisted
 value cache is still cold-reset on restart. A full node can buy its way out of
 that with `PS_CANONICAL_REBUILD=1`, which puts the pair back at `Ready` before
@@ -161,10 +162,12 @@ restart real, and free.
 
 ### Configuration
 
-The cache windows are set in `CacheConfig` ([lib.rs](./src/lib.rs)) — default
-`account_window = 60`, `storage_window = 30` blocks. Adjust there and rebuild.
-(Use [`cache_window_bench`](../partial-stateless/src/bin/README.md) to pick good
-values offline before committing to them.)
+The cache windows default to `account_window = 60`, `storage_window = 30` blocks and are
+selected at startup with `PS_ACCOUNT_WINDOW` and `PS_STORAGE_WINDOW`. Both must be positive
+base-10 integers; invalid values fail startup. Changing a window does not require rebuilding,
+but it does select a different cache-policy ID and persisted-cache filename. Use
+[`cache_window_bench`](../partial-stateless/src/bin/README.md) to screen candidate values
+offline before committing to them.
 
 Optional diagnostic/benchmark features are off by default and enabled per run via environment
 variables, so the core sidecar generation path stays lean:
@@ -173,8 +176,9 @@ variables, so the core sidecar generation path stays lean:
 | --- | --- |
 | `PS_SIDECAR_ROLE=builder\|builder-verifier\|verifier` | choose whether this ExEx writes sidecars, writes and preflights them, or consumes existing sidecars as a live verifier (default: `builder`) |
 | `PS_SIDECAR_DIR=<dir>` | write sidecars in `<dir>` (default: `./sidecar`) |
+| `PS_ACCOUNT_WINDOW=<n>` / `PS_STORAGE_WINDOW=<n>` | inclusive Last-N account and storage/code cache windows (defaults: `60` / `30`). Both are runtime protocol parameters: they select the policy ID and persisted-cache filename; non-positive, signed, whitespace-padded, or non-decimal values fail startup |
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
-| `PS_CAPTURE_DIR=<dir>` | dump each block's `BlockAccessedState` fixture to `<dir>` (see below) |
+| `PS_CAPTURE_DIR=<dir>` | dump each block's accessed-state snapshot to `<dir>` (see below) |
 | `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |
 | `PS_POLICY_DATASET_MAX_BLOCKS=<n>` | **usable** blocks the capture records — reorg-abandoned ones stop counting and are replaced. Required whenever `PS_POLICY_DATASET_CAPTURE_DIR` is set; there is no default |
 | `PS_POLICY_DATASET_CONFIRMATIONS=<n>` | canonical blocks the chain must advance past the recorded range before `END.json` is written (default: `96`, roughly three epochs). `0` disables the wait and leaves the tail reorg-exposed; the terminator records which was chosen |
@@ -418,9 +422,9 @@ Use `PS_SIDECAR_ROLE=builder-verifier` for a bounded correctness run.
 Do not interpret prefix coverage as a literal MPT node count: Patricia extensions
 compress nibble levels.
 
-### Capturing a benchmark dataset
+### Capturing accessed-state data
 
-Set `PS_CAPTURE_DIR` to dump each block's `BlockAccessedState` as a fixture. This
+Set `PS_CAPTURE_DIR` to dump each block's `BlockAccessedState` as an accessed-state file. This
 reuses the exact execution path the live system uses, so the dataset is faithful —
 and once captured, the offline `cache_window_bench` needs no node at all.
 
@@ -436,7 +440,7 @@ snapshot is the portable, self-contained artifact.
 
 ### Capturing a policy replay dataset
 
-The fixture above answers what each block *accessed*, which is all a cache hit/miss
+The accessed-state data above answers what each block *accessed*, which is all a cache hit/miss
 sweep needs. Comparing what cache policies actually *cost* needs more: the real
 sidecar each policy would have produced for each block, which needs the parent-state
 proofs, which ordinarily needs the node database.
@@ -450,11 +454,28 @@ and access set, [`ps-policy-frontier`](../partial-stateless-frontier) generates 
 validates every policy's real sidecar with no database at all.
 
 ```bash
-PS_ENGINE_ACCESS=on PS_ENGINE_PAYLOAD=on PS_SHADOW_SAMPLE=0 \
+cd /path/to/reth
+PS_TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+
+PS_ENGINE_ACCESS=on \
+PS_ENGINE_PAYLOAD=on \
+PS_SHADOW_SAMPLE=0 \
+PS_SIDECAR_ROLE=builder \
 PS_POLICY_DATASET_CAPTURE_DIR=/abs/path/policy-dataset \
 PS_POLICY_DATASET_MAX_BLOCKS=1200 \
-    cargo run --release -p partial-stateless-exex -- node --chain mainnet --datadir /path/to/data
+PS_POLICY_DATASET_CONFIRMATIONS=96 \
+    "$PS_TARGET_DIR/release/reth-partial-stateless" node \
+    --chain mainnet \
+    --datadir /path/to/data \
+    --authrpc.jwtsecret /path/to/jwt.hex \
+    --db.read-transaction-timeout 0
 ```
+
+Build and hash both `reth-partial-stateless` and `ps-policy-frontier` in the same stamped
+shell before capture. Do not assume they are under `./target`: Cargo may select a shared
+target directory through configuration or `CARGO_TARGET_DIR`. For an SSH-safe background
+run, put the command and the `END.json` watcher in one `nohup` supervisor; the shell which
+launched only the node is not a supervisor after the SSH session disappears.
 
 **A capturing run is not a measurement run, and the contract says so in three places.**
 The manifest carries `measurement_eligible: false` and `capture_overhead_excluded: true`;
@@ -520,14 +541,49 @@ version, and checks the confirmation claim rather than taking it: a terminator t
 for a tip must record a canonical head at least `confirmations` above it, or the depth it
 names is just a number in a file.
 
+`END.json` closes the **producer** side of this contract; it is not by itself a dataset
+acceptance result. Before preserving a capture as an experiment input, run the offline loader
+and a small end-to-end replay. The loader verifies every record digest before applying
+`--warmup` or `--samples`, so even a five-sample smoke checks the whole input first:
+
+```bash
+"$PS_TARGET_DIR/release/ps-policy-frontier" \
+    --dataset /abs/path/policy-dataset \
+    --arm weak --arm 60/30 --arm 90/60 --arm 120/45 \
+    --warmup 120 --samples 5 \
+    --out /abs/path/frontier-smoke
+```
+
+The acceptance gate is: a structurally valid terminator, successful loader verification,
+successful database-free replay, and all requested arms completing. Never promote a capture
+to a measurement corpus from the existence of `END.json` alone.
+
+That gate exists because the first 1,200-block capture passed every producer-side check and
+was still unusable. Its records carried a digest taken over their `bincode` serialization, and
+a record holds the access set in `HashMap`s whose iteration order is seeded per process and
+rebuilt on deserialization — so a record hashed one way when written and another when read
+back, and the whole capture failed its own integrity check on load. Records now carry a digest
+over an explicit, sorted, length-prefixed encoding, which is what the schema version at the
+head of every record and manifest tracks; a capture from the superseded schema is refused at
+its manifest.
+
+**Known schema-1 capture status (2026-08-18).** The first 1,200-block live capture closed
+cleanly and waited for 96 confirmations, but this acceptance smoke refused block 25,781,091.
+Schema 1 digests `bincode` bytes containing three unordered `HashMap`s in
+`BlockAccessedState`; after deserialization their iteration order is not stable, so
+re-serializing the same semantic record can produce a different digest. Hashing the exact body
+bytes stored in the rejected file reproduces its recorded digest, which distinguishes this
+from observed disk corruption. Keep that dataset quarantined until a canonical digest schema
+and migration or a fresh capture pass the gate above; it is not paper evidence yet.
+
 ## Outputs
 
 | Path | Contents |
 | --- | --- |
-| `<datadir>/partial_stateless_cache.bin` | persisted flat cache; cold-reset on restart until trie snapshots are persisted |
+| `<datadir>/partial_stateless_cache-a<A>-s<S>.bin` | persisted flat cache for account/storage windows `<A>/<S>`; another policy uses another filename |
 | `./sidecar/block_<N>_<hash>.bin` | witness sidecar (or `$PS_SIDECAR_DIR/block_<N>_<hash>.bin`) |
 | `./sidecar/block_<N>_<hash>.manifest.json` | per-block benchmark manifest |
-| `$PS_CAPTURE_DIR/accessed_<N>.bin` | captured fixture (when capture is enabled) |
+| `$PS_CAPTURE_DIR/accessed_<N>.bin` | captured accessed-state data (when capture is enabled) |
 | `$PS_POLICY_DATASET_CAPTURE_DIR/manifest.json` | policy replay dataset identity, capture configuration, and the measurement disclaimer |
 | `$PS_POLICY_DATASET_CAPTURE_DIR/blocks/block_<N>_<hash>.bin` | one captured block: payload, access set, policy-neutral full witness, roots, and a record digest |
 | `$PS_POLICY_DATASET_CAPTURE_DIR/lifecycle.jsonl` | reorgs and resets seen under the capture; required, and a failed write fails the dataset |

@@ -48,7 +48,14 @@ use std::{
 /// An exact match rather than a floor, for the reason the event stream's frame version is: a newer
 /// producer's record read by an older generator would be parsed for the fields it knows and
 /// silently missing whatever changed.
-pub const POLICY_DATASET_SCHEMA_VERSION: u32 = 1;
+///
+/// **Version 2 exists because version 1's digest was not a function of the record.** It hashed
+/// `bincode::serialize(body)`, and a body holds the access set in `HashMap`s — whose iteration
+/// order is seeded per process and rebuilt on deserialization. A record therefore hashed to one
+/// value when written and another when read back, so every schema-1 dataset fails its own
+/// integrity check on load and none can be accepted as a measurement input. Version 2 hashes an
+/// explicit, sorted, length-prefixed encoding instead: see [`PolicyDatasetRecordBody::digest`].
+pub const POLICY_DATASET_SCHEMA_VERSION: u32 = 2;
 
 /// Subdirectory holding one file per captured block.
 pub const BLOCKS_DIR: &str = "blocks";
@@ -64,25 +71,31 @@ pub const END_FILE: &str = "END.json";
 /// Mirrors the validator's own provenance rather than importing it: this crate sits below the
 /// validator, and a dataset that could only be described in the validator's vocabulary could not
 /// be written by the cache library that owns the witness.
+/// Discriminants are pinned because the record digest hashes them. Reordering the variants would
+/// silently change every digest this build computes, which is the kind of change that shows up as
+/// a corrupt dataset rather than as a version bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum RecordedPayloadProvenance {
     /// The payload a consensus client sent, taken from the Engine that validated it.
-    Witnessed,
+    Witnessed = 0,
     /// Derived from a block the producer had already accepted.
-    Reconstructed,
+    Reconstructed = 1,
     /// No payload was obtained and none was derived.
-    Absent,
+    Absent = 2,
 }
 
 /// How the producer obtained the access set it recorded.
+/// Pinned for the same reason as [`RecordedPayloadProvenance`]: the digest hashes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
 pub enum RecordedAccessProvenance {
     /// The artifact the node's own Engine published when it validated the block.
-    EngineArtifact,
+    EngineArtifact = 0,
     /// The producer re-executed the block against its parent state.
-    Reexecution,
+    Reexecution = 1,
 }
 
 /// One captured block, minus the digest that seals it.
@@ -129,14 +142,110 @@ pub struct PolicyDatasetRecordBody {
 }
 
 impl PolicyDatasetRecordBody {
-    /// Bytes the digest is taken over.
-    fn to_digest_input(&self) -> Result<Vec<u8>, DatasetError> {
-        bincode::serialize(self).map_err(|err| DatasetError::Encode(err.to_string()))
+    /// The digest that seals this record.
+    ///
+    /// Hashes an explicit encoding rather than the record's serialized form, and every map is
+    /// emitted in sorted key order. Both properties are load-bearing and neither is decoration:
+    ///
+    /// - **Explicit** rather than `bincode::serialize(self)`, because that ties the digest to field
+    ///   declaration order and to a serializer's behaviour, neither of which is part of what a
+    ///   record *is*.
+    /// - **Sorted**, because the access set lives in `HashMap`s. Their iteration order is seeded
+    ///   per process and rebuilt on deserialization, so a digest taken over it is not a function of
+    ///   the record at all: it changes between writing a record and reading it back, which is
+    ///   exactly how every schema-1 dataset came to fail its own integrity check.
+    ///
+    /// Infallible, unlike the encoder it replaces — there is nothing here that can fail to encode.
+    pub fn digest(&self) -> B256 {
+        keccak256(self.digest_preimage())
+    }
+
+    /// The exact bytes [`Self::digest`] hashes.
+    ///
+    /// Separate so a test can assert the ordering property directly rather than inferring it from
+    /// two hashes agreeing, which they can do by luck.
+    fn digest_preimage(&self) -> Vec<u8> {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        fn count(out: &mut Vec<u8>, label: &[u8], n: usize) {
+            out.extend_from_slice(label);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"PolicyDatasetRecord/v2");
+        preimage.extend_from_slice(&self.schema_version.to_be_bytes());
+        preimage.extend_from_slice(&self.block_number.to_be_bytes());
+        preimage.extend_from_slice(self.block_hash.as_slice());
+        preimage.extend_from_slice(self.parent_hash.as_slice());
+        preimage.extend_from_slice(self.parent_state_root.as_slice());
+        preimage.extend_from_slice(self.expected_state_root.as_slice());
+
+        preimage.extend_from_slice(b"payload");
+        match &self.payload_json {
+            None => preimage.push(0),
+            Some(json) => {
+                preimage.push(1);
+                bytes(&mut preimage, json);
+            }
+        }
+        preimage.extend_from_slice(b"payload_provenance");
+        preimage.push(self.payload_provenance as u8);
+        preimage.extend_from_slice(b"access_provenance");
+        preimage.push(self.access_provenance as u8);
+
+        let mut accounts = self.accessed.accounts.iter().collect::<Vec<_>>();
+        accounts.sort_unstable_by_key(|(address, _)| *address);
+        count(&mut preimage, b"accessed_accounts", accounts.len());
+        for (address, data) in accounts {
+            preimage.extend_from_slice(address.as_slice());
+            preimage.extend_from_slice(&data.nonce.to_be_bytes());
+            preimage.extend_from_slice(&data.balance.to_be_bytes::<32>());
+            match data.code_hash {
+                None => preimage.push(0),
+                Some(code_hash) => {
+                    preimage.push(1);
+                    preimage.extend_from_slice(code_hash.as_slice());
+                }
+            }
+        }
+
+        let mut storage = self.accessed.storage.iter().collect::<Vec<_>>();
+        storage.sort_unstable_by_key(|(key, _)| *key);
+        count(&mut preimage, b"accessed_storage", storage.len());
+        for ((address, slot), value) in storage {
+            preimage.extend_from_slice(address.as_slice());
+            preimage.extend_from_slice(slot.as_slice());
+            preimage.extend_from_slice(&value.to_be_bytes::<32>());
+        }
+
+        let mut codes = self.accessed.codes.iter().collect::<Vec<_>>();
+        codes.sort_unstable_by_key(|(code_hash, _)| *code_hash);
+        count(&mut preimage, b"accessed_codes", codes.len());
+        for (code_hash, code) in codes {
+            preimage.extend_from_slice(code_hash.as_slice());
+            bytes(&mut preimage, code);
+        }
+
+        count(&mut preimage, b"full_transition_nodes", self.full_transition_nodes.len());
+        for node in &self.full_transition_nodes {
+            bytes(&mut preimage, node);
+        }
+        count(&mut preimage, b"ancestor_headers", self.ancestor_headers.len());
+        for header in &self.ancestor_headers {
+            bytes(&mut preimage, header);
+        }
+        preimage.extend_from_slice(b"parent_header");
+        bytes(&mut preimage, &self.parent_header);
+
+        preimage
     }
 
     /// Seals this body into a record.
     pub fn seal(self) -> Result<PolicyDatasetRecord, DatasetError> {
-        let digest = keccak256(self.to_digest_input()?);
+        let digest = self.digest();
         Ok(PolicyDatasetRecord { body: self, digest })
     }
 }
@@ -158,7 +267,7 @@ impl PolicyDatasetRecord {
 
     /// Recomputes the digest and refuses the record if it does not match.
     pub fn verify_digest(&self) -> Result<(), DatasetError> {
-        let recomputed = keccak256(self.body.to_digest_input()?);
+        let recomputed = self.body.digest();
         if recomputed == self.digest {
             return Ok(())
         }
@@ -813,6 +922,8 @@ fn read_lifecycle(path: &Path) -> Result<Vec<LifecycleEvent>, DatasetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::AccountData;
+    use alloy_primitives::{Address, U256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -883,6 +994,132 @@ mod tests {
 
     fn numbered(tag: u8) -> B256 {
         B256::repeat_byte(tag)
+    }
+
+    /// A populated access set, built twice by different routes.
+    ///
+    /// The maps are `HashMap`s, so the two are equal as sets and need not iterate alike.
+    fn populated_access(reverse: bool, reserve: usize) -> BlockAccessedState {
+        let mut accessed = BlockAccessedState {
+            accounts: HashMap::with_capacity(reserve),
+            storage: HashMap::with_capacity(reserve),
+            codes: HashMap::with_capacity(reserve),
+        };
+        let mut tags = (1..=48u8).collect::<Vec<_>>();
+        if reverse {
+            tags.reverse();
+        }
+        for tag in tags {
+            let address = Address::repeat_byte(tag);
+            accessed.accounts.insert(
+                address,
+                AccountData {
+                    nonce: u64::from(tag),
+                    balance: U256::from(tag) * U256::from(1_000u64),
+                    code_hash: (tag % 3 == 0).then(|| B256::repeat_byte(tag)),
+                },
+            );
+            accessed.storage.insert((address, B256::repeat_byte(tag ^ 0x5a)), U256::from(tag));
+            accessed.codes.insert(B256::repeat_byte(tag), Bytes::from(vec![tag; tag as usize]));
+        }
+        accessed
+    }
+
+    fn populated_body(reverse: bool, reserve: usize) -> PolicyDatasetRecordBody {
+        let mut record = body(10, numbered(0x09), numbered(0x0a));
+        record.accessed = populated_access(reverse, reserve);
+        record
+    }
+
+    /// The defect that made every schema-1 dataset unusable, as a test.
+    ///
+    /// A record hashed one way when written and another when read back, because the digest was
+    /// taken over `bincode::serialize(body)` and the access set lives in `HashMap`s whose order is
+    /// rebuilt on deserialization. Nothing caught it, because the fixtures every other test uses
+    /// carry an empty access set and an empty map has only one order.
+    #[test]
+    fn a_digest_survives_the_round_trip_that_broke_schema_one() {
+        let record = populated_body(false, 0).seal().unwrap();
+        let encoded = bincode::serialize(&record).unwrap();
+        let decoded: PolicyDatasetRecord = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.digest, record.digest,
+            "the stored digest did not survive the round trip"
+        );
+        decoded
+            .verify_digest()
+            .expect("a record must hash to the same value after it is read back");
+    }
+
+    /// The property behind that fix, asserted on the bytes rather than inferred from two hashes
+    /// agreeing — which they can do by luck on any single run.
+    #[test]
+    fn the_digest_preimage_lists_every_map_in_key_order() {
+        let preimage = populated_body(true, 512).digest_preimage();
+        let section = |from: &[u8], to: &[u8]| {
+            let find = |needle: &[u8]| {
+                preimage.windows(needle.len()).position(|window| window == needle).unwrap_or_else(
+                    || panic!("no {} label in the preimage", String::from_utf8_lossy(needle)),
+                )
+            };
+            // Scoped to one section, because a 20-byte run can occur anywhere — the record's own
+            // parent hash is twenty repeated bytes too, and an unscoped search finds that first.
+            preimage[find(from)..find(to)].to_vec()
+        };
+
+        let accounts = section(b"accessed_accounts", b"accessed_storage");
+        let mut previous = 0;
+        for tag in 1..=48u8 {
+            let needle = Address::repeat_byte(tag);
+            let at = accounts
+                .windows(20)
+                .position(|window| window == needle.as_slice())
+                .unwrap_or_else(|| panic!("account {tag} is missing from the preimage"));
+            assert!(at > previous || tag == 1, "account {tag} is encoded out of order");
+            previous = at;
+        }
+
+        let codes = section(b"accessed_codes", b"full_transition_nodes");
+        let mut previous = 0;
+        for tag in 1..=48u8 {
+            let needle = B256::repeat_byte(tag);
+            let at = codes
+                .windows(32)
+                .position(|window| window == needle.as_slice())
+                .unwrap_or_else(|| panic!("code {tag} is missing from the preimage"));
+            assert!(at > previous || tag == 1, "code {tag} is encoded out of order");
+            previous = at;
+        }
+    }
+
+    /// Two access sets that are equal as sets hash alike however they were built.
+    #[test]
+    fn a_digest_is_a_function_of_the_record_and_not_of_its_maps() {
+        assert_eq!(populated_body(false, 0).digest(), populated_body(true, 512).digest());
+        // And still moves when the record actually differs.
+        let mut changed = populated_body(false, 0);
+        changed
+            .accessed
+            .storage
+            .insert((Address::repeat_byte(1), B256::repeat_byte(0xee)), U256::from(7u64));
+        assert_ne!(populated_body(false, 0).digest(), changed.digest());
+    }
+
+    /// A schema-1 dataset is refused rather than half-read: its digests cannot be reproduced, so
+    /// there is nothing to check its records against.
+    #[test]
+    fn a_record_from_the_superseded_schema_is_refused() {
+        let dir = temp_dir("old-schema");
+        let mut writer = started_writer(&dir);
+        let mut stale = body(10, numbered(0x09), numbered(0x0a));
+        stale.schema_version = 1;
+        writer.write_record(&stale.seal().unwrap()).unwrap();
+        finish_all(writer, Some((10, 10, numbered(0x0a))), "").unwrap();
+        assert!(matches!(
+            load_dataset(&dir),
+            Err(DatasetError::SchemaMismatch { found: 1, expected: 2, .. })
+        ));
     }
 
     #[test]
