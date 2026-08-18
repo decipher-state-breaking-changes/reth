@@ -47,6 +47,8 @@ const CAPTURE_DIR_VAR: &str = "PS_POLICY_DATASET_CAPTURE_DIR";
 const MAX_BLOCKS_VAR: &str = "PS_POLICY_DATASET_MAX_BLOCKS";
 /// Canonical blocks the chain must advance past the recorded range before it is vouched for.
 const CONFIRMATIONS_VAR: &str = "PS_POLICY_DATASET_CONFIRMATIONS";
+/// Set to capture from a build that cannot name the commit it was built from.
+const ALLOW_UNSTAMPED_VAR: &str = "PS_POLICY_DATASET_ALLOW_UNSTAMPED";
 
 /// Default confirmation depth: three epochs of slots.
 ///
@@ -204,6 +206,31 @@ impl PolicyDatasetCaptureConfig {
     }
 }
 
+/// Refuses a capture from a build that cannot say which commit it is.
+///
+/// `PS_BUILD_COMMIT` is read by `option_env!` at **compile** time, so a binary built without it
+/// carries no commit and no amount of exporting the variable afterwards puts one there. The
+/// failure is silent in the direction that matters: the capture runs perfectly, for hours, and
+/// writes a manifest whose `build_commit` is `null` — a corpus that cannot be tied to the code
+/// that produced it, discovered when someone reads the manifest rather than when the mistake is
+/// cheap to fix. Checking here costs one comparison at startup and turns that into an immediate
+/// error naming what to do.
+///
+/// [`ALLOW_UNSTAMPED_VAR`] exists for smoke tests, where a throwaway corpus from a working tree is
+/// the point. It hides nothing: the manifest still records `build_commit: null`, so a dataset
+/// captured through the escape hatch says so on its face.
+fn require_stamped_build(build_commit: Option<&str>, allow_unstamped: bool) -> eyre::Result<()> {
+    if build_commit.is_some_and(|commit| !commit.trim().is_empty()) || allow_unstamped {
+        return Ok(())
+    }
+    eyre::bail!(
+        "this build carries no PS_BUILD_COMMIT, so its dataset could not name the code that \
+         produced it. PS_BUILD_COMMIT is read at compile time: export it (with PS_BUILD_DIRTY and \
+         PS_CARGO_LOCK_SHA256) and rebuild before capturing, or set {ALLOW_UNSTAMPED_VAR}=1 to \
+         capture a corpus that records no commit"
+    )
+}
+
 /// The live writer, held for the length of a capturing run.
 ///
 /// It has three states, and the middle one is the reason it is a state machine at all.
@@ -246,6 +273,10 @@ impl PolicyDatasetRecorder {
         chain: String,
     ) -> eyre::Result<Option<Self>> {
         let Some(config) = config else { return Ok(None) };
+        require_stamped_build(
+            build_commit.as_deref(),
+            std::env::var_os(ALLOW_UNSTAMPED_VAR).is_some(),
+        )?;
         let manifest = PolicyDatasetManifest::new(producer, build_commit, chain, config.max_blocks);
         let writer = PolicyDatasetWriter::create(&config.dir, &manifest)?;
         info!(
@@ -655,11 +686,16 @@ mod tests {
         .is_err());
     }
 
+    /// A recorder over a fresh directory, standing in for a stamped build.
+    ///
+    /// The commit is not decoration here: a capture from a build that carries none is refused, so
+    /// a recorder built with `None` would exercise that refusal instead of whatever the test is
+    /// about.
     fn recorder_at(dir: &Path, max_blocks: u64, confirmations: u64) -> PolicyDatasetRecorder {
         PolicyDatasetRecorder::open(
             Some(PolicyDatasetCaptureConfig { dir: dir.to_path_buf(), max_blocks, confirmations }),
             "test".into(),
-            None,
+            Some("0000000000000000000000000000000000000000".into()),
             "mainnet".into(),
         )
         .expect("a fresh directory opens")
@@ -850,6 +886,16 @@ mod tests {
             50,
         )
         .is_err());
+    }
+
+    /// A corpus that cannot name the code that produced it is not evidence, and the moment to
+    /// say so is before the hours are spent rather than after.
+    #[test]
+    fn a_capture_from_an_unstamped_build_is_refused() {
+        assert!(require_stamped_build(None, false).is_err());
+        assert!(require_stamped_build(Some("  "), false).is_err(), "a blank stamp is no stamp");
+        require_stamped_build(Some("dc225dbf50"), false).unwrap();
+        require_stamped_build(None, true).expect("the smoke-test escape hatch is closed");
     }
 
     #[test]

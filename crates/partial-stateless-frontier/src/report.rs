@@ -91,6 +91,17 @@ pub struct RunSummary {
     pub dataset: String,
     /// The dataset's producer, carried forward so a report names the corpus's origin.
     pub dataset_producer: String,
+    /// The commit the capturing node was built from, carried forward from the dataset's manifest.
+    ///
+    /// Copied here so this file alone answers "which code recorded the blocks these numbers came
+    /// from". `null` means the capture ran from a build that carried no stamp, which is a fact
+    /// about the corpus rather than about this run.
+    pub dataset_build_commit: Option<String>,
+    /// The commit *this* binary was built from, read at compile time.
+    ///
+    /// The corpus and the generator are two different pieces of code and either can move under a
+    /// result. `null` means this build carried no stamp.
+    pub generator_build_commit: Option<String>,
     /// Blocks replayed but not counted, so the caches reached their advertised windows.
     pub warmup_blocks: u64,
     /// Blocks counted.
@@ -130,6 +141,7 @@ impl RunSummary {
     pub fn accumulate(
         dataset: &Path,
         dataset_producer: String,
+        dataset_build_commit: Option<String>,
         specs: &[ArmKind],
         results: &[BlockResult],
     ) -> Self {
@@ -175,6 +187,8 @@ impl RunSummary {
         Self {
             dataset: dataset.display().to_string(),
             dataset_producer,
+            dataset_build_commit,
+            generator_build_commit: option_env!("PS_BUILD_COMMIT").map(str::to_string),
             warmup_blocks,
             measured_blocks,
             measured_range: first.zip(last),

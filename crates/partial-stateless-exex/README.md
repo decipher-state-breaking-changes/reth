@@ -182,6 +182,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |
 | `PS_POLICY_DATASET_MAX_BLOCKS=<n>` | **usable** blocks the capture records — reorg-abandoned ones stop counting and are replaced. Required whenever `PS_POLICY_DATASET_CAPTURE_DIR` is set; there is no default |
 | `PS_POLICY_DATASET_CONFIRMATIONS=<n>` | canonical blocks the chain must advance past the recorded range before `END.json` is written (default: `96`, roughly three epochs). `0` disables the wait and leaves the tail reorg-exposed; the terminator records which was chosen |
+| `PS_POLICY_DATASET_ALLOW_UNSTAMPED=1` | capture from a build that carries no `PS_BUILD_COMMIT`. Without it, such a run is a startup error: the manifest would record `build_commit: null`, and a corpus that cannot name the code that produced it is not evidence. The escape hatch hides nothing — the manifest still records `null` |
 | `PS_WITNESS_BASELINE=1` | also compute the full-witness baseline + reduction ratio (an extra, larger multiproof per block) |
 | `PS_PARALLEL_INITIAL_PROOF=1` | use Reth's proof workers for eligible initial V2 multiproofs; low-width target sets and later structural deltas stay serial |
 | `PS_RESOURCE_METRICS=1` | capture process CPU time + page faults around transition-witness construction, including parallel proof workers (`cpu_time_ms`, `major_page_faults`, `minor_page_faults`) |
@@ -211,7 +212,7 @@ variables, so the core sidecar generation path stays lean:
 | `PS_STREAM_EXPORT_RETRIES=<n>` | fresh export attempts after a genuine failure; a reorg fence does not consume one (default: 1) |
 | `PS_STREAM_EXPORT_MAX_WORKERS=<n>` | live export workers allowed at once, abandoned ones included — each holds an MDBX read transaction for its whole multiproof. At the cap a fresh attempt waits for a slot; invalid values are a startup error (default: 4) |
 | `PS_STREAM_REORG_CHECKPOINT=always\|never` | whether a branch change re-checkpoints the open stream at the block it recovered to (default: `always`; anything else is a startup error) |
-| `PS_BUILD_COMMIT` / `PS_BUILD_DIRTY` / `PS_CARGO_LOCK_SHA256` | **compile-time**, not runtime: exported before `cargo build`, read by `option_env!`, and baked into the binary so its run manifests can name their own build (`git rev-parse HEAD`, `0`/`1` tree dirtiness, `sha256sum Cargo.lock`). Unset builds stamp `null` plus a note; the long gate requires a non-null commit from a clean tree |
+| `PS_BUILD_COMMIT` / `PS_BUILD_DIRTY` / `PS_CARGO_LOCK_SHA256` | **compile-time**, not runtime: exported before `cargo build`, read by `option_env!`, and baked into the binary so its run manifests can name their own build (`git rev-parse HEAD`, `0`/`1` tree dirtiness, `sha256sum Cargo.lock`). Unset builds stamp `null` plus a note; the long gate requires a non-null commit from a clean tree, and a policy replay dataset capture refuses to start without one |
 
 The initial parallel-proof gate currently requires at least two distinct storage tries and 64
 total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
@@ -457,6 +458,14 @@ validates every policy's real sidecar with no database at all.
 cd /path/to/reth
 PS_TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
 
+# Exported before the build, not before the run: these are read at compile time, so a binary
+# built without them carries no commit and a capture that used it would record `build_commit:
+# null`. That is refused at startup rather than discovered hours later in the manifest.
+export PS_BUILD_COMMIT=$(git rev-parse HEAD)
+export PS_BUILD_DIRTY=$([ -z "$(git status --porcelain)" ] && echo 0 || echo 1)
+export PS_CARGO_LOCK_SHA256=$(sha256sum Cargo.lock | cut -d' ' -f1)
+cargo build --release -p partial-stateless-exex -p partial-stateless-frontier
+
 PS_ENGINE_ACCESS=on \
 PS_ENGINE_PAYLOAD=on \
 PS_SHADOW_SAMPLE=0 \
@@ -472,7 +481,18 @@ PS_POLICY_DATASET_CONFIRMATIONS=96 \
 ```
 
 Build and hash both `reth-partial-stateless` and `ps-policy-frontier` in the same stamped
-shell before capture. Do not assume they are under `./target`: Cargo may select a shared
+shell before capture, then check the binaries rather than the build log: a `cargo build` run
+from a shell where the stamps were unset can relink a cached unstamped artifact without even
+changing its mtime, which leaves no other trace.
+
+```bash
+for bin in "$PS_TARGET_DIR/release/reth-partial-stateless" \
+           "$PS_TARGET_DIR/release/ps-policy-frontier"; do
+    grep -qa "$PS_BUILD_COMMIT" "$bin" || echo "UNSTAMPED: $bin"
+done
+```
+
+Do not assume they are under `./target`: Cargo may select a shared
 target directory through configuration or `CARGO_TARGET_DIR`. For an SSH-safe background
 run, put the command and the `END.json` watcher in one `nohup` supervisor; the shell which
 launched only the node is not a supervisor after the SSH session disappears.

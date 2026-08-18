@@ -255,7 +255,7 @@ impl PolicyDatasetRecordBody {
 pub struct PolicyDatasetRecord {
     /// What was captured.
     pub body: PolicyDatasetRecordBody,
-    /// keccak256 of the serialized body.
+    /// The body's canonical digest, as [`PolicyDatasetRecordBody::digest`] computes it.
     pub digest: B256,
 }
 
@@ -604,15 +604,33 @@ impl PolicyDatasetWriter {
 
         // A branch can be abandoned and later become canonical again. In that case the producer
         // sees the exact same `(height, hash)` twice, which names the same file and must count as
-        // one physical record in `END.json`. Comparing the bytes also prevents a second observation
-        // from silently overwriting different capture material under the same block identity.
+        // one physical record in `END.json`. The second observation must not silently overwrite
+        // different capture material under the same block identity either, so the two are compared.
+        //
+        // The comparison is by digest and not by serialized bytes. The body holds its access set in
+        // `HashMap`s, and rebuilding the record for the returning branch builds fresh maps, which
+        // iterate in a different order even inside one process: `RandomState` re-seeds per map.
+        // Equal bytes therefore prove sameness but unequal bytes prove nothing, and a byte
+        // comparison would abort a capture over a re-canonicalized branch that changed nothing.
+        // The digest is a function of the record's contents, so it decides the question the byte
+        // comparison was only approximating.
         if path.exists() {
-            let existing = fs::read(&path).map_err(|err| io_err(&path, err))?;
-            if existing != bytes {
-                return Err(DatasetError::ConflictingDuplicate {
-                    block_number: record.body.block_number,
-                    block_hash: record.body.block_hash,
-                })
+            let existing_bytes = fs::read(&path).map_err(|err| io_err(&path, err))?;
+            if existing_bytes != bytes {
+                let existing: PolicyDatasetRecord =
+                    bincode::deserialize(&existing_bytes).map_err(|err| DatasetError::Decode {
+                        path: path.clone(),
+                        detail: err.to_string(),
+                    })?;
+                // Checked rather than read off the file, so a record that was damaged after it was
+                // written fails here, at the block that touched it, instead of at load time.
+                existing.verify_digest()?;
+                if existing.body.digest() != record.body.digest() {
+                    return Err(DatasetError::ConflictingDuplicate {
+                        block_number: record.body.block_number,
+                        block_hash: record.body.block_hash,
+                    })
+                }
             }
             return Ok(path)
         }
@@ -1363,6 +1381,77 @@ mod tests {
         assert_eq!(loaded.abandoned.len(), 1);
         assert_eq!(loaded.abandoned[0].body.block_hash, numbered(0xb1));
         assert_eq!(loaded.end.records, 4, "the re-recorded branch-A block counted twice");
+    }
+
+    /// Rebuilds `record` until it serializes to different bytes than it does now.
+    ///
+    /// A round trip is how the producer's second observation of a returning branch arrives: fresh
+    /// `HashMap`s, same contents, and `RandomState` re-seeds per map, so the iteration order — and
+    /// nothing else — moves. It loops because one round trip can land back on the original order by
+    /// chance; over an access set this wide, doing so 64 times running is not a case worth
+    /// designing for.
+    fn rebuilt_with_different_bytes(record: &PolicyDatasetRecord) -> PolicyDatasetRecord {
+        let original = bincode::serialize(record).unwrap();
+        for _ in 0..64 {
+            let candidate: PolicyDatasetRecord = bincode::deserialize(&original).unwrap();
+            if bincode::serialize(&candidate).unwrap() != original {
+                return candidate
+            }
+        }
+        panic!(
+            "64 rebuilds all reproduced one byte order, which is not how HashMap iteration works"
+        )
+    }
+
+    /// The returning branch of a reorg is the same record, and the writer has to see that.
+    ///
+    /// Its access set is rebuilt into fresh maps, so it serializes to different bytes while
+    /// carrying identical contents. A writer that compared bytes would call that a conflicting
+    /// duplicate and abort the capture over a block nothing was wrong with. Unlike
+    /// [`a_branch_that_is_abandoned_and_then_wins_again_is_canonical`], which re-writes one
+    /// in-memory record whose empty maps have only one order, this rebuilds the record the way the
+    /// producer does.
+    #[test]
+    fn a_returning_branch_rebuilt_into_fresh_maps_is_the_same_record() {
+        let dir = temp_dir("reorg-back-rebuilt");
+        let mut writer = started_writer(&dir);
+        let record = populated_body(false, 64).seal().unwrap();
+        let path = writer.write_record(&record).unwrap();
+
+        let rebuilt = rebuilt_with_different_bytes(&record);
+        assert_eq!(
+            rebuilt.body.digest(),
+            record.body.digest(),
+            "the rebuild changed the record's contents, so this tests the wrong thing"
+        );
+
+        let same_path = writer
+            .write_record(&rebuilt)
+            .expect("a rebuilt record with identical contents was refused as a conflict");
+        assert_eq!(same_path, path);
+        assert_eq!(writer.records(), 1, "the same block counted as two physical records");
+    }
+
+    /// A record damaged on disk is caught by the block that re-observes it, not left for the
+    /// reader.
+    #[test]
+    fn a_duplicate_over_a_damaged_record_is_refused() {
+        let dir = temp_dir("duplicate-over-damage");
+        let mut writer = started_writer(&dir);
+        let record = populated_body(false, 64).seal().unwrap();
+        let path = writer.write_record(&record).unwrap();
+
+        // Its stored digest no longer covers its body: the file is damaged, whatever damaged it.
+        let mut damaged: PolicyDatasetRecord =
+            bincode::deserialize(&fs::read(&path).unwrap()).unwrap();
+        damaged.body.expected_state_root = numbered(0xee);
+        fs::write(&path, bincode::serialize(&damaged).unwrap()).unwrap();
+
+        let err = writer.write_record(&record).unwrap_err();
+        assert!(
+            matches!(err, DatasetError::DigestMismatch { block_number: 10, .. }),
+            "expected the damage to be named, got {err}"
+        );
     }
 
     /// One block identity cannot conceal two different captures. Treating the later write as an

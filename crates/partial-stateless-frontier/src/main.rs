@@ -201,6 +201,7 @@ fn main() -> eyre::Result<()> {
     let summary = RunSummary::accumulate(
         &options.dataset,
         dataset.manifest.producer.clone(),
+        dataset.manifest.build_commit.clone(),
         &options.arms,
         &results,
     );

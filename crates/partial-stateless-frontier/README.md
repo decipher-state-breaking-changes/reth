@@ -125,6 +125,13 @@ records against.
 `frontier.jsonl` is one line per block; `frontier-summary.json` totals the measured
 population per arm.
 
+The summary names both pieces of code behind its numbers: `dataset_build_commit`, copied from
+the corpus's manifest, and `generator_build_commit`, this binary's own. They move independently
+— a corpus outlives many generator builds — so a result that named only one could not be traced
+back. Either is `null` when that build carried no `PS_BUILD_COMMIT`, which is stamped in at
+compile time; a capture refuses to start without one, while this tool records the absence and
+runs, so ad-hoc analysis is still possible and still labelled.
+
 Supported: sidecar size for the same block under each arm, cache and trie-cache footprint,
 cache-miss counts, the **policy-dependent part** of validation cost, and arm-versus-arm —
 including Partial versus Weak when `--arm weak` ran — on one identical block set.
