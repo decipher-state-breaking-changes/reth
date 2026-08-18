@@ -676,6 +676,19 @@ impl NetworkStateCache {
             }
         }
 
+        // Sorted, because these three vectors are the order every downstream artifact inherits.
+        // They are built by iterating `accessed`, whose maps are `HashMap`s seeded per process, so
+        // without this the *same* block on two hosts yields the same miss set in two different
+        // orders — and that order reaches the sidecar's `miss_manifest`, its bytecode list, and
+        // therefore its serialized bytes. The witness commitment already sorts everything it
+        // covers and so never noticed; anything comparing sidecars across hosts would have.
+        //
+        // The cost is a sort over a few thousand keys beside a multiproof, which is nothing, and
+        // what it buys is that a sidecar is a function of the block and the policy alone.
+        missed_accounts.sort_unstable();
+        missed_storage.sort_unstable();
+        missed_codes.sort_unstable();
+
         let total_accessed = accessed.total_keys();
         let total_missed = missed_accounts.len() + missed_storage.len() + missed_codes.len();
         let miss_ratio =
@@ -1218,6 +1231,35 @@ impl std::error::Error for CacheError {}
 
 #[cfg(test)]
 mod tests {
+    /// A miss set is a function of the block and the cache, not of a hash seed.
+    ///
+    /// It is built by iterating the access set's `HashMap`s, so without an explicit sort the same
+    /// block on two hosts produces the same keys in two different orders — and that order is what
+    /// the sidecar's `miss_manifest` and bytecode list inherit, making the sidecar's bytes differ
+    /// between hosts that agree about everything that matters.
+    #[test]
+    fn a_miss_set_comes_out_sorted_whatever_order_it_was_found_in() {
+        use crate::{policy::AccountData, CacheConfig};
+
+        let mut accessed = BlockAccessedState::default();
+        for tag in (1..=32u8).rev() {
+            let address = Address::repeat_byte(tag);
+            accessed.accounts.insert(
+                address,
+                AccountData { nonce: u64::from(tag), balance: U256::from(tag), code_hash: None },
+            );
+            accessed.storage.insert((address, B256::repeat_byte(tag)), U256::from(tag));
+            accessed.codes.insert(B256::repeat_byte(tag), Bytes::from(vec![tag]));
+        }
+
+        let miss = CacheConfig::default().new_cache().compute_miss(&accessed);
+
+        assert_eq!(miss.missed_accounts.len(), 32);
+        assert!(miss.missed_accounts.windows(2).all(|w| w[0] < w[1]), "accounts are not sorted");
+        assert!(miss.missed_storage.windows(2).all(|w| w[0] < w[1]), "storage is not sorted");
+        assert!(miss.missed_codes.windows(2).all(|w| w[0] < w[1]), "codes are not sorted");
+    }
+
     use super::*;
     use crate::{
         policy::{EvictedStorage, LastNBlocksPolicy},
