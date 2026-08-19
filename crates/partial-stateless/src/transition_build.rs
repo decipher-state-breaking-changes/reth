@@ -908,7 +908,7 @@ pub fn build_policy_sidecar(
     let (witness_state, measured_nodes, measured_proof) = match &build.trimmed {
         Some(trimmed) => (
             PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-                retention_version: crate::witness_v3::WITNESS_V3_RETENTION_VERSION,
+                frontier_version: crate::witness_v3::WITNESS_V3_FRONTIER_VERSION,
                 retention_fingerprint: trimmed.retention_fingerprint,
                 nodes: trimmed.nodes.clone(),
             },

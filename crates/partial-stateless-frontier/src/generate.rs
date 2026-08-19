@@ -82,6 +82,10 @@ impl PostStateRootOracle for PostStateTap {
 pub struct PolicyBlockResult {
     /// `weak` or `account/storage`, as the run named it.
     pub policy: String,
+    /// Which wire the sidecar carried: `v2` (self-contained flat), `v3` (trimmed fragments), or
+    /// `legacy` (serialized multiproof). Recorded per block so a result file says for itself
+    /// which format its byte figures describe.
+    pub witness_kind: &'static str,
     /// Position this policy occupied in this block's rotation, from zero.
     pub rotation_slot: usize,
     /// Serialized sidecar size, which is the figure a bandwidth claim is about.
@@ -575,6 +579,13 @@ where
 
     Ok(PolicyBlockResult {
         policy: state.kind.label(),
+        witness_kind: match &sidecar.witness.state {
+            partial_stateless::PartialExecutionWitnessState::MptMultiProof(_) => "legacy",
+            partial_stateless::PartialExecutionWitnessState::MptTransitionNodes(_) => "v2",
+            partial_stateless::PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+                ..
+            } => "v3",
+        },
         rotation_slot,
         sidecar_bytes: sidecar_bytes.len(),
         // Over the sidecar's semantic content rather than its bytes: the bytes carry this host's

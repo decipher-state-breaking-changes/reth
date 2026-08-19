@@ -97,4 +97,4 @@ pub use witness_check::{
 pub use witness_trim::{
     measure_witness_trim, RevealedNodeSet, WitnessTrimStats, WITNESS_TRIM_DEPTH_LEVELS,
 };
-pub use witness_v3::{WitnessNodeMap, WitnessV3Error, WITNESS_V3_RETENTION_VERSION};
+pub use witness_v3::{WitnessNodeMap, WitnessV3Error, WITNESS_V3_FRONTIER_VERSION};

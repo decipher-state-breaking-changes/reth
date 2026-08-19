@@ -38,13 +38,21 @@ use reth_trie_common::{
 };
 use reth_trie_sparse::{LeafLookup, LeafLookupError, SparseTrie};
 
-/// Version of the deterministic retention algorithm a trimmed witness assumes on the receiver.
+/// The frontier protocol version a trimmed witness assumes on the receiver.
 ///
-/// This is protocol surface: the blinded frontier the fragments anchor on is a function of the
-/// retention algorithm, and neither `cache_root` nor the retention fingerprint commits the
-/// revealed frontier shape. A builder and validator disagreeing on this number must not attempt
-/// a graft. Bump it whenever retention semantics change (`PartialTrieNodeCacheRetention/v1`).
-pub const WITNESS_V3_RETENTION_VERSION: u16 = 1;
+/// This is protocol surface, and it is wider than the retention algorithm alone: the blinded
+/// frontier the fragments anchor on — and the graft that re-attaches them — depends on the
+/// deterministic retention rules (`PartialTrieNodeCacheRetention/v1`), the sparse-trie
+/// representation's observable shape, extension normalization (the merged extension+branch form
+/// and the divergent-extension one-level resolution), and the reveal/fold/composite-walk rules
+/// in this module. Neither `cache_root` nor the retention fingerprint commits any of that, so a
+/// builder and validator disagreeing on this number must not attempt a graft.
+///
+/// Bump it for **any** change that can alter the revealed frontier shape or graft semantics.
+/// A change that intends to preserve them — a trie-representation swap, say — keeps the number
+/// only when a cross-representation oracle has shown the fragment sets and anchors identical;
+/// absent that evidence, bump.
+pub const WITNESS_V3_FRONTIER_VERSION: u16 = 1;
 
 /// A trimmed-witness node map with a consumption ledger.
 ///
@@ -58,17 +66,28 @@ pub struct WitnessNodeMap {
 }
 
 impl WitnessNodeMap {
-    /// Decodes a v3 wire node list, rejecting duplicates and standalone sub-32-byte entries.
+    /// Decodes a v3 wire node list, enforcing the canonical wire form: entries in strictly
+    /// ascending byte order (which makes duplicates impossible), none shorter than 32 bytes.
     pub fn decode(nodes: &[Bytes]) -> Result<Self, WitnessV3Error> {
         let mut map = B256Map::with_capacity_and_hasher(nodes.len(), Default::default());
-        for node in nodes {
+        for (index, node) in nodes.iter().enumerate() {
             if node.len() < 32 {
                 return Err(WitnessV3Error::StandaloneInline { len: node.len() });
             }
-            let hash = keccak256(node);
-            if map.insert(hash, node.clone()).is_some() {
-                return Err(WitnessV3Error::DuplicateNode(hash));
+            if let Some(previous) = index.checked_sub(1).map(|prev| &nodes[prev]) {
+                // Strictly ascending: equality is a duplicate, descent is a re-ordering. Both
+                // reject — there is exactly one canonical encoding of a fragment set, so a
+                // builder never produces either and a sidecar carrying one is non-canonical
+                // even when its commitment was recomputed to match.
+                if previous >= node {
+                    if previous == node {
+                        return Err(WitnessV3Error::DuplicateNode(keccak256(node)));
+                    }
+                    return Err(WitnessV3Error::UnsortedNodes { index });
+                }
             }
+            let hash = keccak256(node);
+            map.insert(hash, node.clone());
         }
         Ok(Self { nodes: map, consumed: HashSet::default() })
     }
@@ -180,9 +199,15 @@ pub enum WitnessV3Error {
         /// One of them, for the log line.
         first: B256,
     },
-    /// The sidecar names a retention algorithm version this build does not implement.
-    #[error("trimmed witness names retention version {got}, local implementation is {expected}")]
-    RetentionVersionMismatch {
+    /// A wire entry out of the canonical strictly-ascending byte order.
+    #[error("trimmed witness node at index {index} is not in strictly ascending byte order")]
+    UnsortedNodes {
+        /// Index of the first out-of-order entry.
+        index: usize,
+    },
+    /// The sidecar names a frontier protocol version this build does not implement.
+    #[error("trimmed witness names frontier version {got}, local implementation is {expected}")]
+    FrontierVersionMismatch {
         /// Version named by the sidecar.
         got: u16,
         /// Version this build implements.
@@ -546,5 +571,78 @@ mod tests {
         let outcome = walk_map_chain(&mut map, Nibbles::default(), root, &key_a, None)
             .expect("the inclusion chain resolves");
         assert!(matches!(outcome, ChainValue::Present(_)));
+    }
+    /// A chain through inline (sub-32-byte) children: two keys sharing 63 nibbles produce a
+    /// deep branch whose leaves — and possibly the branch itself — encode below 32 bytes and are
+    /// embedded in their parents rather than hash-addressed. The walk must decode them from the
+    /// embedded bytes, never look them up in the map, and still land on the value; the wire
+    /// carries no standalone entry for any of them.
+    #[test]
+    fn an_inline_child_chain_resolves_without_standalone_wire_entries() {
+        let mut key_a = Nibbles::default();
+        let mut key_b = Nibbles::default();
+        for i in 0..64u8 {
+            if i < 63 {
+                key_a.push_unchecked((i % 15) + 1);
+                key_b.push_unchecked((i % 15) + 1);
+            } else {
+                key_a.push_unchecked(0x4);
+                key_b.push_unchecked(0x9);
+            }
+        }
+        let value = alloy_rlp::encode(U256::from(3u64));
+        let mut leaves = vec![(key_a, value.clone()), (key_b, value)];
+        leaves.sort_unstable_by_key(|(key, _)| *key);
+        let mut builder = HashBuilder::default()
+            .with_proof_retainer(ProofRetainer::from_iter(leaves.iter().map(|(key, _)| *key)));
+        for (key, value) in &leaves {
+            builder.add_leaf(*key, value);
+        }
+        let root = builder.root();
+        let mut witness = B256Map::default();
+        let mut sub32 = 0usize;
+        for (_, node) in builder.take_proof_nodes().into_inner() {
+            // The retainer only yields hash-addressed nodes; anything embedded stays inside its
+            // parent's bytes. Count what would have been a standalone inline entry to prove the
+            // fixture actually exercises embedding.
+            if node.len() < 32 {
+                sub32 += 1;
+                continue;
+            }
+            witness.insert(keccak256(&node), Bytes::from(node.to_vec()));
+        }
+        assert!(
+            witness.values().any(|node| {
+                let decoded = TrieNode::decode(&mut node.as_ref()).expect("wire nodes decode");
+                match decoded {
+                    TrieNode::Extension(ext) => ext.child.as_hash().is_none(),
+                    TrieNode::Branch(branch) => branch
+                        .as_ref()
+                        .children()
+                        .any(|(_, child)| child.is_some_and(|child| child.as_hash().is_none())),
+                    _ => false,
+                }
+            }) || sub32 > 0,
+            "the fixture produced no embedded child at all"
+        );
+
+        let mut map = WitnessNodeMap::from_flat(witness);
+        let mut nodes = Vec::new();
+        let outcome = walk_map_chain(&mut map, Nibbles::default(), root, &key_a, Some(&mut nodes))
+            .expect("the inline chain resolves");
+        assert!(matches!(outcome, ChainValue::Present(_)));
+        // The inline nodes were collected for the reveal even though nothing on the wire
+        // addresses them.
+        assert!(nodes.len() >= 2, "the chain has at least the root and the deep structure");
+        // Absent key through the same deep structure: divergence at the final nibble, which no
+        // leaf uses.
+        let mut absent = Nibbles::default();
+        for i in 0..63 {
+            absent.push_unchecked(key_a.get_unchecked(i));
+        }
+        absent.push_unchecked(0xf);
+        let outcome = walk_map_chain(&mut map, Nibbles::default(), root, &absent, None)
+            .expect("the inline exclusion resolves");
+        assert_eq!(outcome, ChainValue::Absent);
     }
 }

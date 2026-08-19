@@ -152,6 +152,8 @@ pub struct BlockSpec {
     pub touched_storage: Vec<(Address, B256)>,
     pub account_writes: Vec<(Address, u64, u64)>,
     pub storage_writes: Vec<(Address, B256, u64)>,
+    /// Accounts whose entire storage this block destroys before its writes apply.
+    pub wiped_storage: Vec<Address>,
 }
 
 /// The three blocks: two to warm the caches, one to compare on.
@@ -163,6 +165,7 @@ pub fn chain() -> Vec<BlockSpec> {
             touched_storage: vec![(address(1), slot(0x11)), (address(1), slot(0x12))],
             account_writes: vec![(address(1), 10, 5_000), (address(3), 30, 7_000)],
             storage_writes: vec![(address(1), slot(0x11), 101)],
+            wiped_storage: vec![],
         },
         BlockSpec {
             number: 102,
@@ -170,6 +173,7 @@ pub fn chain() -> Vec<BlockSpec> {
             touched_storage: vec![(address(2), slot(0x21)), (address(2), slot(0x22))],
             account_writes: vec![(address(4), 40, 9_000)],
             storage_writes: vec![(address(2), slot(0x21), 202), (address(2), slot(0x23), 0)],
+            wiped_storage: vec![],
         },
         BlockSpec {
             number: 103,
@@ -198,6 +202,7 @@ pub fn chain() -> Vec<BlockSpec> {
                 (address(1), slot(0x1f), 0),
                 (address(1), slot(0x20), 0),
             ],
+            wiped_storage: vec![],
         },
     ]
 }
@@ -235,6 +240,13 @@ pub fn accessed_state(parent: &World, spec: &BlockSpec) -> BlockAccessedState {
 pub fn apply(parent: &World, spec: &BlockSpec) -> (World, HashedPostState) {
     let mut child = parent.clone();
     let mut post = HashedPostState::default();
+    // Wipes destroy the whole storage first; the block's own writes then apply on top, which is
+    // the self-destruct-and-recreate shape a wiped `HashedStorage` describes.
+    for address in &spec.wiped_storage {
+        if let Some((_, storage)) = child.accounts.get_mut(address) {
+            storage.clear();
+        }
+    }
     for (address, nonce, balance) in &spec.account_writes {
         child.set_account(*address, *nonce, *balance);
         let (account, _) = &child.accounts[address];
@@ -245,8 +257,12 @@ pub fn apply(parent: &World, spec: &BlockSpec) -> (World, HashedPostState) {
         child.set_storage(*address, *slot, *value);
         by_account.entry(*address).or_default().push((keccak256(slot), U256::from(*value)));
     }
+    for address in &spec.wiped_storage {
+        by_account.entry(*address).or_default();
+    }
     for (address, slots) in by_account {
-        post.storages.insert(keccak256(address), HashedStorage::from_iter(false, slots));
+        let wiped = spec.wiped_storage.contains(&address);
+        post.storages.insert(keccak256(address), HashedStorage::from_iter(wiped, slots));
         // A storage write touches the account's own leaf too: its storage root moves.
         let (account, _) = &child.accounts[&address];
         post.accounts.entry(keccak256(address)).or_insert(Some(*account));

@@ -144,6 +144,7 @@ fn main() -> eyre::Result<()> {
         weak_baseline = options.arms.contains(&ArmKind::Weak),
         warmup = options.warmup,
         samples = options.samples,
+        witness_v3 = options.witness_v3,
         "Loaded policy replay dataset"
     );
     if !dataset.abandoned.is_empty() {
@@ -212,14 +213,26 @@ fn main() -> eyre::Result<()> {
         dataset.manifest.build_commit.clone(),
         &options.arms,
         &results,
+        options.witness_v3,
     );
     let summary_path = options.out.join("frontier-summary.json");
     summary.write(&summary_path)?;
 
     for (arm, totals) in &summary.policies {
+        // The self-description gate: a v3 run whose measured policy blocks were not all v3 is
+        // reporting mixed wire formats, and its byte totals must not be quoted as v3 figures.
+        if options.witness_v3 && arm != "weak" && totals.witness_v3_blocks != totals.blocks {
+            tracing::warn!(
+                arm = %arm,
+                blocks = totals.blocks,
+                witness_v3_blocks = totals.witness_v3_blocks,
+                "witness-v3 run produced non-v3 measured sidecars; byte totals are mixed-format"
+            );
+        }
         info!(
             arm = %arm,
             blocks = totals.blocks,
+            witness_v3_blocks = totals.witness_v3_blocks,
             mean_sidecar_bytes = totals.mean_sidecar_bytes(),
             total_missed_accounts = totals.total_missed_accounts,
             total_missed_storage = totals.total_missed_storage,

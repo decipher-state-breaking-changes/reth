@@ -575,8 +575,9 @@ pub enum PartialExecutionWitnessState {
     /// blinded trie frontier, graftable against the exact parent trie-cache generation named by
     /// the retention fields. Not self-contained — a cache-less verifier cannot decode this.
     MptTrimmedTransitionNodes {
-        /// Version of the deterministic retention algorithm the trimming frontier assumes.
-        retention_version: u16,
+        /// The frontier protocol version the fragments assume: retention rules, trie
+        /// representation shape, extension normalization, and graft semantics together.
+        frontier_version: u16,
         /// The builder's parent-generation retention fingerprint the fragments were cut against.
         retention_fingerprint: B256,
         /// The fragment node preimages: hash-deduplicated, byte-sorted.
@@ -696,12 +697,12 @@ pub fn partial_witness_commitment(
             }
         }
         PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-            retention_version,
+            frontier_version,
             retention_fingerprint,
             nodes,
         } => {
             preimage.extend_from_slice(b"state_mpt_trimmed_transition_nodes");
-            preimage.extend_from_slice(&retention_version.to_be_bytes());
+            preimage.extend_from_slice(&frontier_version.to_be_bytes());
             preimage.extend_from_slice(retention_fingerprint.as_slice());
             preimage.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
             for node in nodes {
@@ -847,7 +848,7 @@ mod tests {
 
         // The trimmed variant is appended, never inserted: index 2, after both v1/v2 tags.
         let trimmed = PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-            retention_version: 1,
+            frontier_version: 1,
             retention_fingerprint: B256::repeat_byte(0x42),
             nodes: vec![Bytes::from_static(&[0xbb])],
         };

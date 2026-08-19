@@ -10,7 +10,7 @@ use crate::{
     witness_v3::{
         collect_reveal_fragments, composite_account_chain, composite_storage_chain,
         consume_target_chains, ChainValue, WitnessNodeMap, WitnessV3Error,
-        WITNESS_V3_RETENTION_VERSION,
+        WITNESS_V3_FRONTIER_VERSION,
     },
 };
 use alloy_consensus::{Header, EMPTY_ROOT_HASH};
@@ -587,7 +587,7 @@ pub fn materialize_sidecar_witness_after_prefilter_with_cache(
             (MaterializedStateProof::Transition(proof), accounts, storage)
         }
         PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-            retention_version,
+            frontier_version,
             retention_fingerprint,
             nodes,
         } => {
@@ -603,10 +603,10 @@ pub fn materialize_sidecar_witness_after_prefilter_with_cache(
             // algorithm, and neither is committed by cache_root, so both are named on the wire
             // and compared here. A mismatch can only produce a false reject — anchors stay
             // hash-verified — never a false accept.
-            if *retention_version != WITNESS_V3_RETENTION_VERSION {
-                return Err(trimmed_err(WitnessV3Error::RetentionVersionMismatch {
-                    got: *retention_version,
-                    expected: WITNESS_V3_RETENTION_VERSION,
+            if *frontier_version != WITNESS_V3_FRONTIER_VERSION {
+                return Err(trimmed_err(WitnessV3Error::FrontierVersionMismatch {
+                    got: *frontier_version,
+                    expected: WITNESS_V3_FRONTIER_VERSION,
                 }));
             }
             let local_fingerprint = parent_trie.retention_fingerprint();

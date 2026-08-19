@@ -52,6 +52,12 @@ impl RunReport {
 pub struct PolicySummary {
     /// Measured blocks this policy produced a sidecar for.
     pub blocks: u64,
+    /// Measured blocks whose sidecar carried the trimmed (v3) wire.
+    ///
+    /// Under `--witness-v3` this must equal `blocks` for every policy arm — a measured block is
+    /// past warmup, so its builder trie is anchored and never degrades — and the run logs a
+    /// warning when it does not. The Weak arm is always zero: its full witness stays v2.
+    pub witness_v3_blocks: u64,
     /// Total serialized sidecar bytes.
     pub total_sidecar_bytes: u64,
     /// Total parent-state witness bytes.
@@ -135,6 +141,11 @@ pub struct RunSummary {
     pub measured_block_set_digest: B256,
     /// Per-arm totals, keyed by `weak` or `account/storage`.
     pub policies: BTreeMap<String, PolicySummary>,
+    /// Whether this run was asked to build trimmed (v3) policy sidecars.
+    ///
+    /// Byte figures from a v3 run describe a different wire format than a v2 run's and the two
+    /// must never be compared without saying so; this field is what lets the file say so.
+    pub witness_v3_requested: bool,
     /// Whether a no-cache baseline arm ran, so a Partial-versus-Weak comparison is available.
     ///
     /// Recorded rather than inferred from the key set, because "there is no `weak` row" and "the
@@ -163,6 +174,7 @@ impl RunSummary {
         dataset_build_commit: Option<String>,
         specs: &[ArmKind],
         results: &[BlockResult],
+        witness_v3_requested: bool,
     ) -> Self {
         let mut policies = BTreeMap::new();
         for spec in specs {
@@ -190,6 +202,9 @@ impl RunSummary {
             for policy in &result.policies {
                 let entry = policies.entry(policy.policy.clone()).or_default();
                 entry.blocks += 1;
+                if policy.witness_kind == "v3" {
+                    entry.witness_v3_blocks += 1;
+                }
                 entry.total_sidecar_bytes += policy.sidecar_bytes as u64;
                 entry.total_witness_node_bytes += policy.witness_node_bytes as u64;
                 entry.total_witness_code_bytes += policy.witness_code_bytes as u64;
@@ -224,6 +239,7 @@ impl RunSummary {
             measured_range: first.zip(last),
             measured_block_set_digest: alloy_primitives::keccak256(&measured_hashes),
             policies,
+            witness_v3_requested,
             weak_baseline_present,
             total_block_admission_us,
             builder_latency_eligible: false,

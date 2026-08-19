@@ -20,7 +20,7 @@ use partial_stateless::{
     },
     BlockTransitionRef, CacheConfig, MaterializedStateProof, PartialExecutionWitnessState,
     PartialStatelessSidecar, PolicySidecarBuild, TransitionBuildContext,
-    WITNESS_V3_RETENTION_VERSION,
+    WITNESS_V3_FRONTIER_VERSION,
 };
 use reth_trie_common::HashedPostState;
 use std::collections::BTreeSet;
@@ -41,9 +41,13 @@ struct WarmedComparison {
 }
 
 fn warm_three_sides() -> WarmedComparison {
-    let config = CacheConfig { account_window: 60, storage_window: 30 };
     let mut blocks = chain();
     let last = blocks.pop().expect("the chain has blocks");
+    warm_sides_through(&blocks, last)
+}
+
+fn warm_sides_through(blocks: &[BlockSpec], last: BlockSpec) -> WarmedComparison {
+    let config = CacheConfig { account_window: 60, storage_window: 30 };
     let first = blocks.first().expect("the chain has warmup blocks").number;
 
     let mut sides = [
@@ -54,7 +58,7 @@ fn warm_three_sides() -> WarmedComparison {
     let mut parent = genesis();
     let mut parent_hash = B256::repeat_byte(0xf0);
 
-    for spec in &blocks {
+    for spec in blocks {
         let parent_state_root = parent.state_root();
         let complete = parent.complete_witness();
         let provider = WholeTrieSource::new(parent_state_root, &complete);
@@ -180,11 +184,11 @@ fn a_trimmed_build_agrees_with_the_full_build_and_ships_a_strict_subset() {
     // The wire names the retention contract it was cut against.
     match &v3.sidecar.witness.state {
         PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-            retention_version,
+            frontier_version,
             retention_fingerprint,
             nodes,
         } => {
-            assert_eq!(*retention_version, WITNESS_V3_RETENTION_VERSION);
+            assert_eq!(*frontier_version, WITNESS_V3_FRONTIER_VERSION);
             assert_eq!(*retention_fingerprint, parent_fingerprint);
             assert!(!nodes.is_empty(), "a warm block with misses still ships fragments");
         }
@@ -330,12 +334,23 @@ fn every_canonicality_violation_rejects_and_leaves_the_parent_untouched() {
         );
     }
 
-    // Duplicate node.
+    // Re-ordered nodes: the wire has exactly one canonical encoding, so an adjacent swap
+    // rejects even though the content is identical.
+    let err = graft_outcome(
+        &warmed.validator,
+        &with_nodes(sidecar, |nodes| nodes.swap(0, 1)),
+        &inputs.post,
+    )
+    .expect_err("a witness with re-ordered nodes was accepted");
+    assert!(err.contains("ascending"), "unexpected rejection for a swap: {err}");
+
+    // Duplicate node, adjacent so it is a duplicate rather than a re-ordering; a duplicate
+    // anywhere else breaks the ascending order first and rejects as that.
     let err = graft_outcome(
         &warmed.validator,
         &with_nodes(sidecar, |nodes| {
             let first = nodes[0].clone();
-            nodes.push(first);
+            nodes.insert(1, first);
         }),
         &inputs.post,
     )
@@ -354,7 +369,12 @@ fn every_canonicality_violation_rejects_and_leaves_the_parent_untouched() {
         .clone();
     let err = graft_outcome(
         &warmed.validator,
-        &with_nodes(sidecar, |nodes| nodes.push(extra)),
+        &with_nodes(sidecar, |nodes| {
+            // At its sorted position, so the wire stays canonical and the rejection is
+            // genuinely the unconsumed-node rule.
+            let position = nodes.binary_search(&extra).expect_err("not already present");
+            nodes.insert(position, extra);
+        }),
         &inputs.post,
     )
     .expect_err("a witness with an unconsumed node was accepted");
@@ -383,14 +403,14 @@ fn every_canonicality_violation_rejects_and_leaves_the_parent_untouched() {
 
     // Retention version mismatch.
     let mut wrong_version = sidecar.clone();
-    if let PartialExecutionWitnessState::MptTrimmedTransitionNodes { retention_version, .. } =
+    if let PartialExecutionWitnessState::MptTrimmedTransitionNodes { frontier_version, .. } =
         &mut wrong_version.witness.state
     {
-        *retention_version = WITNESS_V3_RETENTION_VERSION + 1;
+        *frontier_version = WITNESS_V3_FRONTIER_VERSION + 1;
     }
     let err = graft_outcome(&warmed.validator, &wrong_version, &inputs.post)
-        .expect_err("a witness naming an unknown retention version was accepted");
-    assert!(err.contains("retention version"), "unexpected rejection: {err}");
+        .expect_err("a witness naming an unknown frontier version was accepted");
+    assert!(err.contains("frontier version"), "unexpected rejection: {err}");
 
     // A cache-less verifier cannot verify a trimmed sidecar at all.
     let err = materialize_sidecar_witness_after_prefilter(sidecar)
@@ -443,5 +463,66 @@ fn a_cold_trie_degrades_the_trimmed_request_to_the_self_contained_wire() {
     assert!(
         matches!(build.sidecar.witness.state, PartialExecutionWitnessState::MptTransitionNodes(_)),
         "a cold-trie build under a trim request must stay byte-identical to v2"
+    );
+}
+
+/// A fourth block, applied after the whole warmup chain: a storage wipe with a
+/// rewrite-after-wipe, plus a first-ever write into an account whose storage trie neither cache
+/// has — the fresh-trie path that forces the graft to learn a storage root through the owner's
+/// account chain.
+fn wipe_and_fresh_trie_block() -> BlockSpec {
+    BlockSpec {
+        number: 104,
+        touched_accounts: vec![address(2), address(6)],
+        touched_storage: vec![(address(2), slot(0x21)), (address(6), slot(0x61))],
+        account_writes: vec![(address(2), 21, 2_100)],
+        storage_writes: vec![(address(2), slot(0x21), 999), (address(6), slot(0x61), 606)],
+        wiped_storage: vec![address(2)],
+    }
+}
+
+#[test]
+fn a_storage_wipe_and_a_fresh_storage_trie_graft_identically() {
+    let mut warmed = warm_sides_through(&chain(), wipe_and_fresh_trie_block());
+    let inputs = last_block_inputs(&warmed);
+
+    let v2 = build_last(&mut warmed, &inputs, false);
+    let v3 = build_last(&mut warmed, &inputs, true);
+
+    assert_eq!(v2.build.state_root, v3.build.state_root);
+    assert!(v2.build.next_trie_cache.structurally_eq(&v3.build.next_trie_cache));
+    assert_eq!(v2.sidecar.miss_manifest, v3.sidecar.miss_manifest);
+    assert_eq!(v2.sidecar.next_cache_anchor, v3.sidecar.next_cache_anchor);
+    let v2_nodes: BTreeSet<&Bytes> = v2.build.nodes.iter().collect();
+    let v3_nodes = trimmed_nodes(&v3.sidecar);
+    for node in v3_nodes {
+        assert!(v2_nodes.contains(node), "a trimmed node is not part of the full witness");
+    }
+    assert!(v3_nodes.len() < v2.build.nodes.len(), "the wipe block trimmed nothing");
+
+    let v3_materialized = materialize_sidecar_witness_after_prefilter_with_cache(
+        &v3.sidecar,
+        Some(&warmed.validator.trie),
+    )
+    .expect("the wipe-block trimmed witness materializes");
+    let MaterializedStateProof::TrimmedTransition(session) = v3_materialized.state_proof else {
+        panic!("a trimmed witness materializes into a trimmed session");
+    };
+    let mut next_trie = warmed.validator.trie.clone();
+    let root = try_compute_trustless_state_root_v3_from_hashed(
+        session,
+        &warmed.validator.trie,
+        &mut next_trie,
+        inputs.post.clone(),
+        &v3.sidecar.miss_manifest,
+    )
+    .expect("the graft handles the wipe and the fresh storage trie");
+    assert_eq!(root, inputs.expected_state_root);
+
+    warmed.validator.cache.on_block_executed(104, &inputs.accessed);
+    next_trie.retain_from_value_cache(&warmed.validator.cache);
+    assert!(
+        next_trie.structurally_eq(&v3.build.next_trie_cache),
+        "the validator landed on a different frontier than the builder after the wipe"
     );
 }

@@ -1102,7 +1102,7 @@ where
                     missed_bytecode_bytes,
                 ),
                 PartialExecutionWitnessState::MptTrimmedTransitionNodes {
-                    retention_version: partial_stateless::WITNESS_V3_RETENTION_VERSION,
+                    frontier_version: partial_stateless::WITNESS_V3_FRONTIER_VERSION,
                     retention_fingerprint: trimmed_build.retention_fingerprint,
                     nodes: trimmed_build.nodes,
                 },
