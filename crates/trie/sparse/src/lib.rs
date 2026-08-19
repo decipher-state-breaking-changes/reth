@@ -24,6 +24,10 @@ pub use arena::*;
 mod parallel;
 pub use parallel::*;
 
+/// Exact-size blinded-hash sibling of the parallel sparse trie, for long-lived caches.
+mod exact;
+pub use exact::ExactSparseTrie;
+
 mod lower;
 
 #[cfg(feature = "metrics")]

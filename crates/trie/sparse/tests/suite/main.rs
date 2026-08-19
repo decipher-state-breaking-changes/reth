@@ -168,6 +168,16 @@ macro_rules! sparse_trie_tests {
             )*
         }
 
+        mod exact_sparse_trie {
+            use reth_trie_sparse::ExactSparseTrie;
+            $(
+                #[test]
+                fn $test_fn() {
+                    super::$test_fn(ExactSparseTrie::default);
+                }
+            )*
+        }
+
         mod arena_parallel_sparse_trie {
             use reth_trie_sparse::ArenaParallelSparseTrie;
 

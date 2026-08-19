@@ -60,6 +60,16 @@ pub struct RetentionOptions {
 }
 
 impl RetentionOptions {
+    /// Whether the caller vouches for `retained_paths` being pre-sorted.
+    pub(crate) const fn is_sorted_input(&self) -> bool {
+        self.sorted_input
+    }
+
+    /// Whether the shape-diagnostic counters were requested.
+    pub(crate) const fn wants_diagnostics(&self) -> bool {
+        self.diagnostics
+    }
+
     /// Uses `retained_paths` directly when it is sorted, otherwise falls back to copying and
     /// sorting it.
     pub const fn sorted_input() -> Self {
@@ -274,6 +284,16 @@ impl CloneMeasureOptions {
     /// Per-component timers and nothing else, which is what a copy on the hot path wants.
     pub const fn timers_only() -> Self {
         Self { accounting: false, branch_hash_probe: false }
+    }
+
+    /// Whether the full accounting walk was requested.
+    pub(crate) const fn wants_accounting(&self) -> bool {
+        self.accounting
+    }
+
+    /// Whether the branch-hash-box probe was requested.
+    pub(crate) const fn wants_branch_hash_probe(&self) -> bool {
+        self.branch_hash_probe
     }
 
     /// Adds the byte, allocation, and structural counts, at the cost of a full walk of the copy.
