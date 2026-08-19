@@ -7,7 +7,7 @@
 //! sidecar it produced by construction.
 
 use eyre::Context as _;
-use partial_stateless::{CacheConfig, NetworkStateCache, PartialTrieNodeCache};
+use partial_stateless::{CacheConfig, CacheTrieRepr, NetworkStateCache, PartialTrieNodeCache};
 use std::str::FromStr;
 
 /// One arm of a comparison: a cache policy, or the no-cache baseline.
@@ -147,8 +147,13 @@ impl std::fmt::Debug for PolicyState {
 }
 
 impl PolicyState {
-    /// A cold pair for `kind`, claiming to sit at `parent_block`.
+    /// A cold pair for `kind`, claiming to sit at `parent_block`, on the default representation.
     pub fn cold_at(kind: ArmKind, parent_block: u64) -> Self {
+        Self::cold_at_with_repr(kind, parent_block, CacheTrieRepr::default())
+    }
+
+    /// A cold pair for `kind` whose trie generations run on `repr`.
+    pub fn cold_at_with_repr(kind: ArmKind, parent_block: u64, repr: CacheTrieRepr) -> Self {
         // Weak's windows are never applied — its caches are discarded every block — but it still
         // needs *some* configuration to name a policy identifier with, and the default is the one
         // value that is not a claim about any policy under comparison.
@@ -159,9 +164,9 @@ impl PolicyState {
         Self {
             kind,
             builder_cache: config.new_cache_at(parent_block),
-            builder_trie: PartialTrieNodeCache::new(),
+            builder_trie: PartialTrieNodeCache::new_with_repr(repr),
             validator_cache: config.new_cache_at(parent_block),
-            validator_trie: PartialTrieNodeCache::new(),
+            validator_trie: PartialTrieNodeCache::new_with_repr(repr),
             config,
         }
     }
@@ -172,10 +177,11 @@ impl PolicyState {
     /// rather than clearing, because "cold" has to mean the same object a first-ever run would
     /// have, not one carrying whatever a previous block left behind.
     pub fn reset_cold_at(&mut self, parent_block: u64) {
+        let repr = self.builder_trie.repr();
         self.builder_cache = self.config.new_cache_at(parent_block);
-        self.builder_trie = PartialTrieNodeCache::new();
+        self.builder_trie = PartialTrieNodeCache::new_with_repr(repr);
         self.validator_cache = self.config.new_cache_at(parent_block);
-        self.validator_trie = PartialTrieNodeCache::new();
+        self.validator_trie = PartialTrieNodeCache::new_with_repr(repr);
     }
 }
 

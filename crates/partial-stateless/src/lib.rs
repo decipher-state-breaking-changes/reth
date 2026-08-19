@@ -10,6 +10,7 @@
 
 pub mod accessed_state;
 pub mod bootstrap;
+pub mod cache_trie;
 pub mod cold_admission;
 pub mod config;
 pub mod fixture;
@@ -37,6 +38,7 @@ pub use bootstrap::{
     rebuild_trie_cache, verify_and_restore, verify_and_restore_with_limits, BootstrapError,
     BootstrapLimits, CacheSnapshotPackage, RebuiltTrieCache, RestoredBootstrapState,
 };
+pub use cache_trie::{CacheTrie, CacheTrieRepr};
 pub use cold_admission::{
     admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };

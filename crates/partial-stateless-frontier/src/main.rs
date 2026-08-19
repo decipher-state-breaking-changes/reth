@@ -17,7 +17,7 @@
 //! policy window, because a policy measured before its window is populated is not the policy the
 //! report names.
 
-use partial_stateless::load_dataset;
+use partial_stateless::{load_dataset, CacheTrieRepr};
 use partial_stateless_frontier::{
     generate::{generate_block, ChainCursor, GeneratorRules},
     policy::{ArmKind, PolicyState},
@@ -40,11 +40,12 @@ struct Options {
     out: PathBuf,
     trie_diagnostics: bool,
     witness_v3: bool,
+    trie_repr: CacheTrieRepr,
 }
 
 fn usage() -> String {
     "usage: ps-policy-frontier --dataset <dir> --arm <weak|a/s> [--arm <weak|a/s> ...] \
-     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3]"
+     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3] [--trie-repr <parallel|exact>]"
         .to_string()
 }
 
@@ -56,6 +57,7 @@ fn parse_args() -> eyre::Result<Options> {
     let mut out = None;
     let mut trie_diagnostics = false;
     let mut witness_v3 = false;
+    let mut trie_repr = CacheTrieRepr::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -72,6 +74,9 @@ fn parse_args() -> eyre::Result<Options> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--trie-diagnostics" => trie_diagnostics = true,
             "--witness-v3" => witness_v3 = true,
+            "--trie-repr" => {
+                trie_repr = value()?.parse().map_err(|err| eyre::eyre!("{err}"))?;
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -100,7 +105,7 @@ fn parse_args() -> eyre::Result<Options> {
         eyre::bail!("--samples must be at least 1")
     }
 
-    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics, witness_v3 })
+    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics, witness_v3, trie_repr })
 }
 
 fn main() -> eyre::Result<()> {
@@ -145,6 +150,7 @@ fn main() -> eyre::Result<()> {
         warmup = options.warmup,
         samples = options.samples,
         witness_v3 = options.witness_v3,
+        trie_repr = options.trie_repr.label(),
         "Loaded policy replay dataset"
     );
     if !dataset.abandoned.is_empty() {
@@ -185,7 +191,13 @@ fn main() -> eyre::Result<()> {
     let mut policies = options
         .arms
         .iter()
-        .map(|arm| PolicyState::cold_at(*arm, first.body.block_number.saturating_sub(1)))
+        .map(|arm| {
+            PolicyState::cold_at_with_repr(
+                *arm,
+                first.body.block_number.saturating_sub(1),
+                options.trie_repr,
+            )
+        })
         .collect::<Vec<_>>();
 
     std::fs::create_dir_all(&options.out)?;
@@ -214,6 +226,7 @@ fn main() -> eyre::Result<()> {
         &options.arms,
         &results,
         options.witness_v3,
+        options.trie_repr,
     );
     let summary_path = options.out.join("frontier-summary.json");
     summary.write(&summary_path)?;

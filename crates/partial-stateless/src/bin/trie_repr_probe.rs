@@ -25,7 +25,7 @@ use std::{
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use partial_stateless::load_dataset;
 use reth_trie_common::DecodedMultiProofV2;
-use reth_trie_sparse::{ArenaParallelSparseTrie, ParallelSparseTrie, SparseStateTrie, SparseTrie};
+use reth_trie_sparse::{ExactSparseTrie, ParallelSparseTrie, SparseStateTrie, SparseTrie};
 
 /// Live heap bytes allocated through the global allocator.
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -132,9 +132,9 @@ fn run() -> Res<()> {
         count
     );
     println!(
-        "block,nodes,node_bytes,parallel_live,arena_live,arena_live_ratio,\
-         parallel_self,arena_self,parallel_build_us,arena_build_us,\
-         parallel_clone_us,arena_clone_us"
+        "block,nodes,node_bytes,parallel_live,exact_live,exact_live_ratio,\
+         parallel_self,exact_self,parallel_build_us,exact_build_us,\
+         parallel_clone_us,exact_clone_us"
     );
 
     let mut totals = [ReprSample::default(); 2];
@@ -149,12 +149,12 @@ fn run() -> Res<()> {
             .map_err(|err| format!("block {}: witness did not decode: {err}", body.block_number))?;
         drop(witness);
 
-        // Parallel first, arena second, each dropped before the other is built, so neither
+        // Parallel first, exact second, each dropped before the other is built, so neither
         // measurement contains the other's allocations.
         let parallel = sample_repr::<ParallelSparseTrie>(&proof, body.parent_state_root)
             .map_err(|err| format!("block {} parallel: {err}", body.block_number))?;
-        let arena = sample_repr::<ArenaParallelSparseTrie>(&proof, body.parent_state_root)
-            .map_err(|err| format!("block {} arena: {err}", body.block_number))?;
+        let exact = sample_repr::<ExactSparseTrie>(&proof, body.parent_state_root)
+            .map_err(|err| format!("block {} exact: {err}", body.block_number))?;
 
         let node_bytes: usize = body.full_transition_nodes.iter().map(|node| node.len()).sum();
         total_nodes += body.full_transition_nodes.len() as u64;
@@ -164,16 +164,16 @@ fn run() -> Res<()> {
             body.full_transition_nodes.len(),
             node_bytes,
             parallel.live_bytes,
-            arena.live_bytes,
-            arena.live_bytes as f64 / parallel.live_bytes.max(1) as f64,
+            exact.live_bytes,
+            exact.live_bytes as f64 / parallel.live_bytes.max(1) as f64,
             parallel.self_reported_bytes,
-            arena.self_reported_bytes,
+            exact.self_reported_bytes,
             parallel.build_us,
-            arena.build_us,
+            exact.build_us,
             parallel.clone_us,
-            arena.clone_us,
+            exact.clone_us,
         );
-        for (total, sample) in totals.iter_mut().zip([parallel, arena]) {
+        for (total, sample) in totals.iter_mut().zip([parallel, exact]) {
             total.live_bytes += sample.live_bytes;
             total.self_reported_bytes += sample.self_reported_bytes;
             total.build_us += sample.build_us;
@@ -181,21 +181,21 @@ fn run() -> Res<()> {
         }
     }
 
-    let [parallel, arena] = totals;
+    let [parallel, exact] = totals;
     println!(
         "TOTALS blocks={count} nodes={total_nodes} \
          parallel_live={} arena_live={} arena_live_ratio={:.4} \
          parallel_self={} arena_self={} \
          parallel_build_us={} arena_build_us={} parallel_clone_us={} arena_clone_us={}",
         parallel.live_bytes,
-        arena.live_bytes,
-        arena.live_bytes as f64 / parallel.live_bytes.max(1) as f64,
+        exact.live_bytes,
+        exact.live_bytes as f64 / parallel.live_bytes.max(1) as f64,
         parallel.self_reported_bytes,
-        arena.self_reported_bytes,
+        exact.self_reported_bytes,
         parallel.build_us,
-        arena.build_us,
+        exact.build_us,
         parallel.clone_us,
-        arena.clone_us,
+        exact.clone_us,
     );
     Ok(())
 }

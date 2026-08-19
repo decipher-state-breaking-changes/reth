@@ -141,6 +141,12 @@ pub struct RunSummary {
     pub measured_block_set_digest: B256,
     /// Per-arm totals, keyed by `weak` or `account/storage`.
     pub policies: BTreeMap<String, PolicySummary>,
+    /// Which sparse-trie representation every cache in this run was built on.
+    ///
+    /// `memory_size`-derived figures (`trie_cache_bytes`, `final_trie_cache_bytes`) are
+    /// representation-specific and must never be compared across runs that disagree here;
+    /// cross-representation memory comparisons use an external meter.
+    pub trie_repr: String,
     /// Whether this run was asked to build trimmed (v3) policy sidecars.
     ///
     /// Byte figures from a v3 run describe a different wire format than a v2 run's and the two
@@ -175,6 +181,7 @@ impl RunSummary {
         specs: &[ArmKind],
         results: &[BlockResult],
         witness_v3_requested: bool,
+        trie_repr: partial_stateless::CacheTrieRepr,
     ) -> Self {
         let mut policies = BTreeMap::new();
         for spec in specs {
@@ -239,6 +246,7 @@ impl RunSummary {
             measured_range: first.zip(last),
             measured_block_set_digest: alloy_primitives::keccak256(&measured_hashes),
             policies,
+            trie_repr: trie_repr.label().to_string(),
             witness_v3_requested,
             weak_baseline_present,
             total_block_admission_us,

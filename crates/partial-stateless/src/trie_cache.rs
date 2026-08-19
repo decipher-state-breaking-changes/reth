@@ -7,6 +7,7 @@
 
 use crate::{
     accessed_state::BlockAccessedState,
+    cache_trie::{CacheTrie, CacheTrieRepr},
     network_cache::{MembershipDelta, MissResult, NetworkStateCache},
     participant::ParticipantCache,
     shared_trie::{self, SharedSparseTrie},
@@ -18,8 +19,8 @@ use alloy_primitives::{
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
 use reth_trie_sparse::{
-    BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, ParallelSparseTrie,
-    RetainWitnessPathsMetrics, RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
+    BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, RetainWitnessPathsMetrics,
+    RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
 };
 use std::{
     fmt,
@@ -91,7 +92,22 @@ impl ShapeDiagnostics {
 /// The account trie is owned outright — every block rewrites the path from the root to each
 /// changed account, so nothing about it is worth sharing — while storage tries are shared
 /// copy-on-write with the generation the snapshot was taken from. See [`SharedSparseTrie`].
-type CacheSparseStateTrie = SparseStateTrie<ParallelSparseTrie, SharedSparseTrie>;
+type CacheSparseStateTrie = SparseStateTrie<CacheTrie, SharedSparseTrie<CacheTrie>>;
+
+/// A blind account-trie slot pre-seeded with the right representation, so the first reveal
+/// builds on it instead of falling back to the wrapper's default (parallel) trie.
+fn blind_account_trie(repr: CacheTrieRepr) -> RevealableSparseTrie<CacheTrie> {
+    RevealableSparseTrie::Blind(Some(Box::new(CacheTrie::new(repr))))
+}
+
+/// A state trie whose account slot and storage-trie template both carry the representation.
+fn sparse_state_trie_for(repr: CacheTrieRepr) -> CacheSparseStateTrie {
+    CacheSparseStateTrie::default()
+        .with_accounts_trie(blind_account_trie(repr))
+        .with_default_storage_trie(RevealableSparseTrie::Blind(Some(Box::new(
+            SharedSparseTrie::new(CacheTrie::new(repr)),
+        ))))
+}
 
 /// Sparse trie plus the value-cache membership whose paths it is required to retain.
 ///
@@ -106,6 +122,8 @@ type CacheSparseStateTrie = SparseStateTrie<ParallelSparseTrie, SharedSparseTrie
 #[derive(Debug)]
 pub struct PartialTrieNodeCache {
     sparse: CacheSparseStateTrie,
+    /// The trie representation every trie in this cache (account and storage) is built on.
+    repr: CacheTrieRepr,
     warm_accounts: HashSet<Address>,
     warm_storage: HashSet<(Address, B256)>,
     state_root: Option<B256>,
@@ -160,8 +178,8 @@ impl PartialTrieNodeCache {
                 timings.account_trie_breakdown = breakdown;
                 RevealableSparseTrie::Revealed(Box::new(copy))
             })
-            .unwrap_or_else(RevealableSparseTrie::blind);
-        let mut sparse = CacheSparseStateTrie::default().with_accounts_trie(accounts);
+            .unwrap_or_else(|| blind_account_trie(self.repr));
+        let mut sparse = sparse_state_trie_for(self.repr).with_accounts_trie(accounts);
         timings.account_trie_us = timings.account_trie_breakdown.total_us;
 
         // Copying the map wholesale is both cheaper and more faithful than rebuilding it from
@@ -193,6 +211,7 @@ impl PartialTrieNodeCache {
         (
             Self {
                 sparse,
+                repr: self.repr,
                 warm_accounts,
                 warm_storage,
                 state_root: self.state_root,
@@ -212,10 +231,19 @@ impl Default for PartialTrieNodeCache {
 }
 
 impl PartialTrieNodeCache {
-    /// Creates a cold local sparse trie.
+    /// Creates a cold local sparse trie on the default (parallel) representation.
     pub fn new() -> Self {
+        Self::new_with_repr(CacheTrieRepr::default())
+    }
+
+    /// Creates a cold local sparse trie on the given representation.
+    ///
+    /// Every trie this cache ever creates — the account trie on first reveal and each storage
+    /// trie template — inherits it, so a cache never mixes representations.
+    pub fn new_with_repr(repr: CacheTrieRepr) -> Self {
         Self {
-            sparse: CacheSparseStateTrie::default(),
+            sparse: sparse_state_trie_for(repr),
+            repr,
             warm_accounts: HashSet::default(),
             warm_storage: HashSet::default(),
             state_root: None,
@@ -223,6 +251,11 @@ impl PartialTrieNodeCache {
             retained_account_paths: Vec::new(),
             synced_to_block: None,
         }
+    }
+
+    /// The trie representation this cache runs on.
+    pub const fn repr(&self) -> CacheTrieRepr {
+        self.repr
     }
 
     pub(crate) fn restore_from_decoded_multiproof(
@@ -946,11 +979,8 @@ impl PartialTrieNodeCache {
     /// Diagnostic: walks every revealed branch node, so it belongs beside the other opt-in
     /// censuses rather than on the per-block hot path.
     pub fn branch_slot_census(&self) -> TrieBranchCensus {
-        let account = self
-            .sparse
-            .state_trie_ref()
-            .map(ParallelSparseTrie::branch_slot_census)
-            .unwrap_or_default();
+        let account =
+            self.sparse.state_trie_ref().map(CacheTrie::branch_slot_census).unwrap_or_default();
         let mut storage = BranchSlotCensus::default();
         let mut storage_tries = 0u64;
         for trie in self.sparse.storage_tries_ref().values() {
