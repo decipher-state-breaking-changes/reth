@@ -1876,12 +1876,16 @@ where
             .ok_or_else(|| eyre::eyre!("the builder captured dataset material with no recorder"))?;
         match record_dataset_block(ctx, recorder, material, dataset_payload, block) {
             Ok(()) => {}
-            Err(err) if recorder.skip_before_first_record(block_number, &format!("{err:#}")) => {}
             Err(err) => {
-                recorder.fail(format!("block {block_number} could not be recorded: {err:#}"));
-                return Err(err.wrap_err(format!(
-                    "policy replay dataset capture failed at block {block_number}"
-                )))
+                let skipped = err
+                    .downcast_ref::<policy_dataset_capture::PolicyDatasetMaterialError>()
+                    .is_some_and(|miss| recorder.skip_startup_handoff_miss(block_number, miss));
+                if !skipped {
+                    recorder.fail(format!("block {block_number} could not be recorded: {err:#}"));
+                    return Err(err.wrap_err(format!(
+                        "policy replay dataset capture failed at block {block_number}"
+                    )))
+                }
             }
         }
     }

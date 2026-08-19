@@ -51,12 +51,14 @@ or either cache anchor.
 ## Reaching a usable cache
 
 Sparse-trie snapshots still have no general branch-aware undo representation, so
-recovery has two layers. Every role that advances the caches keeps the displaced
-parent as one **retained coordinated generation**: on a depth-1 reorg it rolls the
-flat cache back once, restores that parent trie, and verifies the target hash,
-canonical state root, policy, and readiness before continuing. If the retained
-generation is absent or any check fails, recovery falls back to the
-**provider-backed canonical rebuild** ([`rebuild.rs`](./src/rebuild.rs)).
+every role that advances the caches keeps the displaced parent as one **retained
+coordinated generation**. On a depth-1 reorg it rolls the flat cache back once,
+restores that parent trie, and verifies the target hash, canonical state root,
+policy, and readiness before continuing. What happens beyond that point depends on
+the role: an ExEx-attached full node may use the **provider-backed canonical rebuild**
+([`rebuild.rs`](./src/rebuild.rs)); the standalone validator has no provider or
+database path and instead enters `NeedsSnapshot` until the producer supplies a
+recovery checkpoint bound to the required ancestor.
 
 The rebuild produces an exact coordinated pair at a canonical block hash without
 consulting the abandoned generation. It replays `max_window + 1` heights ending
@@ -90,7 +92,8 @@ The retained-generation path covers exactly one block. It adds no new trie clone
 in either role: the transition already copies the parent trie and then overwrites
 it, so both the builder and the live verifier keep a copy that exists anyway. A
 builder-side preflight discards its transactional result and displaces nothing, so
-it retains nothing. A deeper reorg falls back to the rebuild.
+it retains nothing. A deeper reorg falls back to the rebuild only in a full-node
+role; a standalone consumer stops applying frames and requests a recovery snapshot.
 
 Restoring a retained generation cannot promote a pair that is still warming. The
 undo gives back exactly one replayed block, so it is accepted only when the window
@@ -106,12 +109,13 @@ the database cannot replay at all and needs one. It also assumes the last
 `max_window + 1` heights are readable through `history_by_block_hash`, which holds
 for a full node but not under aggressive pruning.
 
-**The open end is the stateless verifier past depth 1.** Retention reaches exactly
-one block and the rebuild needs canonical state, so a node without a database has
-nothing between them. Closing it means a recovery-time snapshot request:
-`recover_at` branches only to the retained generation or to the rebuild, and
-`PS_BOOTSTRAP_IMPORT` runs at process start only. The gap does not show up in the
-benchmarks, where even the verifier role runs as an ExEx on a full node.
+**The standalone path past depth 1 is snapshot recovery, not database rebuild.** A
+`Reorg`, `Revert`, or gap that cannot use the retained generation moves the consumer
+to `NeedsSnapshot`; it does not guess forward from stale cache state. The producer
+publishes a new checkpoint for the recovery ancestor, the consumer verifies and
+installs it, then replays the winning frames. This protocol is implemented and
+synthetically exercised for deeper reorg/revert cases; live mainnet evidence remains
+K = 1 because deeper events did not occur in the live runs.
 
 **Neither recovery path is reachable from the measured verification path.** The
 validator numbers only mean anything because the benchmark validates from
@@ -487,10 +491,10 @@ spends most of a minute reaching the point where the ExEx takes its first notifi
 the Engine taps keep handing off through their ring buffers meanwhile — so at the default the
 first block the capture sees has often already been evicted, and it has neither the payload
 nor the access set the corpus requires. 32 slots is roughly six minutes of chain at mainnet
-block times. A capture also does not fail over such a block *before its first record*: nothing
-is behind it, so the corpus simply starts later and the skip is filed in `lifecycle.jsonl`.
-After the first record the same refusal is fatal, because it would leave a hole in the middle
-of a corpus that would otherwise look complete.
+block times. Before the first record, and only for a typed payload/access handoff miss, the
+corpus starts later and files the skip in `lifecycle.jsonl`. Provider, encoding, filesystem,
+and internal-invariant failures are fatal from the first block. After the first record even a
+handoff miss is fatal, because it would leave a hole in a corpus that otherwise looks complete.
 
 Run the node from somewhere other than the source tree. Some diagnostic output resolves
 against the working directory, so a capture launched from the repo leaves files in it, which
@@ -603,14 +607,17 @@ over an explicit, sorted, length-prefixed encoding, which is what the schema ver
 head of every record and manifest tracks; a capture from the superseded schema is refused at
 its manifest.
 
-**Known schema-1 capture status (2026-08-18).** The first 1,200-block live capture closed
-cleanly and waited for 96 confirmations, but this acceptance smoke refused block 25,781,091.
+**Schema-1 failure and accepted schema-2 replacement (2026-08-18--19).** The first 1,200-block
+live capture closed cleanly and waited for 96 confirmations, but this acceptance smoke refused
+block 25,781,091.
 Schema 1 digests `bincode` bytes containing three unordered `HashMap`s in
 `BlockAccessedState`; after deserialization their iteration order is not stable, so
 re-serializing the same semantic record can produce a different digest. Hashing the exact body
 bytes stored in the rejected file reproduces its recorded digest, which distinguishes this
-from observed disk corruption. Keep that dataset quarantined until a canonical digest schema
-and migration or a fresh capture pass the gate above; it is not paper evidence yet.
+from observed disk corruption. Its bulk data was discarded rather than migrated. The schema-2
+recapture at `/data/bench-runs/policy-frontier-20260818-223726/raw-block-witness-data` passed the
+full loader, five-sample smoke, and 1,000-block four-policy replay and is the accepted evidence
+input; its run root carries `RESULT_SHA256SUMS`.
 
 ## Outputs
 

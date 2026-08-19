@@ -373,17 +373,27 @@ impl PolicyDatasetRecorder {
         &self.dir
     }
 
-    /// Records one block, and closes the dataset when the budget is met.
-    /// Decides what a block that could not be recorded means for the run.
+    /// Decides what a startup Engine-handoff miss means for the run.
     ///
     /// Returns `true` when the run should carry on. That is the case only while the corpus is
     /// empty: a block refused then leaves nothing behind it, so the corpus starts later and is
     /// whole. Once a record exists the same refusal would put a hole in the middle of it, and a
     /// corpus with a hole is worse than none — it looks complete.
     ///
+    /// No other recording error may call this path. Provider, encoding, and filesystem failures
+    /// are fatal even before the first record: unlike a moving handoff ring, none is expected to
+    /// heal merely because the next block arrived.
+    ///
     /// The skips are counted and bounded, because "not yet" and "never" look identical from here
     /// for as long as one is willing to wait.
-    pub fn skip_before_first_record(&mut self, block_number: u64, reason: &str) -> bool {
+    pub(crate) fn skip_startup_handoff_miss(
+        &mut self,
+        block_number: u64,
+        miss: &PolicyDatasetMaterialError,
+    ) -> bool {
+        if !miss.is_startup_handoff_miss() {
+            return false
+        }
         if !self.written.is_empty() || self.complete {
             return false
         }
@@ -396,14 +406,15 @@ impl PolicyDatasetRecorder {
             block = block_number,
             skipped = self.skipped_before_first,
             limit = MAX_SKIPS_BEFORE_FIRST_RECORD,
-            reason,
+            reason = %miss,
             "Policy replay dataset has not started yet; this block cannot be recorded and the \
              corpus will begin at a later one"
         );
-        self.note(LifecycleEvent::Skipped { block_number, reason: reason.to_string() });
+        self.note(LifecycleEvent::Skipped { block_number, reason: miss.to_string() });
         true
     }
 
+    /// Records one block, and closes the dataset when the budget is met.
     pub fn record(&mut self, body: PolicyDatasetRecordBody) -> eyre::Result<()> {
         if !self.wants_block() {
             return Ok(());
@@ -583,6 +594,47 @@ pub struct PolicyDatasetMaterial {
     pub ancestor_headers: Vec<Bytes>,
 }
 
+/// A material refusal whose class determines whether an empty capture may start one block later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyDatasetMaterialError {
+    /// The Engine payload ring no longer held this block.
+    PayloadHandoffMiss { block_number: u64, provenance: RecordedPayloadProvenance },
+    /// The Engine access-artifact ring no longer held this block.
+    AccessHandoffMiss { block_number: u64, provenance: RecordedAccessProvenance },
+    /// The handoff claimed success but supplied no payload bytes.
+    MissingWitnessedPayload { block_number: u64 },
+}
+
+impl PolicyDatasetMaterialError {
+    const fn is_startup_handoff_miss(&self) -> bool {
+        matches!(self, Self::PayloadHandoffMiss { .. } | Self::AccessHandoffMiss { .. })
+    }
+}
+
+impl std::fmt::Display for PolicyDatasetMaterialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PayloadHandoffMiss { block_number, provenance } => write!(
+                f,
+                "block {block_number} has {provenance:?} payload provenance; a policy replay \
+                 dataset records only payloads the Engine witnessed, because an admission check \
+                 run against a derived payload is checking a derivation against itself"
+            ),
+            Self::AccessHandoffMiss { block_number, provenance } => write!(
+                f,
+                "block {block_number} has {provenance:?} access provenance; a policy replay \
+                 dataset records only the access set the node's own Engine produced, because \
+                 that is the set production runs on"
+            ),
+            Self::MissingWitnessedPayload { block_number } => {
+                write!(f, "block {block_number} was reported as witnessed but carries no payload")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolicyDatasetMaterialError {}
+
 impl PolicyDatasetMaterial {
     /// Joins the builder's material to the Engine payload the ExEx loop took.
     ///
@@ -590,7 +642,7 @@ impl PolicyDatasetMaterial {
     /// producer that obtained nothing — a WAL replay, a backfill — and a dataset carrying such a
     /// record would hand the offline generator a block it cannot admit, discovered a thousand
     /// blocks into a run rather than here.
-    pub fn into_record_body(
+    pub(crate) fn into_record_body(
         self,
         block_number: u64,
         block_hash: B256,
@@ -598,13 +650,12 @@ impl PolicyDatasetMaterial {
         parent_header: Bytes,
         payload_json: Option<Vec<u8>>,
         payload_provenance: RecordedPayloadProvenance,
-    ) -> eyre::Result<PolicyDatasetRecordBody> {
+    ) -> Result<PolicyDatasetRecordBody, PolicyDatasetMaterialError> {
         if payload_provenance != RecordedPayloadProvenance::Witnessed {
-            eyre::bail!(
-                "block {block_number} has {payload_provenance:?} payload provenance; a policy \
-                 replay dataset records only payloads the Engine witnessed, because an admission \
-                 check run against a derived payload is checking a derivation against itself"
-            );
+            return Err(PolicyDatasetMaterialError::PayloadHandoffMiss {
+                block_number,
+                provenance: payload_provenance,
+            })
         }
         // The same rule on the other input. Startup already refuses a nonzero `PS_SHADOW_SAMPLE`,
         // so deliberate sampling cannot reach here — what can is a handoff miss, which is
@@ -613,15 +664,13 @@ impl PolicyDatasetMaterial {
         // re-executing rather than from the Engine, and a corpus that mixed the two would be
         // describing two execution paths under one name.
         if self.access_provenance != RecordedAccessProvenance::EngineArtifact {
-            eyre::bail!(
-                "block {block_number} has {:?} access provenance; a policy replay dataset records \
-                 only the access set the node's own Engine produced, because that is the set \
-                 production runs on",
-                self.access_provenance
-            );
+            return Err(PolicyDatasetMaterialError::AccessHandoffMiss {
+                block_number,
+                provenance: self.access_provenance,
+            })
         }
         let Some(payload_json) = payload_json else {
-            eyre::bail!("block {block_number} was reported as witnessed but carries no payload")
+            return Err(PolicyDatasetMaterialError::MissingWitnessedPayload { block_number })
         };
         Ok(PolicyDatasetRecordBody {
             schema_version: partial_stateless::POLICY_DATASET_SCHEMA_VERSION,
@@ -891,7 +940,13 @@ mod tests {
             Some(b"{}".to_vec()),
             RecordedPayloadProvenance::Reconstructed,
         );
-        assert!(refused.is_err());
+        assert_eq!(
+            refused.unwrap_err(),
+            PolicyDatasetMaterialError::PayloadHandoffMiss {
+                block_number: 10,
+                provenance: RecordedPayloadProvenance::Reconstructed,
+            }
+        );
     }
 
     /// A handoff miss falls back to this builder re-executing, which is a different execution path
@@ -914,7 +969,84 @@ mod tests {
             Some(b"{}".to_vec()),
             RecordedPayloadProvenance::Witnessed,
         );
-        assert!(refused.is_err());
+        assert_eq!(
+            refused.unwrap_err(),
+            PolicyDatasetMaterialError::AccessHandoffMiss {
+                block_number: 10,
+                provenance: RecordedAccessProvenance::Reexecution,
+            }
+        );
+    }
+
+    /// The caller recovers the class of a refusal by downcasting the `eyre::Report` that
+    /// `record_dataset_block` returns. If that ever stopped working the skip would silently become
+    /// unreachable and a cold start would kill the node again, so it is asserted rather than
+    /// assumed.
+    #[test]
+    fn a_material_refusal_survives_the_trip_through_eyre() {
+        fn as_report() -> eyre::Result<()> {
+            let material = PolicyDatasetMaterial {
+                parent_state_root: B256::ZERO,
+                expected_state_root: B256::ZERO,
+                accessed: BlockAccessedState::default(),
+                access_provenance: RecordedAccessProvenance::EngineArtifact,
+                full_transition_nodes: Vec::new(),
+                ancestor_headers: Vec::new(),
+            };
+            material.into_record_body(
+                10,
+                B256::ZERO,
+                B256::ZERO,
+                Bytes::new(),
+                None,
+                RecordedPayloadProvenance::Reconstructed,
+            )?;
+            Ok(())
+        }
+        let report = as_report().unwrap_err();
+        assert_eq!(
+            report.downcast_ref::<PolicyDatasetMaterialError>().copied(),
+            Some(PolicyDatasetMaterialError::PayloadHandoffMiss {
+                block_number: 10,
+                provenance: RecordedPayloadProvenance::Reconstructed,
+            }),
+            "the caller's downcast cannot see the refusal class"
+        );
+
+        // And an unrelated failure must not look like one.
+        let unrelated: eyre::Report = eyre::eyre!("provider read failed");
+        assert!(unrelated.downcast_ref::<PolicyDatasetMaterialError>().is_none());
+    }
+
+    /// A claimed handoff with no bytes is an internal invariant failure, not an evicted ring item.
+    #[test]
+    fn missing_witnessed_payload_is_not_a_startup_handoff_miss() {
+        let material = PolicyDatasetMaterial {
+            parent_state_root: B256::ZERO,
+            expected_state_root: B256::ZERO,
+            accessed: BlockAccessedState::default(),
+            access_provenance: RecordedAccessProvenance::EngineArtifact,
+            full_transition_nodes: Vec::new(),
+            ancestor_headers: Vec::new(),
+        };
+        let refused = material
+            .into_record_body(
+                10,
+                B256::ZERO,
+                B256::ZERO,
+                Bytes::new(),
+                None,
+                RecordedPayloadProvenance::Witnessed,
+            )
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            PolicyDatasetMaterialError::MissingWitnessedPayload { block_number: 10 }
+        );
+
+        let dir = temp_dir("missing-witnessed-payload");
+        let mut recorder = recorder_at(&dir, 4, 0);
+        assert!(!recorder.skip_startup_handoff_miss(10, &refused));
     }
 
     /// Sampling records the sampled block's own re-executed set, so a capture must refuse it up
@@ -940,9 +1072,13 @@ mod tests {
     fn a_block_refused_before_the_corpus_starts_lets_the_run_continue() {
         let dir = temp_dir("skip-before-start");
         let mut recorder = recorder_at(&dir, 4, 0);
-
-        assert!(recorder.skip_before_first_record(10, "no Engine payload"));
-        assert!(recorder.skip_before_first_record(11, "no Engine payload"));
+        for block_number in [10, 11] {
+            let miss = PolicyDatasetMaterialError::PayloadHandoffMiss {
+                block_number,
+                provenance: RecordedPayloadProvenance::Absent,
+            };
+            assert!(recorder.skip_startup_handoff_miss(block_number, &miss));
+        }
 
         // And the corpus that follows is whole, starting where the capture actually began.
         for number in 12..=15u64 {
@@ -965,7 +1101,11 @@ mod tests {
         let dir = temp_dir("skip-after-start");
         let mut recorder = recorder_at(&dir, 4, 0);
         record(&mut recorder, 10, 0x0a);
-        assert!(!recorder.skip_before_first_record(11, "no Engine payload"));
+        let miss = PolicyDatasetMaterialError::PayloadHandoffMiss {
+            block_number: 11,
+            provenance: RecordedPayloadProvenance::Absent,
+        };
+        assert!(!recorder.skip_startup_handoff_miss(11, &miss));
     }
 
     /// "Not yet" and "never" look identical from inside the wait, so the wait is bounded.
@@ -974,13 +1114,18 @@ mod tests {
         let dir = temp_dir("skip-budget");
         let mut recorder = recorder_at(&dir, 4, 0);
         for block in 0..MAX_SKIPS_BEFORE_FIRST_RECORD {
-            assert!(
-                recorder.skip_before_first_record(block, "no Engine payload"),
-                "gave up at {block}"
-            );
+            let miss = PolicyDatasetMaterialError::PayloadHandoffMiss {
+                block_number: block,
+                provenance: RecordedPayloadProvenance::Absent,
+            };
+            assert!(recorder.skip_startup_handoff_miss(block, &miss), "gave up at {block}");
         }
+        let miss = PolicyDatasetMaterialError::PayloadHandoffMiss {
+            block_number: MAX_SKIPS_BEFORE_FIRST_RECORD,
+            provenance: RecordedPayloadProvenance::Absent,
+        };
         assert!(
-            !recorder.skip_before_first_record(MAX_SKIPS_BEFORE_FIRST_RECORD, "no Engine payload"),
+            !recorder.skip_startup_handoff_miss(MAX_SKIPS_BEFORE_FIRST_RECORD, &miss),
             "the wait was unbounded"
         );
     }
