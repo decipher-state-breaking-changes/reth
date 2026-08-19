@@ -72,6 +72,19 @@ pub struct PolicySummary {
     pub final_cache_bytes: usize,
     /// Trie cache size after the last measured block.
     pub final_trie_cache_bytes: usize,
+    /// Measured blocks whose witness-trim measurement ran (zero unless diagnostics were on).
+    pub trim_measured_blocks: u64,
+    /// Witness node bytes over exactly those blocks — the denominator for the trim ratio.
+    pub trim_witness_node_bytes: u64,
+    /// Bytes the receiver's trie cache already revealed, summed over those blocks.
+    pub trim_trimmable_bytes: u64,
+    /// The account-trie share of the trimmable bytes.
+    pub trim_trimmable_account_bytes: u64,
+    /// The storage-trie share of the trimmable bytes.
+    pub trim_trimmable_storage_bytes: u64,
+    /// Witness entries the decoded proof walk could not attribute, summed. Must be zero for the
+    /// trim figures above to be trusted.
+    pub trim_unattributed_nodes: u64,
 }
 
 impl PolicySummary {
@@ -181,6 +194,14 @@ impl RunSummary {
                 entry.total_sidecar_decode_us += policy.sidecar_decode_us;
                 entry.final_cache_bytes = policy.cache_bytes;
                 entry.final_trie_cache_bytes = policy.trie_cache_bytes;
+                if let Some(trim) = &policy.witness_trim {
+                    entry.trim_measured_blocks += 1;
+                    entry.trim_witness_node_bytes += trim.witness_node_bytes as u64;
+                    entry.trim_trimmable_bytes += trim.trimmable_bytes as u64;
+                    entry.trim_trimmable_account_bytes += trim.trimmable_account_bytes as u64;
+                    entry.trim_trimmable_storage_bytes += trim.trimmable_storage_bytes as u64;
+                    entry.trim_unattributed_nodes += trim.unattributed_nodes as u64;
+                }
             }
         }
 

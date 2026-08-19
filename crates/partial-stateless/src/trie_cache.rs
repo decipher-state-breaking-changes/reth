@@ -902,6 +902,37 @@ impl PartialTrieNodeCache {
         accounts
     }
 
+    /// Hashes of every hash-addressed node the account trie currently reveals.
+    ///
+    /// Dirty nodes carry no cached hash and are skipped, so this is complete only on a cache
+    /// whose root has been computed — which every committed generation has.
+    pub fn revealed_account_node_hashes(&self) -> HashSet<B256> {
+        let mut hashes = HashSet::default();
+        if let Some(trie) = self.sparse.state_trie_ref() {
+            trie.for_each_cached_node_hash(|_, hash| {
+                hashes.insert(hash);
+            });
+        }
+        hashes
+    }
+
+    /// Per-storage-trie revealed node hashes, keyed by hashed account address.
+    ///
+    /// Kept per trie rather than pooled: two storage tries can hold byte-identical subtrees, and
+    /// a node revealed under one trie proves nothing about a path in the other.
+    pub fn revealed_storage_node_hashes(&self) -> B256Map<HashSet<B256>> {
+        let mut tries = B256Map::default();
+        for (hashed_address, trie) in self.sparse.storage_tries_ref() {
+            let Some(shared) = trie.as_revealed_ref() else { continue };
+            let mut hashes = HashSet::default();
+            shared.shared_ref().for_each_cached_node_hash(|_, hash| {
+                hashes.insert(hash);
+            });
+            tries.insert(*hashed_address, hashes);
+        }
+        tries
+    }
+
     /// Deterministic commitment to the local sparse-trie state and retained path set.
     ///
     /// The canonical state root authenticates the node contents; the sorted membership determines

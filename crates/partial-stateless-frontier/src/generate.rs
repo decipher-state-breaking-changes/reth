@@ -38,9 +38,9 @@ use alloy_consensus::Header;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use partial_stateless::{
-    full_witness_sidecar_from_nodes, policy_dataset::PolicyDatasetRecord, BlockAccessedState,
-    BlockTransitionRef, CacheAwareFlatBuild, PartialStatelessSidecar, PolicySidecarBuild,
-    TransitionBuildContext,
+    full_witness_sidecar_from_nodes, measure_witness_trim, policy_dataset::PolicyDatasetRecord,
+    BlockAccessedState, BlockTransitionRef, CacheAwareFlatBuild, PartialStatelessSidecar,
+    PolicySidecarBuild, TransitionBuildContext, WitnessTrimStats,
 };
 use partial_stateless_validator::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, PostStateRootOracle,
@@ -137,6 +137,11 @@ pub struct PolicyBlockResult {
     /// Reporting that build under a rotation slot would attribute a cost to a position it never
     /// occupied. **Not** a production builder latency either way — see the module docs.
     pub offline_build_us: Option<u64>,
+    /// How much of this sidecar's witness the validator's own trie cache already reveals,
+    /// measured against the parent generation the sidecar applies to. Present only when the run
+    /// asked for trie diagnostics; always absent on the Weak arm, which retains no trie.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_trim: Option<WitnessTrimStats>,
 }
 
 /// Everything one recorded block produced.
@@ -177,6 +182,12 @@ pub struct GeneratorRules<'a, Evm, C: ?Sized, ChainSpec> {
     pub admission: &'a UntrustedAdmission<'a, ChainSpec, C>,
     /// Bounds on sidecar witness decoding.
     pub limits: &'a SidecarReexecLimits,
+    /// Whether to measure witness-trim potential and the branch-slot census per arm and block.
+    ///
+    /// Both walk every revealed node of the arm's trie cache, so they are opt-in: a run carrying
+    /// them reports the same bytes and miss sets but its timing figures are not comparable to a
+    /// run without them.
+    pub trie_diagnostics: bool,
 }
 
 /// What the previous block left behind for the next one.
@@ -312,6 +323,12 @@ where
                 )
                 .map_err(|err| eyre::eyre!("sidecar build failed: {err:#}"))?;
                 let PolicySidecarBuild { sidecar, build, base: _, build_us } = built;
+                // Against the parent generation, which is what the sidecar applies to — the
+                // commit below replaces it, so this is the last moment the receiver's view of
+                // this witness exists to measure against.
+                let witness_trim = rules.trie_diagnostics.then(|| {
+                    measure_witness_trim(&state.builder_trie, &build.nodes, &build.decoded_proof)
+                });
                 validate_and_commit(
                     rules,
                     &block,
@@ -320,6 +337,10 @@ where
                     Some((build, build_us)),
                     rotation_slot,
                 )
+                .map(|mut result| {
+                    result.witness_trim = witness_trim;
+                    result
+                })
             }
         }
         .map_err(|err| {
@@ -514,6 +535,7 @@ where
         sidecar_decode_and_commit_us,
         sidecar_decode_us,
         offline_build_us,
+        witness_trim: None,
     })
 }
 

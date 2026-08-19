@@ -38,11 +38,12 @@ struct Options {
     warmup: u64,
     samples: u64,
     out: PathBuf,
+    trie_diagnostics: bool,
 }
 
 fn usage() -> String {
     "usage: ps-policy-frontier --dataset <dir> --arm <weak|a/s> [--arm <weak|a/s> ...] \
-     --warmup <n> --samples <n> --out <dir>"
+     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics]"
         .to_string()
 }
 
@@ -52,6 +53,7 @@ fn parse_args() -> eyre::Result<Options> {
     let mut warmup = None;
     let mut samples = None;
     let mut out = None;
+    let mut trie_diagnostics = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -66,6 +68,7 @@ fn parse_args() -> eyre::Result<Options> {
             "--warmup" => warmup = Some(value()?.parse::<u64>()?),
             "--samples" => samples = Some(value()?.parse::<u64>()?),
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--trie-diagnostics" => trie_diagnostics = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -94,7 +97,7 @@ fn parse_args() -> eyre::Result<Options> {
         eyre::bail!("--samples must be at least 1")
     }
 
-    Ok(Options { dataset, arms, warmup, samples, out })
+    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics })
 }
 
 fn main() -> eyre::Result<()> {
@@ -168,6 +171,7 @@ fn main() -> eyre::Result<()> {
         validator: ValidatorRules::new(&evm_config, &consensus),
         admission: &admission,
         limits: &limits,
+        trie_diagnostics: options.trie_diagnostics,
     };
 
     let replayed = &dataset.records[..needed as usize];
@@ -219,6 +223,21 @@ fn main() -> eyre::Result<()> {
             final_trie_cache_bytes = totals.final_trie_cache_bytes,
             "Arm totals"
         );
+        if totals.trim_measured_blocks > 0 {
+            let ratio =
+                totals.trim_trimmable_bytes as f64 / totals.trim_witness_node_bytes.max(1) as f64;
+            info!(
+                arm = %arm,
+                trim_measured_blocks = totals.trim_measured_blocks,
+                trimmable_share = format!("{:.4}", ratio),
+                trimmable_bytes = totals.trim_trimmable_bytes,
+                witness_node_bytes = totals.trim_witness_node_bytes,
+                account_bytes = totals.trim_trimmable_account_bytes,
+                storage_bytes = totals.trim_trimmable_storage_bytes,
+                unattributed_nodes = totals.trim_unattributed_nodes,
+                "Witness-trim potential"
+            );
+        }
     }
     info!(
         stream = %stream.display(),

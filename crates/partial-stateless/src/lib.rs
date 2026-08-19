@@ -24,6 +24,7 @@ pub mod shared_trie;
 pub mod transition_build;
 pub mod trie_cache;
 pub mod witness;
+pub mod witness_trim;
 
 pub mod sender_proof;
 pub mod sidecar;
@@ -91,3 +92,4 @@ pub use witness_check::{
     CacheAwareTrieTransition, MaterializedStateProof, TrieProofTarget, TrieProofTargetV2,
     TrieTransitionError,
 };
+pub use witness_trim::{measure_witness_trim, WitnessTrimStats, WITNESS_TRIM_DEPTH_LEVELS};

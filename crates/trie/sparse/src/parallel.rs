@@ -3146,6 +3146,24 @@ impl ParallelSparseTrie {
         size
     }
 
+    /// Calls `f` with the path and hash of every revealed node that is hash-addressed in its
+    /// parent.
+    ///
+    /// A node whose RLP is shorter than 32 bytes is embedded inline in its parent and has no hash
+    /// of its own, and a dirty node has no cached hash yet; both are skipped. Callers that need
+    /// the whole trie must therefore compute the root first, which caches every node's `RlpNode`.
+    pub fn for_each_cached_node_hash(&self, mut f: impl FnMut(&Nibbles, B256)) {
+        for subtrie in core::iter::once(self.upper_subtrie.as_ref())
+            .chain(self.lower_subtries.iter().filter_map(LowerSparseSubtrie::as_revealed_ref))
+        {
+            for (path, node) in &subtrie.nodes {
+                if let Some(hash) = node.cached_hash() {
+                    f(path, hash);
+                }
+            }
+        }
+    }
+
     /// Determines if the given path can be directly reached from the upper trie.
     fn is_path_reachable_from_upper(&self, path: &Nibbles) -> bool {
         let mut current = Nibbles::default();
