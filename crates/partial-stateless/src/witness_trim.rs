@@ -182,6 +182,15 @@ mod tests {
     fn cache_and_witness(
         addresses: &[Address],
     ) -> (PartialTrieNodeCache, Vec<Bytes>, DecodedMultiProofV2) {
+        cache_and_witness_with_warm(addresses, addresses)
+    }
+
+    /// Like [`cache_and_witness`], but the value cache retains only `warm`, so restoring blinds
+    /// the proven-but-unretained remainder — the shape a committed cache actually has.
+    fn cache_and_witness_with_warm(
+        addresses: &[Address],
+        warm: &[Address],
+    ) -> (PartialTrieNodeCache, Vec<Bytes>, DecodedMultiProofV2) {
         let mut leaves: Vec<(B256, Vec<u8>)> = addresses
             .iter()
             .map(|address| {
@@ -211,7 +220,7 @@ mod tests {
             .expect("hand-built witness must decode");
 
         let mut accessed = BlockAccessedState::default();
-        for address in addresses {
+        for address in warm {
             accessed.accounts.insert(
                 *address,
                 AccountData { nonce: 1, balance: U256::from(1_000_000u64), code_hash: None },
@@ -280,5 +289,30 @@ mod tests {
 
     fn inline_bytes(nodes: &[Bytes]) -> usize {
         nodes.iter().filter(|node| node.len() < 32).map(|node| node.len()).sum()
+    }
+
+    #[test]
+    fn the_branch_census_counts_blinding_that_retention_produced() {
+        // The witness proves eight accounts, the value cache retains four: restoring prunes the
+        // other four subtrees, and every pruned child must show up as a blinded slot.
+        let all = addresses(8);
+        let (cache, _, _) = cache_and_witness_with_warm(&all, &all[..4]);
+        let census = cache.branch_slot_census();
+        assert!(census.account.branches > 0, "eight distinct keys must branch somewhere");
+        assert!(census.account.blinded_slots > 0, "pruned siblings must be blinded");
+        assert!(census.account.blinded_slots <= census.account.present_slots);
+        assert_eq!(
+            census.account.branches,
+            census.account.branches_by_depth.iter().sum::<u64>(),
+            "the depth buckets must partition the branches"
+        );
+        assert_eq!(
+            census.account.blinded_slots,
+            census.account.blinded_by_depth.iter().sum::<u64>(),
+        );
+
+        // A fully revealed cache has no blinded child anywhere.
+        let (full, _, _) = cache_and_witness(&all);
+        assert_eq!(full.branch_slot_census().account.blinded_slots, 0);
     }
 }

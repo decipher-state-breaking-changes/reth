@@ -15,7 +15,9 @@ revm-primitives = { workspace = true, features = ["std"] }
 reth-execution-access = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-trie-common = { workspace = true }
-reth-trie-sparse = { workspace = true }
+# `std` is what gates the arena trie implementation, which the representation probe compares
+# against the node-map trie the cache runs on today.
+reth-trie-sparse = { workspace = true, features = ["std"] }
 
 # serialization
 serde = { workspace = true, features = ["derive"] }

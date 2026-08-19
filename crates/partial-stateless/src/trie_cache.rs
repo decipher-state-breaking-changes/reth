@@ -18,8 +18,8 @@ use alloy_primitives::{
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
 use reth_trie_sparse::{
-    CloneBreakdown, CloneMeasureOptions, ParallelSparseTrie, RetainWitnessPathsMetrics,
-    RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
+    BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, ParallelSparseTrie,
+    RetainWitnessPathsMetrics, RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
 };
 use std::{
     fmt,
@@ -933,6 +933,27 @@ impl PartialTrieNodeCache {
         tries
     }
 
+    /// Branch child-slot occupancy across the account trie and every storage trie.
+    ///
+    /// Diagnostic: walks every revealed branch node, so it belongs beside the other opt-in
+    /// censuses rather than on the per-block hot path.
+    pub fn branch_slot_census(&self) -> TrieBranchCensus {
+        let account = self
+            .sparse
+            .state_trie_ref()
+            .map(ParallelSparseTrie::branch_slot_census)
+            .unwrap_or_default();
+        let mut storage = BranchSlotCensus::default();
+        let mut storage_tries = 0u64;
+        for trie in self.sparse.storage_tries_ref().values() {
+            if let Some(shared) = trie.as_revealed_ref() {
+                storage_tries += 1;
+                storage.accumulate(&shared.shared_ref().branch_slot_census());
+            }
+        }
+        TrieBranchCensus { account, storage, storage_tries }
+    }
+
     /// Deterministic commitment to the local sparse-trie state and retained path set.
     ///
     /// The canonical state root authenticates the node contents; the sorted membership determines
@@ -1185,6 +1206,18 @@ impl TrieCloneTimings {
     pub const fn total_us(&self) -> u64 {
         self.account_trie_us.saturating_add(self.membership_and_paths_us())
     }
+}
+
+/// Branch child-slot occupancy for both cache tries, from
+/// [`PartialTrieNodeCache::branch_slot_census`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrieBranchCensus {
+    /// The account trie's census.
+    pub account: BranchSlotCensus,
+    /// Every revealed storage trie's census, accumulated.
+    pub storage: BranchSlotCensus,
+    /// Revealed storage tries the storage census covers.
+    pub storage_tries: u64,
 }
 
 /// Number of account-key prefix levels reported for comparison with the old depth-five pinned

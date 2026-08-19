@@ -5,7 +5,10 @@
 //! computed out of. The summary is the run's own account of itself: what it was given, what it
 //! produced, and which comparisons the numbers support.
 
-use crate::{generate::BlockResult, policy::ArmKind};
+use crate::{
+    generate::{BlockResult, BranchCensusReport},
+    policy::ArmKind,
+};
 use alloy_primitives::B256;
 use std::{
     collections::BTreeMap,
@@ -85,6 +88,9 @@ pub struct PolicySummary {
     /// Witness entries the decoded proof walk could not attribute, summed. Must be zero for the
     /// trim figures above to be trusted.
     pub trim_unattributed_nodes: u64,
+    /// Branch child-slot census after the last measured block, when diagnostics ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_branch_census: Option<BranchCensusReport>,
 }
 
 impl PolicySummary {
@@ -201,6 +207,9 @@ impl RunSummary {
                     entry.trim_trimmable_account_bytes += trim.trimmable_account_bytes as u64;
                     entry.trim_trimmable_storage_bytes += trim.trimmable_storage_bytes as u64;
                     entry.trim_unattributed_nodes += trim.unattributed_nodes as u64;
+                }
+                if let Some(census) = policy.branch_census {
+                    entry.final_branch_census = Some(census);
                 }
             }
         }

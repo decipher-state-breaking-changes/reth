@@ -40,7 +40,7 @@ use alloy_rpc_types_engine::ExecutionData;
 use partial_stateless::{
     full_witness_sidecar_from_nodes, measure_witness_trim, policy_dataset::PolicyDatasetRecord,
     BlockAccessedState, BlockTransitionRef, CacheAwareFlatBuild, PartialStatelessSidecar,
-    PolicySidecarBuild, TransitionBuildContext, WitnessTrimStats,
+    PolicySidecarBuild, TransitionBuildContext, TrieBranchCensus, WitnessTrimStats,
 };
 use partial_stateless_validator::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, PostStateRootOracle,
@@ -142,6 +142,55 @@ pub struct PolicyBlockResult {
     /// asked for trie diagnostics; always absent on the Weak arm, which retains no trie.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_trim: Option<WitnessTrimStats>,
+    /// Branch child-slot occupancy of this arm's trie cache after the block committed. Present
+    /// only when the run asked for trie diagnostics; absent on the Weak arm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_census: Option<BranchCensusReport>,
+}
+
+/// Serializable form of [`TrieBranchCensus`], flattened for the JSONL stream.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct BranchCensusReport {
+    /// Account-trie branch nodes.
+    pub account_branches: u64,
+    /// Account-trie child slots present in state masks.
+    pub account_present_slots: u64,
+    /// Account-trie child slots holding a blinded hash.
+    pub account_blinded_slots: u64,
+    /// Account-trie branches per depth bucket, shallowest first.
+    pub account_branches_by_depth: [u64; 9],
+    /// Account-trie blinded slots per depth bucket.
+    pub account_blinded_by_depth: [u64; 9],
+    /// Storage-trie branch nodes, over every revealed storage trie.
+    pub storage_branches: u64,
+    /// Storage-trie child slots present in state masks.
+    pub storage_present_slots: u64,
+    /// Storage-trie child slots holding a blinded hash.
+    pub storage_blinded_slots: u64,
+    /// Storage-trie branches per depth bucket.
+    pub storage_branches_by_depth: [u64; 9],
+    /// Storage-trie blinded slots per depth bucket.
+    pub storage_blinded_by_depth: [u64; 9],
+    /// Revealed storage tries the storage census covers.
+    pub storage_tries: u64,
+}
+
+impl From<TrieBranchCensus> for BranchCensusReport {
+    fn from(census: TrieBranchCensus) -> Self {
+        Self {
+            account_branches: census.account.branches,
+            account_present_slots: census.account.present_slots,
+            account_blinded_slots: census.account.blinded_slots,
+            account_branches_by_depth: census.account.branches_by_depth,
+            account_blinded_by_depth: census.account.blinded_by_depth,
+            storage_branches: census.storage.branches,
+            storage_present_slots: census.storage.present_slots,
+            storage_blinded_slots: census.storage.blinded_slots,
+            storage_branches_by_depth: census.storage.branches_by_depth,
+            storage_blinded_by_depth: census.storage.blinded_by_depth,
+            storage_tries: census.storage_tries,
+        }
+    }
 }
 
 /// Everything one recorded block produced.
@@ -339,6 +388,9 @@ where
                 )
                 .map(|mut result| {
                     result.witness_trim = witness_trim;
+                    result.branch_census = rules
+                        .trie_diagnostics
+                        .then(|| state.builder_trie.branch_slot_census().into());
                     result
                 })
             }
@@ -536,6 +588,7 @@ where
         sidecar_decode_us,
         offline_build_us,
         witness_trim: None,
+        branch_census: None,
     })
 }
 

@@ -3164,6 +3164,30 @@ impl ParallelSparseTrie {
         }
     }
 
+    /// Counts branch nodes and their child-slot occupancy across the whole trie.
+    ///
+    /// Every branch carries a fixed 16-slot blinded-hash box; only the blinded slots hold a hash.
+    /// The census turns "how much of that box is load-bearing" into numbers, per depth, so a
+    /// narrower representation can be sized instead of estimated.
+    pub fn branch_slot_census(&self) -> BranchSlotCensus {
+        let mut census = BranchSlotCensus::default();
+        for subtrie in core::iter::once(self.upper_subtrie.as_ref())
+            .chain(self.lower_subtries.iter().filter_map(LowerSparseSubtrie::as_revealed_ref))
+        {
+            for (path, node) in &subtrie.nodes {
+                if let SparseNode::Branch { state_mask, blinded_mask, .. } = node {
+                    let bucket = path.len().min(BRANCH_CENSUS_DEPTH_LEVELS - 1);
+                    census.branches += 1;
+                    census.present_slots += u64::from(state_mask.count_ones());
+                    census.blinded_slots += u64::from(blinded_mask.count_ones());
+                    census.branches_by_depth[bucket] += 1;
+                    census.blinded_by_depth[bucket] += u64::from(blinded_mask.count_ones());
+                }
+            }
+        }
+        census
+    }
+
     /// Determines if the given path can be directly reached from the upper trie.
     fn is_path_reachable_from_upper(&self, path: &Nibbles) -> bool {
         let mut current = Nibbles::default();
@@ -3250,6 +3274,54 @@ impl ParallelSparseTrie {
         }
 
         reachable
+    }
+}
+
+/// Depth buckets [`BranchSlotCensus`] reports: nibble path lengths zero through seven, with
+/// everything deeper folded into the last bucket.
+pub const BRANCH_CENSUS_DEPTH_LEVELS: usize = 9;
+
+/// Branch-node child-slot occupancy across one trie, from
+/// [`ParallelSparseTrie::branch_slot_census`].
+///
+/// `blinded_slots * 32` bytes of the fixed boxes are holding a hash; the rest of
+/// `branches * 512` is padding an exact-size representation would not pay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BranchSlotCensus {
+    /// Branch nodes visited.
+    pub branches: u64,
+    /// Child slots present in the state mask.
+    pub present_slots: u64,
+    /// Child slots holding a blinded hash.
+    pub blinded_slots: u64,
+    /// Branch nodes per depth bucket.
+    pub branches_by_depth: [u64; BRANCH_CENSUS_DEPTH_LEVELS],
+    /// Blinded slots per depth bucket.
+    pub blinded_by_depth: [u64; BRANCH_CENSUS_DEPTH_LEVELS],
+}
+
+impl BranchSlotCensus {
+    /// Folds another census into this one.
+    pub fn accumulate(&mut self, other: &Self) {
+        self.branches += other.branches;
+        self.present_slots += other.present_slots;
+        self.blinded_slots += other.blinded_slots;
+        for (bucket, count) in other.branches_by_depth.iter().enumerate() {
+            self.branches_by_depth[bucket] += count;
+        }
+        for (bucket, count) in other.blinded_by_depth.iter().enumerate() {
+            self.blinded_by_depth[bucket] += count;
+        }
+    }
+
+    /// Bytes the fixed 16-slot blinded-hash boxes occupy.
+    pub const fn box_bytes(&self) -> u64 {
+        self.branches * 512
+    }
+
+    /// Of [`Self::box_bytes`], the bytes actually holding a blinded hash.
+    pub const fn used_box_bytes(&self) -> u64 {
+        self.blinded_slots * 32
     }
 }
 

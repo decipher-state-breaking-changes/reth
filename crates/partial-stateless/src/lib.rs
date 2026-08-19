@@ -80,7 +80,7 @@ pub use transition_build::{
     V2TargetSet,
 };
 pub use trie_cache::{
-    PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation,
+    PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation, TrieBranchCensus,
     TrieCacheValidationError, TrieChangeSet, TrieCloneTimings, TrieMutationMetrics,
     TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
 };
