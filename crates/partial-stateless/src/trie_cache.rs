@@ -902,33 +902,37 @@ impl PartialTrieNodeCache {
         accounts
     }
 
-    /// Hashes of every hash-addressed node the account trie currently reveals.
+    /// Path-and-hash of every hash-addressed node the account trie currently reveals.
     ///
-    /// Dirty nodes carry no cached hash and are skipped, so this is complete only on a cache
-    /// whose root has been computed — which every committed generation has.
-    pub fn revealed_account_node_hashes(&self) -> HashSet<B256> {
-        let mut hashes = HashSet::default();
+    /// The path is part of the identity, not a convenience: byte-identical nodes can appear at
+    /// several paths of one trie, and a node revealed at one path proves nothing about the same
+    /// bytes needed at another. Dirty nodes carry no cached hash and are skipped, so this is
+    /// complete only on a cache whose root has been computed — which every committed generation
+    /// has.
+    pub fn revealed_account_nodes(&self) -> HashSet<(Nibbles, B256)> {
+        let mut nodes = HashSet::default();
         if let Some(trie) = self.sparse.state_trie_ref() {
-            trie.for_each_cached_node_hash(|_, hash| {
-                hashes.insert(hash);
+            trie.for_each_cached_node_hash(|path, hash| {
+                nodes.insert((*path, hash));
             });
         }
-        hashes
+        nodes
     }
 
-    /// Per-storage-trie revealed node hashes, keyed by hashed account address.
+    /// Per-storage-trie revealed node paths and hashes, keyed by hashed account address.
     ///
-    /// Kept per trie rather than pooled: two storage tries can hold byte-identical subtrees, and
-    /// a node revealed under one trie proves nothing about a path in the other.
-    pub fn revealed_storage_node_hashes(&self) -> B256Map<HashSet<B256>> {
+    /// Kept per trie rather than pooled, and per path within a trie, for the same reason as
+    /// [`Self::revealed_account_nodes`]: identical bytes under another trie or at another path
+    /// are a different node.
+    pub fn revealed_storage_nodes(&self) -> B256Map<HashSet<(Nibbles, B256)>> {
         let mut tries = B256Map::default();
         for (hashed_address, trie) in self.sparse.storage_tries_ref() {
             let Some(shared) = trie.as_revealed_ref() else { continue };
-            let mut hashes = HashSet::default();
-            shared.shared_ref().for_each_cached_node_hash(|_, hash| {
-                hashes.insert(hash);
+            let mut nodes = HashSet::default();
+            shared.shared_ref().for_each_cached_node_hash(|path, hash| {
+                nodes.insert((*path, hash));
             });
-            tries.insert(*hashed_address, hashes);
+            tries.insert(*hashed_address, nodes);
         }
         tries
     }

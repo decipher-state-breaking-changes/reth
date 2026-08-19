@@ -9,8 +9,11 @@ cheap to run in CI or on a laptop with just the files the ExEx wrote to disk.
 | --- | --- | --- |
 | [`sidecar_verifier`](./sidecar_verifier.rs) | `sidecar/*.bin` (+ optional reference witnesses) | Is the witness sidecar cryptographically anchored to the parent state root, and how complete is it? |
 | [`cache_window_bench`](./cache_window_bench.rs) | `fixtures/accessed/*.bin` | How does the cache window trade off against hit ratio, and which state category is the hot-spot? |
+| [`trie_repr_probe`](./trie_repr_probe.rs) | a recorded policy replay dataset | How many live bytes and how much clone time does each sparse-trie representation cost for the same revealed witness, measured through one counting allocator? |
 
 Run any of them with `cargo run -p partial-stateless --bin <name> -- <args>`.
+`trie_repr_probe` additionally needs `--features repr-probe`, which is what pulls in the arena
+trie implementation it compares against; the library itself never enables it.
 
 ---
 

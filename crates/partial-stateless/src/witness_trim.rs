@@ -25,7 +25,7 @@ use alloy_primitives::{
     Bytes, B256,
 };
 use alloy_rlp::Encodable;
-use reth_trie_common::{BranchNodeRef, DecodedMultiProofV2, ProofTrieNodeV2, TrieNodeV2};
+use reth_trie_common::{BranchNodeRef, DecodedMultiProofV2, Nibbles, ProofTrieNodeV2, TrieNodeV2};
 
 /// Depth buckets the per-depth byte counts use: nibble path lengths zero through seven, with
 /// everything deeper folded into the last bucket.
@@ -74,6 +74,13 @@ struct NodeOccurrence {
     min_depth: usize,
 }
 
+/// The exact node identities one trie reveals: `(path, hash)` pairs.
+///
+/// Hash alone is not an identity here — byte-identical nodes recur at different paths of one
+/// trie, and a graft decode anchors at a *path's* blinded hash, so a node revealed at one path
+/// says nothing about the same bytes needed at another.
+pub type RevealedNodeSet = HashSet<(Nibbles, B256)>;
+
 /// Measures, against the trie cache the receiver holds at this block's parent, how much of the
 /// flat witness `nodes` is redundant.
 ///
@@ -86,12 +93,26 @@ pub fn measure_witness_trim(
     nodes: &[Bytes],
     decoded_proof: &DecodedMultiProofV2,
 ) -> WitnessTrimStats {
-    let account_revealed = trie_cache.revealed_account_node_hashes();
-    let storage_revealed = trie_cache.revealed_storage_node_hashes();
-    let empty = HashSet::default();
+    measure_witness_trim_against(
+        &trie_cache.revealed_account_nodes(),
+        &trie_cache.revealed_storage_nodes(),
+        nodes,
+        decoded_proof,
+    )
+}
+
+/// [`measure_witness_trim`] against explicit revealed-node sets, so the coverage rules are
+/// testable without constructing a cache around them.
+fn measure_witness_trim_against(
+    account_revealed: &RevealedNodeSet,
+    storage_revealed: &B256Map<RevealedNodeSet>,
+    nodes: &[Bytes],
+    decoded_proof: &DecodedMultiProofV2,
+) -> WitnessTrimStats {
+    let empty = RevealedNodeSet::default();
 
     let mut occurrences = B256Map::<NodeOccurrence>::default();
-    record_occurrences(&mut occurrences, &decoded_proof.account_proofs, &account_revealed, true);
+    record_occurrences(&mut occurrences, &decoded_proof.account_proofs, account_revealed, true);
     for (hashed_address, proof_nodes) in &decoded_proof.storage_proofs {
         let revealed = storage_revealed.get(hashed_address).unwrap_or(&empty);
         record_occurrences(&mut occurrences, proof_nodes, revealed, false);
@@ -131,42 +152,46 @@ pub fn measure_witness_trim(
 /// Folds one trie's decoded proof nodes into the occurrence map.
 ///
 /// Encoding mirrors the flat-witness writer exactly: each node's own RLP, plus — for a branch
-/// carrying a short key — the bare branch encoding that the wire stores as a second entry. Any
-/// divergence here surfaces as `unattributed_nodes` rather than a silent misattribution.
+/// carrying a short key — the bare branch encoding that the wire stores as a second entry, at
+/// the path below that key. Any divergence here surfaces as `unattributed_nodes` rather than a
+/// silent misattribution. Coverage is checked at the occurrence's exact `(path, hash)`: the
+/// same bytes revealed at another path do not cover it.
 fn record_occurrences(
     occurrences: &mut B256Map<NodeOccurrence>,
     proof_nodes: &[ProofTrieNodeV2],
-    revealed: &HashSet<B256>,
+    revealed: &RevealedNodeSet,
     in_account_trie: bool,
 ) {
     let mut encoded = Vec::new();
-    let mut record = |hash: B256, depth: usize| {
-        let trimmable = revealed.contains(&hash);
+    let mut record = |hash: B256, path: Nibbles| {
+        let trimmable = revealed.contains(&(path, hash));
         occurrences
             .entry(hash)
             .and_modify(|occurrence| {
                 occurrence.trimmable_everywhere &= trimmable;
                 occurrence.in_account_trie |= in_account_trie;
-                occurrence.min_depth = occurrence.min_depth.min(depth);
+                occurrence.min_depth = occurrence.min_depth.min(path.len());
             })
             .or_insert(NodeOccurrence {
                 trimmable_everywhere: trimmable,
                 in_account_trie,
-                min_depth: depth,
+                min_depth: path.len(),
             });
     };
 
     for proof_node in proof_nodes {
         encoded.clear();
         proof_node.node.encode(&mut encoded);
-        record(keccak256(&encoded), proof_node.path.len());
+        record(keccak256(&encoded), proof_node.path);
 
         if let TrieNodeV2::Branch(branch) = &proof_node.node &&
             !branch.key.is_empty()
         {
             encoded.clear();
             BranchNodeRef::new(&branch.stack, branch.state_mask).encode(&mut encoded);
-            record(keccak256(&encoded), proof_node.path.len() + branch.key.len());
+            let mut branch_path = proof_node.path;
+            branch_path.extend(&branch.key);
+            record(keccak256(&encoded), branch_path);
         }
     }
 }
@@ -289,6 +314,47 @@ mod tests {
 
     fn inline_bytes(nodes: &[Bytes]) -> usize {
         nodes.iter().filter(|node| node.len() < 32).map(|node| node.len()).sum()
+    }
+
+    #[test]
+    fn identical_bytes_at_another_path_do_not_cover_an_occurrence() {
+        // One leaf encoding, needed at two paths of the account trie. Revealing it at one path
+        // must not trim it: the graft anchors at the *other* path's blinded hash, and the bytes
+        // have to be on the wire for that lookup to succeed.
+        use reth_trie_common::LeafNode;
+        let suffix = Nibbles::unpack(B256::repeat_byte(0xAA)).slice(0..63);
+        let leaf = LeafNode::new(suffix, vec![0x77; 40]);
+        let mut encoded = Vec::new();
+        TrieNodeV2::Leaf(leaf.clone()).encode(&mut encoded);
+        let hash = keccak256(&encoded);
+        let nodes = vec![Bytes::from(encoded)];
+
+        let path_one = Nibbles::from_nibbles([0x1]);
+        let path_two = Nibbles::from_nibbles([0x2]);
+        let proof = DecodedMultiProofV2 {
+            account_proofs: vec![
+                ProofTrieNodeV2 {
+                    path: path_one,
+                    node: TrieNodeV2::Leaf(leaf.clone()),
+                    masks: None,
+                },
+                ProofTrieNodeV2 { path: path_two, node: TrieNodeV2::Leaf(leaf), masks: None },
+            ],
+            storage_proofs: Default::default(),
+        };
+
+        let mut revealed = RevealedNodeSet::default();
+        revealed.insert((path_one, hash));
+        let partial = measure_witness_trim_against(&revealed, &B256Map::default(), &nodes, &proof);
+        assert_eq!(partial.unattributed_nodes, 0);
+        assert_eq!(
+            partial.trimmable_nodes, 0,
+            "bytes revealed at one path must not cover the other path's occurrence"
+        );
+
+        revealed.insert((path_two, hash));
+        let full = measure_witness_trim_against(&revealed, &B256Map::default(), &nodes, &proof);
+        assert_eq!(full.trimmable_nodes, 1, "covered at every path, the node is redundant");
     }
 
     #[test]

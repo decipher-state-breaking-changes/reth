@@ -92,4 +92,6 @@ pub use witness_check::{
     CacheAwareTrieTransition, MaterializedStateProof, TrieProofTarget, TrieProofTargetV2,
     TrieTransitionError,
 };
-pub use witness_trim::{measure_witness_trim, WitnessTrimStats, WITNESS_TRIM_DEPTH_LEVELS};
+pub use witness_trim::{
+    measure_witness_trim, RevealedNodeSet, WitnessTrimStats, WITNESS_TRIM_DEPTH_LEVELS,
+};

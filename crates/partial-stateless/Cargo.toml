@@ -15,9 +15,7 @@ revm-primitives = { workspace = true, features = ["std"] }
 reth-execution-access = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-trie-common = { workspace = true }
-# `std` is what gates the arena trie implementation, which the representation probe compares
-# against the node-map trie the cache runs on today.
-reth-trie-sparse = { workspace = true, features = ["std"] }
+reth-trie-sparse = { workspace = true }
 
 # serialization
 serde = { workspace = true, features = ["derive"] }
@@ -44,6 +42,14 @@ tracing = { workspace = true }
 # defect that invalidated every absolute benchmark number before 2026-08-06.
 asm-keccak = ["alloy-primitives/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+# Gates the representation probe binary. `reth-trie-sparse/std` is what exposes the arena trie
+# the probe compares against; the library itself never needs it, so ordinary builds of this
+# crate must not drag the feature in.
+repr-probe = ["reth-trie-sparse/std"]
+
+[[bin]]
+name = "trie_repr_probe"
+required-features = ["repr-probe"]
 
 [dev-dependencies]
 reth-trie = { workspace = true }
