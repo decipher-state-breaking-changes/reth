@@ -25,6 +25,7 @@ pub mod transition_build;
 pub mod trie_cache;
 pub mod witness;
 pub mod witness_trim;
+pub mod witness_v3;
 
 pub mod sender_proof;
 pub mod sidecar;
@@ -77,7 +78,7 @@ pub use transition_build::{
     generate_cache_aware_base_proof, initial_cache_aware_targets, measure_transition_witness_size,
     BlockTransitionRef, CacheAwareBaseProof, CacheAwareFlatBuild, FullWitnessBuild, ParallelProof,
     PolicySidecarBuild, SidecarAssembly, TransitionBuildContext, TransitionProofSource,
-    V2TargetSet,
+    TrimmedWitnessBuild, V2TargetSet,
 };
 pub use trie_cache::{
     PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation, TrieBranchCensus,
@@ -88,10 +89,12 @@ pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult}
 pub use witness_check::{
     compute_trustless_state_root, root_witness_targets_from_bundle,
     try_compute_trustless_state_root, try_compute_trustless_state_root_v2,
-    try_compute_trustless_state_root_v2_with_storage_targets, CacheAwareTransitionProgress,
+    try_compute_trustless_state_root_v2_with_storage_targets, try_compute_trustless_state_root_v3,
+    try_compute_trustless_state_root_v3_from_hashed, CacheAwareTransitionProgress,
     CacheAwareTrieTransition, MaterializedStateProof, TrieProofTarget, TrieProofTargetV2,
-    TrieTransitionError,
+    TrieTransitionError, TrimmedWitnessSession,
 };
 pub use witness_trim::{
     measure_witness_trim, RevealedNodeSet, WitnessTrimStats, WITNESS_TRIM_DEPTH_LEVELS,
 };
+pub use witness_v3::{WitnessNodeMap, WitnessV3Error, WITNESS_V3_RETENTION_VERSION};

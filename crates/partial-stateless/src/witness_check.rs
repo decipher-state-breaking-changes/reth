@@ -1,9 +1,17 @@
 use crate::{
+    network_cache::MissResult,
     sidecar::{
         check_sidecar_self_consistency, PartialExecutionWitnessState, PartialStatelessSidecar,
         RootWitnessCompletenessReport, SerializableMultiProof, SidecarCheckError, StateTargetSet,
+        WitnessTargets,
     },
+    transition_build::{initial_cache_aware_targets, V2TargetSet, MAX_STRUCTURAL_ROUNDS},
     trie_cache::PartialTrieNodeCache,
+    witness_v3::{
+        collect_reveal_fragments, composite_account_chain, composite_storage_chain,
+        consume_target_chains, ChainValue, WitnessNodeMap, WitnessV3Error,
+        WITNESS_V3_RETENTION_VERSION,
+    },
 };
 use alloy_consensus::{Header, EMPTY_ROOT_HASH};
 use alloy_primitives::{keccak256, map::B256Map, Address, Bytes, B256, U256};
@@ -52,11 +60,17 @@ impl Default for SidecarWitnessCheckLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarWitnessCheckError {
     Sidecar(SidecarCheckError),
-    LimitExceeded { label: &'static str, actual: usize, cap: usize },
+    LimitExceeded {
+        label: &'static str,
+        actual: usize,
+        cap: usize,
+    },
     Decode(String),
     Proof(String),
     Bytecode(String),
     Header(String),
+    /// A trimmed (v3) witness violated one of its canonicality rules.
+    Trimmed(String),
 }
 
 impl fmt::Display for SidecarWitnessCheckError {
@@ -70,6 +84,7 @@ impl fmt::Display for SidecarWitnessCheckError {
             Self::Proof(err) => write!(f, "proof check failed: {err}"),
             Self::Bytecode(err) => write!(f, "bytecode check failed: {err}"),
             Self::Header(err) => write!(f, "header witness check failed: {err}"),
+            Self::Trimmed(err) => write!(f, "trimmed witness check failed: {err}"),
         }
     }
 }
@@ -445,6 +460,23 @@ type Result<T> = std::result::Result<T, SidecarWitnessCheckError>;
 pub enum MaterializedStateProof {
     Legacy(MultiProof),
     Transition(DecodedMultiProofV2),
+    /// A trimmed (v3) witness: the node map with the consumption ledger the pre-execution value
+    /// walk already started. The transition continues consuming from the same map, and the
+    /// unconsumed-node rule is checked over both walks together.
+    TrimmedTransition(TrimmedWitnessSession),
+}
+
+/// Carries a trimmed witness from pre-execution materialization into the trie transition.
+#[derive(Debug, Clone)]
+pub struct TrimmedWitnessSession {
+    pub(crate) map: WitnessNodeMap,
+}
+
+impl TrimmedWitnessSession {
+    /// The node map, for diagnostics.
+    pub fn map(&self) -> &WitnessNodeMap {
+        &self.map
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -511,8 +543,24 @@ pub fn materialize_sidecar_witness_with_limits(
 ///
 /// This supports benchmark instrumentation that measures commitment/self-consistency separately
 /// from proof decoding. Production callers should use `materialize_sidecar_witness_with_limits`.
+/// A trimmed (v3) sidecar cannot be materialized without the parent trie cache — use
+/// [`materialize_sidecar_witness_after_prefilter_with_cache`] for that.
 pub fn materialize_sidecar_witness_after_prefilter(
     sidecar: &PartialStatelessSidecar,
+) -> Result<MaterializedSidecarWitness> {
+    materialize_sidecar_witness_after_prefilter_with_cache(sidecar, None)
+}
+
+/// [`materialize_sidecar_witness_after_prefilter`] with the local parent trie cache available.
+///
+/// The self-contained v2/legacy witnesses ignore `parent_trie`. A trimmed (v3) witness requires
+/// it: the miss values are read through a read-only composite walk over the parent trie and the
+/// witness map — local revealed nodes take priority, and the map is consulted only from a
+/// blinded frontier hash, which content-addresses the entry it resolves to. Nothing here writes
+/// to the parent trie; only the map's consumption ledger advances.
+pub fn materialize_sidecar_witness_after_prefilter_with_cache(
+    sidecar: &PartialStatelessSidecar,
+    parent_trie: Option<&PartialTrieNodeCache>,
 ) -> Result<MaterializedSidecarWitness> {
     let mut grouped_targets: BTreeMap<Address, BTreeSet<B256>> = BTreeMap::new();
     for address in &sidecar.cache_miss_targets.accounts {
@@ -538,12 +586,122 @@ pub fn materialize_sidecar_witness_after_prefilter(
                 materialize_v2_targets(&proof, grouped_targets, sidecar.parent_state_root)?;
             (MaterializedStateProof::Transition(proof), accounts, storage)
         }
+        PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+            retention_version,
+            retention_fingerprint,
+            nodes,
+        } => {
+            let Some(parent_trie) = parent_trie else {
+                return Err(SidecarWitnessCheckError::Trimmed(
+                    "a trimmed witness is not self-contained: it cannot be verified without \
+                     the parent trie-cache generation it was cut against"
+                        .to_string(),
+                ));
+            };
+            // Fail-closed compatibility checks before a single node is touched: the fragments
+            // are defined relative to one exact parent generation under one retention
+            // algorithm, and neither is committed by cache_root, so both are named on the wire
+            // and compared here. A mismatch can only produce a false reject — anchors stay
+            // hash-verified — never a false accept.
+            if *retention_version != WITNESS_V3_RETENTION_VERSION {
+                return Err(trimmed_err(WitnessV3Error::RetentionVersionMismatch {
+                    got: *retention_version,
+                    expected: WITNESS_V3_RETENTION_VERSION,
+                }));
+            }
+            let local_fingerprint = parent_trie.retention_fingerprint();
+            if *retention_fingerprint != local_fingerprint {
+                return Err(trimmed_err(WitnessV3Error::RetentionFingerprintMismatch {
+                    got: *retention_fingerprint,
+                    expected: local_fingerprint,
+                }));
+            }
+            if parent_trie.state_root() != Some(sidecar.parent_state_root) {
+                return Err(SidecarWitnessCheckError::Trimmed(format!(
+                    "local trie cache is not anchored to the sidecar's parent state root: \
+                     sidecar={:?}, local={:?}",
+                    sidecar.parent_state_root,
+                    parent_trie.state_root(),
+                )));
+            }
+            let mut map = WitnessNodeMap::decode(nodes).map_err(trimmed_err)?;
+            let (accounts, storage) =
+                materialize_trimmed_targets(parent_trie, &mut map, grouped_targets)?;
+            (
+                MaterializedStateProof::TrimmedTransition(TrimmedWitnessSession { map }),
+                accounts,
+                storage,
+            )
+        }
     };
 
     let codes = materialize_codes(sidecar)?;
     let headers = materialize_headers(sidecar)?;
 
     Ok(MaterializedSidecarWitness { state_proof, accounts, storage, codes, headers })
+}
+
+fn trimmed_err(err: WitnessV3Error) -> SidecarWitnessCheckError {
+    SidecarWitnessCheckError::Trimmed(err.to_string())
+}
+
+/// Reads every miss-manifest value through the composite (parent trie, witness map) walk.
+///
+/// Mirrors [`materialize_v2_targets`]'s strictness: a target whose chain cannot be completed —
+/// a blinded frontier hash the map does not carry — rejects the sidecar; a chain that ends in a
+/// proven exclusion yields `None`/zero exactly as an exclusion proof does on the v2 path.
+fn materialize_trimmed_targets(
+    parent_trie: &PartialTrieNodeCache,
+    map: &mut WitnessNodeMap,
+    grouped_targets: BTreeMap<Address, BTreeSet<B256>>,
+) -> Result<(HashMap<Address, Option<Account>>, HashMap<(Address, B256), U256>)> {
+    let mut accounts = HashMap::new();
+    let mut storage = HashMap::new();
+    for (address, slots) in grouped_targets {
+        let hashed_address = keccak256(address);
+        let trie_account = match composite_account_chain(parent_trie, map, hashed_address, None)
+            .map_err(trimmed_err)?
+        {
+            ChainValue::Present(value) => {
+                Some(TrieAccount::decode(&mut value.as_slice()).map_err(|err| {
+                    SidecarWitnessCheckError::Decode(format!(
+                        "failed to decode account {address:?}: {err}"
+                    ))
+                })?)
+            }
+            ChainValue::Absent => None,
+        };
+        let storage_root =
+            trie_account.as_ref().map_or(EMPTY_ROOT_HASH, |account| account.storage_root);
+        let info = trie_account.map(|account| Account {
+            balance: account.balance,
+            nonce: account.nonce,
+            bytecode_hash: (account.code_hash != KECCAK_EMPTY).then_some(account.code_hash),
+        });
+        accounts.insert(address, info);
+
+        for slot in slots {
+            let value = if storage_root == EMPTY_ROOT_HASH {
+                U256::ZERO
+            } else {
+                let hashed_slot = keccak256(slot);
+                match composite_storage_chain(parent_trie, map, hashed_address, hashed_slot, None)
+                    .map_err(trimmed_err)?
+                {
+                    ChainValue::Present(value) => {
+                        U256::decode(&mut value.as_slice()).map_err(|err| {
+                            SidecarWitnessCheckError::Decode(format!(
+                                "failed to decode storage address={address:?}, slot={slot:?}: {err}"
+                            ))
+                        })?
+                    }
+                    ChainValue::Absent => U256::ZERO,
+                }
+            };
+            storage.insert((address, slot), value);
+        }
+    }
+    Ok((accounts, storage))
 }
 
 fn materialize_legacy_targets(
@@ -890,6 +1048,130 @@ pub fn try_compute_trustless_state_root_v2_with_storage_targets(
             Err(TrieTransitionError::ProofRequired(targets))
         }
     }
+}
+
+/// Applies a trimmed (v3) parent-state witness to a transactional sparse-trie clone by grafting
+/// fragments at the parent trie's blinded frontier.
+///
+/// This is the receiver's replay of the builder's own transition loop, with the witness map in
+/// the proof source's seat: the same initial cache-aware targets, the same flat storage-context
+/// expansion, the same structural discovery rounds under the same round cap, and the same
+/// exact-target reveals. Determinism of every step against a byte-identical parent trie is what
+/// entitles both sides to one wire node set — and the final unconsumed-node check is where that
+/// entitlement is enforced rather than assumed.
+///
+/// `parent_trie` is the untouched parent generation the sidecar was trimmed against;
+/// `trie_cache` is the transactional clone the transition mutates. A rejection at any point
+/// leaves `parent_trie` byte-identical — only the clone and the map's consumption ledger have
+/// moved, and both are discarded with the rejection.
+pub fn try_compute_trustless_state_root_v3(
+    session_map: TrimmedWitnessSession,
+    parent_trie: &PartialTrieNodeCache,
+    trie_cache: &mut PartialTrieNodeCache,
+    bundle_state: &BundleState,
+    miss_manifest: &WitnessTargets,
+) -> std::result::Result<B256, TrieTransitionError> {
+    let hashed_post_state =
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle_state.state);
+    try_compute_trustless_state_root_v3_from_hashed(
+        session_map,
+        parent_trie,
+        trie_cache,
+        hashed_post_state,
+        miss_manifest,
+    )
+}
+
+/// [`try_compute_trustless_state_root_v3`] for callers that already hold the hashed post state.
+pub fn try_compute_trustless_state_root_v3_from_hashed(
+    session_map: TrimmedWitnessSession,
+    parent_trie: &PartialTrieNodeCache,
+    trie_cache: &mut PartialTrieNodeCache,
+    hashed_post_state: HashedPostState,
+    miss_manifest: &WitnessTargets,
+) -> std::result::Result<B256, TrieTransitionError> {
+    let reject = |err: WitnessV3Error| {
+        TrieTransitionError::Failed(format!("trimmed witness graft failed: {err}"))
+    };
+    let TrimmedWitnessSession { mut map } = session_map;
+
+    // The builder computed its targets from its own miss result; the manifest is that result's
+    // raw account/storage lists, and a forged manifest is caught by the post-execution
+    // miss-target check before any commit. Stats fields are irrelevant to target selection.
+    let miss = MissResult {
+        missed_accounts: miss_manifest.missed_accounts.clone(),
+        missed_storage: miss_manifest.missed_storage.clone(),
+        missed_codes: miss_manifest.missed_code_hashes.clone(),
+        total_accessed: 0,
+        total_missed: 0,
+        miss_ratio: 0.0,
+    };
+    let (initial_targets, _) = initial_cache_aware_targets(&hashed_post_state, &miss, parent_trie);
+    let read_only_storage_targets =
+        miss.missed_storage.iter().map(|(address, _)| keccak256(address)).collect::<Vec<_>>();
+
+    let mut requested = initial_targets.clone();
+    let mut revealed_exact = initial_targets.clone();
+    consume_target_chains(parent_trie, &mut map, &initial_targets).map_err(reject)?;
+    let context_delta =
+        initial_targets.with_flat_storage_context().difference_and_record(&mut requested);
+    if !context_delta.is_empty() {
+        consume_target_chains(parent_trie, &mut map, &context_delta).map_err(reject)?;
+    }
+    let initial_fragments =
+        collect_reveal_fragments(parent_trie, &mut map, &initial_targets).map_err(reject)?;
+
+    let root = {
+        let mut session =
+            CacheAwareTrieTransition::new(trie_cache, hashed_post_state, read_only_storage_targets);
+        if !initial_fragments.is_empty() {
+            session.reveal(initial_fragments)?;
+        }
+        let mut structural_rounds = 0usize;
+        loop {
+            match session.advance()? {
+                CacheAwareTransitionProgress::Complete(root) => break root,
+                CacheAwareTransitionProgress::ProofRequired(targets) => {
+                    if structural_rounds >= MAX_STRUCTURAL_ROUNDS {
+                        return Err(TrieTransitionError::Failed(format!(
+                            "trimmed-witness transition exceeded {MAX_STRUCTURAL_ROUNDS} structural graft rounds"
+                        )));
+                    }
+                    structural_rounds += 1;
+                    let mut exact = V2TargetSet::default();
+                    exact.extend(targets);
+                    let flat_delta =
+                        exact.with_flat_storage_context().difference_and_record(&mut requested);
+                    if !flat_delta.is_empty() {
+                        consume_target_chains(parent_trie, &mut map, &flat_delta)
+                            .map_err(reject)?;
+                    }
+                    let reveal_delta = exact.difference_and_record(&mut revealed_exact);
+                    if reveal_delta.is_empty() {
+                        return Err(TrieTransitionError::Failed(format!(
+                            "trimmed-witness transition made no progress: all {} structural targets were already grafted: {:?}",
+                            exact.len(),
+                            exact.to_provider_targets(),
+                        )));
+                    }
+                    let fragments = collect_reveal_fragments(parent_trie, &mut map, &reveal_delta)
+                        .map_err(reject)?;
+                    if fragments.is_empty() {
+                        return Err(TrieTransitionError::Failed(format!(
+                            "trimmed-witness structural fragment delta was empty for {} targets",
+                            reveal_delta.len()
+                        )));
+                    }
+                    session.reveal(fragments)?;
+                }
+            }
+        }
+    };
+
+    // Canonicality: every wire node must have been consumed by the value walk or the graft. An
+    // unconsumed node is unaddressable content a canonical builder would never have shipped.
+    map.ensure_fully_consumed().map_err(reject)?;
+    Ok(root)
 }
 
 fn ensure_cap(label: &'static str, actual: usize, cap: usize) -> Result<()> {

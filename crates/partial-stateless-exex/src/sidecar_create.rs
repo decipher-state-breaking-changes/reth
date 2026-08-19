@@ -70,6 +70,9 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) compute_baseline: bool,
     pub(crate) resource_metrics: bool,
     pub(crate) trie_cache_diagnostics: bool,
+    /// Whether a Ready-cache sidecar carries the trimmed (v3) witness instead of the
+    /// self-contained flat one.
+    pub(crate) witness_v3: bool,
     pub(crate) run_sidecar_preflight: bool,
     pub(crate) validation_bench_output: Option<&'a Path>,
     pub(crate) builder_bench_output: Option<&'a Path>,
@@ -315,7 +318,11 @@ impl<'a> RethStateProviderSource<'a> {
 
     /// The build context a live builder uses: this source, sampling the process it runs in.
     pub(crate) fn context(&self) -> TransitionBuildContext<'_> {
-        TransitionBuildContext { proofs: self, rss_sampler: Some(process_rss_bytes) }
+        TransitionBuildContext {
+            proofs: self,
+            rss_sampler: Some(process_rss_bytes),
+            trim_witness: false,
+        }
     }
 }
 
@@ -991,7 +998,13 @@ where
     // either assigns it or returns, so an initial `None` would be dead.
     let displaced_trie_cache;
     let proof_source = RethStateProviderSource::new(state_provider, options.parallel_initial_proof);
-    let build_ctx = proof_source.context();
+    // v3 only ever ships from a Ready cache: a Warming builder holds a partial frontier whose
+    // shape no validator can be assumed to share, so it degrades to the self-contained wire.
+    let build_ctx = if options.witness_v3 && options.ready_parent.is_some() {
+        proof_source.context().with_trimmed_witness()
+    } else {
+        proof_source.context()
+    };
     let witness = {
         let base =
             generate_cache_aware_base_proof(&build_ctx, &hashed_post_state, &miss, trie_cache)
@@ -999,6 +1012,7 @@ where
         let CacheAwareFlatBuild {
             nodes,
             decoded_proof: proof,
+            trimmed,
             mut next_trie_cache,
             state_root: local_state_root,
             provider_calls,
@@ -1078,8 +1092,26 @@ where
             builder_trie_mutation = Some(mutation);
         }
         let elapsed_ms = transition_witness_build_us / 1_000;
-        let mut result = measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes);
-        let witness_state = PartialExecutionWitnessState::MptTransitionNodes(nodes);
+        // The published wire and the stats must describe the same bytes: a trimmed build is
+        // measured over its fragments, a plain build over the full flat witness.
+        let (mut result, witness_state) = match trimmed {
+            Some(trimmed_build) => (
+                measure_transition_witness_size(
+                    &trimmed_build.nodes,
+                    &trimmed_build.fragments,
+                    missed_bytecode_bytes,
+                ),
+                PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+                    retention_version: partial_stateless::WITNESS_V3_RETENTION_VERSION,
+                    retention_fingerprint: trimmed_build.retention_fingerprint,
+                    nodes: trimmed_build.nodes,
+                },
+            ),
+            None => (
+                measure_transition_witness_size(&nodes, &proof, missed_bytecode_bytes),
+                PartialExecutionWitnessState::MptTransitionNodes(nodes),
+            ),
+        };
         result.computation_time_ms = Some(elapsed_ms);
         if let Some((cpu_us_before, majflt_before, minflt_before)) = rusage_before {
             let (cpu_us_after, majflt_after, minflt_after) = process_rusage();

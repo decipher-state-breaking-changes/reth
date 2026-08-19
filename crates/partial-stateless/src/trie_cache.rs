@@ -261,6 +261,10 @@ impl PartialTrieNodeCache {
         &mut self.sparse
     }
 
+    pub(crate) fn sparse_ref(&self) -> &CacheSparseStateTrie {
+        &self.sparse
+    }
+
     pub(crate) fn set_state_root(&mut self, state_root: B256) {
         self.state_root = Some(state_root);
     }

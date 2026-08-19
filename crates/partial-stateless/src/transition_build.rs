@@ -44,7 +44,7 @@ const PARALLEL_INITIAL_PROOF_MIN_STORAGE_TRIES: usize = 2;
 const PARALLEL_INITIAL_PROOF_MIN_TOTAL_TARGETS: usize = 64;
 
 /// Structural proof rounds one transition may take before it is called a loop.
-const MAX_STRUCTURAL_ROUNDS: usize = 128;
+pub(crate) const MAX_STRUCTURAL_ROUNDS: usize = 128;
 
 /// A wide initial proof and what it cost in workers.
 #[derive(Debug)]
@@ -91,6 +91,11 @@ pub struct TransitionBuildContext<'a> {
     /// process memory is not the production builder's and reporting it under the same field name
     /// would put two different quantities in one column.
     pub rss_sampler: Option<fn() -> u64>,
+    /// Also produce the receiver-aware trimmed (v3) witness alongside the full flat one.
+    ///
+    /// Requires the parent trie cache to be revealed and anchored — a cold or warming cache has
+    /// no frontier to trim against, and callers degrade to the self-contained v2 wire instead.
+    pub trim_witness: bool,
 }
 
 impl std::fmt::Debug for TransitionBuildContext<'_> {
@@ -104,7 +109,13 @@ impl std::fmt::Debug for TransitionBuildContext<'_> {
 impl<'a> TransitionBuildContext<'a> {
     /// A context that measures nothing about the host process.
     pub const fn uninstrumented(proofs: &'a dyn TransitionProofSource) -> Self {
-        Self { proofs, rss_sampler: None }
+        Self { proofs, rss_sampler: None, trim_witness: false }
+    }
+
+    /// The same context, additionally producing the trimmed (v3) witness.
+    pub const fn with_trimmed_witness(mut self) -> Self {
+        self.trim_witness = true;
+        self
     }
 
     fn rss_bytes(&self) -> i64 {
@@ -149,6 +160,16 @@ impl V2TargetSet {
         }
     }
 
+    /// Hashed account keys, in the deterministic set order.
+    pub(crate) fn account_keys(&self) -> impl Iterator<Item = B256> + '_ {
+        self.accounts.keys().copied()
+    }
+
+    /// Hashed `(account, slot)` keys, in the deterministic set order.
+    pub(crate) fn storage_keys(&self) -> impl Iterator<Item = (B256, B256)> + '_ {
+        self.storage.keys().copied()
+    }
+
     fn with_zero_min_len(&self) -> Self {
         Self {
             accounts: self.accounts.keys().copied().map(|key| (key, 0)).collect(),
@@ -162,7 +183,7 @@ impl V2TargetSet {
     /// proof makes the storage root reachable from the state root, allowing a standalone decoder
     /// to recover the account/storage association. Native structured V2 proofs retain that
     /// association directly and do not need these additional account targets.
-    fn with_flat_storage_context(&self) -> Self {
+    pub(crate) fn with_flat_storage_context(&self) -> Self {
         let mut targets = self.with_zero_min_len();
         for &(hashed_address, _) in self.storage.keys() {
             targets.accounts.entry(hashed_address).or_insert(0);
@@ -170,7 +191,7 @@ impl V2TargetSet {
         targets
     }
 
-    fn difference_and_record(&self, requested: &mut Self) -> Self {
+    pub(crate) fn difference_and_record(&self, requested: &mut Self) -> Self {
         let mut delta = Self::default();
         for (&key, &min_len) in &self.accounts {
             if requested.accounts.get(&key).is_some_and(|current| *current <= min_len) {
@@ -252,6 +273,9 @@ pub struct CacheAwareFlatBuild {
     pub nodes: Vec<Bytes>,
     /// The same witness, decoded against the parent state root.
     pub decoded_proof: DecodedMultiProofV2,
+    /// The receiver-aware trimmed (v3) wire, when the context asked for one and the parent trie
+    /// had a frontier to trim against.
+    pub trimmed: Option<TrimmedWitnessBuild>,
     /// The trie cache this block's transition produced, before retention.
     pub next_trie_cache: PartialTrieNodeCache,
     /// The post-state root the local sparse trie computed.
@@ -285,6 +309,18 @@ pub struct CacheAwareFlatBuild {
     pub transition_us: u64,
     /// Wall time the proof source spent inside the structural rounds.
     pub structural_provider_us: u64,
+}
+
+/// The trimmed (v3) wire a transition build produced alongside the full flat witness.
+#[derive(Debug)]
+pub struct TrimmedWitnessBuild {
+    /// The fragment node list: hash-deduplicated, byte-sorted, a strict subset of the full flat
+    /// witness whenever the parent trie reveals anything on a target chain.
+    pub nodes: Vec<Bytes>,
+    /// The same fragments, path-attributed for size accounting and diagnostics.
+    pub fragments: DecodedMultiProofV2,
+    /// The parent generation's retention fingerprint the fragments were cut against.
+    pub retention_fingerprint: B256,
 }
 
 /// The initial proof a transition starts from.
@@ -574,6 +610,29 @@ pub fn build_cache_aware_flat_transition(
         ));
     }
 
+    // The trimmed (v3) wire is derived by running the receiver's own composite walk against the
+    // full flat map: every target ever requested is walked through the parent trie first, and
+    // the map entries the walk consumes below the blinded frontier are exactly the nodes a
+    // grafting validator will consume. Producing the wire with the consumer's algorithm is what
+    // makes the unconsumed-node rejection rule exact rather than approximate.
+    let trimmed = if ctx.trim_witness && trie_cache.state_root().is_some() {
+        let mut wire_map = crate::witness_v3::WitnessNodeMap::from_flat(flat_nodes.clone());
+        crate::witness_v3::consume_target_chains(trie_cache, &mut wire_map, &requested_flat)
+            .map_err(|err| {
+                eyre::eyre!("trimmed-witness wire walk failed against the builder's own map: {err}")
+            })?;
+        let fragments =
+            crate::witness_v3::collect_reveal_fragments(trie_cache, &mut wire_map, &requested_flat)
+                .map_err(|err| eyre::eyre!("trimmed-witness fragment collection failed: {err}"))?;
+        Some(TrimmedWitnessBuild {
+            nodes: wire_map.consumed_nodes_sorted(),
+            fragments,
+            retention_fingerprint: trie_cache.retention_fingerprint(),
+        })
+    } else {
+        None
+    };
+
     let mut nodes = flat_nodes.into_values().collect::<Vec<_>>();
     nodes.sort_unstable();
     nodes.dedup();
@@ -582,6 +641,7 @@ pub fn build_cache_aware_flat_transition(
     Ok(CacheAwareFlatBuild {
         nodes,
         decoded_proof,
+        trimmed,
         next_trie_cache,
         state_root,
         provider_calls,
@@ -843,8 +903,26 @@ pub fn build_policy_sidecar(
     let next_cache_anchor =
         cache.cache_anchor(block.block_number, block.block_hash, cache_policy_id);
 
+    // The wire the sidecar carries is what its stats must describe: for a trimmed build that is
+    // the fragment list, attributed through the fragment proof rather than the full decode.
+    let (witness_state, measured_nodes, measured_proof) = match &build.trimmed {
+        Some(trimmed) => (
+            PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+                retention_version: crate::witness_v3::WITNESS_V3_RETENTION_VERSION,
+                retention_fingerprint: trimmed.retention_fingerprint,
+                nodes: trimmed.nodes.clone(),
+            },
+            &trimmed.nodes,
+            &trimmed.fragments,
+        ),
+        None => (
+            PartialExecutionWitnessState::MptTransitionNodes(build.nodes.clone()),
+            &build.nodes,
+            &build.decoded_proof,
+        ),
+    };
     let mut stats =
-        measure_transition_witness_size(&build.nodes, &build.decoded_proof, missed_bytecode_bytes);
+        measure_transition_witness_size(measured_nodes, measured_proof, missed_bytecode_bytes);
     stats.target_accounts = base.targets.account_count() + build.structural_account_targets;
     stats.target_storage_slots = base.targets.storage_count() + build.structural_storage_targets;
     stats.computation_time_ms = Some(build_start.elapsed().as_millis() as u64);
@@ -863,7 +941,7 @@ pub fn build_policy_sidecar(
         prev_cache_anchor,
         next_cache_anchor,
         miss_manifest,
-        witness_state: PartialExecutionWitnessState::MptTransitionNodes(build.nodes.clone()),
+        witness_state,
         codes: missed_bytecodes,
         headers: block.ancestor_headers.to_vec(),
         stats,
@@ -1035,6 +1113,9 @@ impl FullWitnessBuild {
             PartialExecutionWitnessState::MptMultiProof(_) => Err(eyre::eyre!(
                 "the full witness build produced a legacy multiproof rather than transition nodes"
             )),
+            PartialExecutionWitnessState::MptTrimmedTransitionNodes { .. } => {
+                Err(eyre::eyre!("the full witness build must be self-contained, never trimmed"))
+            }
         }
     }
 }

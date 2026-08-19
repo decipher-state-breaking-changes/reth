@@ -197,6 +197,8 @@ pub struct RunOptions {
     pub resource_metrics: bool,
     /// Whether to validate retained trie paths and log trie shape every block.
     pub trie_cache_diagnostics: bool,
+    /// Whether Ready-cache sidecars carry the receiver-aware trimmed (v3) witness.
+    pub witness_v3: bool,
     /// Whether the builder preflights each sidecar before publishing it.
     pub run_sidecar_preflight: bool,
     /// Where paired Partial/Weak validation records go.
@@ -332,6 +334,7 @@ impl RunOptions {
             compute_baseline: !validation_bench && env_flag("PS_WITNESS_BASELINE"),
             resource_metrics: !validation_bench && env_flag("PS_RESOURCE_METRICS"),
             trie_cache_diagnostics: !validation_bench && env_flag("PS_TRIE_CACHE_DIAGNOSTICS"),
+            witness_v3: env_flag("PS_WITNESS_V3"),
             run_sidecar_preflight: sidecar_role.runs_preflight(),
             validation_bench_output: validation_bench.then(|| {
                 std::env::var_os("PS_BENCH_OUTPUT")
@@ -407,6 +410,12 @@ impl RunOptions {
             info!(
                 target: "partial_stateless",
                 "Trie-shape cache diagnostics ENABLED (PS_TRIE_CACHE_DIAGNOSTICS) — per-block timings, depth-0..5 prefix coverage, and full retained-path validation"
+            );
+        }
+        if self.witness_v3 {
+            info!(
+                target: "partial_stateless",
+                "Trimmed witness ENABLED (PS_WITNESS_V3) — Ready-cache sidecars carry receiver-aware fragments; warming and full-witness sidecars stay self-contained"
             );
         }
         if self.resource_metrics {
@@ -510,6 +519,7 @@ impl RunOptions {
             compute_baseline: self.compute_baseline,
             resource_metrics: self.resource_metrics,
             trie_cache_diagnostics: self.trie_cache_diagnostics,
+            witness_v3: self.witness_v3,
             run_sidecar_preflight: self.run_sidecar_preflight,
             validation_bench_output: self.validation_bench_output.as_deref(),
             builder_bench_output: self.builder_bench_output.as_deref(),

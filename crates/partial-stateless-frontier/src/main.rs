@@ -39,11 +39,12 @@ struct Options {
     samples: u64,
     out: PathBuf,
     trie_diagnostics: bool,
+    witness_v3: bool,
 }
 
 fn usage() -> String {
     "usage: ps-policy-frontier --dataset <dir> --arm <weak|a/s> [--arm <weak|a/s> ...] \
-     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics]"
+     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3]"
         .to_string()
 }
 
@@ -54,6 +55,7 @@ fn parse_args() -> eyre::Result<Options> {
     let mut samples = None;
     let mut out = None;
     let mut trie_diagnostics = false;
+    let mut witness_v3 = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -69,6 +71,7 @@ fn parse_args() -> eyre::Result<Options> {
             "--samples" => samples = Some(value()?.parse::<u64>()?),
             "--out" => out = Some(PathBuf::from(value()?)),
             "--trie-diagnostics" => trie_diagnostics = true,
+            "--witness-v3" => witness_v3 = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -97,7 +100,7 @@ fn parse_args() -> eyre::Result<Options> {
         eyre::bail!("--samples must be at least 1")
     }
 
-    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics })
+    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics, witness_v3 })
 }
 
 fn main() -> eyre::Result<()> {
@@ -172,6 +175,7 @@ fn main() -> eyre::Result<()> {
         admission: &admission,
         limits: &limits,
         trie_diagnostics: options.trie_diagnostics,
+        witness_v3: options.witness_v3,
     };
 
     let replayed = &dataset.records[..needed as usize];

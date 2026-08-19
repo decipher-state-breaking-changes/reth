@@ -89,6 +89,10 @@ impl WitnessSizeBreakdown {
             partial_stateless::PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
                 (nodes.iter().map(|node| node.len()).sum(), nodes.len())
             }
+            partial_stateless::PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+                nodes,
+                ..
+            } => (nodes.iter().map(|node| node.len()).sum(), nodes.len()),
         };
         Ok(Self {
             serialized_witness_bytes: bincode::serialize(witness)?.len(),

@@ -562,12 +562,26 @@ impl SerializableMultiProof {
 }
 
 /// State component of a partial execution witness.
+///
+/// Variant order is wire format: bincode encodes the declaration index, so new variants are
+/// appended, never inserted (see the tag-lock test).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PartialExecutionWitnessState {
     /// Reth MPT multiproof encoded in the local serializable representation.
     MptMultiProof(Vec<u8>),
     /// Parent-state trie node preimages recorded while applying the complete transition.
     MptTransitionNodes(Vec<Bytes>),
+    /// Receiver-aware trimmed transition nodes: only what lies below the receiving validator's
+    /// blinded trie frontier, graftable against the exact parent trie-cache generation named by
+    /// the retention fields. Not self-contained — a cache-less verifier cannot decode this.
+    MptTrimmedTransitionNodes {
+        /// Version of the deterministic retention algorithm the trimming frontier assumes.
+        retention_version: u16,
+        /// The builder's parent-generation retention fingerprint the fragments were cut against.
+        retention_fingerprint: B256,
+        /// The fragment node preimages: hash-deduplicated, byte-sorted.
+        nodes: Vec<Bytes>,
+    },
 }
 
 impl PartialExecutionWitnessState {
@@ -575,6 +589,9 @@ impl PartialExecutionWitnessState {
         match self {
             Self::MptMultiProof(bytes) => bytes.len(),
             Self::MptTransitionNodes(nodes) => nodes.iter().map(|node| node.len()).sum(),
+            Self::MptTrimmedTransitionNodes { nodes, .. } => {
+                2 + 32 + nodes.iter().map(|node| node.len()).sum::<usize>()
+            }
         }
     }
 }
@@ -673,6 +690,19 @@ pub fn partial_witness_commitment(
         }
         PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
             preimage.extend_from_slice(b"state_mpt_transition_nodes");
+            preimage.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
+            for node in nodes {
+                encode_bytes(&mut preimage, node);
+            }
+        }
+        PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+            retention_version,
+            retention_fingerprint,
+            nodes,
+        } => {
+            preimage.extend_from_slice(b"state_mpt_trimmed_transition_nodes");
+            preimage.extend_from_slice(&retention_version.to_be_bytes());
+            preimage.extend_from_slice(retention_fingerprint.as_slice());
             preimage.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
             for node in nodes {
                 encode_bytes(&mut preimage, node);
@@ -814,6 +844,19 @@ mod tests {
         // Keep the established flat-transition discriminant stable for existing sidecars.
         assert_eq!(&encoded[..4], &[1, 0, 0, 0]);
         assert_eq!(bincode::deserialize::<PartialExecutionWitnessState>(&encoded).unwrap(), state);
+
+        // The trimmed variant is appended, never inserted: index 2, after both v1/v2 tags.
+        let trimmed = PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+            retention_version: 1,
+            retention_fingerprint: B256::repeat_byte(0x42),
+            nodes: vec![Bytes::from_static(&[0xbb])],
+        };
+        let encoded = bincode::serialize(&trimmed).unwrap();
+        assert_eq!(&encoded[..4], &[2, 0, 0, 0]);
+        assert_eq!(
+            bincode::deserialize::<PartialExecutionWitnessState>(&encoded).unwrap(),
+            trimmed
+        );
     }
 
     #[test]

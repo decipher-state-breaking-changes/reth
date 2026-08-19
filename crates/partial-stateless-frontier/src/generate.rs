@@ -237,6 +237,13 @@ pub struct GeneratorRules<'a, Evm, C: ?Sized, ChainSpec> {
     /// them reports the same bytes and miss sets but its timing figures are not comparable to a
     /// run without them.
     pub trie_diagnostics: bool,
+    /// Whether policy arms build the trimmed sidecar witness instead of the self-contained one.
+    ///
+    /// The Weak arm is untouched — a full witness must stay decodable by a receiver holding
+    /// nothing — and a policy arm whose trie is still cold degrades to the self-contained wire
+    /// on its own. Byte results from a trimmed run are a different wire format and must never
+    /// be compared against an untrimmed run's without saying so.
+    pub witness_v3: bool,
 }
 
 /// What the previous block left behind for the next one.
@@ -338,7 +345,11 @@ where
     // 4 and 5, per arm, in an order that rotates so no arm keeps the first slot.
     let source =
         RecordedFullWitnessSource::new(body.parent_state_root, &body.full_transition_nodes)?;
-    let ctx = TransitionBuildContext::uninstrumented(&source);
+    let ctx = if rules.witness_v3 {
+        TransitionBuildContext::uninstrumented(&source).with_trimmed_witness()
+    } else {
+        TransitionBuildContext::uninstrumented(&source)
+    };
     let block_ref = BlockTransitionRef {
         block_number: body.block_number,
         block_hash: body.block_hash,

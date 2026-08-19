@@ -10,8 +10,9 @@ use partial_stateless::{
     check_sidecar_context, check_sidecar_miss_targets, cow_copies_taken,
     network_cache::{NetworkStateCache, UpdateStats},
     try_compute_trustless_state_root, try_compute_trustless_state_root_v2_with_storage_targets,
+    try_compute_trustless_state_root_v3,
     witness_check::{
-        check_sidecar_witness_prefilter, materialize_sidecar_witness_after_prefilter,
+        check_sidecar_witness_prefilter, materialize_sidecar_witness_after_prefilter_with_cache,
         root_witness_completeness_from_bundle_with_cache, SidecarWitnessCheckLimits,
     },
     CacheAnchor, CacheRootTimings, MaterializedStateProof, PartialStatelessSidecar,
@@ -220,8 +221,12 @@ where
         .map_err(|err| eyre!("sidecar witness check failed: {err}"))?;
     let witness_self_consistency_us = witness_check_start.elapsed().as_micros() as u64;
     let materialize_start = Instant::now();
-    let materialized = materialize_sidecar_witness_after_prefilter(sidecar)
-        .map_err(|err| eyre!("sidecar witness materialization failed: {err}"))?;
+    // The trimmed (v3) arm reads miss values through a read-only composite walk over the parent
+    // trie cache and the witness map; the self-contained arms ignore the cache. Nothing before
+    // the post-consensus commit writes to `trie_cache` either way.
+    let materialized =
+        materialize_sidecar_witness_after_prefilter_with_cache(sidecar, Some(trie_cache))
+            .map_err(|err| eyre!("sidecar witness materialization failed: {err}"))?;
     let materialize_us = materialize_start.elapsed().as_micros() as u64;
     // Retained for trustless root computation before the other fields are moved into the provider.
     let state_proof = materialized.state_proof;
@@ -250,6 +255,9 @@ where
                 proof.storage_proofs.len(),
                 proof.storage_proofs.values().map(Vec::len).sum::<usize>(),
             ),
+            MaterializedStateProof::TrimmedTransition(session) => {
+                ("transition-v3-trimmed", session.map().len(), 0, 0)
+            }
         };
     let witness_provider = WitnessBackedStateProvider {
         cache: prev_cache,
@@ -353,6 +361,13 @@ where
                 transition_storage_targets.iter().copied(),
             )
         }
+        MaterializedStateProof::TrimmedTransition(session) => try_compute_trustless_state_root_v3(
+            session,
+            trie_cache,
+            &mut next_trie_cache,
+            &execution_output.state,
+            &sidecar.miss_manifest,
+        ),
     }
     .map_err(|err| eyre!("local sparse-trie transition failed: {err}"))?;
     let state_root_us = root_start.elapsed().as_micros() as u64;
@@ -375,6 +390,10 @@ where
             partial_stateless::PartialExecutionWitnessState::MptTransitionNodes(nodes) => {
                 (nodes.len(), nodes.iter().map(|node| node.len()).sum())
             }
+            partial_stateless::PartialExecutionWitnessState::MptTrimmedTransitionNodes {
+                nodes,
+                ..
+            } => (nodes.len(), nodes.iter().map(|node| node.len()).sum()),
         };
         bail!(
             "local sparse-trie state root mismatch: expected {:?}, got {:?}; parent_root={:?}, cache_root={:?}, proof_kind={}, proof_account_nodes={}, proof_storage_tries={}, proof_storage_nodes={}, sidecar_state_nodes={}, sidecar_state_bytes={}, post_accounts={}, post_storage_tries={}, post_storage_slots={}, storage_wipes={}, storage_removals={}, transition_storage_targets={}, cache_warm_accounts={}, cache_warm_storage={}, cache_account_nodes={}, cache_storage_nodes={}",
