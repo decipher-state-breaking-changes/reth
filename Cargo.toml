@@ -157,6 +157,7 @@ members = [
     "crates/partial-stateless-frontier",
     "crates/partial-stateless-replay",
     "crates/partial-stateless-stream",
+    "crates/partial-stateless-treestudy",
     "crates/partial-stateless-validator",
 ]
 default-members = ["bin/reth"]

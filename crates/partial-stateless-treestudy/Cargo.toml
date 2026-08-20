@@ -1,0 +1,39 @@
+[package]
+name = "partial-stateless-treestudy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Offline comparison of cache-complement witness cost across state commitment schemes"
+
+[lints]
+workspace = true
+
+# Features are re-declared here rather than inherited. Cargo unifies features per package, so a
+# study binary built as `-p partial-stateless-treestudy` would otherwise hash with a different
+# keccak implementation than the node whose measured numbers this crate is calibrated against.
+[features]
+default = ["asm-keccak", "keccak-cache-global"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+
+[dependencies]
+# The corpus reader, the flat value cache, and the eviction policy are taken from the production
+# crate rather than reimplemented: the miss set this study holds fixed across tree backends is only
+# meaningful if it is byte-identical to the one the measured MPT arms were built from.
+partial-stateless = { path = "../partial-stateless" }
+
+alloy-primitives.workspace = true
+blake3.workspace = true
+eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[[bin]]
+name = "ps-tree-study"
+path = "src/bin/ps_tree_study.rs"
