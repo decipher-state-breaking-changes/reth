@@ -37,7 +37,7 @@ pub use partial_stateless::CacheConfig;
 use partial_stateless::{
     persistence::{load_from_file, save_to_file, CacheState},
     readiness::{BlockContext, BlockedReason, CacheObservation, CacheReadiness, ReadyParent},
-    CacheAnchor, PartialStatelessSidecar, PartialTrieNodeCache,
+    CacheAnchor, CacheTrieRepr, PartialStatelessSidecar, PartialTrieNodeCache,
 };
 use partial_stateless_stream::{
     BlockRef as StreamBlockRef, CommitInput, CommitOracle, EndKind, RecordedVerdict, Reorg,
@@ -132,6 +132,18 @@ fn env_flag_enabled_by_default(name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// `PS_TRIE_REPR`, refused at startup on anything but a known representation name.
+///
+/// Strict like the windows rather than defaulting like a flag: the value labels every trie the
+/// run constructs, and an A/B arm whose mistyped variable silently fell back to the default
+/// would be a measurement filed under a representation it never ran.
+fn trie_repr_from_env() -> eyre::Result<CacheTrieRepr> {
+    match std::env::var("PS_TRIE_REPR") {
+        Err(_) => Ok(CacheTrieRepr::default()),
+        Ok(raw) => raw.parse::<CacheTrieRepr>().map_err(|err| eyre::eyre!("PS_TRIE_REPR: {err}")),
+    }
+}
+
 fn env_u32(name: &str, default: u32) -> u32 {
     let Ok(value) = std::env::var(name) else { return default };
     // A bare `PS_..=1`-style flag should still mean "on"; a count is the more useful spelling.
@@ -199,6 +211,14 @@ pub struct RunOptions {
     pub trie_cache_diagnostics: bool,
     /// Whether Ready-cache sidecars carry the receiver-aware trimmed (v3) witness.
     pub witness_v3: bool,
+    /// The sparse-trie representation every trie cache this run constructs is built on.
+    ///
+    /// Not protocol: the cross-representation oracle showed the two representations produce
+    /// identical observables (roots, anchors, witness bytes, fragments), so the choice never
+    /// reaches the wire or the policy identifier. It is a measurement label all the same — a run
+    /// is meaningless as an A/B arm unless the label names what actually ran — so it is resolved
+    /// once here, logged at startup, and preserved across cold resets.
+    pub trie_repr: CacheTrieRepr,
     /// Whether the builder preflights each sidecar before publishing it.
     pub run_sidecar_preflight: bool,
     /// Where paired Partial/Weak validation records go.
@@ -322,6 +342,25 @@ impl RunOptions {
                  instead."
             ))
         }
+        let trie_repr = trie_repr_from_env()?;
+        if trie_repr != CacheTrieRepr::default() &&
+            (env_flag("PS_BOOTSTRAP_IMPORT") ||
+                env_flag("PS_CANONICAL_REBUILD") ||
+                bootstrap_self_test_blocks > 0)
+        {
+            // Snapshot restore and canonical rebuild construct their tries inside shared
+            // bootstrap code that builds the default representation; letting them run under a
+            // non-default PS_TRIE_REPR would produce a pair whose actual representation
+            // contradicts the run's label. Refused rather than converted: there is no cheap
+            // in-place conversion, and a mislabelled measurement is worse than no run.
+            return Err(eyre::eyre!(
+                "PS_TRIE_REPR={} applies to cold-started pairs only; snapshot restore, canonical \
+                 rebuild, and the bootstrap self-test build the default representation. Unset \
+                 PS_BOOTSTRAP_IMPORT / PS_CANONICAL_REBUILD / PS_BOOTSTRAP_SELF_TEST, or run on \
+                 the default representation.",
+                trie_repr.label()
+            ))
+        }
         Ok(Self {
             config,
             sidecar_role,
@@ -335,6 +374,7 @@ impl RunOptions {
             resource_metrics: !validation_bench && env_flag("PS_RESOURCE_METRICS"),
             trie_cache_diagnostics: !validation_bench && env_flag("PS_TRIE_CACHE_DIAGNOSTICS"),
             witness_v3: env_flag("PS_WITNESS_V3"),
+            trie_repr,
             run_sidecar_preflight: sidecar_role.runs_preflight(),
             validation_bench_output: validation_bench.then(|| {
                 std::env::var_os("PS_BENCH_OUTPUT")
@@ -381,8 +421,17 @@ impl RunOptions {
             canonical_rebuild = self.canonical_rebuild,
             reorg_checkpoint = ?self.reorg_checkpoint,
             stream_fsync = self.stream_fsync,
+            trie_repr = self.trie_repr.label(),
             "Partial Stateless ExEx started — monitoring cache state per block"
         );
+        if self.trie_repr != CacheTrieRepr::default() {
+            info!(
+                target: "partial_stateless",
+                trie_repr = self.trie_repr.label(),
+                "Non-default cache trie representation ENABLED (PS_TRIE_REPR) — every trie cache \
+                 this run constructs uses it; observables are representation-independent"
+            );
+        }
         if let Some(dir) = &self.capture_dir {
             info!(
                 target: "partial_stateless",
@@ -1417,7 +1466,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
     // processed. Both start cold here, and the tracker starts cold with them.
     LivePair::new(CoordinatedPair {
         cache,
-        trie_cache: PartialTrieNodeCache::new(),
+        trie_cache: PartialTrieNodeCache::new_with_repr(options.trie_repr),
         readiness: config.new_readiness_tracker(),
         previous_generation: None,
         accepted_head: None,
@@ -2947,8 +2996,8 @@ mod tests {
     use super::{
         admit_after_cold_reset, admit_block, block_context, finish_committed_transition,
         inject_recovery, observe_readiness, BlockAdmission, BlockContext, CacheConfig,
-        CanonicalStateRoots, CoordinatedPair, LivePair, PartialTrieNodeCache, ProviderResult,
-        SealedHeader, SidecarRole,
+        CacheTrieRepr, CanonicalStateRoots, CoordinatedPair, LivePair, PartialTrieNodeCache,
+        ProviderResult, SealedHeader, SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -3834,6 +3883,19 @@ mod tests {
         assert_eq!(pair.accepted_head, None);
         assert_eq!(pair.lifecycle_fingerprint().accepted_head, None);
         assert_eq!(pair.lifecycle_fingerprint().retained_generation, None);
+    }
+
+    #[test]
+    fn a_cold_reset_keeps_the_trie_representation() {
+        // Cold means empty, not reconfigured: a mid-run gap on a non-default representation must
+        // come back on that representation, or an A/B arm would silently finish on the other one.
+        let mut pair = cold_pair();
+        pair.trie_cache = PartialTrieNodeCache::new_with_repr(CacheTrieRepr::Exact);
+
+        pair.cold_reset();
+
+        assert_eq!(pair.trie_cache.repr(), CacheTrieRepr::Exact);
+        assert!(pair.trie_cache.state_root().is_none(), "the reset must still empty the trie");
     }
 
     #[test]

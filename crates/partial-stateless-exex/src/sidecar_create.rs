@@ -500,7 +500,9 @@ where
     let weak_witness = WitnessSizeBreakdown::from_witness(&weak_sidecar.witness)?;
 
     let mut weak_cache = config.new_cache_at(block.number().saturating_sub(1));
-    let mut weak_trie = PartialTrieNodeCache::new();
+    // The same representation the live pair runs on, so both arms of the paired benchmark decode
+    // and commit through identical trie code and the Partial/Weak ratio compares nothing else.
+    let mut weak_trie = PartialTrieNodeCache::new_with_repr(trie_cache.repr());
     let expected_cache_policy_id =
         last_n_blocks_cache_policy_id(config.account_window, config.storage_window);
     let partial_first = partial_runs_first(block.number());

@@ -211,7 +211,9 @@ impl CoordinatedPair {
     /// policy: a full node can warm again from live blocks, and a standalone validator cannot,
     /// which is why no decision is taken here.
     pub fn cold_reset(&mut self) {
-        self.trie_cache = PartialTrieNodeCache::new();
+        // Cold means empty, not reconfigured: the pair keeps running on whatever trie
+        // representation it was constructed with, exactly as a fresh process would build it.
+        self.trie_cache = PartialTrieNodeCache::new_with_repr(self.trie_cache.repr());
         self.cache.reset();
         self.readiness.reset();
         self.forget_retained_generation();
