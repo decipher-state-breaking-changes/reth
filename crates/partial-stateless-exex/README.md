@@ -620,7 +620,8 @@ Schema 1 digests `bincode` bytes containing three unordered `HashMap`s in
 re-serializing the same semantic record can produce a different digest. Hashing the exact body
 bytes stored in the rejected file reproduces its recorded digest, which distinguishes this
 from observed disk corruption. Its bulk data was discarded rather than migrated. The schema-2
-recapture at `/data/bench-runs/policy-frontier-20260818-223726/raw-block-witness-data` passed the
+recapture --- run `policy-frontier-20260818-223726` (`raw-block-witness-data`, retained in
+the recording host's local artifact store) --- passed the
 full loader, five-sample smoke, and 1,000-block four-policy replay and is the accepted evidence
 input; its run root carries `RESULT_SHA256SUMS`.
 

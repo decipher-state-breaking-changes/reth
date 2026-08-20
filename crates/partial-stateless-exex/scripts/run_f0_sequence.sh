@@ -39,8 +39,11 @@ set -uo pipefail
 REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
 BASE=${BASE:-$PWD/f0-$(date +%Y%m%d-%H%M)}
 SCRIPTS="$REPO/crates/partial-stateless-exex/scripts"
-PRODUCER_BIN=${PRODUCER_BIN:-$REPO/target/release/reth-partial-stateless}
-REPLAY_BIN=${REPLAY_BIN:-$REPO/target/release/ps-replay}
+# Default to the same target directory Cargo would use: on a host that exports
+# CARGO_TARGET_DIR, $REPO/target holds nothing and a hardcoded default would fail the
+# stamp check on every launch.
+PRODUCER_BIN=${PRODUCER_BIN:-${CARGO_TARGET_DIR:-$REPO/target}/release/reth-partial-stateless}
+REPLAY_BIN=${REPLAY_BIN:-${CARGO_TARGET_DIR:-$REPO/target}/release/ps-replay}
 NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may take over}
 NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
