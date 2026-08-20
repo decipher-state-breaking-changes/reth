@@ -401,8 +401,17 @@ impl CacheReadinessTracker {
         //
         // Recognised here rather than released by a caller, so that every consumer of this
         // tracker heals the same way and none of them has to know it needs to.
+        //
+        // With no watermark outstanding there is no acknowledged chain for the block to chain
+        // onto, and nothing the guard could protect — the guard rules out heights processed on a
+        // chain this tracker was never on, and an empty watermark makes no chain claim at all.
+        // The case is real: a recovery that unwinds the watermark at its own height and then
+        // fails records this height as the gap, and the cold reset re-applies exactly this
+        // height on the canonical chain. Without this arm the two latch each other shut — the
+        // gap blocks the watermark from restarting, and the missing watermark blocks the gap
+        // from healing — so every acknowledgement is withheld for the rest of the run.
         if self.first_gap == Some(block.number) &&
-            self.acknowledgeable.is_some_and(|previous| {
+            self.acknowledgeable.is_none_or(|previous| {
                 block.number == previous.number + 1 && block.parent_hash == previous.hash
             })
         {
@@ -926,6 +935,42 @@ mod tests {
 
         assert_eq!(tracker.first_gap(), Some(101), "the height is still owed on this chain");
         assert_eq!(tracker.acknowledgeable_height(), Some((100, block_hash(100))));
+    }
+
+    #[test]
+    fn a_failed_same_height_recovery_releases_the_watermark_after_the_cold_reset() {
+        // The live incident this reproduces: a one-block reorg replaced the exact block the
+        // watermark stood on. `begin_recovery` at that height cleared the watermark, the failed
+        // recovery recorded the same height as the gap, and the cold reset then re-applied that
+        // height on the canonical chain — after which the gap and the empty watermark latched
+        // each other shut and every acknowledgement was withheld for the rest of the run.
+        let mut tracker = tracker();
+        apply_contiguous(&mut tracker, 100, 6);
+        assert_eq!(tracker.acknowledgeable_height(), Some((105, block_hash(105))));
+
+        // The sibling replaces 105; recovery is entered and never completes.
+        tracker.begin_recovery(105);
+        assert_eq!(tracker.acknowledgeable_height(), None, "the unwind covered the watermark");
+        let mut sibling = block(105);
+        sibling.hash = B256::repeat_byte(0xee);
+        let refused = tracker.begin_block(&sibling).expect_err("recovering refuses admission");
+        assert_eq!(refused, BlockedReason::RecoveryIncomplete { block_number: 105 });
+        assert_eq!(tracker.first_gap(), Some(105));
+
+        // The cold reset, and then the replacement block itself.
+        tracker.reset();
+        tracker.begin_block(&sibling).expect("a reset admits it");
+        tracker.finish_block(&sibling, &observed(&sibling));
+
+        assert_eq!(tracker.first_gap(), None, "the height owed was processed");
+        assert_eq!(tracker.acknowledgeable_height(), Some((105, sibling.hash)));
+
+        // And the watermark follows the chain again from there.
+        let mut next = block(106);
+        next.parent_hash = sibling.hash;
+        tracker.begin_block(&next).expect("the chain continues from the sibling");
+        tracker.finish_block(&next, &observed(&next));
+        assert_eq!(tracker.acknowledgeable_height(), Some((106, next.hash)));
     }
 
     #[test]
