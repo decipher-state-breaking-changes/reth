@@ -46,8 +46,13 @@ check "PS_ENGINE_ACCESS=on"
 check "PS_SHADOW_SAMPLE=50"
 check "PS_ENGINE_PAYLOAD=on"
 check "PS_STREAM_REORG_CHECKPOINT=always"
-check "PS_ACCOUNT_WINDOW=60"
-check "PS_STORAGE_WINDOW=30"
+check "PS_ACCOUNT_WINDOW=90"
+check "PS_STORAGE_WINDOW=60"
+check "PS_WITNESS_V3=1"
+check "PS_TRIE_REPR=exact"
+check "PS_PARALLEL_INITIAL_PROOF=0"
+check "PS_RETAIN_GENERATION=1"
+check "PS_CANONICAL_REBUILD=0"
 check "PS_SIDECAR_ROLE=builder"
 check "PS_STREAM_DIR=$arm/spool"
 check "PS_BOOTSTRAP_DIR=$arm/bootstrap"
@@ -57,7 +62,9 @@ check "PS_SHADOW_OUTPUT=$arm/access-shadow.jsonl"
 check "PS_STREAM_FSYNC=1"
 
 echo "==> and the ones that must be absent are absent"
-for absent in PS_CAPTURE_DIR PS_VALIDATION_BENCH PS_POLICY_DATASET_CAPTURE_DIR; do
+for absent in PS_CAPTURE_DIR PS_VALIDATION_BENCH PS_POLICY_DATASET_CAPTURE_DIR \
+              PS_WITNESS_BASELINE PS_RESOURCE_METRICS PS_TRIE_CACHE_DIAGNOSTICS \
+              PS_FORCE_PREVIOUS_CACHE_SNAPSHOT; do
     if grep -q "^$absent=" "$arm/producer.out"; then
         echo "  FAIL: $absent reached the producer" >&2
         failed=1

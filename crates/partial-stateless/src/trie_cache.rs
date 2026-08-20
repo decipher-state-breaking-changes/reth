@@ -95,7 +95,7 @@ impl ShapeDiagnostics {
 type CacheSparseStateTrie = SparseStateTrie<CacheTrie, SharedSparseTrie<CacheTrie>>;
 
 /// A blind account-trie slot pre-seeded with the right representation, so the first reveal
-/// builds on it instead of falling back to the wrapper's default (parallel) trie.
+/// builds on it instead of falling back to the wrapper's default trie.
 fn blind_account_trie(repr: CacheTrieRepr) -> RevealableSparseTrie<CacheTrie> {
     RevealableSparseTrie::Blind(Some(Box::new(CacheTrie::new(repr))))
 }

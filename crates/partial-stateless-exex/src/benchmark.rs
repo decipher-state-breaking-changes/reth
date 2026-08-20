@@ -168,7 +168,10 @@ pub struct ValidationBenchmarkRecord {
 ///
 /// Since 5 the record names `trie_repr`, because the footprint fields (`trie_cache_bytes`,
 /// `trie_clone_bytes`) are measured under a specific trie representation and mean nothing across
-/// representations: a file written before 5 was measured on the parallel representation.
+/// representations. Files written before 5 do not identify their representation: schema 4 was
+/// still current while `PS_TRIE_REPR=exact` was used for the O2.2 live arm, so an analyzer must
+/// recover the label from that run's external manifest or startup log, never infer it from the
+/// schema number.
 pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 5;
 
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
@@ -225,7 +228,8 @@ pub struct BuilderBenchmarkRecord {
     /// `trie_cache_bytes` and `trie_clone_bytes` are each representation's own accounting of its
     /// own structures, so two records disagreeing here must never have their footprints compared
     /// directly — the counting-allocator differential is the only cross-representation meter.
-    /// Since schema 5; files written before it were measured on `"parallel"`.
+    /// Since schema 5. Older files need an external arm manifest or startup log; their
+    /// representation cannot be inferred from the schema number.
     pub trie_repr: &'static str,
     pub trie_cache_bytes: usize,
     pub retained_generation: RetainedGenerationBytes,

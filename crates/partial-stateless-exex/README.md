@@ -181,6 +181,8 @@ variables, so the core sidecar generation path stays lean:
 | `PS_SIDECAR_ROLE=builder\|builder-verifier\|verifier` | choose whether this ExEx writes sidecars, writes and preflights them, or consumes existing sidecars as a live verifier (default: `builder`) |
 | `PS_SIDECAR_DIR=<dir>` | write sidecars in `<dir>` (default: `./sidecar`) |
 | `PS_ACCOUNT_WINDOW=<n>` / `PS_STORAGE_WINDOW=<n>` | inclusive Last-N account and storage/code cache windows (defaults: `60` / `30`). Both are runtime protocol parameters: they select the policy ID and persisted-cache filename; non-positive, signed, whitespace-padded, or non-decimal values fail startup |
+| `PS_WITNESS_V3=1` | emit receiver-aware `MptTrimmedTransitionNodes` for a Ready cache; Cold/Warming and full-witness sidecars remain self-contained v2 (default: disabled; enabled explicitly by the frozen cohort profile) |
+| `PS_TRIE_REPR=exact\|parallel` | select the sparse-trie representation for cache account and storage tries (default: `exact`). `parallel` remains a differential control and is restricted to cold-started pairs because bootstrap restore/rebuild constructs the adopted default |
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's accessed-state snapshot to `<dir>` (see below) |
 | `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |
@@ -396,10 +398,13 @@ targets already requested, fetches only the delta, and resumes the unfinished se
 full proof regeneration or transition replay. An empty delta is rejected as no progress, and a
 128-round cap guards malformed or unexpectedly deep chains of structural dependencies.
 
-Production sidecars use only `MptTransitionNodes`: deterministic, hash-deduplicated parent-state
-RLP node preimages. Because this flat format carries no account/storage path context, storage
-targets also include the account path needed to reconnect their storage root to the state root.
-Legacy `MptMultiProof` sidecars remain decodable for compatibility.
+The self-contained v2 wire uses `MptTransitionNodes`: deterministic, hash-deduplicated
+parent-state RLP node preimages. With `PS_WITNESS_V3=1`, a Ready builder instead emits
+`MptTrimmedTransitionNodes`: the builder and validator share the same composite walk, prefer
+the authenticated local trie, and carry only nodes consumed after a blinded frontier. The wire
+binds the retention version/fingerprint, verifies every graft by its anchor hash, and rejects
+missing or unconsumed nodes. Cold/Warming and full-witness paths degrade to v2. Legacy
+`MptMultiProof` sidecars remain decodable for compatibility.
 
 For benchmark logs, `initial_provider_us` is the initial native V2 provider call,
 `structural_provider_us` is the sum of later context/structural provider calls, and

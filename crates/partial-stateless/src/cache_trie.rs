@@ -255,3 +255,14 @@ impl SparseTrie for CacheTrie {
         delegate!(self => trie.commit_updates(updated, removed))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_adopted_default_is_exact_at_both_wrapper_layers() {
+        assert_eq!(CacheTrieRepr::default(), CacheTrieRepr::Exact);
+        assert_eq!(CacheTrie::default().repr(), CacheTrieRepr::Exact);
+    }
+}

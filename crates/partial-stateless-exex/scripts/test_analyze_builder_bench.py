@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analyze_builder_bench import build_artifact_section
+from analyze_builder_bench import build_artifact_section, build_trie_repr_section
 
 
 def record(schema_version, **updates):
@@ -99,6 +99,34 @@ class ArtifactSectionSchemaTest(unittest.TestCase):
 
     def test_a_run_without_artifact_fields_emits_nothing(self):
         self.assertEqual(build_artifact_section([{"schema_version": 2}]), [])
+
+
+class TrieRepresentationSchemaTest(unittest.TestCase):
+    def test_schema_four_never_implies_parallel(self):
+        body = "\n".join(build_trie_repr_section([record(4) for _ in range(3)]))
+
+        self.assertIn("Not recorded", body)
+        self.assertIn("do not infer it from the schema number", body)
+        self.assertNotIn("`parallel`", body)
+
+    def test_schema_five_reports_the_recorded_representation(self):
+        records = [record(5, trie_repr="exact") for _ in range(3)]
+        body = "\n".join(build_trie_repr_section(records))
+
+        self.assertIn("`exact`", body)
+        self.assertIn("recorded on all 3", body)
+
+    def test_mixed_representations_are_refused(self):
+        records = [record(5, trie_repr="parallel"), record(5, trie_repr="exact")]
+
+        with self.assertRaisesRegex(ValueError, "mixed trie representations"):
+            build_trie_repr_section(records)
+
+    def test_partial_labelling_is_refused(self):
+        records = [record(4), record(5, trie_repr="exact")]
+
+        with self.assertRaisesRegex(ValueError, "present on only 1/2"):
+            build_trie_repr_section(records)
 
 
 if __name__ == "__main__":

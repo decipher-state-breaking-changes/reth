@@ -29,6 +29,58 @@ def select_builder_samples(records, warmup, limit=None, require_published=False)
 ARTIFACT_SCHEMA = 4
 """Builder schema that declares delivery, sampling, and fallback cause (see `benchmark.rs`)."""
 
+TRIE_REPRS = {"parallel", "exact"}
+
+
+def build_trie_repr_section(selected):
+    """Name the representation behind every footprint, without guessing from old schemas.
+
+    `PS_TRIE_REPR` became runtime-selectable while builder records still declared schema 4, so
+    schema 4 exists for both representations. Schema 5 closes that provenance gap. Old records
+    remain usable when their external arm manifest or startup log supplies the label, but this
+    analyzer cannot manufacture it and must not make cross-representation memory claims from it.
+    """
+    recorded = [record.get("trie_repr") for record in selected if "trie_repr" in record]
+    if not recorded:
+        schemas = sorted(
+            {record.get("schema_version") for record in selected},
+            key=lambda value: (value is None, value),
+        )
+        return [
+            "## Trie representation", "",
+            "- **Not recorded in the builder records.** Resolve it from the arm manifest or "
+            "startup log; do not infer it from the schema number "
+            f"(declared schemas: `{schemas}`).", "",
+            "The memory estimates below are valid only within that resolved representation. "
+            "They are not a cross-representation memory comparison.", "",
+        ]
+
+    if len(recorded) != len(selected):
+        raise ValueError(
+            "mixed builder records: trie_repr is present on only "
+            f"{len(recorded)}/{len(selected)} selected samples"
+        )
+    unknown = sorted({label for label in recorded if label not in TRIE_REPRS})
+    if unknown:
+        raise ValueError(f"unknown trie_repr label(s): {unknown}")
+    labels = sorted(set(recorded))
+    if len(labels) != 1:
+        raise ValueError(
+            f"mixed trie representations in one builder report: {labels}; analyze each arm alone"
+        )
+
+    schemas = sorted(
+        {record.get("schema_version") for record in selected},
+        key=lambda value: (value is None, value),
+    )
+    return [
+        "## Trie representation", "",
+        f"- `{labels[0]}` (recorded on all {len(selected)} selected samples; "
+        f"declared schemas: `{schemas}`)", "",
+        "Footprint estimates below use this representation's own accounting. The counting-"
+        "allocator differential is the cross-representation memory meter.", "",
+    ]
+
 
 def bootstrap_mean_ci(values, iterations=10000, seed=0xB3, confidence=0.95):
     """Percentile bootstrap interval for the mean, seeded so a report regenerates identically.
@@ -198,6 +250,9 @@ def build_builder_report(
         "# Partial-stateless builder benchmark", "",
         f"Accepted builder samples: **{len(selected)}**",
         f"Post-Ready sample-warm-up records excluded: **{warmup}**", "",
+    ]
+    lines.extend(build_trie_repr_section(selected))
+    lines.extend([
         "## Builder timings", "",
         "| Operation | Average | p50 | p90 | p95 | p99 | Maximum |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -210,7 +265,7 @@ def build_builder_report(
         ),
         format_summary("Initial provider", [r["initial_provider_us"] for r in selected]),
         format_summary("Previous-cache snapshot", [r["snapshot_us"] for r in selected]), "",
-    ]
+    ])
     lines.extend(build_artifact_section(selected))
     lines.extend([
         "## Initial proof selection", "",

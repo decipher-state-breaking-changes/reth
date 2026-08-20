@@ -3890,11 +3890,11 @@ mod tests {
         // Cold means empty, not reconfigured: a mid-run gap on a non-default representation must
         // come back on that representation, or an A/B arm would silently finish on the other one.
         let mut pair = cold_pair();
-        pair.trie_cache = PartialTrieNodeCache::new_with_repr(CacheTrieRepr::Exact);
+        pair.trie_cache = PartialTrieNodeCache::new_with_repr(CacheTrieRepr::Parallel);
 
         pair.cold_reset();
 
-        assert_eq!(pair.trie_cache.repr(), CacheTrieRepr::Exact);
+        assert_eq!(pair.trie_cache.repr(), CacheTrieRepr::Parallel);
         assert!(pair.trie_cache.state_root().is_none(), "the reset must still empty the trie");
     }
 

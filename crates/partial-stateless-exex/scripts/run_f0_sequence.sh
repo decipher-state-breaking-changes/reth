@@ -157,13 +157,20 @@ start_producer() { # <arm-dir> <fsync>
     local arm=$1 fsync=$2
     mkdir -p "$arm"/{spool,bootstrap,sidecars,out}
     env -u PS_CAPTURE_DIR -u PS_VALIDATION_BENCH -u PS_POLICY_DATASET_CAPTURE_DIR \
+    -u PS_WITNESS_BASELINE -u PS_RESOURCE_METRICS -u PS_TRIE_CACHE_DIAGNOSTICS \
+    -u PS_FORCE_PREVIOUS_CACHE_SNAPSHOT \
     PS_ENGINE_ACCESS=on \
     PS_SHADOW_SAMPLE=50 \
     PS_ENGINE_PAYLOAD=on \
     PS_STREAM_FSYNC="$fsync" \
     PS_STREAM_REORG_CHECKPOINT=always \
-    PS_ACCOUNT_WINDOW=60 \
-    PS_STORAGE_WINDOW=30 \
+    PS_ACCOUNT_WINDOW=90 \
+    PS_STORAGE_WINDOW=60 \
+    PS_WITNESS_V3=1 \
+    PS_TRIE_REPR=exact \
+    PS_PARALLEL_INITIAL_PROOF=0 \
+    PS_RETAIN_GENERATION=1 \
+    PS_CANONICAL_REBUILD=0 \
     PS_SIDECAR_ROLE=builder \
     PS_STREAM_DIR="$arm/spool" \
     PS_BOOTSTRAP_DIR="$arm/bootstrap" \
@@ -218,7 +225,7 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
     ( cd "$SCRIPTS" && GATE_MODE=reorg GATE_FORCE_RESTORE=1 GATE_PHASE=capture \
         ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" > "$ARM/gate.out" 2>&1 ) &
     GATE_PID=$!
-    say "gate pid=$GATE_PID  log=$ARM/gate.out (a stale datadir warms cold: ~11 min + ~52 s export)"
+    say "gate pid=$GATE_PID  log=$ARM/gate.out (a stale datadir warms cold: ~18 min + export)"
 
     J="$ARM/out/follow.jsonl"
     count() { local n; n=$(grep -c "$1" "$J" 2>/dev/null); echo "${n:-0}"; }
@@ -277,7 +284,7 @@ fi
 # profile (producer fsyncs each frame, follower fsyncs each ack).
 #
 # Each arm bounds itself: long mode's watcher SIGTERMs the producer once the live target is met,
-# so no manual stop. Back-to-back arms keep the cache within its 60-block gap, so only the first
+# so no manual stop. Back-to-back arms keep the cache within its 90-block gap, so only the first
 # pays the cold warm-up.
 
 if [ "${SKIP_ABBA:-0}" != "1" ]; then
