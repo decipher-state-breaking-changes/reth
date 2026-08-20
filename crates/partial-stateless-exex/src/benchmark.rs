@@ -165,7 +165,11 @@ pub struct ValidationBenchmarkRecord {
 /// They are correct; only the label is stale. `analyze_builder_bench.py` therefore keys on field
 /// presence and reports the declared version rather than trusting it, and this bump only fixes
 /// files written from here on.
-pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 4;
+///
+/// Since 5 the record names `trie_repr`, because the footprint fields (`trie_cache_bytes`,
+/// `trie_clone_bytes`) are measured under a specific trie representation and mean nothing across
+/// representations: a file written before 5 was measured on the parallel representation.
+pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 5;
 
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -216,6 +220,13 @@ pub struct BuilderBenchmarkRecord {
     pub sidecar_constructed: bool,
     pub sidecar_published: bool,
     pub value_cache_bytes: usize,
+    /// The trie representation every trie footprint in this record was measured under.
+    ///
+    /// `trie_cache_bytes` and `trie_clone_bytes` are each representation's own accounting of its
+    /// own structures, so two records disagreeing here must never have their footprints compared
+    /// directly — the counting-allocator differential is the only cross-representation meter.
+    /// Since schema 5; files written before it were measured on `"parallel"`.
+    pub trie_repr: &'static str,
     pub trie_cache_bytes: usize,
     pub retained_generation: RetainedGenerationBytes,
     /// Logical size of the trie the per-block snapshot covers.
@@ -537,11 +548,13 @@ mod tests {
         // find `artifact_available` absent and report 0% delivery rather than "not recorded".
         let value = serde_json::to_value(BuilderBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(BUILDER_BENCHMARK_SCHEMA_VERSION, 4);
+        assert_eq!(BUILDER_BENCHMARK_SCHEMA_VERSION, 5);
         for field in ["artifact_available", "artifact_reused", "shadow_sampled", "fallback_reason"]
         {
             assert!(value.get(field).is_some(), "schema 4 must carry {field}");
         }
+        // Since 5: the footprint fields name the representation they were measured under.
+        assert!(value.get("trie_repr").is_some(), "schema 5 must carry trie_repr");
     }
 
     #[test]

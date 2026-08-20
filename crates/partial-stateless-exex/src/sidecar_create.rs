@@ -1545,6 +1545,7 @@ where
             sidecar_constructed,
             sidecar_published: saved_sidecar_path.is_some(),
             value_cache_bytes: cache.estimated_memory_bytes(),
+            trie_repr: trie_cache.repr().label(),
             trie_cache_bytes: trie_cache.estimated_memory_bytes(),
             retained_generation: options.retained_generation,
             trie_clone_bytes: builder_trie_clone_bytes,

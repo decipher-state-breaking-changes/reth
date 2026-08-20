@@ -231,7 +231,7 @@ impl Default for PartialTrieNodeCache {
 }
 
 impl PartialTrieNodeCache {
-    /// Creates a cold local sparse trie on the default (parallel) representation.
+    /// Creates a cold local sparse trie on the default representation.
     pub fn new() -> Self {
         Self::new_with_repr(CacheTrieRepr::default())
     }

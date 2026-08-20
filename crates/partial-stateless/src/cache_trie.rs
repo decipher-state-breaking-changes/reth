@@ -24,12 +24,18 @@ use reth_trie_sparse::{
 use std::borrow::Cow;
 
 /// Which sparse-trie representation a cache runs on.
+///
+/// `Exact` is the default since the exact-size representation cleared its adoption gates: the
+/// cross-representation oracle showed identical observables on the whole accepted corpus, the
+/// counting-allocator differential confirmed the net memory saving, and the live screen showed
+/// the clone and retention phases getting faster, not slower. `Parallel` remains selectable for
+/// differentials against the engine's own representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheTrieRepr {
     /// The node-map parallel sparse trie with fixed 16-slot blinded-hash boxes.
-    #[default]
     Parallel,
     /// The exact-size blinded-hash sibling: 32 bytes per actually blinded child.
+    #[default]
     Exact,
 }
 
@@ -66,7 +72,7 @@ pub enum CacheTrie {
 
 impl Default for CacheTrie {
     fn default() -> Self {
-        Self::Parallel(ParallelSparseTrie::default())
+        Self::new(CacheTrieRepr::default())
     }
 }
 
