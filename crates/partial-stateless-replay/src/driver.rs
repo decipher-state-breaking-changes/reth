@@ -160,6 +160,18 @@ pub struct ReplayReport {
     /// Counted rather than reported one by one: before this existed, every commit after a fault
     /// generated its own `BlockSkipped` failure string, and a single fault read as a cascade.
     pub skipped_after_fault: u64,
+    /// Commits re-read from the spool after a restore landed on the block recovery asked for.
+    ///
+    /// These are verified against the restored pair, and they are verified a second time: this
+    /// driver had already applied them on the generation the restore discarded. They are counted
+    /// here rather than netted out of `commits`, so a reader can tell a corpus that carried a
+    /// late recovery checkpoint from one that did not.
+    pub rewind_replayed_commits: u64,
+    /// Windows a restore refused to replay because they exceeded `MAX_REWIND_FRAMES`.
+    ///
+    /// Not a failure: the restore degrades to the explicit reset it would have been before
+    /// windows existed. It is reported because that degradation changes what the run claims.
+    pub rewind_windows_refused: u64,
     /// What kind of event stopped the replay, when one did.
     pub terminal_kind: Option<&'static str>,
     /// Recorded reorgs this replay undid against the retained generation.
@@ -606,8 +618,41 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
 
     let mut report = ReplayReport::default();
     let mut phase = BatchPhase::AwaitingManifest;
+    // The window opened by a restore that landed on its target, while it is being replayed.
+    let mut rewind: Option<RewindWindow> = None;
 
     while let Some(frame) = spool.next_frame()? {
+        // The window closes where the checkpoint that opened it sits, and the stream resumes past
+        // that checkpoint's chunks. Reaching `until` means every commit below it has been
+        // verified against the restored pair, so the frame just read is the checkpoint itself and
+        // is dropped rather than collected a second time.
+        if let Some(window) = rewind {
+            if frame.header.sequence >= window.until {
+                rewind = None;
+                spool.seek_to(window.resume_at);
+                info!(
+                    target: "ps_replay",
+                    replayed = report.rewind_replayed_commits,
+                    resume_at = window.resume_at,
+                    "The rewind window closed; the replay resumes past the installed checkpoint"
+                );
+                continue
+            }
+            // The producer fences its export against anything that would change the branch, so a
+            // published late checkpoint has only commits beneath it. Enforced, not assumed: a
+            // window holding anything else is a spool this driver must not read as continuous.
+            if !matches!(frame.event, StreamEvent::Commit(_)) {
+                report.failures.push(format!(
+                    "a {:?} frame sits at sequence {} inside a rewind window, which holds only \
+                     commits",
+                    frame.header.kind, frame.header.sequence
+                ));
+                rewind = None;
+                spool.seek_to(window.resume_at);
+                continue
+            }
+            report.rewind_replayed_commits += 1;
+        }
         // A faulted pair replays nothing further. The remaining frames are counted rather than
         // run: replaying commits against a blocked pair would generate one `BlockSkipped`
         // failure per block, and a single fault would read as a cascade.
@@ -625,6 +670,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
         }
         let sequence = frame.header.sequence;
         let costs = FrameCosts::of(&frame);
+        let rewind_before = rewind;
         phase = match (phase, frame.event) {
             (phase, StreamEvent::Manifest(found)) => match phase {
                 BatchPhase::AwaitingManifest => {
@@ -674,17 +720,23 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     BatchPhase::AwaitingCheckpoint { manifest } => {
                         (manifest, CollectPurpose::Install)
                     }
+                    // A discontinuity this driver could not undo: it skipped the frames between,
+                    // so there is nothing behind the cursor it is entitled to replay. The window
+                    // stays closed and those commits remain counted as skipped, exactly as before.
                     BatchPhase::AwaitingResync { manifest, target_ancestor } => {
-                        (manifest, CollectPurpose::Resync { target_ancestor })
+                        (manifest, CollectPurpose::Resync { target_ancestor, window_from: None })
                     }
                     BatchPhase::Collecting { manifest, .. } => {
                         report.failures.push(format!(
                             "a checkpoint arrived at sequence {sequence} while the previous one's \
                              chunks were incomplete"
                         ));
-                        (manifest, CollectPurpose::Resync { target_ancestor: None })
+                        (
+                            manifest,
+                            CollectPurpose::Resync { target_ancestor: None, window_from: None },
+                        )
                     }
-                    BatchPhase::Live { manifest, state, announced, pending_tip } => {
+                    BatchPhase::Live { manifest, state, announced, announced_at, pending_tip } => {
                         match announced {
                             // The producer's recovery checkpoint for a reorg this driver already
                             // undid by itself. Two independent implementations reached the same
@@ -698,17 +750,28 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                             // Forced: install it instead, and judge the rest of the corpus against
                             // the pair the producer's own snapshot produces.
                             Some(ancestor) => {
+                                // Everything this driver verified above the ancestor is about to
+                                // be discarded with the pair it verified it on, and under
+                                // write-through those commits are *behind* this frame. The window
+                                // names them so the restored pair can climb back to the
+                                // checkpoint's own position instead of meeting the next frame
+                                // several blocks short of its parent.
+                                let window_from = announced_at.map(|at| at + 1);
                                 info!(
                                     target: "ps_replay",
                                     sequence,
                                     ancestor = ancestor.number,
+                                    window_from,
                                     "Installing the recovery checkpoint rather than skimming it, \
                                      as a consumer with no retained generation would have to"
                                 );
                                 report.last_verified = state.history.tip().map(|tip| tip.number);
                                 (
                                     manifest,
-                                    CollectPurpose::Resync { target_ancestor: Some(ancestor) },
+                                    CollectPurpose::Resync {
+                                        target_ancestor: Some(ancestor),
+                                        window_from,
+                                    },
                                 )
                             }
                             None => {
@@ -718,7 +781,13 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                                      reset in front of it"
                                 ));
                                 report.last_verified = state.history.tip().map(|tip| tip.number);
-                                (manifest, CollectPurpose::Resync { target_ancestor: None })
+                                (
+                                    manifest,
+                                    CollectPurpose::Resync {
+                                        target_ancestor: None,
+                                        window_from: None,
+                                    },
+                                )
                             }
                         }
                     }
@@ -730,7 +799,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     chunks: Vec::new(),
                     purpose,
                 };
-                finish_collection_if_complete(collecting, &mut report)?
+                finish_collection_if_complete(collecting, &mut report, &mut rewind)?
             }
             (
                 BatchPhase::Collecting {
@@ -752,6 +821,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         purpose,
                     },
                     &mut report,
+                    &mut rewind,
                 )?
             }
             (phase, StreamEvent::SnapshotChunk(_)) => {
@@ -761,7 +831,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 phase
             }
             (
-                BatchPhase::Live { manifest, mut state, announced, mut pending_tip },
+                BatchPhase::Live { manifest, mut state, announced, announced_at, mut pending_tip },
                 StreamEvent::Commit(commit),
             ) => {
                 let (input, oracle) = commit.split();
@@ -805,7 +875,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     }
                     CommitOutcome::Rejected => {}
                 }
-                BatchPhase::Live { manifest, state, announced, pending_tip }
+                BatchPhase::Live { manifest, state, announced, announced_at, pending_tip }
             }
             (BatchPhase::AwaitingResync { manifest, target_ancestor }, StreamEvent::Commit(_)) => {
                 report.skipped_awaiting_resync += 1;
@@ -850,6 +920,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                             manifest,
                             state,
                             announced: Some(ancestor),
+                            announced_at: Some(sequence),
                             pending_tip: winning_tip,
                         }
                     }
@@ -929,6 +1000,12 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 phase
             }
         };
+        // A restore that opened a window did so while standing on the checkpoint frame; the
+        // commits it has to replay are behind the cursor. Enter the window exactly once, here,
+        // where the phase has settled into the restored pair.
+        if let (None, Some(window)) = (rewind_before, rewind) {
+            spool.seek_to(window.from);
+        }
     }
 
     finish_phase(phase, &mut report);
@@ -983,6 +1060,10 @@ enum BatchPhase {
         state: Box<ReplayState>,
         /// The ancestor an applied reorg just returned to, while its checkpoint may still arrive.
         announced: Option<BlockRef>,
+        /// The sequence that announcement arrived at. Under write-through publication the
+        /// winning branch is published before its recovery checkpoint, so this is where the
+        /// window of commits below a late checkpoint begins.
+        announced_at: Option<u64>,
         /// The tip an applied reorg said the winning branch would reach.
         pending_tip: Option<BlockRef>,
     },
@@ -1003,13 +1084,42 @@ enum CollectPurpose {
     CrossCheck { state: Box<ReplayState>, ancestor: BlockRef, pending_tip: Option<BlockRef> },
     /// Recovery from a discontinuity. It becomes the pair, and where it lands decides whether the
     /// recovery was continuous or an explicit reset.
-    Resync { target_ancestor: Option<BlockRef> },
+    Resync {
+        target_ancestor: Option<BlockRef>,
+        /// First frame of the commit window below this checkpoint, when there is one to replay.
+        window_from: Option<u64>,
+    },
 }
+
+/// The commit frames a restored replay re-reads before resuming at the live edge: sequences
+/// `[from, until)`, with `until` the installed checkpoint's own frame.
+///
+/// A recovery checkpoint published after the winning branch names an ancestor below frames the
+/// reader has already passed. Installing it alone would leave the pair at that ancestor with the
+/// next frame in the stream several blocks above it, and the replay would refuse that block for a
+/// parent hash it never had a chance to build — which is what the batch driver did until this
+/// existed, while the follower had replayed the same window all along.
+#[derive(Debug, Clone, Copy)]
+struct RewindWindow {
+    from: u64,
+    until: u64,
+    /// First frame past the checkpoint's chunks: where the stream resumes once the window closes.
+    resume_at: u64,
+}
+
+/// The largest commit window a restore will replay rather than skip.
+///
+/// Matches the follower's bound. Far above the real shape — a 195 s export at one block per 12 s
+/// is about 17 commits — so it fires only on a pathological spool, and it degrades to the
+/// explicit reset the same checkpoint produced before rewinds existed, never to an unbounded
+/// re-read.
+const MAX_REWIND_FRAMES: u64 = 4_096;
 
 /// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
 fn finish_collection_if_complete(
     phase: BatchPhase,
     report: &mut ReplayReport,
+    rewind: &mut Option<RewindWindow>,
 ) -> eyre::Result<BatchPhase> {
     let BatchPhase::Collecting { manifest, checkpoint, checkpoint_sequence, chunks, purpose } =
         phase
@@ -1032,6 +1142,7 @@ fn finish_collection_if_complete(
                 manifest,
                 state: Box::new(state),
                 announced: None,
+                announced_at: None,
                 pending_tip: None,
             })
         }
@@ -1069,6 +1180,7 @@ fn finish_collection_if_complete(
                         manifest,
                         state: Box::new(state),
                         announced: None,
+                        announced_at: None,
                         pending_tip,
                     })
                 }
@@ -1086,7 +1198,13 @@ fn finish_collection_if_complete(
                          reassemble: {err}"
                     ));
                 }
-                return Ok(BatchPhase::Live { manifest, state, announced: None, pending_tip })
+                return Ok(BatchPhase::Live {
+                    manifest,
+                    state,
+                    announced: None,
+                    announced_at: None,
+                    pending_tip,
+                })
             }
             report.checkpoints_skimmed += 1;
             // The bytes are checked even though the package is not installed: a chunk sequence
@@ -1098,12 +1216,41 @@ fn finish_collection_if_complete(
                      {err}"
                 ));
             }
-            Ok(BatchPhase::Live { manifest, state, announced: None, pending_tip })
+            Ok(BatchPhase::Live {
+                manifest,
+                state,
+                announced: None,
+                announced_at: None,
+                pending_tip,
+            })
         }
-        CollectPurpose::Resync { target_ancestor } => {
+        CollectPurpose::Resync { target_ancestor, window_from } => {
             let state = restore(&manifest, &checkpoint, &chunks)?;
             let continuous = target_ancestor.is_some_and(|target| target == checkpoint.block) &&
                 report.skipped_awaiting_resync == 0;
+            // Only a checkpoint that landed on the block recovery asked for licenses a replay of
+            // the commits below it: those are the winning branch by construction. A checkpoint
+            // that landed anywhere else is an explicit reset, and re-reading frames under it
+            // would be replaying a branch this restore has no claim about.
+            *rewind = window_from.filter(|_| continuous).and_then(|from| {
+                let until = checkpoint_sequence;
+                if until.saturating_sub(from) > MAX_REWIND_FRAMES {
+                    report.rewind_windows_refused += 1;
+                    warn!(
+                        target: "ps_replay",
+                        frames = until.saturating_sub(from),
+                        bound = MAX_REWIND_FRAMES,
+                        "The rewind window exceeds the bound; the restore resumes at the live \
+                         edge and the commits below the checkpoint go unverified"
+                    );
+                    return None
+                }
+                (until > from).then_some(RewindWindow {
+                    from,
+                    until,
+                    resume_at: checkpoint_sequence + 1 + u64::from(checkpoint.snapshot_chunks),
+                })
+            });
             let unverified = (!continuous)
                 .then(|| {
                     report
@@ -1129,6 +1276,17 @@ fn finish_collection_if_complete(
                      it skipped"
                 );
             }
+            if let Some(window) = *rewind {
+                info!(
+                    target: "ps_replay",
+                    block = checkpoint.block.number,
+                    replay_from = window.from,
+                    replay_until = window.until,
+                    resume_at = window.resume_at,
+                    "Restored at the exact ancestor; the winning branch replays from the spool \
+                     before the stream resumes"
+                );
+            }
             report.resyncs.push(ResyncRecord {
                 at_sequence: checkpoint_sequence,
                 block: checkpoint.block.number,
@@ -1141,6 +1299,7 @@ fn finish_collection_if_complete(
                 manifest,
                 state: Box::new(state),
                 announced: None,
+                announced_at: None,
                 pending_tip: None,
             })
         }

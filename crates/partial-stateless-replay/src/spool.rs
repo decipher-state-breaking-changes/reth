@@ -170,6 +170,25 @@ impl SpoolIter {
         Ok(Some(frame))
     }
 
+    /// Repositions the walk at `sequence`, so the next `next_frame` yields that frame.
+    ///
+    /// The walk's position *is* the sequence — `next_frame` refuses any frame whose header says
+    /// otherwise — so a seek is an assignment, and the contiguity rule still checks the landing.
+    /// Used to replay a rewind window: a recovery checkpoint published after the winning branch
+    /// names an ancestor below frames already read, and the commits that carry the consumer back
+    /// up to the checkpoint's own position are behind the cursor, not ahead of it.
+    ///
+    /// Backward only, and only inside an open stream. Seeking is not a way to resume past an
+    /// `End`: the flags that record how the stream terminated are left exactly as they are.
+    pub fn seek_to(&mut self, sequence: u64) {
+        self.position = sequence as usize;
+    }
+
+    /// The sequence the next `next_frame` will yield.
+    pub const fn next_sequence(&self) -> u64 {
+        self.position as u64
+    }
+
     /// Whether the stream ended with an `End` frame rather than being cut.
     ///
     /// Meaningful once iteration is done; before that it reports what has been seen so far.

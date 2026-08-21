@@ -20,6 +20,9 @@
 #
 # Environment:
 #     REORG_WATCH_HOURS=24   outer bound on phase 1's wait for a reorg
+#     REORG_MIN_BLOCKS=100   phase 1 keeps recording after the reorg until this many verdicts
+#                            exist, so the corpus meets the bar the judge applies to it
+#     REORG_FLOOR_SECS=3600  outer bound on that wait
 #     ABBA_BLOCKS=300        live verdicts per fsync arm (four arms: A B B A)
 #     GATE_WAIT_CHECKPOINT_SECS=1800
 #                            upper bound for cold 90-block warm-up plus checkpoint export;
@@ -49,7 +52,18 @@ NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may t
 NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
 ABBA_BLOCKS=${ABBA_BLOCKS:-300}
-GATE_WAIT_CHECKPOINT_SECS=${GATE_WAIT_CHECKPOINT_SECS:-1800}
+# The reorg gate's own corpus floor, and how long phase 1 will wait after the reorg to reach it.
+# Must match `run_live_follow_gate.sh`'s reorg-mode GATE_MIN_BLOCKS default, which is what judges
+# the capture; the watcher used to stop as soon as the reorg was seen and hand the judge a corpus
+# too short for its own bar.
+REORG_MIN_BLOCKS=${REORG_MIN_BLOCKS:-100}
+REORG_FLOOR_SECS=${REORG_FLOOR_SECS:-3600}
+# Warm-up plus export, with headroom for a host that warms more slowly than the chain feeds it.
+# 1,800 s was measured at only ~10 minutes of headroom on the NVMe host and was not enough on the
+# SATA one, where an arm armed 153 warming causes and was killed at the ceiling with no checkpoint
+# — losing one arm of an ABBA. Readiness is polled, so a generous ceiling costs nothing on a host
+# that is ready early.
+GATE_WAIT_CHECKPOINT_SECS=${GATE_WAIT_CHECKPOINT_SECS:-3600}
 
 # A policy-dataset capture is a separate job that holds the datadir and spends part of every block
 # on a witness nobody measured. Unsetting it for the producer (below) keeps it out of this run's
@@ -271,6 +285,18 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
                 sleep 15
             done
             say "skimmed=$(count '"kind":"skimmed"') verdicts=$(count '"kind":"verdict"')"
+            # And then keep going until the gate's own corpus floor is met. Stopping the moment
+            # the reorg was seen is what failed both 2026-08-21 rehearsals: an early reorg ends
+            # the corpus at 93 or 98 verdicts and the gate refuses a run in which nothing else
+            # went wrong. The reorg evidence is already in hand here, so this is chain-paced
+            # waiting for a few more blocks, bounded so a stalled chain cannot hold the phase open.
+            FLOOR_BY=$(( $(date +%s) + REORG_FLOOR_SECS ))
+            while [ "$(count '"kind":"verdict"')" -lt "$REORG_MIN_BLOCKS" ] &&
+                  [ "$(date +%s)" -lt "$FLOOR_BY" ]; do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 20
+            done
+            say "verdicts=$(count '"kind":"verdict"') (floor $REORG_MIN_BLOCKS)"
             ARMED=reorg; break
         fi
         sleep 45
@@ -311,8 +337,12 @@ fi
 # profile (producer fsyncs each frame, follower fsyncs each ack).
 #
 # Each arm bounds itself: long mode's watcher SIGTERMs the producer once the live target is met,
-# so no manual stop. Back-to-back arms keep the cache within its 90-block gap, so only the first
-# pays the cold warm-up.
+# so no manual stop. Every arm pays the full cold warm-up, not just the first: the persisted value
+# cache is loaded and its gap checked, and then reset, because the in-memory sparse trie has no
+# persisted snapshot to match it against. So each arm spends `max_window` blocks at mainnet block
+# time — about 18 minutes at 90/60 — plus its checkpoint export before the follower may start, and
+# a 300-verdict arm costs roughly 80 minutes rather than 60. That warm-up is chain-paced waiting,
+# not work: it is bounded by how fast blocks arrive, not by this host.
 
 if [ "${SKIP_ABBA:-0}" != "1" ]; then
     say "=== phase 2: fsync ABBA, ${ABBA_BLOCKS} live verdicts per arm ==="

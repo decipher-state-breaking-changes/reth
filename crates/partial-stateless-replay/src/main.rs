@@ -167,6 +167,8 @@ fn write_record(
         "terminal": report.terminal,
         "terminal_kind": report.terminal_kind,
         "skipped_after_fault": report.skipped_after_fault,
+        "rewind_replayed_commits": report.rewind_replayed_commits,
+        "rewind_windows_refused": report.rewind_windows_refused,
         // Three axes rather than one. `agreed` is about the two implementations, `continuous`
         // about whether any canonical block went unverified, and `complete` about whether the
         // replay reached the end of the corpus. A reorg the pair could not undo moves the last
