@@ -19,6 +19,8 @@ SUMMARY = {
     "late_skim_mismatches": 0,
     "recovery_checkpoints_pending_at_end": 0,
     "transition_mutations_checked": 0,
+    "rewind_replayed_commits": 0,
+    "rewind_windows_refused": 0,
     "elapsed_ms": 68543,
     "transition_us": 17678287,
     "watermark_mismatch_samples": [],
@@ -87,6 +89,17 @@ class CheckReplayInvarianceTest(unittest.TestCase):
         self.assertTrue(
             any(p.startswith("transition_mutations_checked:") for p in problems)
         )
+
+    def test_a_rewind_window_inside_the_replay_fails(self):
+        #: The sweep never passes --force-restore-at, so a window that replayed means this run
+        #: was not the run the comparison assumes it was.
+        for field in ("rewind_replayed_commits", "rewind_windows_refused"):
+            with self.subTest(field=field):
+                self.current = write(
+                    dict(SUMMARY, **{field: 7}), self.dir.name, f"current-{field}.json"
+                )
+                problems = self.compare_against(baseline_from(SUMMARY))
+                self.assertTrue(any(p.startswith(f"{field}:") for p in problems))
 
     def test_current_only_counter_missing_from_current_side_fails_as_old_schema(self):
         current = dict(SUMMARY)

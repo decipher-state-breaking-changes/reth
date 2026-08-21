@@ -9,20 +9,30 @@ ordered per-block (sequence, number, verdict) chain identical. Wall-clock fields
 (`*_us`, `elapsed_ms`), the free-form `label`, and sample lists are excluded —
 replays of one corpus differ there by machine and by run without meaning anything.
 
-The intended baseline is a build old enough to predate the two recovery-ledger
-counters (`late_skim_mismatches`, `recovery_checkpoints_pending_at_end`) and W4's
-`transition_mutations_checked`, so those are exempt from the field comparison — but
-their *presence* on the baseline side fails the check: a baseline that reports them
-was built from too new a commit, and that failure mode is quieter than a field
-mismatch and worth its own message. The mutation counter carries one rule the W1
-pair does not: mutation coverage is opt-in and must never run inside an invariance
-replay, so a nonzero current-side value is its own failure rather than an exemption.
+The intended baseline is a build old enough to predate the recovery-ledger counters
+(`late_skim_mismatches`, `recovery_checkpoints_pending_at_end`), W4's
+`transition_mutations_checked`, and the rewind-window counters, so those are exempt
+from the field comparison — but their *presence* on the baseline side fails the
+check: a baseline that reports them was built from too new a commit, and that
+failure mode is quieter than a field mismatch and worth its own message.
+
+Three of them carry a rule the W1 pair does not, for the same reason in each case:
+the behaviour they count must not happen inside an invariance replay at all.
+Mutation coverage is opt-in and this sweep does not opt in. A rewind window opens
+only under `--force-restore-at`, which the sweep never passes, and a window refused
+for its size means one was offered — so a nonzero current-side value is its own
+failure rather than an exemption, and reads as "this sweep ran something it was not
+supposed to run".
 """
 import json
 import sys
 
 CURRENT_ONLY_COUNTERS = {"late_skim_mismatches", "recovery_checkpoints_pending_at_end"}
-CURRENT_ONLY_ZERO_COUNTERS = {"transition_mutations_checked"}
+CURRENT_ONLY_ZERO_COUNTERS = {
+    "transition_mutations_checked",
+    "rewind_replayed_commits",
+    "rewind_windows_refused",
+}
 
 
 def load_summary(path):
