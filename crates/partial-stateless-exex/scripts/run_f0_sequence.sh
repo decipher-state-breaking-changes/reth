@@ -21,10 +21,11 @@
 # Environment:
 #     REORG_WATCH_HOURS=24   outer bound on phase 1's wait for a reorg
 #     ABBA_BLOCKS=300        live verdicts per fsync arm (four arms: A B B A)
+#     GATE_WAIT_CHECKPOINT_SECS=1800
+#                            upper bound for cold 90-block warm-up plus checkpoint export;
+#                            readiness is polled, so this is not a fixed delay
 #     SKIP_REORG=1           start at phase 2
 #     SKIP_ABBA=1            stop after phase 1
-#     ALLOW_POWERSAVE=1      run without the performance governor (the numbers are then not
-#                            comparable with any run that had it)
 #
 # Host paths — every one of these is outside the repository, so every one is overridable and the
 # two that have no defensible default are required:
@@ -48,6 +49,7 @@ NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may t
 NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
 ABBA_BLOCKS=${ABBA_BLOCKS:-300}
+GATE_WAIT_CHECKPOINT_SECS=${GATE_WAIT_CHECKPOINT_SECS:-1800}
 
 # A policy-dataset capture is a separate job that holds the datadir and spends part of every block
 # on a witness nobody measured. Unsetting it for the producer (below) keeps it out of this run's
@@ -135,12 +137,14 @@ for bin in "$PRODUCER_BIN" "$REPLAY_BIN"; do
         exit 2
     }
 done
+CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
+GOVERNOR_COUNT=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | wc -l)
 GOVERNORS=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | tr '\n' ' ')
-if [ -n "$GOVERNORS" ] && [ "$GOVERNORS" != "performance " ]; then
-    say "CPU governor is '$GOVERNORS', not performance:"
-    say "  sudo cpupower frequency-set -g performance"
-    [ "${ALLOW_POWERSAVE:-0}" = 1 ] || exit 2
-    say "continuing anyway (ALLOW_POWERSAVE=1); these numbers are not comparable with a governed run"
+if [ "$GOVERNOR_COUNT" -ne "$CPU_COUNT" ] || [ "$GOVERNORS" != "ondemand " ]; then
+    say "canonical F0 requires ondemand on every online CPU"
+    say "observed governors='$GOVERNORS' files=$GOVERNOR_COUNT online_cpus=$CPU_COUNT"
+    say "  sudo cpupower frequency-set -g ondemand"
+    exit 2
 fi
 say "base=$BASE"
 say "producer=$PRODUCER_BIN ($(date -r "$PRODUCER_BIN" '+%F %T'))"
@@ -226,6 +230,7 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
     # 2,890 the last time — and its offline half then re-replays all of them twice, which took 56
     # minutes with the datadir sitting empty behind it. The judging waits until the node is back.
     ( cd "$SCRIPTS" && GATE_MODE=reorg GATE_FORCE_RESTORE=1 GATE_PHASE=capture \
+        GATE_WAIT_CHECKPOINT_SECS="$GATE_WAIT_CHECKPOINT_SECS" \
         ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" > "$ARM/gate.out" 2>&1 ) &
     GATE_PID=$!
     say "gate pid=$GATE_PID  log=$ARM/gate.out (a stale datadir warms cold: ~18 min + export)"
@@ -301,6 +306,7 @@ if [ "${SKIP_ABBA:-0}" != "1" ]; then
         PID=$(start_producer "$ARM" "$FSYNC")
         say "producer pid=$PID"
         ( cd "$SCRIPTS" && GATE_MODE=long GATE_MIN_BLOCKS="$ABBA_BLOCKS" GATE_REQUIRE_LIVE=1 \
+            GATE_WAIT_CHECKPOINT_SECS="$GATE_WAIT_CHECKPOINT_SECS" \
             GATE_PHASE=capture GATE_PRODUCER_PID="$PID" \
             ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" "${EXTRA[@]}" \
             > "$ARM/gate.out" 2>&1 )
@@ -337,7 +343,13 @@ say "=== phase 3: transition-mutation gate ==="
 MUTATION_SPOOL=${MUTATION_SPOOL:-$BASE/reorg/spool}
 [ -d "$MUTATION_SPOOL" ] || MUTATION_SPOOL=$(ls -d "$BASE"/fsync-*/spool 2>/dev/null | head -1)
 if [ "${SKIP_MUTATIONS:-0}" != 1 ] && [ -d "${MUTATION_SPOOL:-}" ]; then
-    ( cd "$REPO" && PS_MUTATION_FIXTURE_SPOOL="$MUTATION_SPOOL" \
+    # cargo test can relink the package binary with test-only feature unification. Stamp that
+    # relink from the already-verified clean HEAD so it cannot silently replace ps-replay with
+    # an unattributable artifact. Phase 3 is last; F1 still performs the runbook's explicit
+    # canonical rebuild to restore its declared feature/hash identity.
+    LOCK_SHA256=$(sha256sum "$REPO/Cargo.lock" | cut -d' ' -f1)
+    ( cd "$REPO" && PS_BUILD_COMMIT="$HEAD_COMMIT" PS_BUILD_DIRTY=0 \
+        PS_CARGO_LOCK_SHA256="$LOCK_SHA256" PS_MUTATION_FIXTURE_SPOOL="$MUTATION_SPOOL" \
         cargo test --release -p partial-stateless-replay --test transition_mutations \
         -- --ignored --test-threads=1 > "$BASE/mutations.log" 2>&1 )
     record "phase3 mutations: $([ $? -eq 0 ] && echo PASSED || echo FAILED) \

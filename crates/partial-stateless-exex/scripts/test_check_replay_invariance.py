@@ -18,6 +18,7 @@ SUMMARY = {
     "reorgs_applied": 0,
     "late_skim_mismatches": 0,
     "recovery_checkpoints_pending_at_end": 0,
+    "transition_mutations_checked": 0,
     "elapsed_ms": 68543,
     "transition_us": 17678287,
     "watermark_mismatch_samples": [],
@@ -35,7 +36,8 @@ def write(record, directory, name):
 
 
 def baseline_from(summary):
-    record = {k: v for k, v in summary.items() if k not in inv.CURRENT_ONLY_COUNTERS}
+    exempt = inv.CURRENT_ONLY_COUNTERS | inv.CURRENT_ONLY_ZERO_COUNTERS
+    record = {k: v for k, v in summary.items() if k not in exempt}
     record["label"] = "baseline-arm"
     return record
 
@@ -74,7 +76,28 @@ class CheckReplayInvarianceTest(unittest.TestCase):
         problems = self.compare_against(dict(SUMMARY, label="baseline-arm"))
         self.assertEqual(
             sorted(p.split(":")[0] for p in problems),
-            sorted(inv.CURRENT_ONLY_COUNTERS),
+            sorted(inv.CURRENT_ONLY_COUNTERS | inv.CURRENT_ONLY_ZERO_COUNTERS),
+        )
+
+    def test_mutation_coverage_inside_the_replay_fails_even_though_the_field_is_exempt(self):
+        self.current = write(
+            dict(SUMMARY, transition_mutations_checked=120), self.dir.name, "current.json"
+        )
+        problems = self.compare_against(baseline_from(SUMMARY))
+        self.assertTrue(
+            any(p.startswith("transition_mutations_checked:") for p in problems)
+        )
+
+    def test_current_only_counter_missing_from_current_side_fails_as_old_schema(self):
+        current = dict(SUMMARY)
+        current.pop("transition_mutations_checked")
+        self.current = write(current, self.dir.name, "current-with-old-schema.json")
+        problems = self.compare_against(baseline_from(SUMMARY))
+        self.assertTrue(
+            any(
+                p.startswith("transition_mutations_checked:") and "absent" in p
+                for p in problems
+            )
         )
 
 
