@@ -137,18 +137,37 @@ for bin in "$PRODUCER_BIN" "$REPLAY_BIN"; do
         exit 2
     }
 done
+# The canonical policy is the driver's *dynamic, load-scaling* governor, not a particular name.
+# Under the generic cpufreq governors that is `ondemand`. Under `intel_pstate` in active mode --
+# which is what recent Intel parts default to -- `ondemand` does not exist and the dynamic governor
+# is named `powersave`: it scales with load up to turbo and is emphatically not a pinned low-power
+# mode. Demanding the literal string `ondemand` would make this sequence unrunnable on such a host,
+# and switching that host to `performance` to satisfy the check would put it on a different policy
+# from the other one, which is the thing this gate exists to prevent.
 CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
 GOVERNOR_COUNT=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | wc -l)
 GOVERNORS=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | tr '\n' ' ')
-if [ "$GOVERNOR_COUNT" -ne "$CPU_COUNT" ] || [ "$GOVERNORS" != "ondemand " ]; then
-    say "canonical F0 requires ondemand on every online CPU"
+SCALING_DRIVER=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null)
+AVAILABLE=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null)
+case " $AVAILABLE " in
+    *" ondemand "*) EXPECTED_GOVERNOR=ondemand ;;
+    *" powersave "*) EXPECTED_GOVERNOR=powersave ;;
+    *) EXPECTED_GOVERNOR="" ;;
+esac
+if [ -z "$EXPECTED_GOVERNOR" ]; then
+    say "no dynamic governor is available on this host"
+    say "driver='$SCALING_DRIVER' available='$AVAILABLE'"
+    exit 2
+fi
+if [ "$GOVERNOR_COUNT" -ne "$CPU_COUNT" ] || [ "$GOVERNORS" != "$EXPECTED_GOVERNOR " ]; then
+    say "canonical F0 requires $EXPECTED_GOVERNOR on every online CPU (driver '$SCALING_DRIVER')"
     say "observed governors='$GOVERNORS' files=$GOVERNOR_COUNT online_cpus=$CPU_COUNT"
-    say "  sudo cpupower frequency-set -g ondemand"
+    say "  sudo cpupower frequency-set -g $EXPECTED_GOVERNOR"
     exit 2
 fi
 say "base=$BASE"
 say "producer=$PRODUCER_BIN ($(date -r "$PRODUCER_BIN" '+%F %T'))"
-say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown}"
+say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown} driver=${SCALING_DRIVER:-unknown}"
 
 # --- helpers ------------------------------------------------------------------------------
 
