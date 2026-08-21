@@ -207,6 +207,60 @@ fn a_reset_frame_stops_verification_once() {
     assert!(report.agreed() && !report.continuous() && !report.complete());
 }
 
+/// The window a restore would have to replay is bounded, and a corpus past the bound degrades to
+/// an explicit reset rather than to a clean continuous recovery it did not earn.
+///
+/// This is also what proves the window is computed for the *waiting* path at all: only a
+/// `window_from` derived from the announcement that set the target can be refused for its size.
+/// Before that, `AwaitingResync` forced `window_from: None`, so a consumer that could not undo
+/// skipped the winning branch, installed the ancestor checkpoint, and met the next commit with a
+/// parent it never built.
+///
+/// The bound is set low here on purpose. The branch under test is the classification, and four
+/// thousand synthetic frames would test the arithmetic instead.
+#[test]
+fn a_window_past_the_bound_degrades_to_an_explicit_reset() {
+    let dir = spool_dir("batch-window-refused");
+    let fixture = fixture();
+    write_manifest(&dir);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    write_frame(&dir, next, FrameKind::Reorg, &reorg_above(anchor(&fixture)));
+    next += 1;
+    for number in 0..3 {
+        write_frame(
+            &dir,
+            next,
+            FrameKind::Commit,
+            &commit_frame(ANCHOR_BLOCK + 1 + number, B256::repeat_byte(0xb2)),
+        );
+        next += 1;
+    }
+    // The producer's recovery checkpoint, at the exact block the reorg named.
+    next = write_checkpoint(&dir, next, &fixture);
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+
+    let options = ReplayOptions { max_rewind_frames: 2, ..options() };
+    let report = replay(&dir, &options).expect("the corpus reads");
+
+    assert_eq!(
+        report.rewind_windows_refused, 1,
+        "a three-frame window under a two-frame bound is refused — and it could only be refused \
+         if the waiting path offered one at all"
+    );
+    assert_eq!(report.rewind_replayed_commits, 0, "a refused window replays nothing");
+    assert_eq!(report.resyncs.len(), 1);
+    let resync = &report.resyncs[0];
+    assert_eq!(resync.block, ANCHOR_BLOCK, "it still landed on the block recovery asked for");
+    assert!(
+        !resync.continuous,
+        "but it stands below three commits it will not replay, which is the explicit reset the \
+         bound exists to degrade to. Reporting it as continuous is how a corpus that ends at its \
+         checkpoint could claim a clean recovery having verified none of the branch"
+    );
+    assert_eq!(resync.commits_skipped, 3, "and the commits it did not replay are counted");
+    assert!(!report.continuous(), "the run as a whole says so too");
+}
+
 #[test]
 fn a_malformed_reorg_is_a_failure() {
     let dir = spool_dir("batch-malformed");

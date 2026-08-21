@@ -22,7 +22,7 @@ use crate::{
     driver::{
         chain_spec_for, config_for, consumer_is_at, cross_check_recovery_checkpoint,
         decode_accepted_head, replay_commit, restore, BlockTiming, CommitOutcome, FrameCosts,
-        ReplayOptions, ReplayReport, ReplayState,
+        ReplayOptions, ReplayReport, ReplayState, MAX_REWIND_FRAMES,
     },
     reorg::{apply_reorg, check_shape, warn_inapplicable, ReorgOutcome},
     spool::SpooledFrame,
@@ -358,13 +358,6 @@ struct Supersession {
     at: Option<u64>,
 }
 
-/// The largest commit window a recovery will replay from the spool rather than skip.
-///
-/// Far above the real shape — a 195 s export at one block per 12 s is about 17 commits — so the
-/// bound only fires on a pathological spool, and it degrades to the explicit reset the same
-/// checkpoint would have produced before rewinds existed, never to an unbounded replay.
-const MAX_REWIND_FRAMES: u64 = 4_096;
-
 /// The commit frames a rewound recovery replays: sequences `[from, until)`, with `until` the
 /// installed checkpoint's announce frame.
 #[derive(Debug, Clone, Copy)]
@@ -649,6 +642,9 @@ impl<'a> Follower<'a> {
                 reexec_limits: options.reexec_limits.clone(),
                 // An offline forensic switch; a live follower has a producer to ask instead.
                 force_restore_at: None,
+                // Not reached from here — the follower drives its own window — but set to the
+                // shared bound so the two can never be read as different policies.
+                max_rewind_frames: MAX_REWIND_FRAMES,
             },
             tail: SpoolTail::new(dir, options.frame_limits),
             sink: VerdictSink::open(options)?,

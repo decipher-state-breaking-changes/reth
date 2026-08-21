@@ -69,6 +69,13 @@ pub struct ReplayOptions {
     /// re-checkpoint is what a consumer holding no retained generation would actually recover
     /// from — the claim skimming cannot make.
     pub force_restore_at: Option<u64>,
+    /// Largest commit window a restore will replay from the spool rather than degrade to a reset.
+    ///
+    /// Defaults to `MAX_REWIND_FRAMES`, the follower's own bound. It is a field rather than only a
+    /// constant so a test can reach the degradation: the branch that matters is the one where a
+    /// window is *refused*, and building four thousand frames to reach it would test the
+    /// arithmetic rather than the classification.
+    pub max_rewind_frames: u64,
 }
 
 impl Default for ReplayOptions {
@@ -80,6 +87,7 @@ impl Default for ReplayOptions {
             frame_limits: FrameLimits::default(),
             reexec_limits: SidecarReexecLimits::default(),
             force_restore_at: None,
+            max_rewind_frames: MAX_REWIND_FRAMES,
         }
     }
 }
@@ -622,6 +630,11 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
     let mut rewind: Option<RewindWindow> = None;
 
     while let Some(frame) = spool.next_frame()? {
+        // Whether the frame about to run is one the window is replaying. The count it feeds is
+        // evidence that commits were *verified*, so it is incremented where the verdict is known
+        // and not here: a fault on the first window commit skips the rest, and counting on entry
+        // would report every one of them as replayed.
+        let mut in_window = false;
         // The window closes where the checkpoint that opened it sits, and the stream resumes past
         // that checkpoint's chunks. Reaching `until` means every commit below it has been
         // verified against the restored pair, so the frame just read is the checkpoint itself and
@@ -651,7 +664,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 spool.seek_to(window.resume_at);
                 continue
             }
-            report.rewind_replayed_commits += 1;
+            in_window = true;
         }
         // A faulted pair replays nothing further. The remaining frames are counted rather than
         // run: replaying commits against a blocked pair would generate one `BlockSkipped`
@@ -704,7 +717,11 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         "The producer restarted its stream; the next checkpoint rebootstraps this \
                          replay and the interval across the boundary is not validated"
                     );
-                    BatchPhase::AwaitingResync { manifest: found, target_ancestor: None }
+                    BatchPhase::AwaitingResync {
+                        manifest: found,
+                        target_ancestor: None,
+                        announced_at: None,
+                    }
                 }
             },
             (phase, StreamEvent::Checkpoint(found)) => {
@@ -723,8 +740,18 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     // A discontinuity this driver could not undo: it skipped the frames between,
                     // so there is nothing behind the cursor it is entitled to replay. The window
                     // stays closed and those commits remain counted as skipped, exactly as before.
-                    BatchPhase::AwaitingResync { manifest, target_ancestor } => {
-                        (manifest, CollectPurpose::Resync { target_ancestor, window_from: None })
+                    BatchPhase::AwaitingResync { manifest, target_ancestor, announced_at } => {
+                        // The frames this driver skipped while it waited are the winning branch
+                        // when the checkpoint lands on the block it is waiting for, and they are
+                        // behind the cursor for the same reason the forced path's are: the
+                        // producer published them before its export finished.
+                        (
+                            manifest,
+                            CollectPurpose::Resync {
+                                target_ancestor,
+                                window_from: announced_at.map(|at| at + 1),
+                            },
+                        )
                     }
                     BatchPhase::Collecting { manifest, .. } => {
                         report.failures.push(format!(
@@ -799,7 +826,12 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     chunks: Vec::new(),
                     purpose,
                 };
-                finish_collection_if_complete(collecting, &mut report, &mut rewind)?
+                finish_collection_if_complete(
+                    collecting,
+                    &mut report,
+                    &mut rewind,
+                    options.max_rewind_frames,
+                )?
             }
             (
                 BatchPhase::Collecting {
@@ -822,6 +854,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     },
                     &mut report,
                     &mut rewind,
+                    options.max_rewind_frames,
                 )?
             }
             (phase, StreamEvent::SnapshotChunk(_)) => {
@@ -852,6 +885,9 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     }
                     CommitOutcome::Compared => {
                         report.last_verified = Some(block.number);
+                        if in_window {
+                            report.rewind_replayed_commits += 1;
+                        }
                         // The producer said which block completes the branch it moved to. Reaching
                         // that height with a different hash means the frame and the delivery
                         // disagree about what was replaced, which no later commit can settle.
@@ -877,9 +913,12 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                 }
                 BatchPhase::Live { manifest, state, announced, announced_at, pending_tip }
             }
-            (BatchPhase::AwaitingResync { manifest, target_ancestor }, StreamEvent::Commit(_)) => {
+            (
+                BatchPhase::AwaitingResync { manifest, target_ancestor, announced_at },
+                StreamEvent::Commit(_),
+            ) => {
                 report.skipped_awaiting_resync += 1;
-                BatchPhase::AwaitingResync { manifest, target_ancestor }
+                BatchPhase::AwaitingResync { manifest, target_ancestor, announced_at }
             }
             (_, StreamEvent::Commit(_)) => {
                 eyre::bail!(
@@ -931,7 +970,11 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         report.reorgs_inapplicable += 1;
                         warn_inapplicable(ancestor, depth, &detail, true);
                         report.last_verified = state.history.tip().map(|tip| tip.number);
-                        BatchPhase::AwaitingResync { manifest, target_ancestor: Some(ancestor) }
+                        BatchPhase::AwaitingResync {
+                            manifest,
+                            target_ancestor: Some(ancestor),
+                            announced_at: Some(sequence),
+                        }
                     }
                     // Well-formed but about a branch this driver never held. It carries no
                     // authority: no target, so no recovery under it can be called continuous, and
@@ -940,7 +983,11 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         report.reorgs_inapplicable += 1;
                         warn_inapplicable(ancestor, depth, &detail, false);
                         report.last_verified = state.history.tip().map(|tip| tip.number);
-                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                        BatchPhase::AwaitingResync {
+                            manifest,
+                            target_ancestor: None,
+                            announced_at: None,
+                        }
                     }
                     ReorgOutcome::Malformed { detail } => {
                         report.failures.push(format!(
@@ -948,7 +995,11 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                              evaluate: {detail}"
                         ));
                         report.last_verified = state.history.tip().map(|tip| tip.number);
-                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                        BatchPhase::AwaitingResync {
+                            manifest,
+                            target_ancestor: None,
+                            announced_at: None,
+                        }
                     }
                 }
             }
@@ -975,13 +1026,19 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         // announced tip that never arrived stays a hole.
                         report.winning_branch_incomplete += u64::from(pending_tip.is_some());
                         report.last_verified = state.history.tip().map(|tip| tip.number);
-                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
+                        BatchPhase::AwaitingResync {
+                            manifest,
+                            target_ancestor: None,
+                            announced_at: None,
+                        }
                     }
                     BatchPhase::AwaitingCheckpoint { manifest } |
                     BatchPhase::AwaitingResync { manifest, .. } |
-                    BatchPhase::Collecting { manifest, .. } => {
-                        BatchPhase::AwaitingResync { manifest, target_ancestor: None }
-                    }
+                    BatchPhase::Collecting { manifest, .. } => BatchPhase::AwaitingResync {
+                        manifest,
+                        target_ancestor: None,
+                        announced_at: None,
+                    },
                     BatchPhase::AwaitingManifest => {
                         eyre::bail!("a reset arrived before the manifest")
                     }
@@ -1018,7 +1075,9 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
         reverts_applied = report.reverts_applied,
         disagreements = report.disagreements.len(),
         failures = report.failures.len(),
-        bytes = spool.bytes(),
+        // Bytes actually read, which a forced restore's window replay makes larger than the
+        // corpus: those frames really were read twice.
+        bytes_read = spool.bytes(),
         closed = report.closed,
         continuous = report.continuous(),
         "Read the recorded stream"
@@ -1072,6 +1131,13 @@ enum BatchPhase {
         manifest: Manifest,
         /// The block a recovery checkpoint has to land on to be continuous.
         target_ancestor: Option<BlockRef>,
+        /// The sequence the announcement that named that target arrived at, so the commits it
+        /// published below its recovery checkpoint can be replayed rather than skipped.
+        ///
+        /// Bound to `target_ancestor`: every path that withdraws the target — a reset, an epoch,
+        /// a reorg this driver cannot place — clears both, so a superseded announcement can never
+        /// leave its own window behind for a later checkpoint to replay.
+        announced_at: Option<u64>,
     },
 }
 
@@ -1107,19 +1173,22 @@ struct RewindWindow {
     resume_at: u64,
 }
 
-/// The largest commit window a restore will replay rather than skip.
+/// The largest commit window a recovery will replay from the spool rather than skip.
 ///
-/// Matches the follower's bound. Far above the real shape — a 195 s export at one block per 12 s
-/// is about 17 commits — so it fires only on a pathological spool, and it degrades to the
+/// One definition for both consumers — the follower's live rewind and this driver's restore —
+/// because a bound that differed between them would make the same corpus recoverable on one side
+/// and an explicit reset on the other. Far above the real shape: a 195 s export at one block per
+/// 12 s is about 17 commits, so it fires only on a pathological spool, and it degrades to the
 /// explicit reset the same checkpoint produced before rewinds existed, never to an unbounded
 /// re-read.
-const MAX_REWIND_FRAMES: u64 = 4_096;
+pub(crate) const MAX_REWIND_FRAMES: u64 = 4_096;
 
 /// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
 fn finish_collection_if_complete(
     phase: BatchPhase,
     report: &mut ReplayReport,
     rewind: &mut Option<RewindWindow>,
+    max_rewind_frames: u64,
 ) -> eyre::Result<BatchPhase> {
     let BatchPhase::Collecting { manifest, checkpoint, checkpoint_sequence, chunks, purpose } =
         phase
@@ -1226,39 +1295,62 @@ fn finish_collection_if_complete(
         }
         CollectPurpose::Resync { target_ancestor, window_from } => {
             let state = restore(&manifest, &checkpoint, &chunks)?;
-            let continuous = target_ancestor.is_some_and(|target| target == checkpoint.block) &&
-                report.skipped_awaiting_resync == 0;
             // Only a checkpoint that landed on the block recovery asked for licenses a replay of
             // the commits below it: those are the winning branch by construction. A checkpoint
             // that landed anywhere else is an explicit reset, and re-reading frames under it
             // would be replaying a branch this restore has no claim about.
-            *rewind = window_from.filter(|_| continuous).and_then(|from| {
+            let landed_on_target = target_ancestor.is_some_and(|target| target == checkpoint.block);
+            let mut refused = false;
+            *rewind = window_from.filter(|_| landed_on_target).and_then(|from| {
                 let until = checkpoint_sequence;
-                if until.saturating_sub(from) > MAX_REWIND_FRAMES {
+                if until <= from {
+                    return None
+                }
+                if until - from > max_rewind_frames {
+                    refused = true;
                     report.rewind_windows_refused += 1;
                     warn!(
                         target: "ps_replay",
-                        frames = until.saturating_sub(from),
-                        bound = MAX_REWIND_FRAMES,
-                        "The rewind window exceeds the bound; the restore resumes at the live \
-                         edge and the commits below the checkpoint go unverified"
+                        frames = until - from,
+                        bound = max_rewind_frames,
+                        "The rewind window exceeds the bound; the restore degrades to an explicit \
+                         reset and the commits below the checkpoint go unverified"
                     );
                     return None
                 }
-                (until > from).then_some(RewindWindow {
+                Some(RewindWindow {
                     from,
                     until,
                     resume_at: checkpoint_sequence + 1 + u64::from(checkpoint.snapshot_chunks),
                 })
             });
-            let unverified = (!continuous)
-                .then(|| {
-                    report
-                        .last_verified
-                        .filter(|last| *last < checkpoint.block.number)
-                        .map(|last| (last + 1, checkpoint.block.number))
-                })
-                .flatten();
+            // A replayed window verifies the commits that would otherwise be skipped, so it is
+            // what makes a recovery continuous rather than something continuity survives. A
+            // *refused* one is the opposite: the restore stands below commits it will not
+            // replay, which is the explicit reset the bound exists to degrade to, and saying so
+            // here is the whole point of the bound. Without it a corpus that ends at its
+            // checkpoint reports a clean continuous recovery having verified none of the branch.
+            let replayed_window = rewind.is_some();
+            let skipped = if replayed_window { 0 } else { report.skipped_awaiting_resync };
+            let continuous = landed_on_target && skipped == 0 && !refused;
+            // What the restore cannot account for. A checkpoint that landed short of the target
+            // leaves the interval between the last verified block and itself; a refused window
+            // leaves the branch above the checkpoint that this pair will no longer carry.
+            let unverified = if refused {
+                report
+                    .last_verified
+                    .filter(|last| *last > checkpoint.block.number)
+                    .map(|last| (checkpoint.block.number + 1, last))
+            } else {
+                (!continuous)
+                    .then(|| {
+                        report
+                            .last_verified
+                            .filter(|last| *last < checkpoint.block.number)
+                            .map(|last| (last + 1, checkpoint.block.number))
+                    })
+                    .flatten()
+            };
             if continuous {
                 info!(
                     target: "ps_replay",
@@ -1292,7 +1384,7 @@ fn finish_collection_if_complete(
                 block: checkpoint.block.number,
                 continuous,
                 unverified,
-                commits_skipped: report.skipped_awaiting_resync,
+                commits_skipped: skipped,
             });
             report.skipped_awaiting_resync = 0;
             Ok(BatchPhase::Live {

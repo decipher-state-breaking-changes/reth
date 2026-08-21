@@ -22,11 +22,14 @@
 #     REORG_WATCH_HOURS=24   outer bound on phase 1's wait for a reorg
 #     REORG_MIN_BLOCKS=100   phase 1 keeps recording after the reorg until this many verdicts
 #                            exist, so the corpus meets the bar the judge applies to it
-#     REORG_FLOOR_SECS=3600  outer bound on that wait
+#     REORG_TAIL_BLOCKS=5    and until this many land after the recovery checkpoint was skimmed,
+#                            so the forced-restore judge has frames to chain onto
+#     REORG_FLOOR_SECS=3600  outer bound on both waits
 #     ABBA_BLOCKS=300        live verdicts per fsync arm (four arms: A B B A)
-#     GATE_WAIT_CHECKPOINT_SECS=1800
-#                            upper bound for cold 90-block warm-up plus checkpoint export;
-#                            readiness is polled, so this is not a fixed delay
+#     GATE_WAIT_CHECKPOINT_SECS=3600
+#                            upper bound for the cold warm-up plus checkpoint export, on the
+#                            slowest host in the cohort; readiness is polled, so a generous
+#                            ceiling costs nothing on a host that is ready early
 #     SKIP_REORG=1           start at phase 2
 #     SKIP_ABBA=1            stop after phase 1
 #
@@ -58,6 +61,9 @@ ABBA_BLOCKS=${ABBA_BLOCKS:-300}
 # too short for its own bar.
 REORG_MIN_BLOCKS=${REORG_MIN_BLOCKS:-100}
 REORG_FLOOR_SECS=${REORG_FLOOR_SECS:-3600}
+# Verdicts to keep recording *after* the recovery checkpoint was skimmed, so the corpus asks a
+# rebootstrapped consumer to chain onto the restored pair rather than ending at the checkpoint.
+REORG_TAIL_BLOCKS=${REORG_TAIL_BLOCKS:-5}
 # Warm-up plus export, with headroom for a host that warms more slowly than the chain feeds it.
 # 1,800 s was measured at only ~10 minutes of headroom on the NVMe host and was not enough on the
 # SATA one, where an arm armed 153 warming causes and was killed at the ceiling with no checkpoint
@@ -284,19 +290,26 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
             while [ "$(count '"kind":"skimmed"')" -lt 1 ] && [ "$(date +%s)" -lt "$SKIM_BY" ]; do
                 sleep 15
             done
-            say "skimmed=$(count '"kind":"skimmed"') verdicts=$(count '"kind":"verdict"')"
-            # And then keep going until the gate's own corpus floor is met. Stopping the moment
-            # the reorg was seen is what failed both 2026-08-21 rehearsals: an early reorg ends
-            # the corpus at 93 or 98 verdicts and the gate refuses a run in which nothing else
-            # went wrong. The reorg evidence is already in hand here, so this is chain-paced
-            # waiting for a few more blocks, bounded so a stalled chain cannot hold the phase open.
+            AFTER_SKIM=$(count '"kind":"verdict"')
+            say "skimmed=$(count '"kind":"skimmed"') verdicts=$AFTER_SKIM"
+            # And then keep going, for two reasons. The gate's own corpus floor: stopping the
+            # moment the reorg was seen is what failed both 2026-08-21 rehearsals, where an early
+            # reorg ended the corpus at 93 and 98 verdicts and the gate refused a run in which
+            # nothing else went wrong. And the shape of the corpus: a recording that ends at its
+            # recovery checkpoint never asks a rebootstrapped consumer to chain a block onto the
+            # restored pair, which is exactly the shape that let a driver replaying none of the
+            # winning branch report that all of it agreed. Both are chain-paced waits with the
+            # reorg evidence already in hand, bounded so a stalled chain cannot hold the phase.
             FLOOR_BY=$(( $(date +%s) + REORG_FLOOR_SECS ))
-            while [ "$(count '"kind":"verdict"')" -lt "$REORG_MIN_BLOCKS" ] &&
-                  [ "$(date +%s)" -lt "$FLOOR_BY" ]; do
+            while [ "$(date +%s)" -lt "$FLOOR_BY" ]; do
                 kill -0 "$PID" 2>/dev/null || break
+                VERDICTS=$(count '"kind":"verdict"')
+                [ "$VERDICTS" -ge "$REORG_MIN_BLOCKS" ] &&
+                    [ "$VERDICTS" -ge $(( AFTER_SKIM + REORG_TAIL_BLOCKS )) ] && break
                 sleep 20
             done
-            say "verdicts=$(count '"kind":"verdict"') (floor $REORG_MIN_BLOCKS)"
+            say "verdicts=$(count '"kind":"verdict"') (floor $REORG_MIN_BLOCKS, \
+tail $REORG_TAIL_BLOCKS past the skim at $AFTER_SKIM)"
             ARMED=reorg; break
         fi
         sleep 45

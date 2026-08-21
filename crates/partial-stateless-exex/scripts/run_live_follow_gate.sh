@@ -724,8 +724,19 @@ if [ "$GATE_MODE" = "reorg" ] && [ "${GATE_FORCE_RESTORE:-0}" = "1" ]; then
         if [ -n "$FORCED" ]; then
             check "$FORCED" "the recovery checkpoint really does rebootstrap a validator" \
                 "([.resyncs[] | select(.at_sequence == $RESTORE_AT)] | length) == 1"
+            # The two assertions above pass on a driver that installs the checkpoint and reads
+            # straight on, provided nothing follows the checkpoint to trip over — which is how a
+            # driver that replayed none of the branch reported that all of it agreed, for five
+            # days, against a corpus whose checkpoint sat at the stream tail. Agreement is only
+            # evidence about the branch if the branch was replayed, so that is asserted first.
+            check "$FORCED" "the winning branch below the checkpoint was actually replayed" \
+                ".rewind_replayed_commits > 0"
+            check "$FORCED" "and no window was refused for its size" \
+                ".rewind_windows_refused == 0"
             check "$FORCED" "and the winning branch replayed against it agreed throughout" \
                 ".agreed == true and .complete == true"
+            check "$FORCED" "and the recovery it recorded is continuous" \
+                "[.resyncs[] | select(.at_sequence == $RESTORE_AT) | .continuous] == [true]"
         fi
     fi
 fi
