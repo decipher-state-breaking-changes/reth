@@ -24,6 +24,22 @@ keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 # crate rather than reimplemented: the miss set this study holds fixed across tree backends is only
 # meaningful if it is byte-identical to the one the measured MPT arms were built from.
 partial-stateless = { path = "../partial-stateless" }
+# The coverage binary re-executes each recorded block to see which code chunks actually run. It
+# admits the payload through the same production path the validator uses rather than decoding blocks
+# itself, so a block this study executes is the block the validator would have executed.
+partial-stateless-validator = { path = "../partial-stateless-validator" }
+
+reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm = { workspace = true, features = ["std"] }
+reth-evm-ethereum = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std", "secp256k1", "rayon"] }
+revm = { workspace = true, features = ["std"] }
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["serde"] }
 
 alloy-primitives.workspace = true
 blake3.workspace = true
@@ -37,3 +53,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 [[bin]]
 name = "ps-tree-study"
 path = "src/bin/ps_tree_study.rs"
+
+[[bin]]
+name = "ps-code-coverage"
+path = "src/bin/ps_code_coverage.rs"

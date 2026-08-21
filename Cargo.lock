@@ -6590,11 +6590,23 @@ dependencies = [
 name = "partial-stateless-treestudy"
 version = "2.2.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
  "bincode",
  "blake3",
  "eyre",
  "partial-stateless",
+ "partial-stateless-validator",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-primitives-traits",
+ "revm",
  "serde",
  "serde_json",
  "tracing",

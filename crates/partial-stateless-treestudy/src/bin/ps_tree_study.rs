@@ -317,6 +317,8 @@ impl Options {
         let mut warmup = 120usize;
         let mut params = StudyParams::default();
         let mut header_layout_name = "table".to_string();
+        let mut coverage: Option<PathBuf> = None;
+        let mut ignore_coverage = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -334,6 +336,10 @@ impl Options {
                 "--accounts" => params.account_population = value()?.parse()?,
                 "--slots" => params.storage_population = value()?.parse()?,
                 "--code-coverage" => params.code_coverage = value()?.parse()?,
+                "--coverage" => coverage = Some(PathBuf::from(value()?)),
+                // Lets one sweep arm ignore a measurement the shared command line supplies, so a
+                // modelled-coverage bound can be quoted beside the measured result.
+                "--no-coverage" => ignore_coverage = true,
                 "--stem-occupancy" => {
                     params.stem_occupancy.get_or_insert_with(StemOccupancy::zero).outside_header =
                         value()?.parse()?
@@ -360,6 +366,19 @@ impl Options {
             bail!("--dataset {dataset:?} is not a directory");
         }
         let out = out.ok_or_else(|| eyre::eyre!("--out is required\n{USAGE}"))?;
+        if let Some(path) = coverage.filter(|_| !ignore_coverage).as_ref() {
+            let measured: partial_stateless_treestudy::coverage::CodeCoverage =
+                serde_json::from_slice(
+                    &std::fs::read(path).with_context(|| format!("reading {path:?}"))?,
+                )?;
+            tracing::info!(
+                bytecodes = measured.total_chunks.len(),
+                entered = measured.entered_and_read_only().0,
+                fraction = measured.overall_fraction(),
+                "measured code coverage loaded; it replaces --code-coverage per bytecode"
+            );
+            params.measured_coverage = Some(std::sync::Arc::new(measured));
+        }
         Ok(Self { dataset, frontier, out, limit, warmup, params, header_layout_name })
     }
 }
@@ -375,6 +394,9 @@ ps-tree-study --dataset <corpus dir> --out <results dir> [options]
   --accounts N             accounts in the modelled state (default 412044818, measured)
   --slots N                storage slots in the modelled state (default 1636513307, measured)
   --code-coverage F        fraction of a contract's chunks a call runs (default 1.0)
+  --coverage PATH          measured coverage from ps-code-coverage; replaces --code-coverage per
+                           bytecode, and is what a quotable number should be produced with
+  --no-coverage            ignore a --coverage file, to quote a modelled-coverage bound
   --stem-occupancy N       extra occupied suffixes in a non-header stem; overrides the value
                            derived from --slots and --stems
   --header-stem-occupancy N  extra occupied suffixes assumed in a header stem (default 0)

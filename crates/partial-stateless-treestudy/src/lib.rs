@@ -21,6 +21,7 @@
 //! holds, and how many bytes the difference is.
 
 pub mod corpus;
+pub mod coverage;
 pub mod keys;
 pub mod mpt;
 pub mod population;
@@ -29,6 +30,7 @@ pub mod study;
 pub mod witness;
 
 pub use corpus::{Corpus, CorpusBlock};
+pub use coverage::{ChunkInspector, CodeCoverage};
 pub use keys::{Eip6800Keys, Eip7864Keys, HeaderLayout, StemId, TreeEmbedding, TreeKey};
 pub use population::BackgroundPopulation;
 pub use report::{ArmRatios, ArmSummary, RunReport};

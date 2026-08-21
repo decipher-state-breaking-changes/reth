@@ -25,6 +25,10 @@ pub struct ArmSummary {
     pub mean_binary_total_bytes: f64,
     /// Mean Verkle witness bytes per block.
     pub mean_verkle_total_bytes: f64,
+    /// Mean binary-tree witness bytes per block with contract code left out.
+    pub mean_binary_state_bytes: f64,
+    /// Mean Verkle witness bytes per block with contract code left out.
+    pub mean_verkle_state_bytes: f64,
     /// Mean accounts whose code leaves the tree witness opened.
     pub mean_code_bearing_accounts: f64,
     /// Mean hexary trie nodes the MPT path model predicts.
@@ -50,6 +54,10 @@ pub struct ArmRatios {
     pub binary_vs_weak_median: f64,
     /// Paired median of `weak / arm` Verkle bytes.
     pub verkle_vs_weak_median: f64,
+    /// Paired median of `weak / arm` binary-tree bytes, contract code left out.
+    pub binary_state_vs_weak_median: f64,
+    /// Paired median of `weak / arm` Verkle bytes, contract code left out.
+    pub verkle_state_vs_weak_median: f64,
     /// Paired median of `weak / arm` predicted MPT nodes.
     pub mpt_model_nodes_vs_weak_median: f64,
 }
@@ -101,8 +109,10 @@ pub struct ReportedParams {
     pub stem_occupancy_in_header: u32,
     /// Which EIP-7864 header layout was used.
     pub header_layout: String,
-    /// Fraction of a contract's code chunks a call was assumed to run.
+    /// Fraction of a contract's code chunks a call was assumed to run, where none was measured.
     pub code_coverage: f64,
+    /// Whether a measured coverage file supplied the chunks instead.
+    pub code_coverage_measured: bool,
     /// Storage-trie size the MPT calibration used.
     pub mpt_storage_trie_population: u64,
 }
@@ -143,6 +153,12 @@ impl RunReport {
                     verkle_vs_weak_median: paired_median(baseline, rows, |r| {
                         r.verkle_total_bytes() as f64
                     }),
+                    binary_state_vs_weak_median: paired_median(baseline, rows, |r| {
+                        r.binary_state_bytes() as f64
+                    }),
+                    verkle_state_vs_weak_median: paired_median(baseline, rows, |r| {
+                        r.verkle_state_bytes() as f64
+                    }),
                     mpt_model_nodes_vs_weak_median: paired_median(baseline, rows, |r| {
                         r.mpt_model_nodes as f64
                     }),
@@ -170,6 +186,7 @@ impl RunReport {
                 stem_occupancy_in_header: params.effective_occupancy().in_header,
                 header_layout: header_layout.to_string(),
                 code_coverage: params.code_coverage,
+                code_coverage_measured: params.measured_coverage.is_some(),
                 mpt_storage_trie_population: params.mpt_storage_trie_population,
             },
             arms,
@@ -196,6 +213,8 @@ fn summarise(arm: &str, rows: &[BlockResult]) -> ArmSummary {
         mean_unowned_code_bytes: mean(|r| r.unowned_code_bytes as f64),
         mean_binary_total_bytes: mean(|r| r.binary_total_bytes() as f64),
         mean_verkle_total_bytes: mean(|r| r.verkle_total_bytes() as f64),
+        mean_binary_state_bytes: mean(|r| r.binary_state_bytes() as f64),
+        mean_verkle_state_bytes: mean(|r| r.verkle_state_bytes() as f64),
         mean_code_bearing_accounts: mean(|r| r.code_bearing_accounts as f64),
         mean_mpt_model_nodes: mean(|r| r.mpt_model_nodes as f64),
         mean_stems_opened: mean(|r| r.binary_stems_opened as f64),
@@ -251,6 +270,12 @@ fn disclaimers() -> Vec<String> {
         "Witness bytes for the binary and Verkle arms are structural: they count the nodes, stems, \
          and values a multiproof carries under each scheme's own rules. They are not produced by \
          running either scheme's cryptography."
+            .into(),
+        "Two readings are reported and they answer different questions. The state-only figures \
+         exclude contract code, which under the MPT is not in the trie at all but a blob beside the \
+         proof, and are the comparison the three commitments can be held to on equal terms. The \
+         whole-witness figures include code, which the successors carry as tree leaves, and are what \
+         a validator actually receives."
             .into(),
         "Neither tree arm reports verification time. A hash-based binary proof and an elliptic-curve \
          Verkle proof do not have comparable verification costs, and this study measures neither."

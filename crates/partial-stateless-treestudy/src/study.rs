@@ -11,6 +11,7 @@
 //! reports attributable to the commitment scheme, which is the one thing it is trying to measure.
 
 use crate::{
+    coverage::CodeCoverage,
     keys::{
         mpt_account_key, mpt_storage_key, Eip6800Keys, Eip7864Keys, HeaderLayout, StemId,
         TreeEmbedding, TreeKey, TreeRegion,
@@ -28,7 +29,10 @@ use partial_stateless::{
     network_cache::{MissResult, NetworkStateCache},
     policy::LastNBlocksPolicy,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Bytes of the aggregated polynomial opening a Verkle proof carries once per block.
 ///
@@ -81,7 +85,16 @@ pub struct StudyParams {
     /// Which EIP-7864 header layout to place binary-tree keys under.
     pub header_layout: HeaderLayout,
     /// Fraction of a contract's code chunks a call is assumed to run.
+    ///
+    /// Only consulted when [`Self::measured_coverage`] is absent.
     pub code_coverage: f64,
+    /// Which chunks each bytecode was measured to run, when a measurement exists.
+    ///
+    /// A measurement replaces the assumption per bytecode rather than in aggregate: contracts
+    /// differ enormously in how much of themselves a call touches, and one global fraction
+    /// applied to all of them would reproduce the mean while getting every stem's occupancy
+    /// wrong.
+    pub measured_coverage: Option<Arc<CodeCoverage>>,
     /// How much of an opened stem is assumed occupied beyond what the corpus names.
     ///
     /// `None` derives it from the measured slot count and the modelled stem count, which are not
@@ -101,6 +114,7 @@ impl Default for StudyParams {
             code_stem_population: 3_000_000,
             header_layout: HeaderLayout::TABLE,
             code_coverage: 1.0,
+            measured_coverage: None,
             stem_occupancy: None,
             mpt_storage_trie_population: 4_096,
         }
@@ -173,6 +187,20 @@ pub struct BlockResult {
     pub binary: WitnessCost,
     /// EIP-6800 Verkle witness for the whole block, state and code in one proof.
     pub verkle: WitnessCost,
+    /// EIP-7864 witness for the block's account and storage state, with contract code left out.
+    ///
+    /// A separate proof, not a subtraction: dropping the code targets changes which nodes are
+    /// shared and which stems are opened at all, so the state-only cost is not a component of
+    /// the whole one.
+    ///
+    /// This is the comparison the MPT can be held to on equal terms. Under the MPT, code is not in
+    /// the trie: the account leaf holds a hash and the bytecode travels beside the proof as a
+    /// blob, so its size is a property of the contract rather than of the commitment. Both
+    /// readings are reported because they answer different questions --- this one asks what
+    /// the commitment scheme costs, and the whole-witness one asks what a validator receives.
+    pub binary_state_only: WitnessCost,
+    /// EIP-6800 witness for the block's account and storage state, with contract code left out.
+    pub verkle_state_only: WitnessCost,
     /// Trie nodes a hexary path model predicts for the same miss set.
     pub mpt_model_nodes: u64,
     /// Distinct stems the miss set opened in the binary tree.
@@ -192,6 +220,16 @@ impl BlockResult {
     /// Total Verkle witness bytes.
     pub const fn verkle_total_bytes(&self) -> u64 {
         self.verkle.total_bytes()
+    }
+
+    /// Binary-tree witness bytes for state alone.
+    pub const fn binary_state_bytes(&self) -> u64 {
+        self.binary_state_only.total_bytes()
+    }
+
+    /// Verkle witness bytes for state alone.
+    pub const fn verkle_state_bytes(&self) -> u64 {
+        self.verkle_state_only.total_bytes()
     }
 }
 
@@ -441,18 +479,34 @@ pub fn price_block(
     let binary_plan = plan_targets(&arm.binary.keys, arm, accessed, &miss, params);
     let verkle_plan = plan_targets(&arm.verkle.keys, arm, accessed, &miss, params);
 
+    let binary_wire = |region| arm.binary.keys.stem_wire_bytes(region);
+    let verkle_wire = |region| arm.verkle.keys.stem_wire_bytes(region);
     let binary = binary_witness(
         &binary_plan.targets,
         &arm.binary.retained,
         &populations.binary,
-        &|region| arm.binary.keys.stem_wire_bytes(region),
+        &binary_wire,
         MAX_BINARY_DEPTH,
     );
     let verkle = verkle_witness(
         &verkle_plan.targets,
         &arm.verkle.retained,
         &populations.verkle,
-        &|region| arm.verkle.keys.stem_wire_bytes(region),
+        &verkle_wire,
+        VERKLE_IPA_PROOF_BYTES,
+    );
+    let binary_state_only = binary_witness(
+        &binary_plan.state_targets,
+        &arm.binary.retained,
+        &populations.binary,
+        &binary_wire,
+        MAX_BINARY_DEPTH,
+    );
+    let verkle_state_only = verkle_witness(
+        &verkle_plan.state_targets,
+        &arm.verkle.retained,
+        &populations.verkle,
+        &verkle_wire,
         VERKLE_IPA_PROOF_BYTES,
     );
 
@@ -484,6 +538,8 @@ pub fn price_block(
         unowned_code_bytes: binary_plan.unowned_code_bytes,
         binary,
         verkle,
+        binary_state_only,
+        verkle_state_only,
         mpt_model_nodes: mpt_nodes,
         binary_stems_opened: binary_plan.targets.len() as u64,
         verkle_stems_opened: verkle_plan.targets.len() as u64,
@@ -494,6 +550,8 @@ pub fn price_block(
 /// The whole of one block's witness demand under one embedding.
 struct TargetPlan {
     targets: BTreeMap<StemId, StemTargets>,
+    /// The same, with contract code left out.
+    state_targets: BTreeMap<StemId, StemTargets>,
     missed_code_bytes: u64,
     unowned_code_bytes: u64,
     code_bearing_accounts: usize,
@@ -529,6 +587,10 @@ fn plan_targets<K: TreeEmbedding>(
         insert_target(&mut targets, keys.storage_slot(*address, (*slot).into()));
     }
 
+    // The state-only view is taken here, before code is added: it is the same account and storage
+    // demand priced as its own proof.
+    let mut state_targets = targets.clone();
+
     // Code, at every account the block touched that holds a missed bytecode. The cache is keyed by
     // hash, so one entry covers every deployment; the trees are keyed by account, so each
     // deployment is its own chunk range and its own paths.
@@ -554,7 +616,7 @@ fn plan_targets<K: TreeEmbedding>(
         let chunks = K::chunk_count(code.len());
         for address in addresses {
             code_bearing_accounts += 1;
-            for chunk in covered_chunks(chunks, params.code_coverage, hash) {
+            for chunk in covered_chunks(chunks, params, hash) {
                 let key = keys.code_chunk(*address, chunk);
                 let entry = targets.entry(key.stem_id()).or_default();
                 entry.targets.insert(key.suffix);
@@ -570,8 +632,15 @@ fn plan_targets<K: TreeEmbedding>(
     }
 
     annotate_occupancy(keys, arm, accessed, &mut targets, params);
+    annotate_occupancy(keys, arm, accessed, &mut state_targets, params);
 
-    TargetPlan { targets, missed_code_bytes, unowned_code_bytes, code_bearing_accounts }
+    TargetPlan {
+        targets,
+        state_targets,
+        missed_code_bytes,
+        unowned_code_bytes,
+        code_bearing_accounts,
+    }
 }
 
 /// Fills in what is known and what is modelled about each opened stem's occupancy.
@@ -684,14 +753,25 @@ const fn mpt_stem(key: [u8; 32]) -> StemId {
     StemId { region: TreeRegion::Unified, stem: key }
 }
 
-/// The chunks a call is modelled as running.
+/// The chunks a call runs, measured where a measurement exists and modelled where it does not.
 ///
-/// Coverage below one is spread pseudo-randomly rather than taken as a leading run. Real execution
+/// A measured entry is used verbatim. A bytecode the measurement never saw *entered* is not zero
+/// coverage --- it can be read by `EXTCODECOPY` or `EXTCODEHASH` without executing --- and
+/// returning nothing for it would drop code the witness has to carry, so the modelled fraction
+/// stands in.
+///
+/// Modelled coverage is spread pseudo-randomly rather than taken as a leading run. Real execution
 /// runs basic blocks, which are contiguous, so a contiguous model would understate how many stems a
 /// partially-run contract opens and a scattered one overstates it. The scattered choice is the
-/// pessimistic one for the tree arms, which is the right direction for a bound they are being
-/// credited with.
-fn covered_chunks(chunks: u32, coverage: f64, code_hash: &B256) -> Vec<u32> {
+/// pessimistic one for the tree arms, which is the right direction for a value they are credited
+/// with rather than measured on.
+fn covered_chunks(chunks: u32, params: &StudyParams, code_hash: &B256) -> Vec<u32> {
+    if let Some(ran) =
+        params.measured_coverage.as_ref().and_then(|measured| measured.chunks_of(code_hash))
+    {
+        return ran.iter().copied().filter(|chunk| *chunk < chunks).collect()
+    }
+    let coverage = params.code_coverage;
     if coverage >= 1.0 {
         return (0..chunks).collect()
     }
@@ -892,6 +972,35 @@ mod tests {
         arm.advance(100, &accessed);
         assert!(arm.retained_stems() > 0);
         assert!(arm.miss(&accessed).missed_accounts.is_empty());
+    }
+
+    #[test]
+    fn the_state_only_proof_leaves_code_out_and_is_priced_on_its_own() {
+        let code_hash = B256::repeat_byte(0x5a);
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(Address::repeat_byte(0x11), contract(code_hash));
+        accessed.storage.insert((Address::repeat_byte(0x11), B256::repeat_byte(2)), U256::from(7));
+        accessed.codes.insert(code_hash, vec![0u8; 31 * 600].into());
+
+        let arm = Arm::new(ArmSpec::weak(), HeaderLayout::TABLE);
+        let params = StudyParams::default();
+        let miss = arm.miss(&accessed);
+        let plan = plan_targets(&arm.binary.keys, &arm, &accessed, &miss, &params);
+
+        assert!(
+            plan.state_targets.len() < plan.targets.len(),
+            "600 chunks must open stems the state-only view does not"
+        );
+        let header = arm.binary.keys.header_stem(Address::repeat_byte(0x11));
+        let state_header = plan.state_targets.get(&header).expect("the account is a target");
+        assert!(
+            state_header.targets.iter().all(|suffix| *suffix < 4),
+            "the state-only view opens basic data and code hash, not code chunks"
+        );
+        assert!(
+            plan.targets.get(&header).expect("merged").targets.len() > state_header.targets.len(),
+            "the merged view opens the header-resident code chunks as well"
+        );
     }
 
     #[test]

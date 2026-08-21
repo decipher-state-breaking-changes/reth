@@ -11,7 +11,9 @@
 //! a reorged sibling would be replaying a cache policy over a block sequence its report described
 //! wrongly, and the cache is path-dependent, so the error would not stay local to the bad block.
 
-use alloy_primitives::B256;
+use alloy_consensus::Header;
+use alloy_primitives::{keccak256, B256};
+use alloy_rlp::Decodable;
 use eyre::{bail, Context, Result};
 use partial_stateless::{
     accessed_state::BlockAccessedState,
@@ -34,6 +36,30 @@ pub struct CorpusBlock {
     pub parent_hash: B256,
     /// State the block touched.
     pub accessed: BlockAccessedState,
+    /// Engine-API JSON, when the capture recorded one.
+    ///
+    /// Carried because re-executing a block needs the block, and the corpus's own payload is the
+    /// only version of it that a validator would have seen. Absent under a capture that recorded
+    /// no payload; a consumer that needs one must say what it does about the gap rather than
+    /// skip silently.
+    pub payload_json: Option<Vec<u8>>,
+    /// Hashes of the ancestors the block's `BLOCKHASH` range can reach, lowest first.
+    pub ancestor_hashes: Vec<(u64, B256)>,
+    /// Parent state root the transition witness is proved against.
+    pub parent_state_root: B256,
+    /// The policy-neutral full transition witness: parent-state trie nodes, flat and sorted.
+    ///
+    /// Empty unless the reader was asked for it. This is the bulk of the corpus — 8.8 GB against
+    /// roughly 300 MB of access sets — and only the coverage pass needs it, because only
+    /// re-execution needs *parent* state. The access set records what execution left behind,
+    /// not what it started from, so it cannot stand in.
+    pub transition_nodes: Vec<alloy_primitives::Bytes>,
+    /// The parent block's RLP header.
+    ///
+    /// Every block but the first can take its parent from the record below, which a consumer
+    /// admitted itself and is therefore better evidence. The first has no record below it, and
+    /// without this the corpus could not be entered at all.
+    pub parent_header: Vec<u8>,
 }
 
 /// A corpus, opened but not yet read.
@@ -160,10 +186,31 @@ impl Corpus {
     ///
     /// Streaming rather than collecting because the witness fields dominate the record and are not
     /// wanted: a whole-corpus read would cost about 8.8 GB to deliver roughly 300 MB of access
-    /// sets.
+    /// sets. Each block arrives without its transition witness for the same reason.
     pub fn for_each(
         &self,
         limit: Option<usize>,
+        visit: impl FnMut(CorpusBlock) -> Result<()>,
+    ) -> Result<()> {
+        self.walk(limit, false, visit)
+    }
+
+    /// As [`Self::for_each`], but each block also carries its transition witness.
+    ///
+    /// Only re-execution needs it, and only because the access set records post-execution values:
+    /// the witness is the corpus's one record of the state a block *started* from.
+    pub fn for_each_with_witness(
+        &self,
+        limit: Option<usize>,
+        visit: impl FnMut(CorpusBlock) -> Result<()>,
+    ) -> Result<()> {
+        self.walk(limit, true, visit)
+    }
+
+    fn walk(
+        &self,
+        limit: Option<usize>,
+        with_witness: bool,
         mut visit: impl FnMut(CorpusBlock) -> Result<()>,
     ) -> Result<()> {
         let take = limit.unwrap_or(self.ordered.len()).min(self.ordered.len());
@@ -188,11 +235,26 @@ impl Corpus {
             previous = Some(record.body.block_hash);
 
             let PolicyDatasetRecord { body, .. } = record;
+            let mut ancestor_hashes = Vec::with_capacity(body.ancestor_headers.len());
+            for raw in &body.ancestor_headers {
+                let header = Header::decode(&mut raw.as_ref())
+                    .with_context(|| format!("decoding an ancestor header of block {height}"))?;
+                ancestor_hashes.push((header.number, keccak256(raw)));
+            }
             visit(CorpusBlock {
                 number: body.block_number,
                 hash: body.block_hash,
                 parent_hash: body.parent_hash,
                 accessed: body.accessed,
+                payload_json: body.payload_json,
+                ancestor_hashes,
+                parent_state_root: body.parent_state_root,
+                transition_nodes: if with_witness {
+                    body.full_transition_nodes
+                } else {
+                    Vec::new()
+                },
+                parent_header: body.parent_header.to_vec(),
             })?;
         }
         Ok(())

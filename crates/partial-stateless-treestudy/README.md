@@ -32,6 +32,21 @@ There is no live arm and cannot be one: no chain commits a binary or Verkle root
 no untrusted header to check a recomputed root against. What survives the move offline is everything
 that does not need that anchor.
 
+## Two readings, because there are two questions
+
+Contract code is in the tree under both proposals and outside the trie under the MPT, where the
+account leaf holds a hash and the bytecode travels beside the proof as a blob — so its size is a
+property of the contract, not of the commitment. Every run therefore reports two figures per arm:
+
+- **state proof only**, contract code excluded from all three arms. This is the commitment comparison
+  proper, and it carries no assumption about code execution at all.
+- **whole witness**, code included. This is what a validator receives, and it includes both the
+  design difference (code as tree leaves) and the measured chunk coverage.
+
+They are separate proofs, not a subtraction: dropping the code targets changes which nodes are shared
+and which stems are opened at all. Quoting one without the other misstates the result in a direction
+the reader cannot see.
+
 ## One embedding per proposal
 
 EIP-7864 and EIP-6800 are not the same tree with a different commitment, and the difference lands on
@@ -52,10 +67,23 @@ leaves, and the run reports how many accounts that came to.
 
 ```bash
 cargo build --release -p partial-stateless-treestudy
-ps-tree-study --dataset <policy dataset dir> --out <results dir> [--limit N] [--warmup N]
+
+# Measure which code chunks the corpus's blocks actually run. Needed once per corpus.
+ps-code-coverage --dataset <policy dataset dir> --out coverage.json
+
+# Price the witnesses.
+ps-tree-study --dataset <policy dataset dir> --frontier <recorded frontier.jsonl> \
+              --coverage coverage.json --out <results dir> [--limit N] [--warmup N]
 ```
 
-Useful options: `--frontier` (the recorded run to check the miss set against), `--stems` (modelled
+`ps-code-coverage` re-executes every recorded block against its recorded parent-state witness with an
+inspector on the program counter, and checks each block's replayed gas against its header before
+believing what it saw. The access set cannot stand in for the witness here: it is read off revm's
+cache after the block is merged, so it holds post-execution values.
+
+Useful options: `--frontier` (the recorded run to check the miss set against), `--coverage` (the
+measured chunk coverage, which replaces `--code-coverage` per bytecode and is what a quotable number
+should be produced with), `--stems` (modelled
 whole-tree stem count), `--accounts` / `--slots` (measured state sizes), `--code-coverage` (fraction
 of a contract's chunks a call runs), `--stem-occupancy` (overrides the occupancy otherwise derived
 from `--slots` and `--stems`), `--header-layout` (`table` or `prose` — EIP-7864's constant table and
@@ -75,6 +103,7 @@ Outputs `blocks.jsonl` (one record per block per arm), `summary.json`, and `cens
 | Module | Responsibility |
 | --- | --- |
 | `corpus` | Streams the recorded dataset, resolving the canonical chain from the terminator's tip |
+| `coverage` | Which code chunks a block runs, and the parent-state database a replay needs to find out |
 | `keys` | One `TreeEmbedding` per proposal, and the prefix arithmetic they are walked with |
 | `population` | The background state per key region, sampled lazily from a deterministic PRF |
 | `witness` | The multiproof accounting all backends share: held, derived, empty, carried |
