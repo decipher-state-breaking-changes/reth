@@ -123,7 +123,6 @@ enum SpoolPhase {
 /// reader that caught a partial one would have to distinguish "still being written" from "written
 /// wrong" — a distinction the frame format can make but the filesystem cannot help with. Files are
 /// named by sequence so a reader's ordering is the producer's ordering and not the directory's.
-#[derive(Debug)]
 pub struct StreamRecorder {
     dir: PathBuf,
     chunk_bytes: usize,
@@ -185,6 +184,38 @@ pub struct StreamRecorder {
     frame_fsync_us: u64,
     /// Directory fsyncs performed, so a test can pin the batching shape.
     dir_syncs: u64,
+    /// Held so the node's shutdown cannot outrun this recorder's close.
+    ///
+    /// Whatever is in here is dropped by [`write_end`](Self::write_end) when it returns, on every
+    /// path — after the `End` is on disk, and also when it decides there is none to write. In the
+    /// node it is a channel sender awaited by a task holding a graceful-shutdown guard, so the
+    /// process stays alive until it falls. Doing the release inside `write_end` rather than
+    /// leaving it to field-drop order is deliberate: this defect was an implicit ordering nobody
+    /// had checked, and replacing it with a different implicit ordering would be the same bet.
+    ///
+    /// Untyped so a test can pass a value whose own `Drop` observes the release the instant it
+    /// happens — the only way to tell "released after the write" from "released before it", which
+    /// is the entire content of the fix.
+    ///
+    /// `None` for a recorder nothing is waiting on, which is most recorders in the tests.
+    close_guard: Option<Box<dyn Send>>,
+}
+
+impl std::fmt::Debug for StreamRecorder {
+    /// Hand-written because the close guard is untyped; everything a log line wants is here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamRecorder")
+            .field("dir", &self.dir)
+            .field("sequence", &self.sequence)
+            .field("phase", &self.phase)
+            .field("frames", &self.frames)
+            .field("bytes", &self.bytes)
+            .field("epoch", &self.epoch)
+            .field("poisoned", &self.poisoned)
+            .field("ended", &self.ended)
+            .field("fsync", &self.fsync)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamRecorder {
@@ -268,6 +299,7 @@ impl StreamRecorder {
             frame_write_us: 0,
             frame_fsync_us: 0,
             dir_syncs: 0,
+            close_guard: None,
         }))
     }
 
@@ -321,6 +353,7 @@ impl StreamRecorder {
             frame_write_us: 0,
             frame_fsync_us: 0,
             dir_syncs: 0,
+            close_guard: None,
         }
     }
 
@@ -668,6 +701,15 @@ impl StreamRecorder {
         self.emit(&StreamEvent::Reset(reset));
     }
 
+    /// Hands this recorder the sender whose fall lets the node finish shutting down.
+    ///
+    /// Called once, from the ExEx, right after construction. See the field's own note: the point
+    /// is that `Drop::drop` writes the `End` before this sender is dropped, so the wait the
+    /// sender's holder is performing covers the write instead of racing it.
+    pub fn hold_until_closed(&mut self, guard: impl Send + 'static) {
+        self.close_guard = Some(Box::new(guard));
+    }
+
     /// Closes the stream. A corpus without this ended unexpectedly.
     ///
     /// An `End` frame means the writer ran its close path — orderly termination, never success on
@@ -676,6 +718,8 @@ impl StreamRecorder {
     /// that wrote nothing writes no `End` either: an empty directory needs no closing, and
     /// `last_sequence` would have no frame to name.
     pub fn write_end(&mut self, kind: EndKind, reason: impl Into<String>) {
+        // Falls when this function returns, on every path. See the field's note.
+        let _release_on_return = self.close_guard.take();
         if self.poisoned || self.ended || self.frames == 0 {
             return
         }
@@ -1132,6 +1176,10 @@ fn write_run_manifest(dir: &Path, producer: &str) {
 mod tests {
     use super::*;
     use partial_stateless_stream::{decode_event, FrameLimits};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     fn recorder(dir: &Path) -> StreamRecorder {
         StreamRecorder::for_tests(dir, DEFAULT_BUFFER_MAX_FRAMES)
@@ -1785,5 +1833,72 @@ mod tests {
 
         assert_eq!(survey.bytes, on_disk);
         assert_eq!(survey.frames, frames_in(&dir).len() as u64);
+    }
+
+    /// The node may finish shutting down only once the `End` is on disk.
+    ///
+    /// This is the whole content of the 2026-08-22 shutdown fix, and the only way to assert it is
+    /// to observe the release *as it happens*: checking after the recorder is gone cannot tell
+    /// "released after the write" from "released before it", because by then both have happened.
+    /// So the guard is a probe whose own `Drop` reads the spool at that instant.
+    #[test]
+    fn the_close_guard_falls_only_after_the_end_frame_is_on_disk() {
+        struct Probe {
+            dir: PathBuf,
+            last_frame_at_release: Arc<Mutex<Option<FrameKind>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let last = frames_in(&self.dir).pop().map(|(_, kind)| kind);
+                *self.last_frame_at_release.lock().expect("probe") = last;
+            }
+        }
+
+        let dir = spool_dir("close-guard");
+        let observed: Arc<Mutex<Option<FrameKind>>> = Arc::new(Mutex::new(None));
+        let mut recorder = recorder(&dir);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
+        recorder.write_checkpoint(&checkpoint(), None, &[1u8; 8]);
+        recorder.hold_until_closed(Probe {
+            dir: dir.clone(),
+            last_frame_at_release: Arc::clone(&observed),
+        });
+
+        assert!(observed.lock().expect("probe").is_none(), "nothing is released while open");
+        drop(recorder);
+
+        assert_eq!(
+            *observed.lock().expect("probe"),
+            Some(FrameKind::End),
+            "the terminator must already be the last frame when the node is let go"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same guarantee on the path where there is nothing to write: a recorder that never
+    /// opened a stream writes no `End`, and must still let the node go rather than hold it to the
+    /// shutdown timeout.
+    #[test]
+    fn a_recorder_with_no_frames_still_releases_its_close_guard() {
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dir = spool_dir("close-guard-empty");
+        let released = Arc::new(AtomicBool::new(false));
+        let mut recorder = recorder(&dir);
+        recorder.hold_until_closed(Probe(Arc::clone(&released)));
+
+        recorder.write_end(EndKind::Shutdown, "nothing was recorded");
+
+        assert!(released.load(Ordering::SeqCst), "released even though no End was written");
+        assert!(frames_in(&dir).is_empty(), "and no terminator was invented for an empty spool");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
