@@ -73,6 +73,30 @@ impl Drop for GracefulShutdownGuard {
 #[derive(Debug, Clone)]
 pub struct Shutdown(Shared<oneshot::Receiver<()>>);
 
+/// Why the task shutdown future completed.
+///
+/// A requested shutdown sends a value through the channel. If the task manager itself goes away
+/// without requesting shutdown, the sender is dropped instead. Callers that merely need to stop
+/// can continue awaiting [`Shutdown`]; callers that must not turn a task-manager failure into a
+/// clean shutdown can inspect this cause through [`Shutdown::cause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownCause {
+    /// The runtime or task manager explicitly requested an orderly shutdown.
+    Requested,
+    /// The shutdown sender disappeared without making that request.
+    SenderDropped,
+}
+
+impl Shutdown {
+    /// Waits for shutdown while preserving whether it was requested or merely lost its sender.
+    pub async fn cause(self) -> ShutdownCause {
+        match self.0.await {
+            Ok(()) => ShutdownCause::Requested,
+            Err(_) => ShutdownCause::SenderDropped,
+        }
+    }
+}
+
 impl Future for Shutdown {
     type Output = ();
 
@@ -124,6 +148,17 @@ mod tests {
         });
 
         shutdown.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cause_distinguishes_a_request_from_a_lost_sender() {
+        let (requested_signal, shutdown) = signal();
+        requested_signal.fire();
+        assert_eq!(shutdown.cause().await, ShutdownCause::Requested);
+
+        let (dropped_signal, shutdown) = signal();
+        drop(dropped_signal);
+        assert_eq!(shutdown.cause().await, ShutdownCause::SenderDropped);
     }
 
     #[tokio::test(flavor = "multi_thread")]

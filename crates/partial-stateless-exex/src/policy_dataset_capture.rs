@@ -250,7 +250,6 @@ fn require_stamped_build(build_commit: Option<&str>, allow_unstamped: bool) -> e
 /// **Confirming** — budget met, paying for nothing, watching the chain advance past the range it
 /// recorded. A reorg here can send it back to capturing.
 /// **Closed** — the range settled, the terminator written, everything after it a no-op.
-#[derive(Debug)]
 pub struct PolicyDatasetRecorder {
     writer: Option<PolicyDatasetWriter>,
     dir: PathBuf,
@@ -276,6 +275,25 @@ pub struct PolicyDatasetRecorder {
     /// Blocks refused before the first record landed, bounded by
     /// [`MAX_SKIPS_BEFORE_FIRST_RECORD`].
     skipped_before_first: u64,
+    /// Held so node shutdown cannot outrun an `END.json` written by this recorder's destructor.
+    /// Released inside [`Self::close_with`] after the terminator write returns, never by relying
+    /// on the relative field-drop order of an async future.
+    close_guard: Option<Box<dyn Send>>,
+}
+
+impl std::fmt::Debug for PolicyDatasetRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyDatasetRecorder")
+            .field("dir", &self.dir)
+            .field("max_blocks", &self.max_blocks)
+            .field("confirmations", &self.confirmations)
+            .field("written", &self.written.len())
+            .field("usable", &self.usable.len())
+            .field("head", &self.head)
+            .field("complete", &self.complete)
+            .field("skipped_before_first", &self.skipped_before_first)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyDatasetRecorder {
@@ -310,7 +328,13 @@ impl PolicyDatasetRecorder {
             head: 0,
             complete: false,
             skipped_before_first: 0,
+            close_guard: None,
         }))
+    }
+
+    /// Hands this recorder a sender whose release lets graceful node shutdown finish.
+    pub fn hold_until_closed(&mut self, guard: impl Send + 'static) {
+        self.close_guard = Some(Box::new(guard));
     }
 
     /// Whether the builder should still pay for a full witness on this block.
@@ -539,6 +563,9 @@ impl PolicyDatasetRecorder {
         confirmed_at_head: Option<u64>,
         detail: String,
     ) {
+        // Release only when this function returns, after `finish` has either written `END.json`
+        // or reported that it could not. This mirrors the stream recorder's close ordering.
+        let _release_on_return = self.close_guard.take();
         let Some(writer) = self.writer.take() else { return };
         self.complete = true;
         let written = self.written.len();
@@ -570,6 +597,32 @@ impl PolicyDatasetRecorder {
     pub fn fail(&mut self, detail: String) {
         let head = (self.head > 0).then_some(self.head);
         self.close_with(DatasetEndKind::Failed, None, head, detail);
+    }
+}
+
+impl Drop for PolicyDatasetRecorder {
+    /// Terminates a capture when reth drops the ExEx future during shutdown.
+    ///
+    /// The ExEx cannot run code after its outer shutdown `select` fires, so the destructor is the
+    /// normal early-stop path just as it is for the stream recorder. Error returns call
+    /// [`Self::fail`] before propagating; a panic is still distinguishable here and must not leave
+    /// a usable-looking `ProducerShutdown` dataset behind.
+    fn drop(&mut self) {
+        if self.complete {
+            return
+        }
+        if std::thread::panicking() {
+            self.fail(
+                "policy dataset recorder dropped while the producer was unwinding after a panic"
+                    .into(),
+            );
+        } else {
+            self.close(
+                DatasetEndKind::ProducerShutdown,
+                "node shutdown dropped the ExEx future; the settled dataset prefix was closed"
+                    .into(),
+            );
+        }
     }
 }
 
@@ -909,6 +962,73 @@ mod tests {
         // Head reached 12, confirmations 2, so only block 10 is settled.
         assert_eq!(end["usable_range"][0], 10);
         assert_eq!(end["usable_range"][1], 10);
+    }
+
+    /// Graceful node shutdown may finish only after the capture terminator write returns. Observe
+    /// the sender's release at that instant so moving it above `finish` would fail this test.
+    #[test]
+    fn the_close_guard_falls_only_after_the_dataset_end_is_on_disk() {
+        struct Probe {
+            dir: PathBuf,
+            end_existed_at_release: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                *self.end_existed_at_release.lock().expect("probe") =
+                    Some(self.dir.join("END.json").exists());
+            }
+        }
+
+        let dir = temp_dir("close-guard");
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut recorder = recorder_at(&dir, 100, 2);
+        record(&mut recorder, 10, 0x0a);
+        recorder.hold_until_closed(Probe {
+            dir: dir.clone(),
+            end_existed_at_release: std::sync::Arc::clone(&observed),
+        });
+
+        assert!(observed.lock().expect("probe").is_none());
+        drop(recorder);
+        assert_eq!(*observed.lock().expect("probe"), Some(true));
+    }
+
+    /// Reth drops the ExEx future on a requested shutdown, so no explicit call after the
+    /// notification loop can close a capture. Dropping the recorder must preserve the settled
+    /// prefix under a typed shutdown terminator.
+    #[test]
+    fn dropping_an_active_capture_closes_its_settled_prefix() {
+        let dir = temp_dir("drop-stop");
+        let mut recorder = recorder_at(&dir, 100, 2);
+        for (number, tag) in [(10, 0x0a), (11, 0x0b), (12, 0x0c)] {
+            record(&mut recorder, number, tag);
+        }
+        drop(recorder);
+
+        let end: partial_stateless::DatasetEnd =
+            serde_json::from_slice(&std::fs::read(dir.join("END.json")).unwrap()).unwrap();
+        assert_eq!(end.kind, DatasetEndKind::ProducerShutdown);
+        assert_eq!(end.usable_range, Some((10, 10)));
+        assert!(end.detail.contains("node shutdown dropped the ExEx future"));
+    }
+
+    /// A destructor running under panic unwind is an error terminator, not a clean early stop.
+    #[test]
+    fn panic_unwind_marks_an_active_capture_failed() {
+        let dir = temp_dir("drop-panic");
+        let thread_dir = dir.clone();
+        let result = std::thread::spawn(move || {
+            let mut recorder = recorder_at(&thread_dir, 100, 2);
+            record(&mut recorder, 10, 0x0a);
+            panic!("capture failed");
+        })
+        .join();
+        assert!(result.is_err());
+
+        let end: partial_stateless::DatasetEnd =
+            serde_json::from_slice(&std::fs::read(dir.join("END.json")).unwrap()).unwrap();
+        assert_eq!(end.kind, DatasetEndKind::Failed);
+        assert!(end.detail.contains("unwinding after a panic"));
     }
 
     /// The property the whole opt-in contract rests on: a process nobody configured for capture

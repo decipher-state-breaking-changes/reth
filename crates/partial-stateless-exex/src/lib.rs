@@ -32,7 +32,7 @@ mod sidecar_verify;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 pub use partial_stateless::CacheConfig;
 use partial_stateless::{
     persistence::{load_from_file, save_to_file, CacheState},
@@ -52,6 +52,7 @@ use reth_ethereum::{
     exex::{ExExContext, ExExEvent, ExExNotification},
     node::api::{FullNodeComponents, NodeTypes},
     provider::{Chain, StateProviderFactory},
+    tasks::shutdown::{Shutdown, ShutdownCause},
     EthPrimitives,
 };
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -893,13 +894,18 @@ where
         remove_stale_attempt_dirs(&options.bootstrap_dir);
     }
     if let Some(recorder) = recorder.as_mut() {
-        recorder.write_manifest(
+        if let Err(err) = recorder.write_manifest(
             ctx.config.chain.chain().id(),
             ctx.config.chain.genesis_hash(),
             options.config.cache_policy_id(),
             options.config.account_window,
             options.config.storage_window,
-        )?;
+        ) {
+            if let Some(dataset) = dataset.as_mut() {
+                dataset.fail(format!("the stream manifest could not be written: {err:#}"));
+            }
+            return Err(err)
+        }
         // After the manifest, so the log carries the epoch frames are actually written under.
         gate.events =
             Some(producer_events::ProducerEvents::beside_spool(recorder.dir(), recorder.epoch()));
@@ -908,6 +914,13 @@ where
     // provider that cannot reach far enough back — and retrying it every block would spend the
     // whole run re-executing windows that never install.
     let mut rebuild_failures = 0u32;
+
+    // A direct probe of the task manager's shutdown channel, cloned before any close can race us.
+    // Unlike a boolean published by the companion task below, polling this probe does not depend
+    // on which task the scheduler happened to run first. Its cause also matters: an orderly
+    // shutdown sends `()`, while a task-manager failure merely drops the sender. The latter must
+    // not turn a closed acknowledgement channel into an accepted `End(shutdown)` corpus.
+    let shutdown_probe = ctx.task_executor().on_shutdown_signal().clone();
 
     // Make the node wait for the `End` frame, which nothing used to do.
     //
@@ -927,23 +940,28 @@ where
     //
     // So this adds the wait, and orders it explicitly rather than by timing. The companion task
     // takes a graceful-shutdown guard at spawn, so the node blocks on it from the start, and
-    // releases it only when the far end of this channel goes away. That sender is handed to the
-    // recorder, and `write_end` drops it as it returns — after the frame is on disk, and also on
-    // the path where it decides there is none to write. A timeout could only have made the old
-    // race rarer; this makes the wait cover the write. With no recorder there is no stream to
-    // close, and the sender falls with this future.
-    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    // releases it only when the far end of this channel goes away. A sender is handed to each
+    // configured artifact recorder. The stream's `write_end` and the policy dataset's `close_with`
+    // drop their sender as they return — after the terminator write, and also on the path where
+    // they decide there is none to write. A timeout could only have made the old race rarer; this
+    // makes the wait cover every configured close. With neither recorder the channel closes here.
+    let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
-        "partial-stateless stream closer",
+        "partial-stateless artifact closer",
         move |shutdown| async move {
             let _guard = shutdown.await;
-            let _ = closed_rx.await;
+            while closed_rx.recv().await.is_some() {}
         },
     );
-    let mut closed_tx = Some(closed_tx);
     if let Some(recorder) = recorder.as_mut() {
-        recorder.hold_until_closed(closed_tx.take().expect("just constructed"));
+        recorder.hold_until_closed(closed_tx.clone());
     }
+    if let Some(dataset) = dataset.as_mut() {
+        dataset.hold_until_closed(closed_tx.clone());
+    }
+    // The receiver closes once every configured artifact recorder has released its clone. This
+    // root sender must not keep it open for the lifetime of the ExEx future itself.
+    drop(closed_tx);
 
     loop {
         // Every `?`-shaped exit from this loop must classify itself first: the recorder's drop
@@ -971,6 +989,7 @@ where
                 Ok(Err(err)) => {
                     return Err(fail_producer(
                         recorder.as_mut(),
+                        dataset.as_mut(),
                         err,
                         "the notification stream failed",
                     ))
@@ -983,6 +1002,7 @@ where
                 Err(err) => {
                     return Err(fail_producer(
                         recorder.as_mut(),
+                        dataset.as_mut(),
                         err,
                         "the notification stream failed",
                     ))
@@ -1025,6 +1045,9 @@ where
                                 EndKind::ProducerFault,
                                 format!("block {block_number} failed: {err:#}"),
                             );
+                        }
+                        if let Some(dataset) = dataset.as_mut() {
+                            dataset.fail(format!("block {block_number} failed: {err:#}"));
                         }
                         return Err(eyre::eyre!("block {block_number} failed: {err:#}"))
                     }
@@ -1123,6 +1146,9 @@ where
                                 EndKind::ProducerFault,
                                 format!("reorg block {block_number} failed: {err:#}"),
                             );
+                        }
+                        if let Some(dataset) = dataset.as_mut() {
+                            dataset.fail(format!("reorg block {block_number} failed: {err:#}"));
                         }
                         return Err(eyre::eyre!("reorg block {block_number} failed: {err:#}"))
                     }
@@ -1226,8 +1252,30 @@ where
                     if let Err(err) =
                         ctx.events.send(ExExEvent::FinishedHeight(BlockNumHash::new(number, hash)))
                     {
+                        if shutdown_was_requested(&shutdown_probe) {
+                            let reason = "node shutdown was requested before the processed-height \
+                                          acknowledgement could be delivered";
+                            // Each artifact owns one graceful-close sender. Close the dataset
+                            // first, then the stream; the companion lets reth finish only after
+                            // both terminator writes have returned.
+                            if let Some(dataset) = dataset.as_mut() {
+                                dataset.close(
+                                    partial_stateless::DatasetEndKind::ProducerShutdown,
+                                    reason.to_string(),
+                                );
+                            }
+                            if let Some(recorder) = recorder.as_mut() {
+                                recorder.write_end(EndKind::Shutdown, reason);
+                            }
+                            // Returning either Ok or Err makes the ExEx launcher panic because an
+                            // ExEx is required to run forever. The node is already leaving; park
+                            // so its outer `select(on_shutdown, exex)` drops this future normally.
+                            std::future::pending::<()>().await;
+                            unreachable!("a pending future returned")
+                        }
                         return Err(fail_producer(
                             recorder.as_mut(),
+                            dataset.as_mut(),
                             eyre::Report::new(err),
                             "the acknowledgement channel closed",
                         ))
@@ -1271,8 +1319,6 @@ where
             "exex notification stream ended".to_string(),
         );
     }
-    drop(closed_tx);
-
     Ok(())
 }
 
@@ -1339,13 +1385,24 @@ fn note_dataset_branch_change(
 /// it, because the first close wins.
 fn fail_producer(
     recorder: Option<&mut recorder::StreamRecorder>,
+    dataset: Option<&mut policy_dataset_capture::PolicyDatasetRecorder>,
     err: eyre::Report,
     what: &str,
 ) -> eyre::Report {
     if let Some(recorder) = recorder {
         recorder.write_end(EndKind::ProducerFault, format!("{what}: {err:#}"));
     }
+    if let Some(dataset) = dataset {
+        dataset.fail(format!("{what}: {err:#}"));
+    }
     err.wrap_err(what.to_string())
+}
+
+/// Checks the shutdown channel without waiting or losing the distinction between a request and a
+/// task manager that disappeared. The acknowledgement receiver closing is normal only in the
+/// former case.
+fn shutdown_was_requested(shutdown: &Shutdown) -> bool {
+    matches!(shutdown.clone().cause().now_or_never(), Some(ShutdownCause::Requested))
 }
 
 /// Describes a branch change as the stream's one unwind event.
@@ -3033,9 +3090,9 @@ fn process_rss_bytes() -> u64 {
 mod tests {
     use super::{
         admit_after_cold_reset, admit_block, block_context, finish_committed_transition,
-        inject_recovery, observe_readiness, BlockAdmission, BlockContext, CacheConfig,
-        CacheTrieRepr, CanonicalStateRoots, CoordinatedPair, LivePair, PartialTrieNodeCache,
-        ProviderResult, SealedHeader, SidecarRole,
+        inject_recovery, observe_readiness, shutdown_was_requested, BlockAdmission, BlockContext,
+        CacheConfig, CacheTrieRepr, CanonicalStateRoots, CoordinatedPair, LivePair,
+        PartialTrieNodeCache, ProviderResult, SealedHeader, SidecarRole,
     };
     use alloy_primitives::{keccak256, Address, B256, U256};
     use partial_stateless::{
@@ -3050,6 +3107,20 @@ mod tests {
     };
 
     const TOUCHED: Address = Address::repeat_byte(0x11);
+
+    /// A closed manager channel is accepted only after an explicit shutdown request. Losing the
+    /// signal sender must keep the acknowledgement failure classified as a producer fault.
+    #[test]
+    fn acknowledgement_close_recognizes_only_requested_shutdown() {
+        let (signal, shutdown) = reth_ethereum::tasks::shutdown::signal();
+        assert!(!shutdown_was_requested(&shutdown));
+        signal.fire();
+        assert!(shutdown_was_requested(&shutdown));
+
+        let (signal, shutdown) = reth_ethereum::tasks::shutdown::signal();
+        drop(signal);
+        assert!(!shutdown_was_requested(&shutdown));
+    }
 
     fn cold_pair() -> LivePair {
         let config = CacheConfig::default();
@@ -4823,6 +4894,7 @@ mod tests {
 
             let err = super::super::fail_producer(
                 Some(&mut recorder),
+                None,
                 eyre::eyre!("channel closed"),
                 "the notification stream failed",
             );

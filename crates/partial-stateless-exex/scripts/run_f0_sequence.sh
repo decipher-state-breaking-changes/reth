@@ -26,6 +26,8 @@
 #                            so the forced-restore judge has frames to chain onto
 #     REORG_FLOOR_SECS=3600  outer bound on both waits
 #     ABBA_BLOCKS=300        live verdicts per fsync arm (four arms: A B B A)
+#     ABBA_PATTERN="A B B A" canonical arm order; `A` is allowed only for a bounded shutdown
+#                            diagnostic, never as durability evidence
 #     GATE_WAIT_CHECKPOINT_SECS=3600
 #                            upper bound for the cold warm-up plus checkpoint export, on the
 #                            slowest host in the cohort; readiness is polled, so a generous
@@ -62,6 +64,17 @@ NODE_DATADIR=${NODE_DATADIR:?set NODE_DATADIR to the node datadir this run may t
 NODE_JWT=${NODE_JWT:?set NODE_JWT to the engine JWT secret}
 REORG_WATCH_HOURS=${REORG_WATCH_HOURS:-24}
 ABBA_BLOCKS=${ABBA_BLOCKS:-300}
+read -r -a ABBA_ARMS <<< "${ABBA_PATTERN:-A B B A}"
+if [ "${#ABBA_ARMS[@]}" -eq 0 ]; then
+    echo "ABBA_PATTERN must contain at least one A or B arm" >&2
+    exit 2
+fi
+for letter in "${ABBA_ARMS[@]}"; do
+    [[ "$letter" = A || "$letter" = B ]] || {
+        echo "ABBA_PATTERN contains '$letter'; only A and B are valid" >&2
+        exit 2
+    }
+done
 # The reorg gate's own corpus floor, and how long phase 1 will wait after the reorg to reach it.
 # Must match `run_live_follow_gate.sh`'s reorg-mode GATE_MIN_BLOCKS default, which is what judges
 # the capture; the watcher used to stop as soon as the reorg was seen and hand the judge a corpus
@@ -110,17 +123,78 @@ record() { echo "$*" >> "$RESULTS"; say "RESULT: $*"; }
 # run hands the datadir over. Unset means the cleanup only stops the producer.
 RESTORE_VANILLA=${RESTORE_VANILLA:-}
 CLEANED=0
+ACTIVE_GROUP_PID=
+
+read_pid_file() { # <file>
+    local pid
+    pid=$(sed -n '1p' "$1" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ ]] && printf '%s\n' "$pid"
+}
+
+recorded_pid_matches() { # <pid-file> <producer|janitor>
+    local file=$1 role=$2 pid cmd arm
+    pid=$(read_pid_file "$file") || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    arm=${file%/*}
+    case "$role" in
+        producer) [[ "$cmd" == *"$PRODUCER_BIN"*"node --datadir $NODE_DATADIR"* ]] ;;
+        janitor) [[ "$cmd" == *"while sleep 300; do find '$arm/sidecars'"* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+signal_recorded_pid() { # <pid-file> <producer|janitor>
+    local file=$1 role=$2 pid
+    recorded_pid_matches "$file" "$role" || return 0
+    pid=$(read_pid_file "$file") || return 0
+    kill -TERM "$pid" 2>/dev/null
+}
+
+terminate_process_group() { # <group leader pid>
+    local pid=$1 pgid
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -z "$pgid" ] || [ "$pgid" = "$pid" ]; then
+        # The leader may already have exited while one of its grandchildren remains in the job's
+        # group. The group id remains the leader pid, so signal it even when `ps` finds no leader.
+        kill -TERM -- "-$pid" 2>/dev/null
+    else
+        # Fallback for a shell without monitor mode. `-P` matches only children, never this
+        # caller's command line, and the leader is signalled explicitly afterwards.
+        pkill -TERM -P "$pid" 2>/dev/null
+        kill -TERM "$pid" 2>/dev/null
+    fi
+}
+
 cleanup() {
+    local file any
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
     # Whatever happened — finished, failed, killed — the datadir goes back to the node that had
     # it. A run that dies unattended must not leave the node down until somebody notices.
-    pkill -f "while sleep 300; do find '" 2>/dev/null
-    if pgrep -f "reth-partial-stateless node --datadir" >/dev/null; then
+    if [ -n "${ACTIVE_GROUP_PID:-}" ]; then
+        say "cleanup: stopping active gate/test process group $ACTIVE_GROUP_PID"
+        terminate_process_group "$ACTIVE_GROUP_PID"
+    fi
+    for file in "$BASE"/*/janitor.pid; do
+        [ -f "$file" ] && signal_recorded_pid "$file" janitor
+    done
+    any=0
+    for file in "$BASE"/*/producer.pid; do
+        if [ -f "$file" ] && recorded_pid_matches "$file" producer; then
+            any=1
+            signal_recorded_pid "$file" producer
+        fi
+    done
+    if [ "$any" = 1 ]; then
         say "cleanup: SIGTERM to the producer"
-        pkill -TERM -f "reth-partial-stateless node --datadir" 2>/dev/null
         for _ in $(seq 1 180); do
-            pgrep -f "reth-partial-stateless node --datadir" >/dev/null || break
+            any=0
+            for file in "$BASE"/*/producer.pid; do
+                [ -f "$file" ] && recorded_pid_matches "$file" producer && any=1
+            done
+            [ "$any" = 0 ] && break
             sleep 2
         done
     fi
@@ -129,7 +203,21 @@ cleanup() {
         bash "$RESTORE_VANILLA" >> "$BASE/restore.out" 2>&1
     fi
 }
-trap cleanup EXIT INT TERM
+on_exit() {
+    local status=$?
+    trap - EXIT INT TERM
+    cleanup
+    exit "$status"
+}
+on_signal() { # <128 + signal>
+    local status=$1
+    trap - EXIT INT TERM
+    cleanup
+    exit "$status"
+}
+trap on_exit EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 if pgrep -x reth >/dev/null; then
     if [ "${STOP_VANILLA:-0}" = 1 ]; then
@@ -194,6 +282,7 @@ if [ "$GOVERNOR_COUNT" -ne "$CPU_COUNT" ] || [ "$GOVERNORS" != "$EXPECTED_GOVERN
 fi
 say "base=$BASE"
 say "producer=$PRODUCER_BIN ($(date -r "$PRODUCER_BIN" '+%F %T'))"
+say "replay=$REPLAY_BIN ($(date -r "$REPLAY_BIN" '+%F %T'))"
 say "repo HEAD=$HEAD_COMMIT  clean  governor=${GOVERNORS:-unknown} driver=${SCALING_DRIVER:-unknown}"
 
 # --- helpers ------------------------------------------------------------------------------
@@ -244,13 +333,15 @@ start_producer() { # <arm-dir> <fsync>
 # complete corpus instead of a truncated one.
 stop_producer() { # <arm-dir>
     local arm=$1 pid
-    pkill -f "while sleep 300; do find '$arm/sidecars'" 2>/dev/null
-    pid=$(cat "$arm/producer.pid" 2>/dev/null)
-    [ -n "$pid" ] || return 0
-    kill -0 "$pid" 2>/dev/null || return 0
+    signal_recorded_pid "$arm/janitor.pid" janitor
+    recorded_pid_matches "$arm/producer.pid" producer || return 0
+    pid=$(read_pid_file "$arm/producer.pid") || return 0
     say "SIGTERM -> producer $pid"
     kill -TERM "$pid" 2>/dev/null
-    for _ in $(seq 1 180); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+    for _ in $(seq 1 180); do
+        recorded_pid_matches "$arm/producer.pid" producer || break
+        sleep 2
+    done
     # The one line that says the stream was closed rather than abandoned. It is asserted here,
     # right after the process is gone, because that is the only moment the answer is cheap and
     # unambiguous: later the corpus is judged by a follower that may already have given up on it.
@@ -281,10 +372,14 @@ if [ "${SKIP_REORG:-0}" != "1" ]; then
     # Capture only. This phase's corpus is however many blocks a reorg takes to arrive —
     # 2,890 the last time — and its offline half then re-replays all of them twice, which took 56
     # minutes with the datadir sitting empty behind it. The judging waits until the node is back.
-    ( cd "$SCRIPTS" && GATE_MODE=reorg GATE_FORCE_RESTORE=1 GATE_PHASE=capture \
+    set -m
+    ( cd "$SCRIPTS" && PS_REPLAY_BIN="$REPLAY_BIN" \
+        GATE_MODE=reorg GATE_FORCE_RESTORE=1 GATE_PHASE=capture \
         GATE_WAIT_CHECKPOINT_SECS="$GATE_WAIT_CHECKPOINT_SECS" \
         ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" > "$ARM/gate.out" 2>&1 ) &
     GATE_PID=$!
+    set +m
+    ACTIVE_GROUP_PID=$GATE_PID
     say "gate pid=$GATE_PID  log=$ARM/gate.out (a stale datadir warms cold: ~18 min + export)"
 
     J="$ARM/out/follow.jsonl"
@@ -339,16 +434,15 @@ tail $REORG_TAIL_BLOCKS past the skim at $AFTER_SKIM)"
     while kill -0 "$GATE_PID" 2>/dev/null; do
         if [ "$(date +%s)" -ge "$GATE_JOIN_BY" ]; then
             say "WARNING: the capture gate did not return within ${GATE_JOIN_SECS:-1800}s; killing it"
-            pkill -TERM -P "$GATE_PID" 2>/dev/null
-            kill -TERM "$GATE_PID" 2>/dev/null
+            terminate_process_group "$GATE_PID"
             sleep 15
-            kill -KILL "$GATE_PID" 2>/dev/null
+            kill -KILL -- "-$GATE_PID" 2>/dev/null
             break
         fi
         sleep 10
     done
     wait "$GATE_PID" 2>/dev/null
-    pkill -f "reth-partial-stateless node --datadir" 2>/dev/null
+    ACTIVE_GROUP_PID=
     # The datadir goes back to the node *before* the offline half runs. Both passes read files
     # only, so the node syncs through them instead of waiting an hour to start backfilling.
     if [ "${RESTORE:-1}" = 1 ] && [ -x "$RESTORE_VANILLA" ] && ! pgrep -x reth >/dev/null; then
@@ -357,8 +451,13 @@ tail $REORG_TAIL_BLOCKS past the skim at $AFTER_SKIM)"
         sleep 10
     fi
     say "judging phase 1 offline (batch re-replay, forced restore, render)"
-    ( cd "$SCRIPTS" && GATE_MODE=reorg GATE_PHASE=judge \
-        ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" >> "$ARM/gate.out" 2>&1 )
+    set -m
+    ( cd "$SCRIPTS" && PS_REPLAY_BIN="$REPLAY_BIN" GATE_MODE=reorg GATE_PHASE=judge \
+        ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" >> "$ARM/gate.out" 2>&1 ) &
+    ACTIVE_GROUP_PID=$!
+    set +m
+    wait "$ACTIVE_GROUP_PID" 2>/dev/null
+    ACTIVE_GROUP_PID=
     record "phase1 reorg: watch=$ARMED gate=$(gate_verdict "$ARM") \
 verdicts=$(grep -c '"kind":"verdict"' "$J" 2>/dev/null || echo 0) \
 reorgs=$(grep -c '"kind":"lifecycle"' "$J" 2>/dev/null || echo 0) report=$ARM/out/result.md"
@@ -388,9 +487,9 @@ fi
 # not work: it is bounded by how fast blocks arrive, not by this host.
 
 if [ "${SKIP_ABBA:-0}" != "1" ]; then
-    say "=== phase 2: fsync ABBA, ${ABBA_BLOCKS} live verdicts per arm ==="
+    say "=== phase 2: fsync arms ${ABBA_ARMS[*]}, ${ABBA_BLOCKS} live verdicts per arm ==="
     INDEX=0
-    for LETTER in A B B A; do
+    for LETTER in "${ABBA_ARMS[@]}"; do
         INDEX=$((INDEX + 1))
         ARM="$BASE/fsync-$INDEX$LETTER"
         if [ "$LETTER" = B ]; then FSYNC=1; EXTRA=(--ack-fsync); else FSYNC=0; EXTRA=(); fi
@@ -405,22 +504,27 @@ if [ "${SKIP_ABBA:-0}" != "1" ]; then
         # matter: the follower is a grandchild and outlives a bare SIGTERM to the subshell.
         CAPTURE_SECS=${GATE_CAPTURE_SECS:-$(( GATE_WAIT_CHECKPOINT_SECS + ABBA_BLOCKS * 15 + 1800 ))}
         CAPTURE_RC=0
+        set -m
         ( cd "$SCRIPTS" && timeout -k 60 --foreground "$CAPTURE_SECS" env \
+            PS_REPLAY_BIN="$REPLAY_BIN" \
             GATE_MODE=long GATE_MIN_BLOCKS="$ABBA_BLOCKS" GATE_REQUIRE_LIVE=1 \
             GATE_WAIT_CHECKPOINT_SECS="$GATE_WAIT_CHECKPOINT_SECS" \
             GATE_PHASE=capture GATE_PRODUCER_PID="$PID" \
             ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" "${EXTRA[@]}" \
-            > "$ARM/gate.out" 2>&1 ) || CAPTURE_RC=$?
+            > "$ARM/gate.out" 2>&1 ) &
+        ACTIVE_GROUP_PID=$!
+        set +m
+        wait "$ACTIVE_GROUP_PID" || CAPTURE_RC=$?
+        CAPTURE_GROUP_PID=$ACTIVE_GROUP_PID
+        ACTIVE_GROUP_PID=
         if [ "$CAPTURE_RC" -ge 124 ]; then
             say "WARNING: arm $INDEX$LETTER capture hit the ${CAPTURE_SECS}s bound (rc=$CAPTURE_RC)"
             echo "==> GATE FAILED (capture exceeded ${CAPTURE_SECS}s)" >> "$ARM/gate.out"
         fi
-        # The follower is a grandchild of the subshell, so it survives the timeout that killed
-        # its parent. Left alive it would hold the next arm's spool reader slot and its own file
-        # handles on a directory the next arm is about to recreate.
-        [ "$CAPTURE_RC" -ne 0 ] && pkill -f -- "--follow $ARM/spool" 2>/dev/null
+        # A failed parent may leave the follower alive. The whole asynchronous job was put in its
+        # own process group, so clean that exact group without matching any caller command line.
+        [ "$CAPTURE_RC" -ne 0 ] && terminate_process_group "$CAPTURE_GROUP_PID"
         stop_producer "$ARM"
-        pkill -f "reth-partial-stateless node --datadir" 2>/dev/null
         # Same rule as phase 1, for the same reason and at a smaller scale: the offline half reads
         # files only, so the node holds the datadir through it rather than the chain running away
         # from an empty one.
@@ -428,8 +532,13 @@ if [ "${SKIP_ABBA:-0}" != "1" ]; then
             bash "$RESTORE_VANILLA" >> "$BASE/restore.out" 2>&1
             sleep 10
         fi
-        ( cd "$SCRIPTS" && GATE_MODE=long GATE_PHASE=judge \
-            ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" >> "$ARM/gate.out" 2>&1 )
+        set -m
+        ( cd "$SCRIPTS" && PS_REPLAY_BIN="$REPLAY_BIN" GATE_MODE=long GATE_PHASE=judge \
+            ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" >> "$ARM/gate.out" 2>&1 ) &
+        ACTIVE_GROUP_PID=$!
+        set +m
+        wait "$ACTIVE_GROUP_PID" 2>/dev/null
+        ACTIVE_GROUP_PID=
         record "phase2 arm$INDEX$LETTER: fsync=$FSYNC gate=$(gate_verdict "$ARM") \
 report=$ARM/out/result.md"
         if pgrep -x reth >/dev/null; then
@@ -457,11 +566,17 @@ if [ "${SKIP_MUTATIONS:-0}" != 1 ] && [ -d "${MUTATION_SPOOL:-}" ]; then
     # an unattributable artifact. Phase 3 is last; F1 still performs the runbook's explicit
     # canonical rebuild to restore its declared feature/hash identity.
     LOCK_SHA256=$(sha256sum "$REPO/Cargo.lock" | cut -d' ' -f1)
+    set -m
     ( cd "$REPO" && PS_BUILD_COMMIT="$HEAD_COMMIT" PS_BUILD_DIRTY=0 \
         PS_CARGO_LOCK_SHA256="$LOCK_SHA256" PS_MUTATION_FIXTURE_SPOOL="$MUTATION_SPOOL" \
         cargo test --release -p partial-stateless-replay --test transition_mutations \
-        -- --ignored --test-threads=1 > "$BASE/mutations.log" 2>&1 )
-    record "phase3 mutations: $([ $? -eq 0 ] && echo PASSED || echo FAILED) \
+        -- --ignored --test-threads=1 > "$BASE/mutations.log" 2>&1 ) &
+    ACTIVE_GROUP_PID=$!
+    set +m
+    MUTATION_RC=0
+    wait "$ACTIVE_GROUP_PID" || MUTATION_RC=$?
+    ACTIVE_GROUP_PID=
+    record "phase3 mutations: $([ "$MUTATION_RC" -eq 0 ] && echo PASSED || echo FAILED) \
 spool=$MUTATION_SPOOL log=$BASE/mutations.log"
 else
     record "phase3 mutations: SKIPPED (no recorded spool at ${MUTATION_SPOOL:-<none>})"
@@ -470,39 +585,7 @@ fi
 # --- summary --------------------------------------------------------------------------------
 
 say "=== summary ==="
-python3 - "$BASE" <<'PY'
-import json, pathlib, sys
-base = pathlib.Path(sys.argv[1])
-rows = []
-for dist in sorted(base.glob("*/out/distributions.json")):
-    arm = dist.parent.parent.name
-    try:
-        data = json.loads(dist.read_text())
-    except Exception as err:
-        rows.append((arm, f"unreadable: {err}", "", "", "", ""))
-        continue
-    summary = (data.get("follow") or {}).get("summary") or {}
-    steady = ((data.get("follow") or {}).get("populations") or {}).get("phase:steady") or {}
-    metrics = steady.get("metrics") or {}
-    def p50(name):
-        row = metrics.get(name)
-        return f"{row['p50']:,.0f}" if row else "—"
-    ack = summary.get("ack_write_us") or {}
-    rows.append((
-        arm,
-        str(summary.get("blocks_verified")),
-        f"{summary.get('reorgs_applied')}/{summary.get('reverts_applied')}",
-        p50("standalone_validation_us"),
-        p50("decision_latency_us[mtime]"),
-        f"{ack.get('p50', '—')}",
-    ))
-header = ("arm", "blocks", "reorg/revert", "primary p50 us", "latency p50 us", "ack write p50 us")
-widths = [max(len(str(r[i])) for r in ([header] + rows)) for i in range(len(header))]
-line = lambda r: "  ".join(str(c).ljust(w) for c, w in zip(r, widths))
-print(line(header)); print("  ".join("-" * w for w in widths))
-for row in rows:
-    print(line(row))
-PY
+python3 "$SCRIPTS/summarize_f0.py" "$BASE"
 echo
 cat "$RESULTS"
 say "done — results in $BASE"

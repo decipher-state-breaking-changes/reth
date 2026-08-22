@@ -724,7 +724,11 @@ impl StreamRecorder {
             return
         }
         let end = End { kind, reason: reason.into(), last_sequence: self.sequence - 1 };
+        let sequence_before = self.sequence;
         self.write_event(&StreamEvent::End(end));
+        if self.poisoned || self.sequence != sequence_before.saturating_add(1) {
+            return
+        }
         self.ended = true;
         info!(
             target: "partial_stateless_stream",
@@ -906,21 +910,28 @@ pub enum CommitDisposition {
 }
 
 impl Drop for StreamRecorder {
-    /// Closes the stream when nothing else did.
+    /// Closes the stream when reth drops the ExEx future or panic unwinding reaches the recorder.
     ///
-    /// A backstop, not the shutdown path. Reth `select`s every spawned task against the shutdown
-    /// signal and drops the loser, so this destructor does run on SIGTERM — but an ExEx is not a
-    /// graceful task, so nothing waits for it, and both the shutdown and the runtime drop behind
-    /// it are capped at five seconds the exiting process does not join. A SATA host lost that
-    /// race on 2026-08-22. The ExEx now closes explicitly under a graceful-shutdown guard
-    /// (`partial_stateless_exex`), and `write_end` is idempotent, so reaching here at all means
-    /// something skipped that path. A panic unwinding through here is a producer fault, not a
-    /// shutdown, and the frame says so; `write` converts I/O failure into poisoning rather than
-    /// panicking, so this cannot double-panic.
+    /// This is the normal requested-shutdown path: reth `select`s every spawned task against the
+    /// shutdown signal and drops the ExEx future before code after its notification loop can run.
+    /// A companion graceful task keeps the node alive until `write_end` returns. Explicit closes
+    /// still cover classified error returns and a notification stream that drains on its own, and
+    /// idempotence keeps those kinds and reasons intact. Panic unwinding is a producer fault, not
+    /// a shutdown; `write` converts I/O failure into poisoning rather than panicking, so this
+    /// cannot double-panic.
     fn drop(&mut self) {
-        let kind =
-            if std::thread::panicking() { EndKind::ProducerFault } else { EndKind::Shutdown };
-        self.write_end(kind, "recorder dropped before the stream was explicitly closed");
+        let (kind, reason) = if std::thread::panicking() {
+            (
+                EndKind::ProducerFault,
+                "stream recorder dropped while the producer was unwinding after a panic",
+            )
+        } else {
+            (
+                EndKind::Shutdown,
+                "node shutdown dropped the ExEx future; the stream recorder closed it",
+            )
+        };
+        self.write_end(kind, reason);
     }
 }
 
@@ -1359,6 +1370,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A failed End write is a cut stream. It must not enter the ended state that backs the
+    /// `Closed the event stream` summary consumed by the F0 harness.
+    #[test]
+    fn a_failed_end_write_is_not_reported_as_a_closed_stream() {
+        let dir = spool_dir("end-write-failed");
+        let mut recorder = recorder(&dir);
+        recorder
+            .write_manifest(1, B256::ZERO, B256::with_last_byte(0x44), 60, 30)
+            .expect("a fresh spool takes a manifest");
+        let sequence_before = recorder.sequence;
+
+        fs::remove_dir_all(&dir).expect("remove spool before End");
+        recorder.write_end(EndKind::Shutdown, "shutdown");
+
+        assert!(recorder.poisoned, "the failed End poisons the recorder");
+        assert!(!recorder.ended, "a stream with no End frame was marked closed");
+        assert_eq!(recorder.sequence, sequence_before, "the failed frame advanced sequence");
+        fs::create_dir_all(&dir).expect("recreate for drop");
+        drop(recorder);
+        assert!(frames_in(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Decodes the last frame of the spool as an `End`, with the header sequence beside it.
     fn last_end(dir: &Path) -> (u64, End) {
         let (sequence, kind) = *frames_in(dir).last().expect("spool is not empty");
@@ -1385,6 +1419,10 @@ mod tests {
 
         let (sequence, end) = last_end(&dir);
         assert_eq!(end.kind, EndKind::Shutdown);
+        assert_eq!(
+            end.reason,
+            "node shutdown dropped the ExEx future; the stream recorder closed it"
+        );
         assert_eq!(end.last_sequence + 1, sequence, "the End frame names its predecessor");
         let ends = frames_in(&dir).iter().filter(|(_, kind)| *kind == FrameKind::End).count();
         assert_eq!(ends, 1, "exactly one End frame");
@@ -1437,6 +1475,10 @@ mod tests {
 
         let (_, end) = last_end(&dir);
         assert_eq!(end.kind, EndKind::ProducerFault);
+        assert_eq!(
+            end.reason,
+            "stream recorder dropped while the producer was unwinding after a panic"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

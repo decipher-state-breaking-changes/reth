@@ -15,7 +15,13 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 LAUNCHER=${LAUNCHER:-$REPO/crates/partial-stateless-exex/scripts/run_f0_sequence.sh}
 WORK=$(mktemp -d)
-trap 'pkill -f "while sleep 300; do find .$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+cleanup_test() {
+    local pid
+    pid=$(sed -n '1p' "$WORK/arm/janitor.pid" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ ]] && kill -TERM "$pid" 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup_test EXIT
 
 cat > "$WORK/stub" <<'STUB'
 #!/usr/bin/env bash
