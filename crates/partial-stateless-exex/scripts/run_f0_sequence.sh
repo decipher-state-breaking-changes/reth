@@ -41,6 +41,13 @@
 #     NODE_DATADIR=<dir>     the node datadir all three phases take turns holding (required)
 #     NODE_JWT=<file>        the engine JWT secret (required)
 #     RESTORE_VANILLA=<file> optional script the cleanup runs to put the ordinary node back
+#     GATE_JOIN_SECS=N       phase 1: outer bound on waiting for the capture gate to return
+#                            (default 1800). Nothing should reach it — the gate's own
+#                            GATE_END_GRACE_SECS fires first — but no single accident may
+#                            hold the phase and the datadir open indefinitely.
+#     GATE_CAPTURE_SECS=N    phase 2: same bound per arm (default the readiness ceiling +
+#                            15 s per requested verdict + 1800 s of slack). An arm that
+#                            exceeds it is recorded FAILED and the sequence moves on.
 set -uo pipefail
 
 REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -244,6 +251,12 @@ stop_producer() { # <arm-dir>
     say "SIGTERM -> producer $pid"
     kill -TERM "$pid" 2>/dev/null
     for _ in $(seq 1 180); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+    # The one line that says the stream was closed rather than abandoned. It is asserted here,
+    # right after the process is gone, because that is the only moment the answer is cheap and
+    # unambiguous: later the corpus is judged by a follower that may already have given up on it.
+    if [ -f "$arm/producer.out" ] && ! grep -q "Closed the event stream" "$arm/producer.out"; then
+        say "WARNING: producer $pid exited without closing the stream — $arm is truncated"
+    fi
 }
 
 gate_verdict() { # <arm-dir> -> PASSED | FAILED | UNKNOWN
@@ -317,6 +330,23 @@ tail $REORG_TAIL_BLOCKS past the skim at $AFTER_SKIM)"
     say "phase 1 watch ended: $ARMED"
     stop_producer "$ARM"
     say "waiting for the follower to consume the End"
+    # Bounded, for the reason in run_live_follow_gate.sh: a producer that exits without writing
+    # `End` leaves the follower waiting on a terminator that will never arrive, and an unbounded
+    # `wait` here would hand the whole phase — and the datadir — to that one accident. The gate's
+    # own grace period fires first and fails the arm; this is the outer stop for anything else
+    # that could wedge the capture half.
+    GATE_JOIN_BY=$(( $(date +%s) + ${GATE_JOIN_SECS:-1800} ))
+    while kill -0 "$GATE_PID" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$GATE_JOIN_BY" ]; then
+            say "WARNING: the capture gate did not return within ${GATE_JOIN_SECS:-1800}s; killing it"
+            pkill -TERM -P "$GATE_PID" 2>/dev/null
+            kill -TERM "$GATE_PID" 2>/dev/null
+            sleep 15
+            kill -KILL "$GATE_PID" 2>/dev/null
+            break
+        fi
+        sleep 10
+    done
     wait "$GATE_PID" 2>/dev/null
     pkill -f "reth-partial-stateless node --datadir" 2>/dev/null
     # The datadir goes back to the node *before* the offline half runs. Both passes read files
@@ -367,11 +397,28 @@ if [ "${SKIP_ABBA:-0}" != "1" ]; then
         say "--- arm $INDEX$LETTER: PS_STREAM_FSYNC=$FSYNC ${EXTRA[*]:-(no ack fsync)} ---"
         PID=$(start_producer "$ARM" "$FSYNC")
         say "producer pid=$PID"
-        ( cd "$SCRIPTS" && GATE_MODE=long GATE_MIN_BLOCKS="$ABBA_BLOCKS" GATE_REQUIRE_LIVE=1 \
+        # `timeout` on the capture half, because an arm that never returns costs more than an arm
+        # that fails: on 2026-08-22 one producer exited without its `End`, the follower waited for
+        # it by design, and the arm took the remaining phases and three hours of node downtime
+        # with it. The bound is the readiness ceiling plus the arm's own chain-paced length plus
+        # slack, so it cannot fire on a run that is merely slow. `--foreground` and the group kill
+        # matter: the follower is a grandchild and outlives a bare SIGTERM to the subshell.
+        CAPTURE_SECS=${GATE_CAPTURE_SECS:-$(( GATE_WAIT_CHECKPOINT_SECS + ABBA_BLOCKS * 15 + 1800 ))}
+        CAPTURE_RC=0
+        ( cd "$SCRIPTS" && timeout -k 60 --foreground "$CAPTURE_SECS" env \
+            GATE_MODE=long GATE_MIN_BLOCKS="$ABBA_BLOCKS" GATE_REQUIRE_LIVE=1 \
             GATE_WAIT_CHECKPOINT_SECS="$GATE_WAIT_CHECKPOINT_SECS" \
             GATE_PHASE=capture GATE_PRODUCER_PID="$PID" \
             ./run_live_follow_gate.sh "$ARM/spool" "$ARM/out" "${EXTRA[@]}" \
-            > "$ARM/gate.out" 2>&1 )
+            > "$ARM/gate.out" 2>&1 ) || CAPTURE_RC=$?
+        if [ "$CAPTURE_RC" -ge 124 ]; then
+            say "WARNING: arm $INDEX$LETTER capture hit the ${CAPTURE_SECS}s bound (rc=$CAPTURE_RC)"
+            echo "==> GATE FAILED (capture exceeded ${CAPTURE_SECS}s)" >> "$ARM/gate.out"
+        fi
+        # The follower is a grandchild of the subshell, so it survives the timeout that killed
+        # its parent. Left alive it would hold the next arm's spool reader slot and its own file
+        # handles on a directory the next arm is about to recreate.
+        [ "$CAPTURE_RC" -ne 0 ] && pkill -f -- "--follow $ARM/spool" 2>/dev/null
         stop_producer "$ARM"
         pkill -f "reth-partial-stateless node --datadir" 2>/dev/null
         # Same rule as phase 1, for the same reason and at a smaller scale: the offline half reads

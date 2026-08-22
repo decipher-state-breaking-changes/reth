@@ -909,6 +909,36 @@ where
     // whole run re-executing windows that never install.
     let mut rebuild_failures = 0u32;
 
+    // The `End` frame must not depend on a destructor racing process exit.
+    //
+    // reth spawns an ExEx with `spawn_critical_task`, which wraps it in `select(on_shutdown,
+    // task)` and does **not** register it as a graceful task. So on SIGTERM nothing waits for
+    // this future: `graceful_shutdown_with_timeout` counts only graceful tasks, and the runtime
+    // drop that would otherwise run our destructor is itself capped at five seconds on a detached
+    // thread the exiting process does not join. Closing the stream from `Drop` therefore had a
+    // deadline no one enforced, and on 2026-08-22 a SATA host lost that race once in five arms:
+    // the producer logged `Received SIGTERM` and exited with the spool's last frame a commit,
+    // which is exactly what an abrupt kill is defined to look like. Every consumer of that corpus
+    // then waited for an `End` that would never come.
+    //
+    // This companion task fixes the ordering rather than widening the window. Its guard is taken
+    // at spawn, so the node's graceful shutdown blocks on it from the start; it wakes on the
+    // shutdown signal, tells the loop below to close, and releases only once the `End` is on
+    // disk. If the loop is wedged the node still leaves after its own five seconds — no worse
+    // than before, and now the missing close is a diagnosable state rather than a silent one.
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
+        "partial-stateless stream closer",
+        move |shutdown| async move {
+            let _guard = shutdown.await;
+            let _ = close_tx.send(());
+            let _ = closed_rx.await;
+        },
+    );
+    let mut closed_tx = Some(closed_tx);
+    let mut signalled_close = false;
+
     loop {
         // Every `?`-shaped exit from this loop must classify itself first: the recorder's drop
         // cannot tell an error return from reth dropping the future at shutdown — both run the
@@ -917,40 +947,55 @@ where
         // While an export is in flight, completion must publish on its own clock: waiting for the
         // next notification would quantize checkpoint publication to block cadence, and a quiet
         // chain (or a pure revert with nothing behind it) would hold a finished checkpoint
-        // unpublished indefinitely. `try_next` on the notification channel is cancel-safe, so the
-        // timeout drops nothing.
+        // unpublished indefinitely. `try_next` on the notification channel is cancel-safe, so
+        // neither the timeout nor the shutdown arm below drops anything.
+        // `biased` so a pending shutdown always wins a notification that arrived on the same
+        // wake: one more block is worth less than a closed stream, and that block is still on the
+        // chain to be re-derived.
         let notification = if matches!(gate.job, ExportJob::InFlight { .. }) {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(EXPORT_COMPLETION_TICK_MS),
-                ctx.notifications.try_next(),
-            )
-            .await
-            {
-                Err(_tick) => {
-                    poll_export_job(&options, &mut gate, &mut recorder.as_mut());
-                    continue
+            tokio::select! {
+                biased;
+                _ = &mut close_rx => {
+                    signalled_close = true;
+                    break
                 }
-                Ok(Ok(Some(notification))) => notification,
-                Ok(Ok(None)) => break,
-                Ok(Err(err)) => {
-                    return Err(fail_producer(
-                        recorder.as_mut(),
-                        err,
-                        "the notification stream failed",
-                    ))
-                }
+                ticked = tokio::time::timeout(
+                    std::time::Duration::from_millis(EXPORT_COMPLETION_TICK_MS),
+                    ctx.notifications.try_next(),
+                ) => match ticked {
+                    Err(_tick) => {
+                        poll_export_job(&options, &mut gate, &mut recorder.as_mut());
+                        continue
+                    }
+                    Ok(Ok(Some(notification))) => notification,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(err)) => {
+                        return Err(fail_producer(
+                            recorder.as_mut(),
+                            err,
+                            "the notification stream failed",
+                        ))
+                    }
+                },
             }
         } else {
-            match ctx.notifications.try_next().await {
-                Ok(Some(notification)) => notification,
-                Ok(None) => break,
-                Err(err) => {
-                    return Err(fail_producer(
-                        recorder.as_mut(),
-                        err,
-                        "the notification stream failed",
-                    ))
+            tokio::select! {
+                biased;
+                _ = &mut close_rx => {
+                    signalled_close = true;
+                    break
                 }
+                next = ctx.notifications.try_next() => match next {
+                    Ok(Some(notification)) => notification,
+                    Ok(None) => break,
+                    Err(err) => {
+                        return Err(fail_producer(
+                            recorder.as_mut(),
+                            err,
+                            "the notification stream failed",
+                        ))
+                    }
+                },
             }
         };
         match &notification {
@@ -1219,20 +1264,33 @@ where
         }
     }
 
-    // The notification stream ended, which is a clean shutdown. Reth's SIGTERM path never returns
-    // from the loop above — it drops this future — so the recorder's own drop is what closes the
-    // stream there; this explicit call only covers the stream draining on its own.
+    // Both ways out of the loop above are orderly, and both close here rather than in a
+    // destructor: the notification stream draining on its own, and the node's shutdown signal
+    // reaching the closer task. The reason distinguishes them because only the first means the
+    // chain stopped feeding us.
+    let reason =
+        if signalled_close { "node shutdown signal" } else { "exex notification stream ended" };
     if let Some(recorder) = recorder.as_mut() {
-        recorder.write_end(EndKind::Shutdown, "exex notification stream ended");
+        recorder.write_end(EndKind::Shutdown, reason);
     }
     // A capture that stopped short of its budget still gets a terminator, and the terminator says
     // it stopped short. The alternative is a dataset directory that reads as incomplete forever,
     // which is indistinguishable from one whose producer crashed.
     if let Some(dataset) = dataset.as_mut() {
-        dataset.close(
-            partial_stateless::DatasetEndKind::ProducerShutdown,
-            "exex notification stream ended".to_string(),
-        );
+        dataset.close(partial_stateless::DatasetEndKind::ProducerShutdown, reason.to_string());
+    }
+    // Only now may the node finish shutting down: the guard the closer holds is what keeps the
+    // process alive past this point, and releasing it before the `End` is on disk would restore
+    // the very race this exists to remove.
+    if let Some(closed) = closed_tx.take() {
+        let _ = closed.send(());
+    }
+    // Returning `Ok` here makes reth panic with "ExEx finished" by design, which is right when the
+    // stream drained on its own and wrong when we were told to stop: a shutdown that reports a
+    // panicked critical task is a false alarm in the logs and in the exit status. On that path the
+    // process is already leaving, so park and let reth's own `select` drop this future.
+    if signalled_close {
+        std::future::pending::<()>().await
     }
 
     Ok(())

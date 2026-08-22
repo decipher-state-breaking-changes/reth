@@ -75,6 +75,11 @@
 #     GATE_PRODUCER_PID=P   long only: the producer to SIGTERM when the live target is reached.
 #     GATE_REQUIRE_LIVE=1   long only: fail unless live (tail_live) verdicts >= GATE_MIN_BLOCKS.
 #     GATE_WATCH_SECS=N     long only: watcher poll interval (default 15).
+#     GATE_END_GRACE_SECS=N long only: how long to keep waiting for the producer's End after
+#                           the producer process itself is gone (default 300). Past it the
+#                           follower is abandoned and the corpus judged truncated, so a
+#                           producer that died without closing fails its arm instead of
+#                           holding the gate open indefinitely.
 #     GATE_MIN_BLOCKS=N     minimum verified blocks (default 100 clean, 6000 long, 1 truncated).
 #     GATE_PHASE=capture    run only the online half: everything up to the follower's exit, then
 #                           stop. The datadir is free the moment this returns, so the node that
@@ -387,6 +392,31 @@ if [ "$GATE_MODE" = "long" ]; then
             else
                 echo "==> $LIVE_VERDICTS live verdicts: target reached — SIGTERM the producer now;"
                 echo "    the follower exits when it consumes the End(shutdown) the producer writes"
+            fi
+        fi
+        # An `End` that never comes must not hold this gate open forever.
+        #
+        # The producer writes `End` from its own shutdown path, but nothing outside this process
+        # tree guarantees it ran: reth does not register an ExEx as a graceful task, so on
+        # 2026-08-22 a SATA host exited on SIGTERM with the spool's last frame a commit, and the
+        # follower — correctly, by long mode's own rules — waited for a terminator that did not
+        # exist. It waited nearly four hours, taking the arm, the phase behind it and the node's
+        # datadir with it. The producer-side fix removes the race; this removes the dependence.
+        #
+        # The bound starts only once the producer is gone, so a slow chain still gets all the time
+        # it wants. What follows is a real failure — the assertions below refuse an unclosed
+        # corpus — and failing an arm is the outcome this is for. Silently hanging is not.
+        if [ "$signaled" -eq 1 ] && [ -n "${GATE_PRODUCER_PID:-}" ] &&
+           ! kill -0 "$GATE_PRODUCER_PID" 2>/dev/null; then
+            END_DEADLINE=${END_DEADLINE:-$(( $(date +%s) + ${GATE_END_GRACE_SECS:-300} ))}
+            if [ "$(date +%s)" -ge "$END_DEADLINE" ]; then
+                echo "warning: producer $GATE_PRODUCER_PID exited without closing the stream;" >&2
+                echo "         no End reached the follower in ${GATE_END_GRACE_SECS:-300}s." >&2
+                echo "==> abandoning the follower; this corpus is truncated and the assertions say so"
+                kill -TERM "$follow_pid" 2>/dev/null
+                for _ in $(seq 1 30); do kill -0 "$follow_pid" 2>/dev/null || break; sleep 1; done
+                kill -KILL "$follow_pid" 2>/dev/null
+                break
             fi
         fi
         sleep "${GATE_WATCH_SECS:-15}"

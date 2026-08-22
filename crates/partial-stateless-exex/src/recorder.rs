@@ -864,12 +864,15 @@ pub enum CommitDisposition {
 impl Drop for StreamRecorder {
     /// Closes the stream when nothing else did.
     ///
-    /// Reth's shutdown drops the ExEx future while the process is still alive — every spawned
-    /// task is `select`ed against the shutdown signal — so this is what turns a SIGTERM into an
-    /// `End` frame. Only an abrupt kill skips it, and an abruptly killed stream is exactly what a
-    /// missing `End` frame is defined to mean. A panic unwinding through here is a producer
-    /// fault, not a shutdown, and the frame says so; `write` converts I/O failure into poisoning
-    /// rather than panicking, so this cannot double-panic.
+    /// A backstop, not the shutdown path. Reth `select`s every spawned task against the shutdown
+    /// signal and drops the loser, so this destructor does run on SIGTERM — but an ExEx is not a
+    /// graceful task, so nothing waits for it, and both the shutdown and the runtime drop behind
+    /// it are capped at five seconds the exiting process does not join. A SATA host lost that
+    /// race on 2026-08-22. The ExEx now closes explicitly under a graceful-shutdown guard
+    /// (`partial_stateless_exex`), and `write_end` is idempotent, so reaching here at all means
+    /// something skipped that path. A panic unwinding through here is a producer fault, not a
+    /// shutdown, and the frame says so; `write` converts I/O failure into poisoning rather than
+    /// panicking, so this cannot double-panic.
     fn drop(&mut self) {
         let kind =
             if std::thread::panicking() { EndKind::ProducerFault } else { EndKind::Shutdown };
