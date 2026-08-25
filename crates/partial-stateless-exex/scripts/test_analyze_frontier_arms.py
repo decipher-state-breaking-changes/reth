@@ -29,7 +29,10 @@ from analyze_frontier_arms import (  # noqa: E402
     analyze,
     as_two_arms,
     break_even,
+    delta_total_ms,
+    endpoints,
     load_run,
+    population_crossover,
     rotation_balance,
     self_check,
 )
@@ -50,6 +53,17 @@ def policy(arm, slot, *, us=100_000, decode_us=1_000, size=1_000_000, zstd=None,
     if zstd is not None:
         record["sidecar_zstd_bytes"] = zstd
     return record
+
+
+# The two passes a real campaign produces: one binary, one corpus, one flag apart. Spelled out
+# because the analyzer now checks that claim, and a fixture that omits it is testing a refusal it
+# did not mean to trigger.
+TIMING_SUMMARY = {
+    "allocator": "jemalloc",
+    "generator_build_commit": "deadbeef",
+    "measured_block_set_digest": "0xcorpus",
+}
+SIZE_SUMMARY = dict(TIMING_SUMMARY, compressed_sidecars=True, sidecar_zstd_level=3)
 
 
 def synthetic(count=400, *, weak_us=100_000, cand_us=125_000, weak_zstd=None, cand_zstd=None,
@@ -88,13 +102,18 @@ class RotationBalance(unittest.TestCase):
             run["arms"]["weak"][number]["rotation_slot"] = 0
         self.assertFalse(rotation_balance(run["arms"])["balanced"])
 
-    def test_a_small_skew_is_still_not_balanced(self):
-        """The tolerance is loose but it is not a licence: a real imbalance is structural."""
+    def test_an_even_population_must_be_exactly_balanced(self):
+        """400 blocks over 2 arms lands on exactly 200/200; anything else is a defect."""
         run = synthetic()
         numbers = sorted(run["arms"]["weak"])
-        for number in numbers[:60]:
-            run["arms"]["weak"][number]["rotation_slot"] = 0
-        self.assertFalse(rotation_balance(run["arms"])["balanced"])
+        run["arms"]["weak"][numbers[0]]["rotation_slot"] = 0
+        run["arms"]["weak"][numbers[1]]["rotation_slot"] = 0
+        result = rotation_balance(run["arms"])
+        self.assertFalse(result["balanced"])
+        self.assertFalse(result["exact"])
+
+    def test_an_exactly_balanced_run_says_so(self):
+        self.assertTrue(rotation_balance(synthetic()["arms"])["exact"])
 
 
 class LatencyRefusals(unittest.TestCase):
@@ -138,12 +157,23 @@ class Pairing(unittest.TestCase):
         report = analyze(run, None, "weak", "90/60")
         self.assertAlmostEqual(report["latency"][PRIMARY]["median_ratio"], 1.25, delta=0.03)
 
-    def test_blocks_only_one_arm_saw_are_counted_not_dropped_silently(self):
+    def test_blocks_only_one_arm_saw_refuse_the_whole_report(self):
+        """Every arm rotates over every measured block; a gap means the run is inconsistent."""
         run = synthetic(count=100)
         del run["arms"]["90/60"][1099]
         report = analyze(run, None, "weak", "90/60")
-        self.assertEqual(report["paired_blocks"], 99)
         self.assertEqual(report["baseline_only"], 1)
+        self.assertTrue(report["integrity_refusals"])
+        self.assertIsNone(report["latency"])
+        self.assertIsNone(report["bytes"]["sidecar_bytes"])
+        self.assertIsNone(report["break_even"])
+
+    def test_a_block_missing_its_hash_refuses_too(self):
+        run = synthetic(count=100)
+        run["blocks"][1050]["block_hash"] = None
+        report = analyze(run, None, "weak", "90/60")
+        self.assertEqual(report["refused"], 1)
+        self.assertIsNone(report["latency"])
 
     def test_interval_is_wider_than_an_iid_one_would_be(self):
         """Serially correlated blocks: the moving-block interval must not read as narrow."""
@@ -166,8 +196,8 @@ class Pairing(unittest.TestCase):
 
 class SizePass(unittest.TestCase):
     def test_two_pass_digest_mismatch_refuses_compressed_numbers(self):
-        timing = synthetic()
-        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000)
+        timing = synthetic(summary=TIMING_SUMMARY)
+        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000, summary=SIZE_SUMMARY)
         for number in sizes["arms"]["weak"]:
             sizes["arms"]["weak"][number]["sidecar_digest"] = "0xdifferent"
         report = analyze(timing, sizes, "weak", "90/60")
@@ -175,9 +205,8 @@ class SizePass(unittest.TestCase):
         self.assertIn("not describing the same objects", report["compressed_refused_because"])
 
     def test_matching_two_pass_reports_compressed_ratio(self):
-        timing = synthetic()
-        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000,
-                          summary={"sidecar_zstd_level": 3})
+        timing = synthetic(summary=TIMING_SUMMARY)
+        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000, summary=SIZE_SUMMARY)
         report = analyze(timing, sizes, "weak", "90/60")
         self.assertAlmostEqual(report["compressed"]["sidecar_zstd_bytes"]["median_ratio"], 0.2)
         self.assertEqual(report["compressed"]["zstd_level"], 3)
@@ -185,7 +214,8 @@ class SizePass(unittest.TestCase):
     def test_compressed_ratio_differs_from_uncompressed_when_arms_compress_unequally(self):
         """The whole reason to measure this: equal byte ratios do not survive compression."""
         sizes = synthetic(weak_size=7_500_000, cand_size=1_500_000,
-                          weak_zstd=3_000_000, cand_zstd=1_000_000)
+                          weak_zstd=3_000_000, cand_zstd=1_000_000,
+                          summary={"sidecar_zstd_level": 3})
         report = analyze(sizes, None, "weak", "90/60")
         self.assertAlmostEqual(report["bytes"]["sidecar_bytes"]["median_ratio"], 0.2)
         self.assertAlmostEqual(report["compressed"]["sidecar_zstd_bytes"]["median_ratio"], 1 / 3)
@@ -194,6 +224,102 @@ class SizePass(unittest.TestCase):
         report = analyze(synthetic(), None, "weak", "90/60")
         self.assertIsNone(report["compressed"])
         self.assertIn("no run recorded", report["compressed_refused_because"])
+
+    def test_partial_zstd_coverage_refuses_rather_than_using_the_subset(self):
+        """Compressibility varies with composition, so a partial subset is not a sample."""
+        run = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000,
+                        summary={"sidecar_zstd_level": 3})
+        for number in list(run["arms"]["weak"])[:100]:
+            del run["arms"]["weak"][number]["sidecar_zstd_bytes"]
+        report = analyze(run, None, "weak", "90/60")
+        self.assertIsNone(report["compressed"])
+        self.assertIn("not a sample of the population", report["compressed_refused_because"])
+
+    def test_compressed_sizes_without_a_recorded_level_are_refused(self):
+        run = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000, summary={})
+        report = analyze(run, None, "weak", "90/60")
+        self.assertIsNone(report["compressed"])
+        self.assertIn("no zstd level", report["compressed_refused_because"])
+
+    def test_two_passes_from_different_builds_are_refused(self):
+        timing = synthetic(summary={"generator_build_commit": "aaa", "allocator": "jemalloc"})
+        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000, summary={
+            "generator_build_commit": "bbb", "allocator": "jemalloc",
+            "compressed_sidecars": True, "sidecar_zstd_level": 3,
+        })
+        report = analyze(timing, sizes, "weak", "90/60")
+        self.assertIsNone(report["compressed"])
+        self.assertIn("generator_build_commit", report["compressed_refused_because"])
+
+    def test_a_size_pass_that_did_not_compress_is_refused(self):
+        timing = synthetic(summary={"allocator": "jemalloc"})
+        sizes = synthetic(weak_zstd=5_000_000, cand_zstd=1_000_000,
+                          summary={"allocator": "jemalloc", "sidecar_zstd_level": 3})
+        report = analyze(timing, sizes, "weak", "90/60")
+        self.assertIsNone(report["compressed"])
+        self.assertIn("does not say it compressed", report["compressed_refused_because"])
+
+
+class Direction(unittest.TestCase):
+    """The sign. A pre-registration in this project once had it backwards on both branches."""
+
+    def test_cached_wins_below_break_even_and_loses_above(self):
+        # 4 MB saved, 25 ms of extra CPU -> B* = 1280 Mbit/s.
+        args = (100_000, 125_000, 5_000_000, 1_000_000)
+        self.assertLess(delta_total_ms(*args, 100), 0)
+        self.assertLess(delta_total_ms(*args, 1000), 0)
+        self.assertAlmostEqual(delta_total_ms(*args, 1280), 0.0, delta=0.1)
+        self.assertGreater(delta_total_ms(*args, 4000), 0)
+
+    def test_a_slower_link_helps_the_smaller_arm_monotonically(self):
+        args = (100_000, 125_000, 5_000_000, 1_000_000)
+        deltas = [delta_total_ms(*args, b) for b in (50, 100, 500, 1000, 2000)]
+        self.assertEqual(deltas, sorted(deltas))
+
+    def test_endpoints_report_the_win_rate_alongside_the_median(self):
+        shared = list(range(200))
+        rows = endpoints(
+            shared,
+            {n: 100_000 for n in shared},
+            {n: 125_000 for n in shared},
+            {n: 5_000_000 for n in shared},
+            {n: 1_000_000 for n in shared},
+            random.Random(1),
+            (100.0, 4000.0),
+        )
+        self.assertEqual(rows[0]["candidate_win_rate"], 1.0)
+        self.assertEqual(rows[1]["candidate_win_rate"], 0.0)
+
+
+class PopulationVersusPerBlock(unittest.TestCase):
+    """The two crossovers are different estimands and the tool must not conflate them."""
+
+    def test_endpoints_use_every_block_while_per_block_crossover_does_not(self):
+        shared = list(range(100))
+        cpu_base = {n: 100_000 for n in shared}
+        cpu_cand = {n: 125_000 for n in shared}
+        b_base = {n: 5_000_000 for n in shared}
+        b_cand = {n: 1_000_000 for n in shared}
+        # A quarter of the blocks have the cached arm both smaller and faster: no crossover.
+        for n in shared[:25]:
+            cpu_cand[n] = 90_000
+        rng = random.Random(1)
+        rows = endpoints(shared, cpu_base, cpu_cand, b_base, b_cand, rng, (100.0,))
+        crossing = break_even(shared, cpu_base, cpu_cand, b_base, b_cand, rng)
+        self.assertEqual(rows[0]["n"], 100)
+        self.assertEqual(crossing["n"], 75)
+        self.assertEqual(crossing["candidate_dominates_blocks"], 25)
+
+    def test_population_crossover_returns_none_when_the_median_never_flips(self):
+        shared = list(range(50))
+        result = population_crossover(
+            shared,
+            {n: 125_000 for n in shared},   # baseline slower
+            {n: 100_000 for n in shared},   # candidate faster
+            {n: 5_000_000 for n in shared},  # and smaller
+            {n: 1_000_000 for n in shared},
+        )
+        self.assertIsNone(result)
 
 
 class BreakEven(unittest.TestCase):
@@ -233,6 +359,7 @@ class BreakEven(unittest.TestCase):
     def test_needs_both_halves_before_it_will_answer(self):
         report = analyze(synthetic(), None, "weak", "90/60")
         self.assertIsNone(report["break_even"])
+        self.assertIsNone(report["endpoints"])
 
 
 class AAFloor(unittest.TestCase):

@@ -14,14 +14,34 @@ by hand from two files that nobody re-derives:
      and therefore the part a bandwidth argument is allowed to touch.
   2. *Arm versus arm on bytes*: the same pairing on `sidecar_bytes`, and on `sidecar_zstd_bytes`
      when a size pass recorded them.
-  3. *Break-even bandwidth*: per block, `8 * delta_bytes / delta_seconds` — the link speed at which
-     the bytes an arm saves exactly pay for the CPU time it costs. This replaces judging a
-     network arm by a latency ratio, which cannot answer the question: what decides a crossover is
-     the absolute trade on one block, not how the two latencies compare.
+  3. *The deployment question*: at a given link speed, which arm delivers a block sooner, and by
+     how much? Modelled as `8 * bytes / B + cpu`, so for the cached arm against the baseline
+
+         delta_total(B) = (cached_cpu - weak_cpu) + 8 * (cached_bytes - weak_bytes) / B
+
+     which is negative — cached wins — while `B` is **below** the break-even
+     `B* = 8 * (weak_bytes - cached_bytes) / (cached_cpu - weak_cpu)`, and positive above it.
+     Cached ships less and computes more, so a slow link favours it and a fast link does not. This
+     replaces judging a network arm by a latency ratio, which cannot answer the question at all:
+     what decides a crossover is the absolute trade on one block, not how two latencies compare.
+
+     Reported two ways, because they are different estimands and only the first is a deployment
+     answer. `endpoints` evaluates `delta_total` at fixed link speeds over **every** paired block,
+     which is the statistic a decision is made on. `break_even` is the median of the per-block
+     crossover over the blocks that *have* one, which is a description of the corpus: blocks where
+     one arm is both smaller and faster have no crossover and are excluded from it, so it is not a
+     population statistic and must not be read as one.
 
 Statistics are `analyze_run_drift`'s, imported rather than reimplemented, so the two tools cannot
-drift apart in method: ratio of medians (never a mean of ratios), moving-block bootstrap with the
-block length shrunk on short samples, one seeded RNG.
+drift apart in method: moving-block bootstrap with the block length shrunk on short samples, one
+seeded RNG.
+
+The paired estimator is the **median of the per-block ratio**, which is the right one for paired
+data and is not the same as either alternative it gets confused with. A *mean* of ratios would
+weight a cheap block like an expensive one. A *ratio of totals* answers a different question — what
+a link carrying the whole corpus sees, rather than what a typical block sees — and both are
+defensible, so this tool reports the paired median and the summary keeps the totals, and neither is
+quoted without naming which it is.
 
 Refusals, each one a failure this tool is here to catch rather than average over:
 
@@ -149,17 +169,27 @@ def rotation_balance(arm_records):
         slots[arm] = counts
     arm_count = len(arm_records)
     balanced = True
+    exact = True
     for counts in slots.values():
         total = sum(counts.values())
-        if not counts:
+        if not counts or len(counts) < arm_count:
             balanced = False
+            exact = False
             continue
         expected = total / arm_count
-        if len(counts) < arm_count or any(
-            abs(value - expected) > max(2.0, 0.05 * expected) for value in counts.values()
-        ):
-            balanced = False
-    return {"slots": slots, "balanced": balanced}
+        # A cyclic rotation over a population that divides evenly by the arm count lands on exactly
+        # equal occupancy, so that is what is required rather than a tolerance: any deviation is a
+        # block the rotation did not visit as designed, and a tolerance would let a real defect
+        # through as rounding.
+        if total % arm_count == 0:
+            if any(value != total // arm_count for value in counts.values()):
+                balanced = False
+                exact = False
+        else:
+            exact = False
+            if any(abs(value - expected) > 1.0 for value in counts.values()):
+                balanced = False
+    return {"slots": slots, "balanced": balanced, "exact": exact}
 
 
 def paired_ratio(pairs, rng):
@@ -180,6 +210,79 @@ def paired_ratio(pairs, rng):
         "interval": interval(replicates),
         "block_len": block_len,
     }
+
+
+DEFAULT_ENDPOINTS_MBIT = (100.0, 1000.0)
+
+
+def delta_total_ms(cpu_base, cpu_cand, bytes_base, bytes_cand, bandwidth_mbit):
+    """Candidate minus baseline block-ready time at one link speed, in milliseconds.
+
+    Negative means the candidate delivers the block sooner. Transfer and processing are added
+    because this is a store-and-forward transport: `decode_frame` verifies a digest over the whole
+    payload before anything is deserialized, so nothing is processed while it is still arriving. A
+    model that overlapped them would describe a protocol this system does not implement.
+    """
+    transfer_s = 8.0 * (bytes_cand - bytes_base) / (bandwidth_mbit * 1e6)
+    cpu_s = (cpu_cand - cpu_base) * 1e-6
+    return (transfer_s + cpu_s) * 1e3
+
+
+def endpoints(shared, base, cand, size_base, size_cand, rng, bandwidths):
+    """The deployment statistic: `delta_total` at fixed link speeds, over every paired block.
+
+    Every block counts, including the ones the per-block crossover has to discard — a block where
+    one arm is both smaller and faster has no break-even, but it certainly has a delta at 100
+    Mbit/s, and dropping it would answer the deployment question on a subset chosen by the answer.
+
+    The win rate rides along because a median near zero and a 50% win rate mean something very
+    different from a median near zero and a 95% win rate.
+    """
+    rows = []
+    for bandwidth in bandwidths:
+        deltas = [
+            delta_total_ms(base[n], cand[n], size_base[n], size_cand[n], bandwidth)
+            for n in shared
+        ]
+        block_len = effective_block_len(len(deltas))
+        replicates = [
+            statistics.median(moving_block_resample(deltas, rng, block_len))
+            for _ in range(RESAMPLES)
+        ]
+        rows.append({
+            "bandwidth_mbit_s": bandwidth,
+            "n": len(deltas),
+            "median_delta_ms": statistics.median(deltas),
+            "interval_ms": interval(replicates),
+            "candidate_win_rate": sum(1 for d in deltas if d < 0) / len(deltas),
+        })
+    return rows
+
+
+def population_crossover(shared, base, cand, size_base, size_cand, low=1.0, high=1e6):
+    """The link speed where the *median* block's delta is zero, by bisection.
+
+    Not the same number as the median of per-block crossovers, and the difference is the whole
+    reason both are reported: one asks where the typical block flips, the other where the
+    population's median flips. They coincide only if the two deltas are perfectly rank-correlated.
+    Returns `None` when the sign does not change over the bracket — the median block never flips
+    at any realistic link speed, which is itself the answer.
+    """
+    def median_delta(bandwidth):
+        return statistics.median(
+            delta_total_ms(base[n], cand[n], size_base[n], size_cand[n], bandwidth)
+            for n in shared
+        )
+
+    if median_delta(low) * median_delta(high) > 0:
+        return None
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        if median_delta(low) * median_delta(mid) <= 0:
+            high = mid
+        else:
+            low = mid
+    return (low + high) / 2.0
 
 
 def break_even(shared, base, cand, size_base, size_cand, rng):
@@ -225,7 +328,7 @@ def break_even(shared, base, cand, size_base, size_cand, rng):
     }
 
 
-def analyze(timing, sizes, baseline, candidate):
+def analyze(timing, sizes, baseline, candidate, bandwidths=DEFAULT_ENDPOINTS_MBIT):
     rng = random.Random(SEED)
     report = {"timing_run": timing["path"], "baseline": baseline, "candidate": candidate}
 
@@ -249,16 +352,51 @@ def analyze(timing, sizes, baseline, candidate):
     base_records = timing["arms"][baseline]
     cand_records = timing["arms"][candidate]
     shared = sorted(set(base_records) & set(cand_records))
-    refused = [
+    baseline_only = sorted(set(base_records) - set(cand_records))
+    candidate_only = sorted(set(cand_records) - set(base_records))
+    incomplete = [
         number
         for number in shared
         if base_records[number]["witness_commitment"] is None
+        or cand_records[number]["witness_commitment"] is None
         or timing["blocks"][number]["block_hash"] is None
     ]
     report["paired_blocks"] = len(shared)
-    report["baseline_only"] = len(set(base_records) - set(cand_records))
-    report["candidate_only"] = len(set(cand_records) - set(base_records))
-    report["refused"] = len(refused)
+    report["baseline_only"] = len(baseline_only)
+    report["candidate_only"] = len(candidate_only)
+    report["refused"] = len(incomplete)
+
+    # Integrity is fail-closed and refuses the whole report rather than dropping rows. Every arm
+    # runs over every measured block by construction, so a block one arm is missing is not a gap to
+    # work around — it means the run did not do what the file says it did, and a population quietly
+    # shrunk to the blocks that happened to survive is exactly the kind of number that reads as
+    # clean and is not.
+    integrity = []
+    if baseline_only or candidate_only:
+        integrity.append(
+            f"{len(baseline_only)} blocks only {baseline} saw and {len(candidate_only)} only "
+            f"{candidate} saw; every arm rotates over every measured block, so this run is not "
+            "internally consistent"
+        )
+    if incomplete:
+        integrity.append(
+            f"{len(incomplete)} blocks are missing a block hash or a witness commitment"
+        )
+    if not shared:
+        integrity.append("the two arms share no measured blocks")
+    report["integrity_refusals"] = integrity
+    if integrity:
+        report["latency"] = None
+        report["latency_refused_because"] = "; ".join(integrity)
+        report["bytes"] = {"sidecar_bytes": None}
+        report["bytes_refused_because"] = "; ".join(integrity)
+        report["size_run"] = (sizes or timing)["path"]
+        report["compressed"] = None
+        report["compressed_refused_because"] = "; ".join(integrity)
+        report["break_even"] = None
+        report["endpoints"] = None
+        report["break_even_refused_because"] = "; ".join(integrity)
+        return report
 
     if compressed_timing:
         report["latency"] = None
@@ -315,7 +453,40 @@ def analyze(timing, sizes, baseline, candidate):
         for n in size_shared
         if size_base[n].get("sidecar_zstd_bytes") and size_cand[n].get("sidecar_zstd_bytes")
     ]
-    if mismatched:
+    # Partial coverage is refused rather than computed over whatever subset carries values. A
+    # sidecar's compressibility varies with its own composition, so a subset chosen by which blocks
+    # happen to have been compressed is a subset chosen by something correlated with the answer.
+    partial_coverage = have_zstd and len(have_zstd) != len(shared)
+
+    # A size pass is only a stand-in for the timing pass if it was the same build doing the same
+    # thing to the same corpus. Checked here rather than trusted to the driver, because the driver
+    # is untracked and this file is what a later reader has.
+    size_summary = size_run["summary"] or {}
+    metadata = []
+    if sizes is not None:
+        for key in ("allocator", "generator_build_commit", "measured_block_set_digest"):
+            left, right = summary.get(key), size_summary.get(key)
+            if left != right:
+                metadata.append(f"{key}: timing {left!r} vs size {right!r}")
+        if not size_summary.get("compressed_sidecars"):
+            metadata.append("the size run's summary does not say it compressed sidecars")
+    if have_zstd and size_summary.get("sidecar_zstd_level") is None:
+        metadata.append("compressed sizes are present but no zstd level was recorded")
+
+    if metadata:
+        report["compressed"] = None
+        report["compressed_refused_because"] = (
+            "the size pass and the timing pass do not describe the same measurement — "
+            + "; ".join(metadata)
+        )
+    elif partial_coverage:
+        report["compressed"] = None
+        report["compressed_refused_because"] = (
+            f"only {len(have_zstd)} of {len(shared)} paired blocks carry compressed sizes; "
+            "compressibility varies with a sidecar's composition, so a partial subset is not a "
+            "sample of the population"
+        )
+    elif mismatched:
         report["compressed"] = None
         report["compressed_refused_because"] = (
             f"{len(mismatched)} blocks have a different sidecar in the size pass than in the "
@@ -347,17 +518,22 @@ def analyze(timing, sizes, baseline, candidate):
         report["compressed"] = None
         report["compressed_refused_because"] = "no run recorded sidecar_zstd_bytes"
 
-    if report["latency"] and report["compressed"] and not mismatched:
-        report["break_even"] = break_even(
-            have_zstd,
-            {n: base_records[n][PRIMARY] for n in have_zstd},
-            {n: cand_records[n][PRIMARY] for n in have_zstd},
-            {n: size_base[n]["sidecar_zstd_bytes"] for n in have_zstd},
-            {n: size_cand[n]["sidecar_zstd_bytes"] for n in have_zstd},
-            rng,
+    if report["latency"] and report["compressed"]:
+        cpu_base = {n: base_records[n][PRIMARY] for n in have_zstd}
+        cpu_cand = {n: cand_records[n][PRIMARY] for n in have_zstd}
+        zb = {n: size_base[n]["sidecar_zstd_bytes"] for n in have_zstd}
+        zc = {n: size_cand[n]["sidecar_zstd_bytes"] for n in have_zstd}
+        # The decision statistic first, over every paired block.
+        report["endpoints"] = endpoints(have_zstd, cpu_base, cpu_cand, zb, zc, rng, bandwidths)
+        report["population_crossover_mbit_s"] = population_crossover(
+            have_zstd, cpu_base, cpu_cand, zb, zc
         )
+        # The corpus description second, over the subset that has a crossover at all.
+        report["break_even"] = break_even(have_zstd, cpu_base, cpu_cand, zb, zc, rng)
     else:
+        report["endpoints"] = None
         report["break_even"] = None
+        report["population_crossover_mbit_s"] = None
         report["break_even_refused_because"] = (
             "needs both a valid latency pairing and compressed sizes for the same blocks"
         )
@@ -388,8 +564,12 @@ def print_human(report):
         f"\npaired on {report['paired_blocks']} blocks "
         f"(+{report['baseline_only']} baseline-only, +{report['candidate_only']} candidate-only)"
     )
+    if report.get("integrity_refusals"):
+        print("\n**REFUSED**: " + "; ".join(report["integrity_refusals"]))
     slots = report["rotation"]["slots"]
     verdict = "balanced" if report["rotation"]["balanced"] else "**NOT BALANCED**"
+    if report["rotation"]["balanced"] and report["rotation"].get("exact"):
+        verdict = "balanced exactly"
     print(f"rotation slots {verdict}: " + "; ".join(f"{a} {dict(sorted(c.items()))}" for a, c in slots.items()))
 
     print("\n## Latency")
@@ -400,7 +580,10 @@ def print_human(report):
         print(f"  refused: {report['latency_refused_because']}")
 
     print("\n## Bytes")
-    print(f"sidecar_bytes (uncompressed)\n{fmt_ratio(report['bytes']['sidecar_bytes'])}")
+    if report["bytes"].get("sidecar_bytes") is None:
+        print(f"  refused: {report.get('bytes_refused_because')}")
+    else:
+        print(f"sidecar_bytes (uncompressed)\n{fmt_ratio(report['bytes']['sidecar_bytes'])}")
     if report["compressed"]:
         comp = report["compressed"]
         print(f"sidecar_zstd_bytes (level {comp['zstd_level']})\n{fmt_ratio(comp['sidecar_zstd_bytes'])}")
@@ -411,21 +594,48 @@ def print_human(report):
     else:
         print(f"  compressed: refused — {report['compressed_refused_because']}")
 
-    print("\n## Break-even bandwidth")
+    print("\n## Block-ready latency at deployment link speeds")
+    rows = report.get("endpoints")
+    if rows:
+        print(f"  negative = {report['candidate']} delivers the block sooner\n")
+        print("  | link | median delta | 95% interval | " + f"{report['candidate']} win rate |")
+        print("  | ---: | ---: | :---: | ---: |")
+        for row in rows:
+            low, high = row["interval_ms"]
+            print(
+                f"  | {row['bandwidth_mbit_s']:,.0f} Mbit/s | {row['median_delta_ms']:+.2f} ms "
+                f"| [{low:+.2f}, {high:+.2f}] | {row['candidate_win_rate']:.1%} |"
+            )
+        crossover = report.get("population_crossover_mbit_s")
+        if crossover:
+            print(
+                f"\n  Median block flips at **{crossover:,.0f} Mbit/s**: {report['candidate']} is "
+                f"sooner below it,\n  {report['baseline']} above it — the cached arm ships less and "
+                "computes more, so a slow\n  link favours it and a fast link does not."
+            )
+        else:
+            print(
+                f"\n  The median block does not flip at any link speed in the bracket: one arm is "
+                "sooner throughout."
+            )
+    else:
+        print(f"  refused: {report.get('break_even_refused_because') or 'not computed'}")
+
+    print("\n## Per-block crossover (corpus description, not a deployment answer)")
     be = report["break_even"]
     if be and be["n"]:
         low, high = be["interval_mbit_s"]
         print(
-            f"  n={be['n']} blocks with a crossover  median **{be['median_mbit_s']:,.0f} Mbit/s**"
-            f"  95% [{low:,.0f}, {high:,.0f}]"
+            f"  n={be['n']} of {report['paired_blocks']} blocks have a crossover  "
+            f"median **{be['median_mbit_s']:,.0f} Mbit/s**  95% [{low:,.0f}, {high:,.0f}]"
         )
         print(
-            f"  {be['candidate_dominates_blocks']} blocks where {report['candidate']} wins on both"
-            f"; {be['baseline_dominates_blocks']} where {report['baseline']} does"
+            f"  {be['candidate_dominates_blocks']} blocks where {report['candidate']} is both "
+            f"smaller and faster; {be['baseline_dominates_blocks']} where {report['baseline']} is"
         )
         print(
-            "\n  Below this link speed the smaller arm wins; above it the faster one does. Compare"
-            "\n  against the deployment range fixed before the run, not against this line."
+            "\n  Excludes the blocks with no crossover, so this is not a population statistic and"
+            "\n  the decision is not made on it. Use the table above."
         )
     else:
         print(f"  refused: {report.get('break_even_refused_because') or 'no crossover blocks'}")
@@ -477,6 +687,28 @@ def self_check():
     be = report["break_even"]["median_mbit_s"]
     if not math.isclose(be, 1280.0, rel_tol=0.03):
         failures.append(f"break-even {be:,.0f} Mbit/s should be ~1280")
+    crossover = report["population_crossover_mbit_s"]
+    if not math.isclose(crossover, 1280.0, rel_tol=0.03):
+        failures.append(f"population crossover {crossover:,.0f} Mbit/s should be ~1280")
+
+    # The direction, which is the thing a sign error would silently invert. Break-even is above
+    # both endpoints, so the smaller-and-slower arm must deliver sooner at both.
+    rows = {row["bandwidth_mbit_s"]: row for row in report["endpoints"]}
+    slow, fast = rows[100.0], rows[1000.0]
+    if not slow["median_delta_ms"] < 0:
+        failures.append("at 100 Mbit/s the cached arm must deliver sooner: it is far below B*")
+    if not fast["median_delta_ms"] < 0:
+        failures.append("at 1000 Mbit/s the cached arm must still deliver sooner: B* is 1280")
+    if not slow["median_delta_ms"] < fast["median_delta_ms"]:
+        failures.append("the cached arm's advantage must shrink as the link gets faster")
+    if not math.isclose(slow["median_delta_ms"], -295.0, abs_tol=3.0):
+        failures.append(f"100 Mbit/s delta {slow['median_delta_ms']:.1f} ms should be ~-295")
+    if not math.isclose(fast["median_delta_ms"], -7.0, abs_tol=3.0):
+        failures.append(f"1000 Mbit/s delta {fast['median_delta_ms']:.1f} ms should be ~-7")
+    # Above the crossover the sign must flip, or the model is not a model of anything.
+    above = analyze(run, None, "weak", "90/60", bandwidths=(4000.0,))["endpoints"][0]
+    if not above["median_delta_ms"] > 0:
+        failures.append("above B* the baseline must deliver sooner")
 
     # A run whose summary admits it compressed must refuse to answer on time.
     voided = dict(run, summary={"compressed_sidecars": True, "sidecar_zstd_level": 3})
@@ -493,7 +725,10 @@ def self_check():
     for line in failures:
         print(f"FAIL: {line}")
     if not failures:
-        print("self-check ok: latency 1.25x, bytes 0.2x, break-even ~1280 Mbit/s, both refusals fire")
+        print(
+            "self-check ok: latency 1.25x, bytes 0.2x, B* ~1280 Mbit/s, cached sooner below it and "
+            "later above it, both refusals fire"
+        )
     return 1 if failures else 0
 
 
@@ -506,6 +741,11 @@ def main():
     parser.add_argument("--arm", default="90/60", help="the arm to compare across runs with --vs")
     parser.add_argument("--baseline", default="weak")
     parser.add_argument("--candidate", default="90/60")
+    parser.add_argument(
+        "--endpoints",
+        default=",".join(str(int(b)) for b in DEFAULT_ENDPOINTS_MBIT),
+        help="comma-separated link speeds in Mbit/s to evaluate the deployment question at",
+    )
     parser.add_argument("--json", help="write the full report here")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
@@ -528,6 +768,10 @@ def main():
                 f"({left} vs {right}); they are not comparable"
             )
 
+    bandwidths = tuple(float(x) for x in args.endpoints.split(",") if x.strip())
+    if not bandwidths:
+        parser.error("--endpoints needs at least one link speed")
+
     if args.vs:
         other = load_run(args.vs)
         left = (timing["summary"] or {}).get("measured_block_set_digest")
@@ -536,10 +780,12 @@ def main():
             raise SystemExit(
                 f"the two repetitions measured different block sets ({left} vs {right})"
             )
-        report = analyze(as_two_arms(timing, other, args.arm), None, "rep-a", "rep-b")
+        report = analyze(
+            as_two_arms(timing, other, args.arm), None, "rep-a", "rep-b", bandwidths
+        )
         report["a_a_floor_for_arm"] = args.arm
     else:
-        report = analyze(timing, sizes, args.baseline, args.candidate)
+        report = analyze(timing, sizes, args.baseline, args.candidate, bandwidths)
     print_human(report)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
