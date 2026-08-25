@@ -20,6 +20,44 @@
 // The summary record's `json!` block is wide enough to hit the default macro recursion limit.
 #![recursion_limit = "256"]
 
+// Global allocator, selected at compile time by the `jemalloc`/`snmalloc` features and left as the
+// platform allocator when neither is named.
+//
+// The validator's transition allocates and frees sparse-trie node maps in the thousands per block,
+// so which allocator services that churn is an input to every number this binary reports rather
+// than a packaging choice. It belongs in `main.rs` because a `#[global_allocator]` in a library is
+// only honoured when that library happens to be the root crate.
+//
+// jemalloc takes precedence when both features are on, matching `reth_cli_util::allocator`.
+#[cfg(all(feature = "jemalloc", unix))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Required for jemalloc to override the allocator on supported Unix platforms: the symbols only
+// reach the linker if something `use`s the sys crate.
+#[cfg(all(feature = "jemalloc", unix))]
+use tikv_jemalloc_sys as _;
+
+#[cfg(all(feature = "snmalloc", not(feature = "jemalloc"), unix))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// Keeps `--all-features` from warning about the crate the precedence rule above shuts out.
+#[cfg(all(feature = "snmalloc", feature = "jemalloc", unix))]
+use snmalloc_rs as _;
+
+/// Name of the allocator this binary was built with, for the run manifest.
+///
+/// Compile-time rather than probed: the point is to record what the build selected, and a probe
+/// would report what the process happens to have loaded.
+pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
+    "jemalloc"
+} else if cfg!(all(feature = "snmalloc", unix)) {
+    "snmalloc"
+} else {
+    "system"
+};
+
 use partial_stateless_replay::{
     follow, replay, FollowOptions, FollowOutcome, FollowReport, ReplayOptions, ReplayReport,
 };
@@ -221,6 +259,11 @@ fn write_manifest(
         "benchmark": benchmark,
         "kind": "run_manifest",
         "label": label,
+        // Additive, and beside the provenance rather than inside it: the shared `RunProvenance` is
+        // the producer's record too, and the producer's allocator is fixed by the node graph. Here
+        // it is a build axis, so a file that does not carry it is a build from before the axis
+        // existed, which is exactly the distinction a reader needs.
+        "allocator": ALLOCATOR_NAME,
         "provenance": provenance,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {

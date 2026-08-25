@@ -40,8 +40,18 @@
 # the output to show which were which.
 #
 # Usage: check_validator_isolation.sh [package-name ...]
+#
+# `PS_ISOLATION_FEATURES` passes a feature list through to every `cargo tree` below, so an arm
+# built with non-default features is checked as the graph it actually links rather than as the
+# default one. A build profile that differs from the checked profile is precisely the defect
+# invariants 2 and 3 exist to catch, and an allocator arm is a build profile.
 
 set -euo pipefail
+
+FEATURE_ARGS=()
+if [ -n "${PS_ISOLATION_FEATURES:-}" ]; then
+  FEATURE_ARGS=(--features "${PS_ISOLATION_FEATURES}")
+fi
 
 if [ "$#" -gt 0 ]; then
   PACKAGES=("$@")
@@ -65,7 +75,7 @@ check_package() {
   local PKG="$1"
 
 echo "==> ${PKG}: normal dependency graph"
-if ! deps="$(cargo tree -p "${PKG}" -e normal --prefix none 2>/dev/null)"; then
+if ! deps="$(cargo tree -p "${PKG}" -e normal --prefix none "${FEATURE_ARGS[@]}" 2>/dev/null)"; then
   echo "FAIL: cargo tree could not resolve package '${PKG}'" >&2
   status=2
   return
@@ -80,7 +90,7 @@ else
 fi
 
 echo "==> ${PKG}: keccak build profile"
-edges="$(cargo tree -p "${PKG}" -e features -i alloy-primitives 2>/dev/null \
+edges="$(cargo tree -p "${PKG}" -e features -i alloy-primitives "${FEATURE_ARGS[@]}" 2>/dev/null \
   | grep -cE "${REQUIRED_FEATURES}" || true)"
 if [ "${edges}" -eq 0 ]; then
   echo "FAIL: ${PKG} selects neither asm-keccak nor keccak-cache-global on alloy-primitives." >&2
@@ -91,7 +101,7 @@ else
 fi
 
 echo "==> ${PKG}: signature recovery backend"
-recovery="$(cargo tree -p "${PKG}" -e features -i reth-primitives-traits 2>/dev/null \
+recovery="$(cargo tree -p "${PKG}" -e features -i reth-primitives-traits "${FEATURE_ARGS[@]}" 2>/dev/null \
   | grep -cE "${REQUIRED_RECOVERY}" || true)"
 if [ "${recovery}" -eq 0 ]; then
   echo "FAIL: ${PKG} does not select secp256k1 on reth-primitives-traits." >&2

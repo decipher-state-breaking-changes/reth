@@ -23,6 +23,21 @@ default = ["asm-keccak", "keccak-cache-global"]
 asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 
+# Global allocator selection, off by default so the default build stays the platform allocator
+# and a build that names no allocator is unambiguous rather than silently jemalloc.
+#
+# This binary is the standalone validator, and its hot path allocates and frees sparse-trie node
+# maps by the thousand per block. That makes the allocator a measurable input to every timing this
+# package produces, not a packaging detail: the producer links jemalloc through the node graph
+# while this binary linked the platform allocator, so the two processes were never running the
+# same allocator even in the same run. These features exist to make that an arm rather than an
+# accident. Whichever is selected is recorded in the run manifest.
+#
+# jemalloc wins if both are named, matching `reth-cli-util`'s precedence so a build here cannot
+# mean something different from a build there.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+snmalloc = ["dep:snmalloc-rs"]
+
 [dependencies]
 partial-stateless = { path = "../partial-stateless" }
 partial-stateless-stream = { path = "../partial-stateless-stream" }
@@ -50,6 +65,12 @@ serde_json = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+# Allocator backends. Leaf crates with no reth graph of their own, which is why selecting one
+# cannot reach the implementation crates `check_validator_isolation.sh` forbids.
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
+snmalloc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-chainspec = { workspace = true, features = ["std"] }

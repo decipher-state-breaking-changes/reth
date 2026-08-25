@@ -6566,7 +6566,10 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "snmalloc-rs",
  "thiserror 2.0.18",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
