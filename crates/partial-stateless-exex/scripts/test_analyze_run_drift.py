@@ -30,6 +30,7 @@ from analyze_run_drift import (  # noqa: E402
     compare,
     drift,
     load_records,
+    pair_key,
     per_copy_cost,
     select,
 )
@@ -37,8 +38,12 @@ from analyze_run_drift import (  # noqa: E402
 import random  # noqa: E402
 
 
-def record(block, total, phases=None, copies=None, tail_live=None):
+def record(block, total, phases=None, copies=None, tail_live=None, sequence=None,
+           block_hash=None):
     out = {"block": block, PRIMARY: total}
+    out["sequence"] = block if sequence is None else sequence
+    if block_hash is not None:
+        out["block_hash"] = block_hash
     if phases:
         out["phases"] = phases
     if copies is not None:
@@ -115,6 +120,20 @@ class DriftStatistics(unittest.TestCase):
             values.append(record(index, 100_000 if (index // 100) % 2 == 0 else 160_000))
         result = drift(select(values, "steady"), rng)
         self.assertGreater(result["interval"][1] - result["interval"][0], 0.2)
+
+
+class BootstrapCoverage(unittest.TestCase):
+    def test_every_observation_can_enter_a_replicate(self):
+        """The last legal block start was excluded, so the final value entered no replicate."""
+        from analyze_run_drift import moving_block_resample
+
+        rng = random.Random(1)
+        values = list(range(100))
+        seen = set()
+        for _ in range(4000):
+            seen.update(moving_block_resample(values, rng, 10))
+        self.assertIn(99, seen)
+        self.assertEqual(len(seen), 100)
 
 
 class BootstrapBlockLength(unittest.TestCase):
@@ -216,17 +235,72 @@ class UnitCostVersusWorkload(unittest.TestCase):
 
 
 class CrossRunComparison(unittest.TestCase):
-    def test_pairs_by_block_and_ignores_unshared_blocks(self):
+    def test_pairs_by_sequence_and_ignores_unshared_frames(self):
         rng = random.Random(1)
         baseline = select([record(index, 100_000) for index in range(100)], "steady")
         candidate = select([record(index, 80_000) for index in range(50, 150)], "steady")
         result = compare(baseline, candidate, rng)
-        self.assertEqual(result["paired_blocks"], 50)
+        self.assertEqual(result["paired_frames"], 50)
         self.assertEqual(result["baseline_only"], 50)
         self.assertEqual(result["candidate_only"], 50)
         self.assertAlmostEqual(result["paired_median_ratio"], 0.8)
 
-    def test_no_shared_blocks_is_no_comparison(self):
+    def test_a_reorg_repeats_a_height_and_both_attempts_survive(self):
+        """Keying on height collapses the reorg pair; keying on sequence keeps both attempts.
+
+        The abandoned-branch verdict is real work the validator did, and it is a different
+        measurement from the canonical block that replaced it at the same height.
+        """
+        rows = [record(100, 100_000, sequence=1), record(101, 100_000, sequence=2)]
+        # The reorg: sequence 3 re-attempts height 101 on the winning branch.
+        rows.append(record(101, 140_000, sequence=3))
+        selected = select(rows, "steady")
+        self.assertEqual(len(selected), 3)
+        self.assertEqual([key for key, _ in selected], [1, 2, 3])
+
+    def test_height_is_the_fallback_only_when_no_sequence_exists(self):
+        self.assertEqual(pair_key({"sequence": 7, "block": 100}), 7)
+        self.assertEqual(pair_key({"block": 100}), 100)
+        self.assertEqual(pair_key({"number": 100}), 100)
+        self.assertIsNone(pair_key({}))
+
+    def test_frames_naming_different_blocks_are_refused_not_paired(self):
+        """One sequence must mean one block in both runs, or the pair is not a pair."""
+        rng = random.Random(1)
+        baseline = select([record(index, 100_000, sequence=index) for index in range(100)],
+                          "steady")
+        shifted = [record(index + 1, 80_000, sequence=index) for index in range(100)]
+        result = compare(baseline, select(shifted, "steady"), rng)
+        self.assertIsNone(result)
+
+    def test_hash_disagreement_under_one_sequence_is_refused(self):
+        rng = random.Random(1)
+        left = [record(index, 100_000, block_hash="0xaa") for index in range(100)]
+        right = [
+            record(index, 80_000, block_hash="0xbb" if index == 5 else "0xaa")
+            for index in range(100)
+        ]
+        result = compare(select(left, "steady"), select(right, "steady"), rng)
+        self.assertEqual(result["paired_frames"], 99)
+        self.assertEqual(result["refused_for_naming_different_blocks"], 1)
+
+    def test_paired_interval_uses_a_moving_block_resample(self):
+        """Pairing removes workload variance, not host or heap state carried across frames.
+
+        A ratio series that alternates between two regimes in long stretches has a wide
+        moving-block interval and a vanishing i.i.d. one; reporting the second would claim a
+        precision the pairing does not buy.
+        """
+        rng = random.Random(1)
+        baseline = select([record(index, 100_000) for index in range(1000)], "steady")
+        candidate = select(
+            [record(index, 100_000 if (index // 100) % 2 == 0 else 60_000) for index in range(1000)],
+            "steady",
+        )
+        result = compare(baseline, candidate, rng)
+        self.assertGreater(result["interval"][1] - result["interval"][0], 0.2)
+
+    def test_no_shared_frames_is_no_comparison(self):
         """Two runs of different corpora are not an A/B, and must not be reported as one."""
         rng = random.Random(1)
         baseline = select([record(index, 100_000) for index in range(100)], "steady")
@@ -385,7 +459,7 @@ class AcceptedCohortRegression(unittest.TestCase):
             "steady",
         )
         comparison = result["comparisons"][0]
-        self.assertGreater(comparison["paired_blocks"], 3500)
+        self.assertGreater(comparison["paired_frames"], 3500)
         self.assertLess(comparison["paired_median_ratio"], 1.0)
         self.assertGreater(comparison["paired_median_ratio"], 0.95)
 

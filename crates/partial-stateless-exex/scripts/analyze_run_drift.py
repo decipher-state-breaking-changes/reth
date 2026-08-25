@@ -102,9 +102,25 @@ def load_records(path):
     return expanded, manifest
 
 
-def block_number(record):
-    """Blocks are keyed by number; `sequence` is the fallback a pre-number recording needs."""
-    for key in ("block", "number", "sequence"):
+def pair_key(record):
+    """The key an aggregator must use: the commit frame's sequence, never the height.
+
+    A reorg legitimately repeats a height, and the repeated attempts are abandoned-branch work
+    rather than double counting. Keying on height silently collapses each reorg pair to whichever
+    record happened to be seen last, and two runs need not collapse to the same one — the accepted
+    3,600-verdict corpus holds 3,609 records under 3,606 distinct heights for exactly this reason.
+    Height is the fallback only for a recording too old to carry a sequence.
+    """
+    for key in ("sequence", "block", "number"):
+        value = record.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def block_height(record):
+    """Height, for cross-checking that two runs' records under one sequence name one block."""
+    for key in ("block", "number"):
         value = record.get(key)
         if value is not None:
             return value
@@ -124,10 +140,11 @@ def select(records, population):
             continue
         if population == "steady" and record.get("tail_live") is False:
             continue
-        number = block_number(record)
-        if number is None:
+        key = pair_key(record)
+        if key is None:
             continue
-        kept.append((number, record))
+        kept.append((key, record))
+    # Sequence order is also attempt order, which is the time order the drift statistics need.
     kept.sort(key=lambda pair: pair[0])
     return kept
 
@@ -170,7 +187,9 @@ def moving_block_resample(values, rng, block_len):
         return [values[rng.randrange(len(values))] for _ in values]
     out = []
     while len(out) < len(values):
-        start = rng.randrange(0, len(values) - block_len)
+        # `+ 1` because `len - block_len` is a legal start: without it the final observation is
+        # reachable from no block at all and never enters any replicate.
+        start = rng.randrange(0, len(values) - block_len + 1)
         out.extend(values[start : start + block_len])
     return out[: len(values)]
 
@@ -201,9 +220,31 @@ def drift(selected, rng):
     quarters = [
         statistics.median(values[index * quarter : (index + 1) * quarter]) for index in range(4)
     ]
+    # The block length is a choice, not a measurement, and "95%" means less than it looks if the
+    # verdict flips with it. Reporting the interval at several lengths makes that visible instead
+    # of leaving it to whoever picked the default.
+    sensitivity = []
+    for candidate_len in (10, 25, 50, 100):
+        if candidate_len > half // 4:
+            continue
+        replicate_set = [
+            statistics.median(moving_block_resample(second, rng, candidate_len))
+            / statistics.median(moving_block_resample(first, rng, candidate_len))
+            for _ in range(RESAMPLES // 4)
+        ]
+        bounds = interval(replicate_set)
+        sensitivity.append(
+            {
+                "block_len": candidate_len,
+                "interval": bounds,
+                "resolves_drift": bounds[0] > 1.0 or bounds[1] < 1.0,
+            }
+        )
     return {
         "n": count,
         "block_len": block_len,
+        "block_len_sensitivity": sensitivity,
+        "sensitivity_agrees": len({row["resolves_drift"] for row in sensitivity}) <= 1,
         "first_half_p50_us": statistics.median(first),
         "second_half_p50_us": statistics.median(second),
         "ratio": ratio,
@@ -281,25 +322,45 @@ def per_copy_cost(selected):
 
 
 def compare(baseline, candidate, rng):
-    """Per-block paired ratio, candidate / baseline, over the blocks both runs verified."""
-    left = {number: record for number, record in baseline}
-    right = {number: record for number, record in candidate}
+    """Per-frame paired ratio, candidate / baseline, over the frames both runs verified.
+
+    Paired on the commit sequence, and every pair is cross-checked to name the same height (and
+    the same hash where both records carry one). Pairing the same corpus removes workload variance
+    but not host or heap state, which persists across consecutive frames in both runs, so the
+    interval is a moving-block bootstrap over the ratio series in sequence order rather than an
+    i.i.d. resample of it.
+    """
+    left = {key: record for key, record in baseline}
+    right = {key: record for key, record in candidate}
     shared = sorted(set(left) & set(right))
-    ratios = [right[number][PRIMARY] / left[number][PRIMARY] for number in shared]
+    mismatched = []
+    paired = []
+    for key in shared:
+        one, two = left[key], right[key]
+        if block_height(one) != block_height(two):
+            mismatched.append(key)
+            continue
+        hashes = (one.get("block_hash"), two.get("block_hash"))
+        if all(hashes) and hashes[0] != hashes[1]:
+            mismatched.append(key)
+            continue
+        paired.append(key)
+    ratios = [right[key][PRIMARY] / left[key][PRIMARY] for key in paired]
     if not ratios:
         return None
-    replicates = []
-    for _ in range(RESAMPLES):
-        sample = [ratios[rng.randrange(len(ratios))] for _ in ratios]
-        replicates.append(statistics.median(sample))
+    block_len = effective_block_len(len(ratios))
+    replicates = [
+        statistics.median(moving_block_resample(ratios, rng, block_len))
+        for _ in range(RESAMPLES)
+    ]
     phases = []
     for name in sorted(set(phase_names(baseline)) & set(phase_names(candidate))):
         pairs = [
-            (phase_value(left[number], name), phase_value(right[number], name))
-            for number in shared
-            if phase_value(left[number], name) and phase_value(right[number], name)
+            (phase_value(left[key], name), phase_value(right[key], name))
+            for key in paired
+            if phase_value(left[key], name) and phase_value(right[key], name)
         ]
-        if len(pairs) < max(8, len(shared) // 10):
+        if len(pairs) < max(8, len(paired) // 10):
             continue
         phases.append(
             {
@@ -314,11 +375,13 @@ def compare(baseline, candidate, rng):
         )
     phases.sort(key=lambda row: row["baseline_p50_us"] - row["candidate_p50_us"], reverse=True)
     return {
-        "paired_blocks": len(shared),
+        "paired_frames": len(paired),
         "baseline_only": len(set(left) - set(right)),
         "candidate_only": len(set(right) - set(left)),
-        "baseline_p50_us": statistics.median(left[number][PRIMARY] for number in shared),
-        "candidate_p50_us": statistics.median(right[number][PRIMARY] for number in shared),
+        "refused_for_naming_different_blocks": len(mismatched),
+        "block_len": block_len,
+        "baseline_p50_us": statistics.median(left[key][PRIMARY] for key in paired),
+        "candidate_p50_us": statistics.median(right[key][PRIMARY] for key in paired),
         "paired_median_ratio": statistics.median(ratios),
         "interval": interval(replicates),
         "phases": phases,
@@ -401,6 +464,14 @@ def print_human(result):
             )
             print(f"- half split (second/first): **{drift_row['ratio']:.3f}x**  "
                   f"95% moving-block [{low:.3f}, {high:.3f}]{shrunk} — {verdict}")
+            if drift_row["block_len_sensitivity"] and not drift_row["sensitivity_agrees"]:
+                spread = "  ".join(
+                    f"{row['block_len']}:[{row['interval'][0]:.3f},{row['interval'][1]:.3f}]"
+                    f"{'*' if row['resolves_drift'] else ''}"
+                    for row in drift_row["block_len_sensitivity"]
+                )
+                print(f"- **the verdict depends on the block length** — {spread} "
+                      "(* = resolves); treat the effect as unresolved")
             quarters = "  ".join(f"{value / 1000:.2f}" for value in drift_row["quarter_p50_us"])
             print(f"- quarter p50 (ms): {quarters}   Q4/Q1 {drift_row['quarter_ratio']:.3f}x")
         if run["per_copy"]:
@@ -422,14 +493,17 @@ def print_human(result):
         low, high = comparison["interval"]
         print()
         print(f"## {comparison['candidate']} vs {comparison['baseline']}")
-        print(f"paired on {comparison['paired_blocks']} blocks "
+        print(f"paired on {comparison['paired_frames']} frames by sequence "
               f"(+{comparison['baseline_only']} baseline-only, "
-              f"+{comparison['candidate_only']} candidate-only)")
+              f"+{comparison['candidate_only']} candidate-only, "
+              f"{comparison['refused_for_naming_different_blocks']} refused for naming "
+              f"different blocks)")
         print()
         print(f"- p50 {comparison['baseline_p50_us'] / 1000:.2f} -> "
               f"{comparison['candidate_p50_us'] / 1000:.2f} ms")
         print(f"- paired median ratio **{comparison['paired_median_ratio']:.4f}x**  "
-              f"95% [{low:.4f}, {high:.4f}]")
+              f"95% moving-block [{low:.4f}, {high:.4f}] "
+              f"(block length {comparison['block_len']})")
         rows = [
             row
             for row in comparison["phases"]
@@ -506,8 +580,8 @@ def self_check():
         # (1 + 5/6) / 2. Asserting that rather than either arm's ratio is what catches a median
         # that silently became a mean.
         comparison = result["comparisons"][0]
-        if comparison["paired_blocks"] != 1000:
-            failures.append(f"expected 1000 paired blocks, got {comparison['paired_blocks']}")
+        if comparison["paired_frames"] != 1000:
+            failures.append(f"expected 1000 paired frames, got {comparison['paired_frames']}")
         if abs(comparison["paired_median_ratio"] - 11 / 12) > 1e-9:
             failures.append(
                 f"paired ratio should be 11/12, got {comparison['paired_median_ratio']}"

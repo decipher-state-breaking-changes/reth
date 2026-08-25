@@ -34,8 +34,15 @@ keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 # accident. Whichever is selected is recorded in the run manifest.
 #
 # jemalloc wins if both are named, matching `reth-cli-util`'s precedence so a build here cannot
-# mean something different from a build there.
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
+# mean something different from a build there. The override feature is part of that match and not
+# optional: without it only Rust's `#[global_allocator]` path reaches jemalloc, while C and FFI
+# allocations keep going to the platform allocator — which would make this arm a *different*
+# allocator profile from the producer's rather than the same one.
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-sys",
+    "tikv-jemallocator?/override_allocator_on_supported_platforms",
+]
 snmalloc = ["dep:snmalloc-rs"]
 
 [dependencies]
