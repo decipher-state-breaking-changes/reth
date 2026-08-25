@@ -102,6 +102,9 @@ fn run() -> Res<()> {
         limits: &limits,
         trie_diagnostics: false,
         witness_v3: false,
+        // A memory meter, not a byte report: compressed sizes would be dead weight here, and this
+        // binary's counting allocator makes any extra allocation a distortion of its own reading.
+        compress_sidecars: false,
     };
 
     println!(

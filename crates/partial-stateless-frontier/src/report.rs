@@ -60,6 +60,13 @@ pub struct PolicySummary {
     pub witness_v3_blocks: u64,
     /// Total serialized sidecar bytes.
     pub total_sidecar_bytes: u64,
+    /// Total zstd-compressed sidecar bytes over the blocks that measured them.
+    ///
+    /// Zero unless the run was asked to compress. Its denominator is `zstd_measured_blocks`, not
+    /// `blocks`, so a partial measurement cannot be divided by the wrong population.
+    pub total_sidecar_zstd_bytes: u64,
+    /// Measured blocks whose compressed size was recorded.
+    pub zstd_measured_blocks: u64,
     /// Total parent-state witness bytes.
     pub total_witness_node_bytes: u64,
     /// Total bytecode bytes.
@@ -122,6 +129,21 @@ pub struct RunSummary {
     /// from". `null` means the capture ran from a build that carried no stamp, which is a fact
     /// about the corpus rather than about this run.
     pub dataset_build_commit: Option<String>,
+    /// The global allocator this binary was built with.
+    ///
+    /// Recorded because it is an input to every timing here and not a packaging detail: the arms
+    /// share one allocator inside one process while stressing it very differently, so two runs
+    /// that disagree on this field are not comparable on time however well they agree on bytes.
+    pub allocator: String,
+    /// Whether this run recorded compressed sidecar sizes, and therefore whether its *timings*
+    /// are usable.
+    ///
+    /// A run with this set is a size pass: its byte figures are the ones to quote and its latency
+    /// figures are to be discarded. Recorded so the file itself says which of the two it is,
+    /// rather than leaving it to whoever still remembers how it was launched.
+    pub compressed_sidecars: bool,
+    /// The zstd level compressed sizes were measured at, or `null` for a run that measured none.
+    pub sidecar_zstd_level: Option<i32>,
     /// The commit *this* binary was built from, read at compile time.
     ///
     /// The corpus and the generator are two different pieces of code and either can move under a
@@ -182,6 +204,8 @@ impl RunSummary {
         results: &[BlockResult],
         witness_v3_requested: bool,
         trie_repr: partial_stateless::CacheTrieRepr,
+        allocator: &str,
+        compressed_sidecars: bool,
     ) -> Self {
         let mut policies = BTreeMap::new();
         for spec in specs {
@@ -213,6 +237,10 @@ impl RunSummary {
                     entry.witness_v3_blocks += 1;
                 }
                 entry.total_sidecar_bytes += policy.sidecar_bytes as u64;
+                if let Some(zstd_bytes) = policy.sidecar_zstd_bytes {
+                    entry.total_sidecar_zstd_bytes += zstd_bytes as u64;
+                    entry.zstd_measured_blocks += 1;
+                }
                 entry.total_witness_node_bytes += policy.witness_node_bytes as u64;
                 entry.total_witness_code_bytes += policy.witness_code_bytes as u64;
                 entry.total_missed_accounts += policy.missed_accounts as u64;
@@ -240,6 +268,9 @@ impl RunSummary {
             dataset: dataset.display().to_string(),
             dataset_producer,
             dataset_build_commit,
+            allocator: allocator.to_string(),
+            compressed_sidecars,
+            sidecar_zstd_level: compressed_sidecars.then_some(crate::generate::SIDECAR_ZSTD_LEVEL),
             generator_build_commit: option_env!("PS_BUILD_COMMIT").map(str::to_string),
             warmup_blocks,
             measured_blocks,
@@ -252,7 +283,7 @@ impl RunSummary {
             total_block_admission_us,
             builder_latency_eligible: false,
             standalone_latency_eligible: false,
-            supported_claims: claims(weak_baseline_present),
+            supported_claims: claims(weak_baseline_present, compressed_sidecars),
         }
     }
 
@@ -271,7 +302,7 @@ impl RunSummary {
 /// Written as a function rather than a literal because the Partial-versus-Weak claim is the one
 /// that was previously recorded unconditionally while nothing ever produced a Weak arm — a report
 /// asserting a comparison it did not make.
-fn claims(weak_baseline_present: bool) -> Vec<String> {
+fn claims(weak_baseline_present: bool, compressed_sidecars: bool) -> Vec<String> {
     let mut claims = vec![
         "sidecar size for the same block under each arm".to_string(),
         "cache and trie-cache footprint under each arm".to_string(),
@@ -282,6 +313,21 @@ fn claims(weak_baseline_present: bool) -> Vec<String> {
     ];
     if weak_baseline_present {
         claims.push("Partial versus Weak on that same block set".to_string());
+    }
+    if compressed_sidecars {
+        // The claim list is the one place a reader is guaranteed to look, so the size pass says
+        // here that half of its own output is not evidence.
+        claims.push(
+            "compressed sidecar size per arm, at the recorded zstd level, for the serialized \
+             sidecar and not for a wire frame"
+                .to_string(),
+        );
+        claims.retain(|claim| !claim.starts_with("sidecar decode-and-commit cost"));
+        claims.push(
+            "NOT time: this run compressed sidecars, so every latency figure in it is void and \
+             the timings come from a separate pass over the same corpus at the same commit"
+                .to_string(),
+        );
     }
     claims
 }

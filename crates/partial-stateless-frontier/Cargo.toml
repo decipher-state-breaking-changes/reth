@@ -23,6 +23,29 @@ default = ["asm-keccak", "keccak-cache-global"]
 asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
 
+# Global allocator selection, off by default so the default build stays the platform allocator and
+# a build that names no allocator is unambiguous rather than silently jemalloc.
+#
+# The same reason as `partial-stateless-replay`, and it applies here with a twist that makes it
+# worse: this binary rotates every cache policy over the same block inside one process, so the
+# allocator is shared by arms that stress it very differently. A no-cache arm does no cache
+# maintenance at all while a windowed arm does all of it, and an allocator that degrades under
+# churn therefore lands on one arm and not the other. That is not a nuisance term in a
+# policy-versus-policy comparison, it is a confound in the comparison itself. These features exist
+# so the allocator is a recorded input rather than whatever the platform supplied. Whichever is
+# selected is recorded in the run summary.
+#
+# jemalloc wins if both are named, matching `reth-cli-util`'s precedence so a build here cannot
+# mean something different from a build there. The override feature is part of that match and not
+# optional: without it only Rust's `#[global_allocator]` path reaches jemalloc, while C and FFI
+# allocations keep going to the platform allocator.
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-sys",
+    "tikv-jemallocator?/override_allocator_on_supported_platforms",
+]
+snmalloc = ["dep:snmalloc-rs"]
+
 [dependencies]
 partial-stateless = { path = "../partial-stateless" }
 partial-stateless-validator = { path = "../partial-stateless-validator" }
@@ -53,6 +76,17 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["std"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+# Compressed sidecar sizes. Linked unconditionally and used only under `--compress-sidecars`, so
+# the latency pass and the size pass are the same binary at the same commit differing by a flag —
+# which is what licenses reading sizes off one pass and timings off the other.
+zstd.workspace = true
+
+# Allocator backends. Leaf crates with no reth graph of their own, which is why selecting one
+# cannot reach the implementation crates `check_validator_isolation.sh` forbids.
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
+snmalloc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The equivalence gate builds a real parent trie and proves against it, which is the only way to

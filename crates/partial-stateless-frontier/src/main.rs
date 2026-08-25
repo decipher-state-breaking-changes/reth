@@ -17,6 +17,46 @@
 //! policy window, because a policy measured before its window is populated is not the policy the
 //! report names.
 
+// Global allocator, selected at compile time by the `jemalloc`/`snmalloc` features and left as the
+// platform allocator when neither is named.
+//
+// This binary rotates every arm over the same block in one process, so the allocator is shared by
+// arms that stress it very differently: a no-cache arm does no cache maintenance while a windowed
+// arm does all of it. An allocator that degrades under churn therefore lands unevenly across the
+// arms of the very comparison this tool exists to make. It belongs in `main.rs` because a
+// `#[global_allocator]` in a library is only honoured when that library happens to be the root
+// crate.
+//
+// jemalloc takes precedence when both features are on, matching `reth_cli_util::allocator`.
+#[cfg(all(feature = "jemalloc", unix))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Required for jemalloc to override the allocator on supported Unix platforms: the symbols only
+// reach the linker if something `use`s the sys crate.
+#[cfg(all(feature = "jemalloc", unix))]
+use tikv_jemalloc_sys as _;
+
+#[cfg(all(feature = "snmalloc", not(feature = "jemalloc"), unix))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// Keeps `--all-features` from warning about the crate the precedence rule above shuts out.
+#[cfg(all(feature = "snmalloc", feature = "jemalloc", unix))]
+use snmalloc_rs as _;
+
+/// Name of the allocator this binary was built with, for the run summary.
+///
+/// Compile-time rather than probed: the point is to record what the build selected, and a probe
+/// would report what the process happens to have loaded.
+pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
+    "jemalloc"
+} else if cfg!(all(feature = "snmalloc", unix)) {
+    "snmalloc"
+} else {
+    "system"
+};
+
 use partial_stateless::{load_dataset, CacheTrieRepr};
 use partial_stateless_frontier::{
     generate::{generate_block, ChainCursor, GeneratorRules},
@@ -41,11 +81,13 @@ struct Options {
     trie_diagnostics: bool,
     witness_v3: bool,
     trie_repr: CacheTrieRepr,
+    compress_sidecars: bool,
 }
 
 fn usage() -> String {
     "usage: ps-policy-frontier --dataset <dir> --arm <weak|a/s> [--arm <weak|a/s> ...] \
-     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3] [--trie-repr <parallel|exact>]"
+     --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3] \
+     [--trie-repr <parallel|exact>] [--compress-sidecars]"
         .to_string()
 }
 
@@ -58,6 +100,7 @@ fn parse_args() -> eyre::Result<Options> {
     let mut trie_diagnostics = false;
     let mut witness_v3 = false;
     let mut trie_repr = CacheTrieRepr::default();
+    let mut compress_sidecars = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -74,6 +117,7 @@ fn parse_args() -> eyre::Result<Options> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--trie-diagnostics" => trie_diagnostics = true,
             "--witness-v3" => witness_v3 = true,
+            "--compress-sidecars" => compress_sidecars = true,
             "--trie-repr" => {
                 trie_repr = value()?.parse().map_err(|err| eyre::eyre!("{err}"))?;
             }
@@ -105,7 +149,17 @@ fn parse_args() -> eyre::Result<Options> {
         eyre::bail!("--samples must be at least 1")
     }
 
-    Ok(Options { dataset, arms, warmup, samples, out, trie_diagnostics, witness_v3, trie_repr })
+    Ok(Options {
+        dataset,
+        arms,
+        warmup,
+        samples,
+        out,
+        trie_diagnostics,
+        witness_v3,
+        trie_repr,
+        compress_sidecars,
+    })
 }
 
 fn main() -> eyre::Result<()> {
@@ -151,6 +205,8 @@ fn main() -> eyre::Result<()> {
         samples = options.samples,
         witness_v3 = options.witness_v3,
         trie_repr = options.trie_repr.label(),
+        allocator = ALLOCATOR_NAME,
+        compress_sidecars = options.compress_sidecars,
         "Loaded policy replay dataset"
     );
     if !dataset.abandoned.is_empty() {
@@ -183,6 +239,7 @@ fn main() -> eyre::Result<()> {
         limits: &limits,
         trie_diagnostics: options.trie_diagnostics,
         witness_v3: options.witness_v3,
+        compress_sidecars: options.compress_sidecars,
     };
 
     let replayed = &dataset.records[..needed as usize];
@@ -227,6 +284,8 @@ fn main() -> eyre::Result<()> {
         &results,
         options.witness_v3,
         options.trie_repr,
+        ALLOCATOR_NAME,
+        options.compress_sidecars,
     );
     let summary_path = options.out.join("frontier-summary.json");
     summary.write(&summary_path)?;

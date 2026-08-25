@@ -6538,8 +6538,12 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "snmalloc-rs",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "zstd",
 ]
 
 [[package]]

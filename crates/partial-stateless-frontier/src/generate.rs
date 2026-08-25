@@ -90,6 +90,14 @@ pub struct PolicyBlockResult {
     pub rotation_slot: usize,
     /// Serialized sidecar size, which is the figure a bandwidth claim is about.
     pub sidecar_bytes: usize,
+    /// The same sidecar compressed at [`SIDECAR_ZSTD_LEVEL`], or `None` when the run did not ask.
+    ///
+    /// This is the *sidecar*, not a frame: a live `CommitFrame` adds a header and the Engine
+    /// payload, which are the same bytes for every arm and so can only pull an arm-versus-arm
+    /// ratio toward one. A ratio quoted as an on-the-wire figure has to be built from frames, not
+    /// from this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar_zstd_bytes: Option<usize>,
     /// keccak256 of the serialized sidecar, so two hosts can be compared without shipping either.
     pub sidecar_digest: B256,
     /// The sidecar's own witness commitment.
@@ -248,7 +256,25 @@ pub struct GeneratorRules<'a, Evm, C: ?Sized, ChainSpec> {
     /// on its own. Byte results from a trimmed run are a different wire format and must never
     /// be compared against an untrimmed run's without saying so.
     pub witness_v3: bool,
+    /// Whether to record the zstd-compressed size of each arm's serialized sidecar.
+    ///
+    /// Off for any run whose timings are going to be read. The compression itself happens after
+    /// the boundary below has closed, but a multi-megabyte zstd pass leaves the CPU cache and the
+    /// allocator arenas in a state the *next* arm in the rotation inherits — and because the arms
+    /// differ several-fold in sidecar size, that carry-over is asymmetric between exactly the arms
+    /// being compared. "No extra work inside the boundary" is not "no effect on the boundary", so
+    /// sizes come from a separate pass over the same corpus at the same commit. The sidecars are
+    /// deterministic (`tests/live_offline_equivalence.rs` asserts them byte-identical), which is
+    /// what makes the two passes describe the same objects.
+    pub compress_sidecars: bool,
 }
+
+/// The zstd level compressed sidecar sizes are measured at.
+///
+/// A constant rather than an option: the level is a parameter of any byte claim derived from these
+/// figures, so it is recorded in the run summary and changed by editing this line, not by an
+/// operator's flag that a later reader cannot recover.
+pub const SIDECAR_ZSTD_LEVEL: i32 = 3;
 
 /// What the previous block left behind for the next one.
 #[derive(Debug)]
@@ -556,6 +582,19 @@ where
     .map_err(|err| eyre::eyre!("standalone validation refused the generated sidecar: {err:#}"))?;
     let sidecar_decode_and_commit_us = validation_start.elapsed().as_micros() as u64;
 
+    // Strictly after the boundary closed, and still only in a run whose timings are being thrown
+    // away — see `GeneratorRules::compress_sidecars` for why "after the timer" is not sufficient
+    // on its own.
+    let sidecar_zstd_bytes = if rules.compress_sidecars {
+        Some(
+            zstd::stream::encode_all(sidecar_bytes.as_slice(), SIDECAR_ZSTD_LEVEL)
+                .map_err(|err| eyre::eyre!("sidecar failed to compress: {err}"))?
+                .len(),
+        )
+    } else {
+        None
+    };
+
     if validated.outcome.next_cache_anchor != sidecar.next_cache_anchor {
         eyre::bail!(
             "the validator's own next cache anchor {:?} differs from the sidecar's {:?}",
@@ -588,6 +627,7 @@ where
         },
         rotation_slot,
         sidecar_bytes: sidecar_bytes.len(),
+        sidecar_zstd_bytes,
         // Over the sidecar's semantic content rather than its bytes: the bytes carry this host's
         // own build time, so hashing them would report two hosts as disagreeing about a sidecar
         // they both produced identically.
