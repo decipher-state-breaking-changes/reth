@@ -117,6 +117,39 @@ class DriftStatistics(unittest.TestCase):
         self.assertGreater(result["interval"][1] - result["interval"][0], 0.2)
 
 
+class BootstrapBlockLength(unittest.TestCase):
+    """The interval has to contain the point estimate; at small n a fixed block length does not.
+
+    With the default 50 over a 100-value half a replicate is two blocks, and the resulting interval
+    can sit entirely to one side of the ratio it is supposed to bracket — a silent failure that
+    reads like a confident narrow answer.
+    """
+
+    def test_interval_brackets_the_point_estimate_at_small_n(self):
+        rng = random.Random(1)
+        rows = select(
+            [record(index, 100_000 + (6_000 if index >= 100 else 0)) for index in range(200)],
+            "steady",
+        )
+        result = drift(rows, rng)
+        self.assertLessEqual(result["interval"][0], result["ratio"])
+        self.assertGreaterEqual(result["interval"][1], result["ratio"])
+
+    def test_block_length_shrinks_only_when_the_sample_is_short(self):
+        from analyze_run_drift import BLOCK_LEN, effective_block_len
+
+        self.assertEqual(effective_block_len(1800), BLOCK_LEN)
+        self.assertEqual(effective_block_len(100), 5)
+        self.assertEqual(effective_block_len(4), 1)
+
+    def test_full_length_sample_still_uses_the_default(self):
+        rng = random.Random(1)
+        rows = select([record(index, 100_000) for index in range(4000)], "steady")
+        from analyze_run_drift import BLOCK_LEN
+
+        self.assertEqual(drift(rows, rng)["block_len"], BLOCK_LEN)
+
+
 class PhaseAttribution(unittest.TestCase):
     def test_ranks_by_absolute_time_not_ratio(self):
         """A phase that triples from 0.1 ms must not outrank one that adds 10 ms."""
@@ -260,6 +293,51 @@ class InputShapes(unittest.TestCase):
             run = analyze([path], [], "steady")["runs"][0]
         self.assertEqual(run["allocator"], "jemalloc")
         self.assertEqual(run["build_commit"], "079cbbc6aa")
+
+
+class CommandLine(unittest.TestCase):
+    """The CLI shape the campaign driver depends on.
+
+    `--run` exists because argparse stops collecting positionals at the first option, so
+    `a.jsonl --label a b.jsonl --label b` silently loses every run after the first. That failure
+    mode is invisible until a campaign has already spent its replays.
+    """
+
+    def run_cli(self, argv):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "analyze_run_drift.py")] + argv,
+            capture_output=True,
+            text=True,
+        )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.paths = []
+        for name in ("a", "b"):
+            path = os.path.join(self.tmp.name, f"{name}.jsonl")
+            write_follow(path, [record(index, 100_000) for index in range(100)])
+            self.paths.append(path)
+
+    def test_runs_and_labels_pair_when_given_as_options(self):
+        result = self.run_cli(
+            ["--run", self.paths[0], "--label", "one", "--run", self.paths[1], "--label", "two"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("## one", result.stdout)
+        self.assertIn("## two", result.stdout)
+        self.assertIn("## two vs one", result.stdout)
+
+    def test_bare_positionals_still_work(self):
+        result = self.run_cli(self.paths)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_label_count_mismatch_is_refused(self):
+        result = self.run_cli(["--run", self.paths[0], "--run", self.paths[1], "--label", "one"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("labels are positional", result.stderr)
 
 
 class Determinism(unittest.TestCase):

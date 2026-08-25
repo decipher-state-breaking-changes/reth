@@ -154,14 +154,24 @@ def median_of(values):
     return statistics.median(values) if values else None
 
 
-def moving_block_resample(values, rng):
+def effective_block_len(count):
+    """Block length actually used, shrunk when the sample is too short to carry the default.
+
+    A fixed 50 over a 100-value half draws two blocks per replicate, which is so coarse that the
+    interval can miss the point estimate entirely — the failure is silent and reads like a
+    confident narrow answer. Twenty blocks per replicate is the floor this keeps.
+    """
+    return max(1, min(BLOCK_LEN, count // 20))
+
+
+def moving_block_resample(values, rng, block_len):
     """One moving-block bootstrap replicate, preserving local serial structure."""
-    if len(values) <= BLOCK_LEN:
+    if len(values) <= block_len:
         return [values[rng.randrange(len(values))] for _ in values]
     out = []
     while len(out) < len(values):
-        start = rng.randrange(0, len(values) - BLOCK_LEN)
-        out.extend(values[start : start + BLOCK_LEN])
+        start = rng.randrange(0, len(values) - block_len)
+        out.extend(values[start : start + block_len])
     return out[: len(values)]
 
 
@@ -181,9 +191,10 @@ def drift(selected, rng):
     half = count // 2
     first, second = values[:half], values[half : 2 * half]
     ratio = statistics.median(second) / statistics.median(first)
+    block_len = effective_block_len(half)
     replicates = [
-        statistics.median(moving_block_resample(second, rng))
-        / statistics.median(moving_block_resample(first, rng))
+        statistics.median(moving_block_resample(second, rng, block_len))
+        / statistics.median(moving_block_resample(first, rng, block_len))
         for _ in range(RESAMPLES)
     ]
     quarter = count // 4
@@ -192,6 +203,7 @@ def drift(selected, rng):
     ]
     return {
         "n": count,
+        "block_len": block_len,
         "first_half_p50_us": statistics.median(first),
         "second_half_p50_us": statistics.median(second),
         "ratio": ratio,
@@ -382,8 +394,13 @@ def print_human(result):
                 else "no time-order effect resolvable at this sample size"
             )
             print()
+            shrunk = (
+                f", block length {drift_row['block_len']} (shrunk for the sample size)"
+                if drift_row["block_len"] != BLOCK_LEN
+                else ""
+            )
             print(f"- half split (second/first): **{drift_row['ratio']:.3f}x**  "
-                  f"95% moving-block [{low:.3f}, {high:.3f}] — {verdict}")
+                  f"95% moving-block [{low:.3f}, {high:.3f}]{shrunk} — {verdict}")
             quarters = "  ".join(f"{value / 1000:.2f}" for value in drift_row["quarter_p50_us"])
             print(f"- quarter p50 (ms): {quarters}   Q4/Q1 {drift_row['quarter_ratio']:.3f}x")
         if run["per_copy"]:
@@ -537,6 +554,12 @@ def main():
     )
     parser.add_argument("runs", nargs="*", metavar="RUN.jsonl",
                         help="replay JSONL; the first is the baseline every other is compared to")
+    # Repeatable alternative to the positionals. Positionals cannot be interleaved with `--label`
+    # — argparse stops collecting them at the first option — so a caller naming every run has to
+    # pass them as options too, and a caller naming none can keep the shorter positional form.
+    parser.add_argument("--run", action="append", default=[], metavar="PATH", dest="run",
+                        help="replay JSONL, repeatable; use instead of the positionals when "
+                             "pairing each run with a --label")
     parser.add_argument("--label", action="append", default=[], metavar="NAME",
                         help="name for each run, in order; defaults to the manifest label")
     parser.add_argument("--population", choices=("steady", "all"), default="steady",
@@ -547,10 +570,16 @@ def main():
 
     if args.self_check:
         return self_check()
-    if not args.runs:
+    runs = args.runs + args.run
+    if not runs:
         parser.error("give at least one run, or --self-check")
+    if args.label and len(args.label) != len(runs):
+        parser.error(
+            f"{len(args.label)} labels for {len(runs)} runs; labels are positional, so a partial "
+            "list would silently name the wrong run"
+        )
 
-    result = analyze(args.runs, args.label, args.population)
+    result = analyze(runs, args.label, args.population)
     print_human(result)
     if args.json:
         with open(args.json, "w") as handle:
