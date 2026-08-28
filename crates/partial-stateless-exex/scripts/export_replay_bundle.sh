@@ -140,14 +140,17 @@ git fetch && git checkout $COMMIT
 export PS_BUILD_COMMIT=\$(git rev-parse HEAD)
 export PS_BUILD_DIRTY=\$([ -z "\$(git status --porcelain)" ] && echo 0 || echo 1)
 export PS_CARGO_LOCK_SHA256=\$(sha256sum Cargo.lock | cut -d' ' -f1)
-cargo build --release -p partial-stateless-replay
-crates/partial-stateless-exex/scripts/check_validator_isolation.sh
+cargo build --release -p partial-stateless-replay --features jemalloc
+PS_ISOLATION_FEATURES=jemalloc \\
+    crates/partial-stateless-exex/scripts/check_validator_isolation.sh partial-stateless-replay
 \`\`\`
 
 The three exports are read at *compile* time and baked into the binary, so the run manifest the
 replay stamps can name its own build; a dirty tree stamps \`build_dirty: true\` and the record
 says so. The isolation script must pass — it is what proves the binary you are about to run has
 no provider or database path and carries the keccak and secp256k1 build profile.
+\`--features jemalloc\` is part of the accepted profile: omitting it silently recreates the superseded
+platform-allocator validator.
 
 ## 3. Replay
 
