@@ -1183,6 +1183,21 @@ struct RewindWindow {
 /// re-read.
 pub(crate) const MAX_REWIND_FRAMES: u64 = 4_096;
 
+/// Undo generations a consumer keeps after a commit.
+///
+/// One. A consumer can only self-recover a reorg exactly one block deep: `reorg.rs` refuses
+/// anything deeper with "a reorg {depth} blocks deep needs a snapshot at the common ancestor; the
+/// retained generation reaches exactly one block", and the coordination layer says the same --
+/// "Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has to
+/// move as one generation." Every read of the log is `back()`, so a record below the tip is
+/// unreachable by any supported recovery path.
+///
+/// The producer sets its own retention by a different rule — finality, with a fixed-depth floor
+/// when no finality is available (`partial-stateless-exex/src/lib.rs`). That is not a bound this
+/// side inherits. Whatever the producer keeps its log for, retaining as much here would hold
+/// records nothing on this side can read.
+pub(crate) const CONSUMER_UNDO_RETAIN_BLOCKS: u64 = 1;
+
 /// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
 fn finish_collection_if_complete(
     phase: BatchPhase,
@@ -1888,6 +1903,14 @@ pub(crate) fn replay_commit(
             ))
         }
     };
+
+    // The commit above pushed one undo record. Drop every older one: without this the log grows by
+    // one record per block for the life of the run -- each holding the prior value of every account,
+    // storage slot and code the block touched or evicted -- which is what took a 53-hour follower
+    // from 0.8 GiB to 13.3 GiB of resident memory. The producer prunes to finality
+    // (`partial-stateless-exex/src/lib.rs`); this side has no provider to ask, and needs far less.
+    let height = state.pair.cache.current_block();
+    state.pair.cache.prune_undo_below(height.saturating_sub(CONSUMER_UNDO_RETAIN_BLOCKS));
     // The core's instrumentation, completed the way the paired harness completes it: admission
     // and the sidecar decode happened out here in the driver, so the core record carries them
     // only if the driver puts them in.
