@@ -43,6 +43,12 @@ jemalloc = [
     "dep:tikv-jemalloc-sys",
     "tikv-jemallocator?/override_allocator_on_supported_platforms",
 ]
+
+# Diagnostic only, and deliberately NOT part of `jemalloc`: it turns on `--enable-stats` in the
+# jemalloc build, which adds counter bookkeeping to the allocator's own fast path. A binary built
+# with this is a different allocator profile from the accepted one, so its timings are not
+# comparable to an accepted run's — use it to find where resident memory went, not to measure.
+jemalloc-stats = ["jemalloc", "dep:tikv-jemalloc-ctl", "tikv-jemalloc-ctl/stats"]
 snmalloc = ["dep:snmalloc-rs"]
 
 [dependencies]
@@ -77,6 +83,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 # cannot reach the implementation crates `check_validator_isolation.sh` forbids.
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-sys = { workspace = true, optional = true }
+# Reads jemalloc's own accounting. `allocated` and `active` are what the process actually owns and
+# what the allocator holds pages for; `resident`, `mapped` and `retained` are what it has not given
+# back. Separating those is the only way to tell an owned-structure growth from fragmentation from
+# arena retention — a decay setting cannot.
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 snmalloc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]

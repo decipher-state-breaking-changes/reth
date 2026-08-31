@@ -387,6 +387,13 @@ pub struct PhaseLeaves {
     /// Committing the transition into the coordinated pair and recording the block in this
     /// consumer's own verified history — the close of the primary boundary.
     pub pair_commit_us: Option<u64>,
+    /// Dropping the undo generations this consumer can no longer reach.
+    ///
+    /// A leaf of its own rather than part of `pair_commit_us`: reclaiming memory is not committing
+    /// the pair, and folding it in would silently change what an already-published metric means.
+    /// The cost is one `BlockCacheUndo` destructor per block, so it is expected to be small at the
+    /// median and is measured because it need not be at the tail.
+    pub undo_prune_us: Option<u64>,
 }
 
 impl PhaseLeaves {
@@ -416,6 +423,7 @@ impl PhaseLeaves {
             self.next_cache_anchor_us,
             self.trie_commit_us,
             self.pair_commit_us,
+            self.undo_prune_us,
         ]
         .into_iter()
         .flatten()
@@ -481,6 +489,7 @@ struct AttemptTimer {
     admission: Option<AdmissionTimings>,
     transition_us: Option<u64>,
     pair_commit_us: Option<u64>,
+    undo_prune_us: Option<u64>,
     oracle_compare_us: Option<u64>,
     /// The primary wall, frozen before the oracle comparison so harness work stays outside it.
     validation_wall_us: Option<u64>,
@@ -501,6 +510,7 @@ impl AttemptTimer {
             admission: None,
             transition_us: None,
             pair_commit_us: None,
+            undo_prune_us: None,
             oracle_compare_us: None,
             validation_wall_us: None,
             core: None,
@@ -547,6 +557,7 @@ impl AttemptTimer {
             next_cache_anchor_us: core.map(|c| c.next_cache_anchor_us),
             trie_commit_us: core.map(|c| c.trie_commit_us),
             pair_commit_us: self.pair_commit_us,
+            undo_prune_us: self.undo_prune_us,
         };
         let leaf_sum = phases.sum_us();
         if leaf_sum > standalone_validation_us {
@@ -1197,6 +1208,70 @@ pub(crate) const MAX_REWIND_FRAMES: u64 = 4_096;
 /// side inherits. Whatever the producer keeps its log for, retaining as much here would hold
 /// records nothing on this side can read.
 pub(crate) const CONSUMER_UNDO_RETAIN_BLOCKS: u64 = 1;
+
+/// How often the memory probe reports, in blocks. `0` (the default) disables it.
+///
+/// Read once: this is diagnostic instrumentation on the hot path, and re-reading the environment
+/// every block would itself be a cost the probe is supposed to be measuring around.
+fn memory_probe_interval() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("PS_MEMORY_PROBE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// jemalloc's own accounting, refreshed. `None` unless built with `--features jemalloc-stats`.
+///
+/// The three numbers answer different questions and only together identify where resident memory
+/// has gone: `allocated` is what the process owns right now, `active` is the pages jemalloc holds
+/// because of those live allocations, and `resident` is what it has not returned to the kernel.
+/// So `allocated` rising is owned structures or container capacity; `allocated` flat while
+/// `active` rises is fragmentation inside pages; `active` flat while `resident` rises is dirty,
+/// muzzy or arena retention. A decay setting moves only the third and therefore cannot tell the
+/// three apart, which is why they are read rather than inferred.
+#[cfg(feature = "jemalloc-stats")]
+fn jemalloc_stats() -> Option<[u64; 5]> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // The stats are cached behind an epoch; without advancing it every read returns the values
+    // from process start.
+    epoch::advance().ok()?;
+    Some([
+        stats::allocated::read().ok()? as u64,
+        stats::active::read().ok()? as u64,
+        stats::resident::read().ok()? as u64,
+        stats::mapped::read().ok()? as u64,
+        stats::retained::read().ok()? as u64,
+    ])
+}
+
+#[cfg(not(feature = "jemalloc-stats"))]
+fn jemalloc_stats() -> Option<[u64; 5]> {
+    None
+}
+
+/// Emit one memory sample when `PS_MEMORY_PROBE` is set and this is a reporting block.
+fn memory_probe(height: u64) {
+    let interval = memory_probe_interval();
+    if interval == 0 || height % interval != 0 {
+        return
+    }
+    let mut rss_kib = 0u64;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kib = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+    }
+    match jemalloc_stats() {
+        Some([allocated, active, resident, mapped, retained]) => eprintln!(
+            "PS_MEMORY\tblock={height}\trss_kib={rss_kib}\tallocated={allocated}\t\
+active={active}\tresident={resident}\tmapped={mapped}\tretained={retained}"
+        ),
+        None => eprintln!("PS_MEMORY\tblock={height}\trss_kib={rss_kib}\tjemalloc_stats=unavailable"),
+    }
+}
+
 
 /// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
 fn finish_collection_if_complete(
@@ -1909,8 +1984,11 @@ pub(crate) fn replay_commit(
     // storage slot and code the block touched or evicted -- which is what took a 53-hour follower
     // from 0.8 GiB to 13.3 GiB of resident memory. The producer prunes to finality
     // (`partial-stateless-exex/src/lib.rs`); this side has no provider to ask, and needs far less.
+    let prune_started = Instant::now();
     let height = state.pair.cache.current_block();
     state.pair.cache.prune_undo_below(height.saturating_sub(CONSUMER_UNDO_RETAIN_BLOCKS));
+    timer.undo_prune_us = Some(prune_started.elapsed().as_micros() as u64);
+    memory_probe(height);
     // The core's instrumentation, completed the way the paired harness completes it: admission
     // and the sidecar decode happened out here in the driver, so the core record carries them
     // only if the driver puts them in.
