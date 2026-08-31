@@ -1988,7 +1988,6 @@ pub(crate) fn replay_commit(
     let height = state.pair.cache.current_block();
     state.pair.cache.prune_undo_below(height.saturating_sub(CONSUMER_UNDO_RETAIN_BLOCKS));
     timer.undo_prune_us = Some(prune_started.elapsed().as_micros() as u64);
-    memory_probe(height);
     // The core's instrumentation, completed the way the paired harness completes it: admission
     // and the sidecar decode happened out here in the driver, so the core record carries them
     // only if the driver puts them in.
@@ -2010,6 +2009,14 @@ pub(crate) fn replay_commit(
     timer.pair_commit_us = Some(commit_started.elapsed().as_micros() as u64);
     // The verdict is committed; everything after this line is the harness checking itself.
     timer.close_validation();
+
+    // Sampled here and not at the prune: until `commit_transition` above ran, three trie
+    // generations were reachable at once — the new one, the parent the transition displaced and
+    // handed back, and the one still sitting in `previous_generation`. A sample taken there reads
+    // a transition, not a steady state, and would have counted a generation about to be dropped as
+    // live. Being past `close_validation` also keeps the probe's own cost — a `/proc` read and six
+    // mallctl calls — out of the primary boundary.
+    memory_probe(height);
 
     let compare_started = Instant::now();
     let disagreements = compare_accepted(oracle, &outcome, &state.pair);
