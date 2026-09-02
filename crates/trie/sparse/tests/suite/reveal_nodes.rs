@@ -430,3 +430,84 @@ pub(super) fn test_reveal_boundary_node_with_missing_upper_parent_branch<T: Spar
     }])
     .expect("boundary reveal should not panic");
 }
+
+/// A proof node above its subtrie's entry point is rejected.
+///
+/// When an upper extension reaches past the two-nibble boundary — two keys sharing `0x405` put an
+/// extension at `0x4` keyed `[0, 5]` — the only legitimate root of subtrie `0x40` is `0x405`, and
+/// the upper trie jumps straight over `0x40`. A proof taken against a topology that branched at
+/// `0x4` instead carries a compact branch recorded at `0x40`. Admitting it makes the subtrie adopt
+/// `0x40` as its root, which the trie root cannot reach.
+///
+/// That alone hashes correctly, because the upper traversal looks the child up at its exact path.
+/// The damage surfaces one removal later: collapsing the branch at `0x405` merges it into the
+/// upper extension and deletes it, and the next hash pass walks the subtrie from the adopted
+/// `0x40` into the hole where `0x405` used to be.
+pub(super) fn test_reveal_nodes_rejects_node_above_subtrie_entry<T: SparseTrie>(
+    new_trie: fn() -> T,
+) {
+    // Exactly two keys under `0x405`, so removing one collapses the branch there.
+    let mut key_a = B256::ZERO;
+    key_a.0[0] = 0x40;
+    key_a.0[1] = 0x50; // nibbles 4, 0, 5, 0
+    let mut key_b = B256::ZERO;
+    key_b.0[0] = 0x40;
+    key_b.0[1] = 0x51; // nibbles 4, 0, 5, 1
+    // A second top-level nibble, so the root stays a branch rather than collapsing.
+    let mut key_other = B256::ZERO;
+    key_other.0[0] = 0x10;
+
+    let deep: BTreeMap<B256, U256> = BTreeMap::from([
+        (key_a, U256::from(1)),
+        (key_b, U256::from(2)),
+        (key_other, U256::from(99)),
+    ]);
+
+    // The stale topology: one extra key diverges at the *second* nibble, so `0x4` becomes a branch
+    // and `0x40` becomes a node of its own — an extension keyed `[5]` onto the same branch at
+    // `0x405`. Proof v2 encodes that extension and branch as one compact branch recorded at
+    // `0x40`, which is the shape the live failure carried.
+    let mut shallow = deep.clone();
+    let mut diverging = B256::ZERO;
+    diverging.0[0] = 0x41;
+    shallow.insert(diverging, U256::from(201));
+
+    let deep_harness = SuiteTestHarness::new(deep);
+    let shallow_harness = SuiteTestHarness::new(shallow);
+
+    let mut trie: T = deep_harness.init_trie_fully_revealed(false, new_trie);
+    assert_eq!(
+        trie.root(),
+        deep_harness.original_root(),
+        "the deep topology should hash correctly once revealed",
+    );
+
+    // Feed in the *lower* half of a proof taken against the shallow topology. The upper half is
+    // dropped deliberately: revealing the shallow branch at `0x4` would rewrite the upper trie and
+    // make `0x40` a legitimate entry, which is a different situation. What is under test is a
+    // stale lower node arriving while the upper trie still says the entry is `0x405`.
+    let mut targets = vec![ProofV2Target::new(key_a), ProofV2Target::new(key_b)];
+    let (stale, _) = shallow_harness.proof_v2(&mut targets);
+    let mut stale: Vec<_> = stale.into_iter().filter(|n| n.path.len() >= 2).collect();
+    assert!(
+        stale.iter().any(|n| n.path == Nibbles::from_nibbles([0x4, 0x0])),
+        "the shallow topology must supply a node at the boundary for this test to mean anything",
+    );
+    trie.reveal_nodes(&mut stale).expect("revealing stale proof nodes should not fail");
+
+    // Remove one of the pair, collapsing the branch at `0x405` into the upper extension.
+    let removal: BTreeMap<B256, U256> = BTreeMap::from([(key_b, U256::ZERO)]);
+    let mut leaf_updates = SuiteTestHarness::leaf_updates(&removal);
+    deep_harness.reveal_and_update(&mut trie, &mut leaf_updates);
+
+    let expected = SuiteTestHarness::new(BTreeMap::from([
+        (key_a, U256::from(1)),
+        (key_other, U256::from(99)),
+    ]))
+    .original_root();
+    assert_eq!(
+        trie.root(),
+        expected,
+        "a node above the subtrie's entry point must not become its root",
+    );
+}

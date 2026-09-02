@@ -626,8 +626,13 @@ impl SparseTrie for ParallelSparseTrie {
         );
 
         // Update the top-level branch node masks. This is simple and can't be done in parallel.
+        // Upper nodes only: a lower node's masks are stored under `path + branch.key`, so a stale
+        // compact branch at the boundary would write its masks over the canonical entry's. Lower
+        // masks are therefore deferred until `reachable_subtries` can say which nodes are admitted.
         self.branch_node_masks.reserve(nodes.len());
-        for ProofTrieNodeV2 { path, masks, node } in nodes.iter() {
+        for ProofTrieNodeV2 { path, masks, node } in
+            nodes.iter().filter(|n| SparseSubtrieType::path_len_is_upper(n.path.len()))
+        {
             if let Some(branch_masks) = masks {
                 // Use proper path for branch nodes by combining path and extension key.
                 let path = if let TrieNodeV2::Branch(branch) = node &&
@@ -661,6 +666,24 @@ impl SparseTrie for ParallelSparseTrie {
 
         let reachable_subtries = self.reachable_subtries();
 
+        // The lower half of the mask update, now that admission is decidable.
+        for ProofTrieNodeV2 { path, masks, node } in lower_nodes.iter().filter(|n| {
+            reachable_subtries.admits(path_subtrie_index_unchecked(&n.path), &n.path)
+        }) {
+            if let Some(branch_masks) = masks {
+                let path = if let TrieNodeV2::Branch(branch) = node &&
+                    !branch.key.is_empty()
+                {
+                    let mut path = *path;
+                    path.extend(&branch.key);
+                    path
+                } else {
+                    *path
+                };
+                self.branch_node_masks.insert(path, *branch_masks);
+            }
+        }
+
         // Best-effort for boundary nodes: if the parent upper node exists as a branch and the
         // boundary child is still blinded, unset that blinded bit and carry the hash into
         // `reveal_node`. If the parent path is absent/non-branch (for example upper extension
@@ -669,7 +692,8 @@ impl SparseTrie for ParallelSparseTrie {
             .iter()
             .filter_map(|node| {
                 if node.path.len() != UPPER_TRIE_MAX_DEPTH ||
-                    !reachable_subtries.get(path_subtrie_index_unchecked(&node.path))
+                    !reachable_subtries
+                        .admits(path_subtrie_index_unchecked(&node.path), &node.path)
                 {
                     return None;
                 }
@@ -692,11 +716,11 @@ impl SparseTrie for ParallelSparseTrie {
         if !self.is_reveal_parallelism_enabled(lower_nodes.len()) {
             for node in lower_nodes {
                 let idx = path_subtrie_index_unchecked(&node.path);
-                if !reachable_subtries.get(idx) {
+                if !reachable_subtries.admits(idx, &node.path) {
                     trace!(
                         target: "trie::parallel_sparse",
                         reveal_path = ?node.path,
-                        "Node's lower subtrie is not reachable, skipping",
+                        "Node is not at or below its subtrie's entry point, skipping",
                     );
                     continue;
                 }
@@ -752,6 +776,19 @@ impl SparseTrie for ParallelSparseTrie {
                     let mut nodes = nodes
                         .iter()
                         .filter(|node| {
+                            // Above its subtrie's entry point the node is stale, and it must be
+                            // dropped here rather than later: the first surviving node's path is
+                            // what `reveal` below adopts as the subtrie's root.
+                            if !reachable_subtries
+                                .admits(path_subtrie_index_unchecked(&node.path), &node.path)
+                            {
+                                trace!(
+                                    target: "trie::parallel_sparse",
+                                    path = ?node.path,
+                                    "Node is not at or below its subtrie's entry point, skipping",
+                                );
+                                return false
+                            }
                             // For boundary leaves, check reachability from upper subtrie's parent
                             // branch.
                             if node.path.len() == UPPER_TRIE_MAX_DEPTH &&
@@ -779,7 +816,7 @@ impl SparseTrie for ParallelSparseTrie {
                             || panic!("upper subtrie node {node:?} found amongst lower nodes"),
                         );
 
-                    if !reachable_subtries.get(idx) {
+                    if !reachable_subtries.is_reachable(idx) {
                         trace!(
                             target: "trie::parallel_sparse",
                             nodes = ?nodes,
@@ -3260,8 +3297,8 @@ impl ParallelSparseTrie {
 
     /// Returns a bitset of all subtries that are reachable from the upper trie. If subtrie is not
     /// reachable it means that it does not exist.
-    fn reachable_subtries(&self) -> SubtriesBitmap {
-        let mut reachable = SubtriesBitmap::default();
+    fn reachable_subtries(&self) -> ReachableSubtries {
+        let mut reachable = ReachableSubtries::default();
 
         let mut stack = Vec::new();
         stack.push(Nibbles::default());
@@ -3274,7 +3311,7 @@ impl ParallelSparseTrie {
                         let mut next = current;
                         next.push_unchecked(idx);
                         if next.len() >= UPPER_TRIE_MAX_DEPTH {
-                            reachable.set(path_subtrie_index_unchecked(&next));
+                            reachable.set(path_subtrie_index_unchecked(&next), next);
                         } else {
                             stack.push(next);
                         }
@@ -3284,7 +3321,7 @@ impl ParallelSparseTrie {
                     let mut next = current;
                     next.extend(key);
                     if next.len() >= UPPER_TRIE_MAX_DEPTH {
-                        reachable.set(path_subtrie_index_unchecked(&next));
+                        reachable.set(path_subtrie_index_unchecked(&next), next);
                     } else {
                         stack.push(next);
                     }
@@ -3362,6 +3399,48 @@ impl SubtriesBitmap {
     fn get(&self, idx: usize) -> bool {
         debug_assert!(idx < NUM_LOWER_SUBTRIES);
         self.0.bit(idx)
+    }
+}
+
+/// Which lower subtries the upper trie reaches, and *where* it enters each one.
+///
+/// A bitmap of indices is not enough. An upper extension may reach past the two-nibble boundary --
+/// an extension at `0x4` with key `[0, 5]` makes `0x405`, not `0x40`, the only legitimate root of
+/// subtrie `0x40`. Recording just the index admits a stale proof node at the boundary itself, and
+/// `LowerSparseSubtrie::reveal` then adopts that shallower path as the subtrie's root, leaving a
+/// node the global root cannot reach. That node outlives the removal of the real root and the next
+/// hash traversal walks into the hole it leaves.
+///
+/// Only entries deeper than the boundary are stored: entering at exactly two nibbles is the common
+/// case and needs no path, so the map is normally empty and this costs what the bitmap alone cost.
+#[derive(Clone, Default, Debug)]
+struct ReachableSubtries {
+    reachable: SubtriesBitmap,
+    deep_entries: HashMap<usize, Nibbles>,
+}
+
+impl ReachableSubtries {
+    /// Records that the upper trie enters the subtrie at `idx` by way of `entry`.
+    fn set(&mut self, idx: usize, entry: Nibbles) {
+        self.reachable.set(idx);
+        if entry.len() > UPPER_TRIE_MAX_DEPTH {
+            self.deep_entries.insert(idx, entry);
+        }
+    }
+
+    /// Whether the upper trie reaches the subtrie at all.
+    fn is_reachable(&self, idx: usize) -> bool {
+        self.reachable.get(idx)
+    }
+
+    /// Whether a node revealed at `path` sits at or below the subtrie's canonical entry point.
+    ///
+    /// Rejecting is not merely declining to store a node: the caller must also leave the parent's
+    /// blinded hash and the branch node masks alone, since a stale compact branch carries its key
+    /// into the mask path and would otherwise overwrite the canonical entry's masks.
+    fn admits(&self, idx: usize, path: &Nibbles) -> bool {
+        self.reachable.get(idx) &&
+            self.deep_entries.get(&idx).is_none_or(|entry| path.starts_with(entry))
     }
 }
 
