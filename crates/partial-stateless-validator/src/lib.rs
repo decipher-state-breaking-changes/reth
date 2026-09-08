@@ -29,7 +29,8 @@ pub use coordination::{
     admit_block, block_context, inject_recovery, try_deep_recovery, try_depth_one_recovery,
     BlockAdmission,
     CanonicalStateRoots, CoordinatedFingerprint, CoordinatedPair, LifecycleFingerprint,
-    ExpectedLineage, LineageError, RetainedGeneration, RetainedGenerationBytes, RetentionDepth,
+    ExpectedLineage, LineageError, RetainedDequeBytes, RetainedGeneration,
+    RetainedGenerationBytes, RetentionDepth,
     RetentionDepthError, MAX_RETENTION_DEPTH,
 };
 pub use reexec::{

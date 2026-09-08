@@ -14,7 +14,10 @@
 //! Logging state lives with the caller too. [`CoordinatedPair`] carries protocol state only, so the
 //! ExEx wraps it to add the last readiness label its run log reports on.
 
-use alloy_primitives::B256;
+use alloy_primitives::{
+    map::{HashMap, HashSet},
+    B256,
+};
 use partial_stateless::{
     network_cache::NetworkStateCache,
     readiness::{
@@ -411,6 +414,51 @@ impl CoordinatedPair {
         }
     }
 
+    /// What the whole retained deque costs, which is not K times what one generation costs.
+    ///
+    /// `exclusive_memory_bytes` is defined against one other holder, and at K > 1 that definition
+    /// stops meaning anything: a storage trie shared by three generations is non-exclusive in all
+    /// three, so summing exclusives undercounts it — flattering the design — and summing totals
+    /// counts it three times. The quantity an operator's budget cares about is what dropping the
+    /// deque would return, and that is a union:
+    ///
+    /// ```text
+    /// union(allocations reachable from every retained generation)
+    ///   - (allocations reachable from the live cache)
+    /// + per generation, the parts nothing else can be holding
+    /// ```
+    ///
+    /// The subtraction is the half that is easy to forget. A trie the live cache still points at
+    /// is not freed by dropping the deque, however many retained generations also point at it, so
+    /// counting it as retention cost would charge the deque for memory the pair needs anyway.
+    pub fn retained_deque_bytes(&self) -> RetainedDequeBytes {
+        let live: HashSet<usize> =
+            self.trie_cache.shared_allocations().into_iter().map(|(id, _)| id).collect();
+
+        let mut pool: HashMap<usize, usize> = HashMap::default();
+        let mut unshared = 0usize;
+        for generation in &self.retained {
+            unshared = unshared.saturating_add(generation.trie_cache.unshared_bytes());
+            for (id, bytes) in generation.trie_cache.shared_allocations() {
+                // Inserted rather than added: the same allocation reached from two generations is
+                // one allocation. `live` is excluded here rather than subtracted afterwards, so a
+                // trie the pair still uses never enters the total in the first place.
+                if !live.contains(&id) {
+                    pool.insert(id, bytes);
+                }
+            }
+        }
+        let shared_pool_bytes: usize = pool.values().sum();
+
+        RetainedDequeBytes {
+            generations: self.retained.len(),
+            unshared_bytes: unshared,
+            shared_pool_bytes,
+            shared_allocations: pool.len(),
+            total_bytes: unshared.saturating_add(shared_pool_bytes),
+        }
+    }
+
     /// Drop the retained generation because the pair no longer descends from it.
     ///
     /// Called wherever the pair is replaced wholesale — cold reset, snapshot restore, canonical
@@ -722,6 +770,27 @@ pub struct RetainedGenerationBytes {
     pub complete_exclusive_bytes: usize,
     /// Where the two complete figures came from.
     pub breakdown: TrieCacheMemory,
+}
+
+/// What the whole retained deque physically holds, over and above the live cache.
+///
+/// Never a sum of per-generation figures. See [`CoordinatedPair::retained_deque_bytes`] for why
+/// the two obvious ways to build one from `exclusive_memory_bytes` are both wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RetainedDequeBytes {
+    /// How many generations the figure covers. Zero means the deque is empty, not that it is free.
+    pub generations: usize,
+    /// Summed over generations: the account trie, both warm sets, the retained account paths, and
+    /// the retained-storage-paths map. Nothing here can be shared, so summing is correct.
+    pub unshared_bytes: usize,
+    /// Storage tries and retained-path slices reachable from the deque but not from the live
+    /// cache, each counted once however many generations hold it.
+    pub shared_pool_bytes: usize,
+    /// How many distinct allocations `shared_pool_bytes` covers, so a run can see whether sharing
+    /// is doing any work at all: equal to the per-generation count times K means it is not.
+    pub shared_allocations: usize,
+    /// What dropping the whole deque would return.
+    pub total_bytes: usize,
 }
 
 /// The one canonical-chain question depth-1 recovery has to ask.

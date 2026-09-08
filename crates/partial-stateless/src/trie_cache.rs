@@ -791,6 +791,45 @@ impl PartialTrieNodeCache {
         self.estimated_memory_bytes().saturating_sub(shared)
     }
 
+    /// Every allocation this cache may be sharing with another generation, as `(identity, bytes)`.
+    ///
+    /// Two structures qualify. The revealed storage tries are shared by `SharedSparseTrie`'s
+    /// `Arc`, which is the whole point of the copy-on-write layer; and the `Arc<[Nibbles]>` slices
+    /// behind `retained_storage_paths` are shared by a clone of the map, which copies the handles
+    /// and not the slices.
+    ///
+    /// Identity rather than a boolean, because `exclusive_memory_bytes` is defined against exactly
+    /// one other holder and stops being meaningful past it. What a caller holding K generations
+    /// needs is the union — one entry per allocation however many generations point at it — and
+    /// only an identity supports that.
+    ///
+    /// Addresses are valid only while every handle involved is alive, which a measurement taken
+    /// against a live pair satisfies. They are not identities to store.
+    pub fn shared_allocations(&self) -> Vec<(usize, usize)> {
+        let nibble = std::mem::size_of::<Nibbles>();
+        let tries = self
+            .sparse
+            .storage_tries_ref()
+            .values()
+            .filter_map(|trie| trie.as_revealed_ref())
+            .map(|trie| (trie.allocation_id(), trie.memory_size()));
+        let slices = self
+            .retained_storage_paths
+            .values()
+            .map(|paths| (Arc::as_ptr(paths) as *const () as usize, paths.len() * nibble));
+        tries.chain(slices).collect()
+    }
+
+    /// Of [`Self::memory_breakdown`], the part no other generation can be holding.
+    ///
+    /// The complement of [`Self::shared_allocations`] within the same total, so the two partition
+    /// the cache: a caller unions the shared halves across generations and adds these unchanged.
+    pub fn unshared_bytes(&self) -> usize {
+        let total = self.memory_breakdown().total_bytes();
+        let shared: usize = self.shared_allocations().iter().map(|(_, bytes)| bytes).sum();
+        total.saturating_sub(shared)
+    }
+
     /// Returns diagnostics for comparing deterministic path retention with a fixed-depth pinned
     /// account-trie cache.
     ///
@@ -1818,6 +1857,38 @@ mod tests {
             "a clone cannot hold more path capacity than its source"
         );
         assert!(retained.total_bytes() <= live.total_bytes());
+    }
+
+    #[test]
+    fn a_clone_shares_its_retained_path_slices_by_identity() {
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 3, balance: U256::from(7), code_hash: None });
+        accessed.storage.insert((address, slot), U256::from(1));
+
+        let mut values = value_cache();
+        values.on_block_executed(1, &accessed);
+        let mut trie = PartialTrieNodeCache::new();
+        trie.retain_from_value_cache(&values);
+
+        let shared = trie.shared_allocations();
+        assert!(!shared.is_empty(), "a cache with a warm slot has a retained-path slice to share");
+
+        // The property the union rests on: a clone points at the *same* allocations, so a caller
+        // holding both must count each once. Identity, not equal byte counts — two separately
+        // allocated slices of the same length would compare equal on size and be double-counted.
+        let clone = trie.clone();
+        let mine: HashSet<usize> = shared.iter().map(|(id, _)| *id).collect();
+        let theirs: HashSet<usize> = clone.shared_allocations().iter().map(|(id, _)| *id).collect();
+        assert_eq!(mine, theirs, "a clone shares every allocation rather than copying it");
+
+        // And the two halves partition the cache, which is what lets a caller union the shared
+        // side and add the unshared side unchanged.
+        let shared_bytes: usize = shared.iter().map(|(_, bytes)| bytes).sum();
+        assert_eq!(trie.unshared_bytes() + shared_bytes, trie.memory_breakdown().total_bytes());
     }
 
     #[test]

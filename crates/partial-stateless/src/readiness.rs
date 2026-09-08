@@ -1211,6 +1211,42 @@ mod tests {
     }
 
     #[test]
+    fn the_warm_floor_refuses_at_exactly_one_block_past_the_history_a_pair_has() {
+        let mut tracker = tracker();
+        // Two blocks more than the window needs, so the pair can give two back and no more.
+        apply_contiguous(&mut tracker, 100, REPLAY + 2);
+
+        assert!(tracker.stays_warm_after_undo(1));
+        assert!(tracker.stays_warm_after_undo(2), "two spare blocks means two are giveable");
+        assert!(
+            !tracker.stays_warm_after_undo(3),
+            "the third would drop the pair below where its window became whole"
+        );
+
+        // Monotone, which is the property a caller relies on when it offers the deepest recovery
+        // it can and settles for a rebuild rather than retrying at shallower depths.
+        for deeper in 3..=8 {
+            assert!(!tracker.stays_warm_after_undo(deeper), "refused at 3 stays refused at {deeper}");
+        }
+
+        // And the predicate agrees with the restore it exists to front-run: the depth it refuses
+        // is the depth that errors, with the shortfall named rather than a bare refusal.
+        let undone_to = 100 + REPLAY - 1;
+        tracker.begin_recovery(undone_to + 1);
+        let checkpoint = checkpoint_at(undone_to);
+        let error = tracker
+            .restore_from_undone_blocks(3, &checkpoint, &restored(&checkpoint))
+            .expect_err("three is one past the floor");
+        assert_eq!(
+            error,
+            ReadinessError::UndoneBlockStillWarming {
+                replay_depth: REPLAY - 1,
+                required: REPLAY
+            }
+        );
+    }
+
+    #[test]
     fn a_block_applied_on_a_snapshot_can_be_undone_without_replaying_a_window() {
         // The snapshot's own generation is warm by assertion, so a pair one block past it can give
         // that block back and land on a generation the checkpoint already vouched for — even

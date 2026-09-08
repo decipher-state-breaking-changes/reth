@@ -110,6 +110,21 @@ impl<T> SharedSparseTrie<T> {
     pub fn is_sole_owner(&self) -> bool {
         Arc::strong_count(&self.inner) == 1
     }
+
+    /// Which allocation this handle points at, as an address.
+    ///
+    /// [`Self::is_sole_owner`] answers "would dropping *this* handle free the trie", which is the
+    /// right question against one other holder and the wrong one against several: a trie held by
+    /// three generations is non-exclusive in all three, so summing exclusives undercounts it and
+    /// summing totals counts it three times. Identity is what lets a caller union instead —
+    /// recognising one allocation held by many handles as one entry.
+    ///
+    /// Sound only for handles that are all alive at the time of the comparison, which is what a
+    /// measurement taken against a live pair is: a freed allocation's address can be reused, and
+    /// nothing here would notice. Not an identity to store.
+    pub fn allocation_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as *const () as usize
+    }
 }
 
 impl<T: Clone> SharedSparseTrie<T> {

@@ -1165,6 +1165,39 @@ impl NetworkStateCache {
     /// Drop undo records at or below `finalized_block`. Reorgs never cross a finalized
     /// block, so these records can never be needed again — this bounds undo-log memory
     /// to the unfinalized window.
+    /// A digest of the whole undo log, for asserting that a refused operation touched nothing.
+    ///
+    /// The counterpart to [`PartialTrieNodeCache::retention_fingerprint`] on the flat side. A
+    /// depth-D restore is specified to leave the log byte-identical on every failure, and the only
+    /// way to hold it to that is to take one of these before and after and require equality —
+    /// checking `current_block` alone would pass a log that had been popped and pushed back.
+    ///
+    /// Covers each record's identity and shape: the block it undoes, the height it restores, the
+    /// memoized root, and how many preimages of each kind it carries. That is every field a pop, a
+    /// push, or a prune moves. It deliberately does not hash the preimage *contents*: nothing in
+    /// this cache mutates a record in place — records are appended whole and consumed whole — so
+    /// hashing megabytes of entries per call would buy no coverage. A future path that edits a
+    /// record in place would need this widened, and this sentence is where to start.
+    pub fn undo_log_fingerprint(&self) -> B256 {
+        let mut hasher = alloy_primitives::Keccak256::new();
+        hasher.update((self.undo_log.len() as u64).to_be_bytes());
+        for undo in &self.undo_log {
+            hasher.update(undo.block_number.to_be_bytes());
+            hasher.update(undo.previous_block.to_be_bytes());
+            match undo.previous_cache_root {
+                Some(root) => {
+                    hasher.update([1u8]);
+                    hasher.update(root);
+                }
+                None => hasher.update([0u8]),
+            }
+            hasher.update((undo.accounts_before.len() as u64).to_be_bytes());
+            hasher.update((undo.storage_before.len() as u64).to_be_bytes());
+            hasher.update((undo.codes_before.len() as u64).to_be_bytes());
+        }
+        hasher.finalize()
+    }
+
     pub fn prune_undo_below(&mut self, finalized_block: u64) {
         while let Some(front) = self.undo_log.front() {
             if front.block_number <= finalized_block {

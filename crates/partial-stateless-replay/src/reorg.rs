@@ -369,7 +369,7 @@ pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bo
 mod tests {
     use super::*;
     use crate::driver::restore;
-    use partial_stateless_validator::RetentionDepth;
+    use partial_stateless_validator::{CoordinatedPair, RetentionDepth};
     use alloy_primitives::{keccak256, Address, U256};
     use alloy_rlp::Encodable;
     use partial_stateless::{
@@ -736,6 +736,184 @@ mod tests {
             2,
             "a root mismatch is not evidence the branch was withdrawn, so the deque survives"
         );
+    }
+
+    #[test]
+    fn the_deque_total_is_a_union_and_not_a_multiple_of_one_generation() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        advance_run(&mut state, 3);
+        assert_eq!(state.pair.retained_depth(), 3);
+
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!(deque.generations, 3);
+        assert_eq!(deque.total_bytes, deque.unshared_bytes + deque.shared_pool_bytes);
+
+        // A union can never exceed the sum it replaces, whatever the population.
+        let one = state.pair.retained_generation_bytes(true);
+        assert!(deque.total_bytes <= one.complete_exclusive_bytes * 3);
+
+        // This fixture is a one-account snapshot whose blocks touch no storage, so it holds no
+        // revealed storage tries and no retained-path slices — there is nothing to share, and the
+        // union degenerates to the sum. Asserted rather than glossed over: a later fixture change
+        // that introduces sharing should fail here and be re-read, not silently weaken the test.
+        // The sharing case itself is covered where a cache can actually have it, in
+        // `trie_cache`'s `a_clone_shares_its_retained_path_slices_by_identity`.
+        assert_eq!(deque.shared_pool_bytes, 0, "this fixture has nothing shareable");
+        assert_eq!(deque.total_bytes, one.complete_exclusive_bytes * 3);
+
+        // Nothing the live cache still points at is charged to the deque — it would not be freed
+        // by dropping it. Asserted by identity rather than by arithmetic on the totals.
+        let live: std::collections::HashSet<usize> = state
+            .pair
+            .trie_cache
+            .shared_allocations()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let charged: std::collections::HashSet<usize> = state
+            .pair
+            .retained
+            .iter()
+            .flat_map(|generation| generation.trie_cache.shared_allocations())
+            .map(|(id, _)| id)
+            .filter(|id| !live.contains(id))
+            .collect();
+        assert_eq!(
+            charged.len(),
+            deque.shared_allocations,
+            "the pool is exactly the allocations the live cache does not hold"
+        );
+    }
+
+    #[test]
+    fn an_empty_deque_costs_nothing_and_says_so() {
+        let (state, _) = restored_state_at_depth(depth(3));
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!(deque.generations, 0, "a restored pair has not retained anything yet");
+        assert_eq!(deque.total_bytes, 0);
+        assert_eq!(deque.shared_allocations, 0);
+    }
+
+    /// Everything §4.4's invariance table calls "untouched", in one comparable value.
+    ///
+    /// Wider than `structurally_eq` and `retention_fingerprint` on purpose. Those cover the trie's
+    /// state root, warm sets, trie maps and retained paths, and a restore that half-applied could
+    /// still leave all four intact while having moved the flat cache, popped an undo record,
+    /// promoted the tracker or consumed a generation. Each line below is one of those.
+    #[derive(Debug, PartialEq)]
+    struct PairSnapshot {
+        cache_block: u64,
+        cache_root: B256,
+        undo_log: B256,
+        trie_state_root: Option<B256>,
+        trie_cache_root: B256,
+        retention: B256,
+        readiness: String,
+        accepted_head: Option<(u64, B256)>,
+        /// Per retained generation: its tag, the header it carries, and its trie's own roots.
+        generations: Vec<(u64, B256, Option<(u64, B256)>, Option<B256>, B256)>,
+    }
+
+    fn snapshot(pair: &mut CoordinatedPair) -> PairSnapshot {
+        PairSnapshot {
+            cache_block: pair.cache.current_block(),
+            cache_root: pair.cache.cache_root(),
+            undo_log: pair.cache.undo_log_fingerprint(),
+            trie_state_root: pair.trie_cache.state_root(),
+            trie_cache_root: pair.trie_cache.cache_root(),
+            retention: pair.trie_cache.retention_fingerprint(),
+            readiness: format!("{:?}", pair.readiness.state()),
+            accepted_head: pair.accepted_head.as_ref().map(|h| (h.number, h.hash())),
+            generations: pair
+                .retained
+                .iter_mut()
+                .map(|generation| {
+                    (
+                        generation.block_number,
+                        generation.block_hash,
+                        generation.accepted_head.as_ref().map(|h| (h.number, h.hash())),
+                        generation.trie_cache.state_root(),
+                        generation.trie_cache.cache_root(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_malformed_frame_changes_nothing_at_all() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        advance_run(&mut state, 3);
+        let before = snapshot(&mut state.pair);
+
+        // Row 1: not even readiness moves, because the frame never binds an ancestor.
+        let bogus = BlockRef { number: 500, hash: B256::with_last_byte(0xee) };
+        let outcome = apply_reorg(&mut state, &reorg_of(bogus, Vec::new(), None));
+        assert!(matches!(outcome, ReorgOutcome::Malformed { .. }));
+        assert_eq!(snapshot(&mut state.pair), before);
+    }
+
+    #[test]
+    fn a_bound_but_refused_frame_moves_readiness_and_nothing_else() {
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+        let before = snapshot(&mut state.pair);
+
+        // Row 2: too deep for this pair. `apply_reorg` marks recovery as soon as the ancestor is
+        // bound — before the depth check — so "byte-identical at every failure" is false by
+        // design, and this is the one field that legitimately moves.
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, run, None));
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+
+        let after = snapshot(&mut state.pair);
+        assert_ne!(after.readiness, before.readiness, "the tracker went Recovering");
+        assert_eq!(PairSnapshot { readiness: before.readiness.clone(), ..after }, before);
+    }
+
+    #[test]
+    fn a_failed_depth_d_preflight_moves_nothing_but_readiness() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+        // The flat half cannot reach the ancestor, so the preflight fails after the lineage check
+        // has already passed — the deepest a refusal gets before phase 2.
+        state.pair.cache.prune_undo_below(ANCHOR_BLOCK + 2);
+        let before = snapshot(&mut state.pair);
+
+        // Row 3: the caches, the undo log, the tracker's history, the accepted head and the whole
+        // deque are all still there. Readiness moves for the same reason as row 2.
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, run, None));
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+
+        let after = snapshot(&mut state.pair);
+        assert_eq!(after.generations.len(), 3, "no generation was consumed");
+        assert_eq!(PairSnapshot { readiness: before.readiness.clone(), ..after }, before);
+    }
+
+    #[test]
+    fn a_lineage_mismatch_clears_the_deque_and_leaves_everything_else() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+        let before = snapshot(&mut state.pair);
+
+        let mut abandoned: Vec<(u64, B256)> =
+            run.iter().map(|block| (block.number, block.hash)).collect();
+        abandoned[1].1 = B256::with_last_byte(0xf0);
+        let lineage = ExpectedLineage::new((ancestor.number, ancestor.hash), &abandoned)
+            .expect("the shape is still a chain");
+
+        let policy_id = state.config.cache_policy_id();
+        let ReplayState { pair, history, .. } = &mut state;
+        assert!(try_deep_recovery(pair, &*history, &lineage, policy_id).is_none());
+
+        // Row 4: the deque goes wholesale — every generation is on the withdrawn branch — and the
+        // caches, the undo log, the accepted head and readiness are all exactly as they were.
+        // Readiness does *not* move here, because this path was entered past `apply_reorg`.
+        let after = snapshot(pair);
+        assert!(after.generations.is_empty(), "the whole deque is cleared, not truncated");
+        assert_eq!(PairSnapshot { generations: before.generations.clone(), ..after }, before);
     }
 
     #[test]
