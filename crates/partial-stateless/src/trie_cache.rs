@@ -18,6 +18,7 @@ use alloy_primitives::{
     Address, B256,
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
+use serde::Serialize;
 use reth_trie_sparse::{
     BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, RetainWitnessPathsMetrics,
     RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
@@ -724,6 +725,48 @@ impl PartialTrieNodeCache {
         self.sparse.memory_size()
     }
 
+    /// Where this cache's memory is, component by component.
+    ///
+    /// [`Self::estimated_memory_bytes`] reports the sparse trie and nothing else, which is the
+    /// figure every published cohort quotes and is deliberately left alone. It is also incomplete:
+    /// the two warm sets and the two retained-path indexes are copied per generation and cost
+    /// real bytes that no consumer measurement has ever included. This reports all of them, so a
+    /// retained generation's true cost is known rather than bounded below.
+    ///
+    /// Heuristic in the same sense as `memory_size`: containers are charged their *capacity*, not
+    /// their length, because that is what they hold from the allocator.
+    pub fn memory_breakdown(&self) -> TrieCacheMemory {
+        // hashbrown carries one control byte per slot beside the bucket itself.
+        const CTRL: usize = 1;
+        let nibble = std::mem::size_of::<Nibbles>();
+
+        let shared_storage_trie_bytes = self
+            .sparse
+            .storage_tries_ref()
+            .values()
+            .filter_map(|trie| trie.as_revealed_ref())
+            .filter(|trie| !trie.is_sole_owner())
+            .map(SparseTrie::memory_size)
+            .sum();
+
+        TrieCacheMemory {
+            sparse_bytes: self.sparse.memory_size(),
+            shared_storage_trie_bytes,
+            warm_accounts_bytes: self.warm_accounts.capacity() *
+                (std::mem::size_of::<Address>() + CTRL),
+            warm_storage_bytes: self.warm_storage.capacity() *
+                (std::mem::size_of::<(Address, B256)>() + CTRL),
+            retained_account_paths_bytes: self.retained_account_paths.capacity() * nibble,
+            retained_storage_paths_map_bytes: self.retained_storage_paths.capacity() *
+                (std::mem::size_of::<B256>() + std::mem::size_of::<Arc<[Nibbles]>>() + CTRL),
+            retained_storage_paths_slice_bytes: self
+                .retained_storage_paths
+                .values()
+                .map(|paths| paths.len() * nibble)
+                .sum(),
+        }
+    }
+
     /// Of [`Self::estimated_memory_bytes`], the part that would actually be freed by dropping
     /// this cache.
     ///
@@ -1258,6 +1301,56 @@ pub struct TrieBranchCensus {
     pub storage_tries: u64,
 }
 
+/// Where one trie cache's memory is, component by component.
+///
+/// Exists because `estimated_memory_bytes` is the sparse trie alone: the four structures beside it
+/// are copied per generation and were outside every memory figure a cohort has published, so the
+/// cost of retaining a generation was known only as a lower bound.
+///
+/// The `Arc<[Nibbles]>` slices are split out from the map that holds them because they are shared
+/// with any generation cloned from this one — the map is per-generation, the slices are not, and
+/// a K-generation total has to union them rather than add them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct TrieCacheMemory {
+    /// `SparseStateTrie::memory_size()`: the account trie, every revealed storage trie, and the
+    /// cleared tries held for allocation reuse. Unchanged from `estimated_memory_bytes`.
+    pub sparse_bytes: usize,
+    /// Of `sparse_bytes`, the storage tries this cache is not the sole owner of.
+    pub shared_storage_trie_bytes: usize,
+    pub warm_accounts_bytes: usize,
+    pub warm_storage_bytes: usize,
+    pub retained_account_paths_bytes: usize,
+    /// The `B256Map` itself — keys, `Arc` handles, control bytes — not what the handles point at.
+    pub retained_storage_paths_map_bytes: usize,
+    /// The `Arc<[Nibbles]>` slices behind that map.
+    pub retained_storage_paths_slice_bytes: usize,
+}
+
+impl TrieCacheMemory {
+    /// Everything this cache holds, sharing counted once per holder.
+    pub const fn total_bytes(&self) -> usize {
+        self.sparse_bytes +
+            self.warm_accounts_bytes +
+            self.warm_storage_bytes +
+            self.retained_account_paths_bytes +
+            self.retained_storage_paths_map_bytes +
+            self.retained_storage_paths_slice_bytes
+    }
+
+    /// What dropping this cache would actually free, against one other holder.
+    ///
+    /// The same definition `exclusive_memory_bytes` uses, extended to the four structures it
+    /// omitted. All four are unshared per generation, so only the storage tries subtract.
+    pub const fn exclusive_bytes(&self) -> usize {
+        self.total_bytes().saturating_sub(self.shared_storage_trie_bytes)
+    }
+
+    /// Of `total_bytes`, the part `estimated_memory_bytes` never counted.
+    pub const fn beyond_sparse_bytes(&self) -> usize {
+        self.total_bytes() - self.sparse_bytes
+    }
+}
+
 /// Number of account-key prefix levels reported for comparison with the old depth-five pinned
 /// cache. The array covers depths zero through five, inclusive.
 pub const TRIE_SHAPE_PREFIX_LEVELS: usize = 6;
@@ -1657,6 +1750,74 @@ mod tests {
         assert_eq!(timings.retained_account_paths, trie.retained_account_paths.len() as u64);
         assert_eq!(timings.storage_tries, trie.sparse.storage_tries_ref().len() as u64);
         assert_eq!(timings.total_us(), timings.account_trie_us + timings.membership_and_paths_us());
+    }
+
+    #[test]
+    fn memory_breakdown_counts_what_estimated_memory_bytes_leaves_out() {
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 3, balance: U256::from(7), code_hash: None });
+        accessed.storage.insert((address, slot), U256::from(1));
+
+        let mut values = value_cache();
+        values.on_block_executed(1, &accessed);
+        let mut trie = PartialTrieNodeCache::new();
+        trie.retain_from_value_cache(&values);
+
+        let memory = trie.memory_breakdown();
+
+        // The published definition is unchanged: the sparse component *is* the old figure.
+        assert_eq!(memory.sparse_bytes, trie.estimated_memory_bytes());
+
+        // The warm sets are populated, so the part the old figure omitted is real rather than a
+        // structure that happens to be empty on this fixture — which is the whole claim.
+        assert!(trie.tracked_account_count() > 0, "fixture must warm an account");
+        assert!(trie.tracked_storage_slot_count() > 0, "fixture must warm a slot");
+        assert!(memory.warm_accounts_bytes > 0);
+        assert!(memory.warm_storage_bytes > 0);
+        assert_eq!(memory.beyond_sparse_bytes(), memory.total_bytes() - memory.sparse_bytes);
+        assert!(memory.beyond_sparse_bytes() > 0);
+        assert!(memory.total_bytes() > trie.estimated_memory_bytes());
+
+        // Exclusive is the same relation the old pair had, extended to the new components: with no
+        // second holder nothing is shared, so exclusive and total agree.
+        assert_eq!(memory.shared_storage_trie_bytes, 0);
+        assert_eq!(memory.exclusive_bytes(), memory.total_bytes());
+        assert_eq!(trie.exclusive_memory_bytes(), trie.estimated_memory_bytes());
+    }
+
+    #[test]
+    fn cloning_a_generation_compacts_capacity_so_the_two_are_not_byte_equal() {
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 3, balance: U256::from(7), code_hash: None });
+        accessed.storage.insert((address, slot), U256::from(1));
+
+        let mut values = value_cache();
+        values.on_block_executed(1, &accessed);
+        let mut trie = PartialTrieNodeCache::new();
+        trie.retain_from_value_cache(&values);
+
+        let live = trie.memory_breakdown();
+        let retained = trie.clone().memory_breakdown();
+
+        // The trie itself copies exactly. What does not is `retained_account_paths`: `Vec::clone`
+        // allocates for the length, not the capacity, so a retained generation can be strictly
+        // smaller than the live cache it was copied from. Retention grows the live vector again
+        // the next block, which is the same ratchet §5.5 names from the other direction — and the
+        // reason a K-generation total has to be measured per generation rather than as K times one.
+        assert_eq!(retained.sparse_bytes, live.sparse_bytes);
+        assert!(
+            retained.retained_account_paths_bytes <= live.retained_account_paths_bytes,
+            "a clone cannot hold more path capacity than its source"
+        );
+        assert!(retained.total_bytes() <= live.total_bytes());
     }
 
     #[test]

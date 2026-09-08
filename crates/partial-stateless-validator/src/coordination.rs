@@ -21,7 +21,7 @@ use partial_stateless::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
         TrustedCheckpoint,
     },
-    PartialTrieNodeCache,
+    PartialTrieNodeCache, TrieCacheMemory,
 };
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -188,11 +188,15 @@ impl CoordinatedPair {
         let Some(retained) = &self.previous_generation else {
             return RetainedGenerationBytes { enabled, ..Default::default() }
         };
+        let breakdown = retained.trie_cache.memory_breakdown();
         RetainedGenerationBytes {
             enabled,
             present: true,
             total_bytes: retained.trie_cache.estimated_memory_bytes(),
             exclusive_bytes: retained.trie_cache.exclusive_memory_bytes(),
+            complete_total_bytes: breakdown.total_bytes(),
+            complete_exclusive_bytes: breakdown.exclusive_bytes(),
+            breakdown,
         }
     }
 
@@ -447,8 +451,20 @@ pub struct RetainedGenerationBytes {
     pub enabled: bool,
     /// Whether a generation was actually being held. False while cold, warming, or recovering.
     pub present: bool,
+    /// The sparse trie alone, which is what every published cohort figure means. Kept at that
+    /// definition so those rows stay comparable; `complete_total_bytes` is the honest number.
     pub total_bytes: usize,
+    /// `total_bytes` less the storage tries another generation also holds.
     pub exclusive_bytes: usize,
+    /// The sparse trie *plus* the warm sets and the retained-path indexes.
+    ///
+    /// Always at least `total_bytes`. The gap is what a retained generation costs beyond the trie
+    /// and what no consumer measurement has previously included.
+    pub complete_total_bytes: usize,
+    /// `complete_total_bytes` less the storage tries another generation also holds.
+    pub complete_exclusive_bytes: usize,
+    /// Where the two complete figures came from.
+    pub breakdown: TrieCacheMemory,
 }
 
 /// The one canonical-chain question depth-1 recovery has to ask.

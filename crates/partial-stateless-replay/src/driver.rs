@@ -1250,7 +1250,17 @@ fn jemalloc_stats() -> Option<[u64; 5]> {
 }
 
 /// Emit one memory sample when `PS_MEMORY_PROBE` is set and this is a reporting block.
-fn memory_probe(height: u64) {
+///
+/// Process-level accounting says how much memory the consumer holds; it cannot say how much of it
+/// the retained generation is, which is the only quantity a retention-depth decision reads. That
+/// second half comes from `pair` and is why this takes one: `retained_generation_bytes` has always
+/// existed on the validator but had never been called anywhere except the producer, so no consumer
+/// run has ever measured what it retains.
+///
+/// Both halves are gated on the same interval. Walking the storage-trie map and the retained-path
+/// slices is O(tries) per sample, which is why it is off unless a run asks for it — a timing cohort
+/// must not pay for a memory cohort's instrument.
+fn memory_probe(height: u64, pair: &CoordinatedPair) {
     let interval = memory_probe_interval();
     if interval == 0 || height % interval != 0 {
         return
@@ -1263,13 +1273,38 @@ fn memory_probe(height: u64) {
             }
         }
     }
-    match jemalloc_stats() {
-        Some([allocated, active, resident, mapped, retained]) => eprintln!(
-            "PS_MEMORY\tblock={height}\trss_kib={rss_kib}\tallocated={allocated}\t\
-active={active}\tresident={resident}\tmapped={mapped}\tretained={retained}"
+    let process = match jemalloc_stats() {
+        Some([allocated, active, resident, mapped, retained]) => format!(
+            "allocated={allocated}\tactive={active}\tresident={resident}\t\
+mapped={mapped}\tretained={retained}"
         ),
-        None => eprintln!("PS_MEMORY\tblock={height}\trss_kib={rss_kib}\tjemalloc_stats=unavailable"),
-    }
+        None => "jemalloc_stats=unavailable".to_string(),
+    };
+    // `true`: this driver retains unconditionally, so the flag reports the build rather than a
+    // per-run choice. `present` is the field that says whether a generation was actually held.
+    let retained = pair.retained_generation_bytes(true);
+    let b = retained.breakdown;
+    eprintln!(
+        "PS_MEMORY\tblock={height}\trss_kib={rss_kib}\t{process}\t\
+retained_present={present}\tretained_total={total}\tretained_exclusive={exclusive}\t\
+retained_complete_total={complete_total}\tretained_complete_exclusive={complete_exclusive}\t\
+retained_sparse={sparse}\tretained_shared_storage={shared_storage}\t\
+retained_warm_accounts={warm_accounts}\tretained_warm_storage={warm_storage}\t\
+retained_account_paths={account_paths}\tretained_storage_paths_map={storage_paths_map}\t\
+retained_storage_paths_slices={storage_paths_slices}",
+        present = retained.present,
+        total = retained.total_bytes,
+        exclusive = retained.exclusive_bytes,
+        complete_total = retained.complete_total_bytes,
+        complete_exclusive = retained.complete_exclusive_bytes,
+        sparse = b.sparse_bytes,
+        shared_storage = b.shared_storage_trie_bytes,
+        warm_accounts = b.warm_accounts_bytes,
+        warm_storage = b.warm_storage_bytes,
+        account_paths = b.retained_account_paths_bytes,
+        storage_paths_map = b.retained_storage_paths_map_bytes,
+        storage_paths_slices = b.retained_storage_paths_slice_bytes,
+    );
 }
 
 
@@ -2012,11 +2047,12 @@ pub(crate) fn replay_commit(
 
     // Sampled here and not at the prune: until `commit_transition` above ran, three trie
     // generations were reachable at once — the new one, the parent the transition displaced and
-    // handed back, and the one still sitting in `previous_generation`. A sample taken there reads
+    // handed back, and the one still sitting in the retained-generation slot. A sample taken
+    // there reads
     // a transition, not a steady state, and would have counted a generation about to be dropped as
     // live. Being past `close_validation` also keeps the probe's own cost — a `/proc` read and six
     // mallctl calls — out of the primary boundary.
-    memory_probe(height);
+    memory_probe(height, &state.pair);
 
     let compare_started = Instant::now();
     let disagreements = compare_accepted(oracle, &outcome, &state.pair);

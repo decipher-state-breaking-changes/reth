@@ -84,7 +84,8 @@ pub use transition_build::{
 };
 pub use trie_cache::{
     PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation, TrieBranchCensus,
-    TrieCacheValidationError, TrieChangeSet, TrieCloneTimings, TrieMutationMetrics,
+    TrieCacheMemory, TrieCacheValidationError, TrieChangeSet, TrieCloneTimings,
+    TrieMutationMetrics,
     TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
 };
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
