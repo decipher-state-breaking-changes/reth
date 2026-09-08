@@ -30,21 +30,217 @@ use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHe
 /// making it add a dependency to spell the return type would be a boundary that means nothing.
 pub use reth_storage_errors::provider::ProviderResult;
 use serde::Serialize;
-use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use std::{collections::VecDeque, time::Instant};
+use tracing::{debug, info, warn};
+
+/// The deepest reorg any pair may be configured to undo from its own retained generations.
+///
+/// A bound rather than a target. The cost of retention is memory that scales with K (§4.3 of the
+/// deep-reorg plan), and the production default is 1; this exists so a misconfigured run is
+/// refused at construction rather than discovered as an allocator report. The value is chosen to
+/// sit well inside the replay history window, which is what lets a refusal at depth K still name
+/// the right ancestor.
+pub const MAX_RETENTION_DEPTH: u64 = 64;
+
+/// How many trie generations a pair retains, and therefore the deepest reorg it can undo alone.
+///
+/// A newtype because three separate limits have to be the same number — the retained-generation
+/// deque's cap, the flat undo log's prune depth, and the depth a reorg is refused above — and
+/// nothing in the type system stopped them from being three constants that drifted apart. Every
+/// one of them reads this off the pair, so there is one place to change and no way to disagree.
+///
+/// Zero is not a value. A pair that retains nothing is not "K = 0"; it is a pair with retention
+/// switched off, which is a separate flag on the commit path, and conflating the two would make a
+/// disabled run look like a legal configuration that always refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct RetentionDepth(u64);
+
+impl RetentionDepth {
+    /// The production default: today's behaviour exactly.
+    pub const ONE: Self = Self(1);
+
+    /// Validates a configured depth against `1 ..= MAX_RETENTION_DEPTH`.
+    pub const fn new(depth: u64) -> Result<Self, RetentionDepthError> {
+        if depth == 0 {
+            return Err(RetentionDepthError::Zero)
+        }
+        if depth > MAX_RETENTION_DEPTH {
+            return Err(RetentionDepthError::TooDeep { requested: depth, max: MAX_RETENTION_DEPTH })
+        }
+        Ok(Self(depth))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Default for RetentionDepth {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+impl std::fmt::Display for RetentionDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Why a configured retention depth was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionDepthError {
+    /// Zero is retention switched off, which is a different setting.
+    Zero,
+    /// Deeper than [`MAX_RETENTION_DEPTH`].
+    TooDeep { requested: u64, max: u64 },
+}
+
+impl std::fmt::Display for RetentionDepthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => write!(
+                f,
+                "a retention depth of 0 is retention switched off, not a depth; use the retain \
+                 flag on the commit path instead"
+            ),
+            Self::TooDeep { requested, max } => {
+                write!(f, "a retention depth of {requested} is deeper than the maximum {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RetentionDepthError {}
+
+/// The run of blocks a caller believes it is giving back, ancestor first.
+///
+/// Consecutive `(number, hash)` does not prove parentage, and the pair cannot see the caller's own
+/// verified history — so the caller states the lineage explicitly and the pair checks its retained
+/// generations against it. Immutable once built, and built only through [`Self::new`], so a pair
+/// that accepts one has already had the shape checked.
+///
+/// Preferred over walking `accepted_head.parent_hash` from the tip: that chain is `None` for a
+/// generation retained one block out of a cold reset, which is a legal state a recovery must still
+/// be able to land on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedLineage {
+    /// The generations a depth-D undo consumes, ancestor first: `ancestor ..= ancestor + D - 1`.
+    ///
+    /// Generation tags, not abandoned blocks. A generation is tagged with the block it is the
+    /// state *after*, and the tip of the abandoned run has no retained generation — its generation
+    /// is the live cache, which the undo replaces rather than restores. Storing the tags makes
+    /// that structural instead of an index adjustment at the point of comparison, and it is why a
+    /// depth-1 lineage needs no hash for the block it gives back.
+    tags: Vec<(u64, B256)>,
+}
+
+impl ExpectedLineage {
+    /// Builds a lineage from the ancestor and the blocks above it, checking the shape.
+    ///
+    /// The shape check is arithmetic only: the run is non-empty, starts one above the ancestor,
+    /// and does not skip a height. Whether those blocks are *this pair's* blocks is what
+    /// [`CoordinatedPair::restore_retained_generations`] then decides against the deque; this
+    /// constructor only rules out a run that could not describe any chain.
+    pub fn new(ancestor: (u64, B256), abandoned: &[(u64, B256)]) -> Result<Self, LineageError> {
+        let Some(first) = abandoned.first() else { return Err(LineageError::Empty) };
+        if first.0 != ancestor.0 + 1 {
+            return Err(LineageError::NotAboveAncestor { ancestor: ancestor.0, lowest: first.0 })
+        }
+        for window in abandoned.windows(2) {
+            if window[1].0 != window[0].0 + 1 {
+                return Err(LineageError::Gap { from: window[0].0, to: window[1].0 })
+            }
+        }
+        // The tip is dropped: D abandoned blocks consume D generations, and they are the ancestor
+        // plus the first D - 1 abandoned blocks.
+        let mut tags = Vec::with_capacity(abandoned.len());
+        tags.push(ancestor);
+        tags.extend_from_slice(&abandoned[..abandoned.len() - 1]);
+        Ok(Self { tags })
+    }
+
+    /// The one-block lineage, which needs nothing about the block it gives back.
+    ///
+    /// The depth-1 undo consumes exactly the ancestor's own generation, so there is no second tag
+    /// to state and no hash for the abandoned block to check. Kept as its own constructor because
+    /// the callers that have only a target hash — the ExEx's notification hook among them — would
+    /// otherwise have to invent one.
+    pub fn depth_one(ancestor: (u64, B256)) -> Self {
+        Self { tags: vec![ancestor] }
+    }
+
+    /// The block the pair lands on.
+    pub fn ancestor(&self) -> (u64, B256) {
+        self.tags[0]
+    }
+
+    /// How many blocks are given back, which is also how many generations are consumed.
+    pub fn depth(&self) -> u64 {
+        self.tags.len() as u64
+    }
+
+    /// The `i`-th consumed generation's expected `(number, hash)`, ancestor first.
+    fn generation_tag(&self, index: usize) -> Option<(u64, B256)> {
+        self.tags.get(index).copied()
+    }
+}
+
+/// Why a proposed lineage could not describe any chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageError {
+    /// A reorg that abandons no block is not a reorg.
+    Empty,
+    /// The lowest abandoned block is not the ancestor's child.
+    NotAboveAncestor { ancestor: u64, lowest: u64 },
+    /// The abandoned run skips a height.
+    Gap { from: u64, to: u64 },
+}
+
+impl std::fmt::Display for LineageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a lineage that abandons no block is not a reorg"),
+            Self::NotAboveAncestor { ancestor, lowest } => write!(
+                f,
+                "the lowest abandoned block is {lowest} but the common ancestor is {ancestor}"
+            ),
+            Self::Gap { from, to } => {
+                write!(f, "the abandoned blocks jump from {from} to {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LineageError {}
 
 /// The one coordinated generation a validator maintains, plus what it is authenticated against.
 pub struct CoordinatedPair {
     pub cache: NetworkStateCache,
     pub trie_cache: PartialTrieNodeCache,
     pub readiness: CacheReadinessTracker,
-    /// The single previous trie generation, kept so a depth-1 reorg does not need a full rebuild.
+    /// The previous trie generations, oldest at the front, capped at [`Self::retention_depth`].
     ///
-    /// K is 1 because that is the depth at which retention is free: the transition already copies
-    /// the parent trie and then overwrites it, so keeping the displaced copy costs no extra work.
-    /// Any K beyond 1 would need genuinely extra copies, and a deeper reorg falls back to whatever
-    /// the caller has — a rebuild for a full node, a snapshot request for a standalone validator.
-    pub previous_generation: Option<RetainedGeneration>,
+    /// Retention is free at any depth, which is the correction this deque carries. The comment
+    /// this replaces said "any K beyond 1 would need genuinely extra copies" — it does not. The
+    /// transition already copies the parent trie every block and then overwrites the copy, and
+    /// `make_mut` copies only when the handle is `Shared` *and* its strong count exceeds one,
+    /// which one retained parent already makes true. Raising K adds no copies; it adds only the
+    /// memory of not dropping them, which is why the depth is a runtime setting and not a
+    /// compile-time constant.
+    ///
+    /// A generation is tagged with the block it is the state *after*, so the back of the deque is
+    /// the pair's parent and the front is `retention_depth - 1` blocks below that.
+    pub retained: VecDeque<RetainedGeneration>,
+    /// How deep this pair retains, and therefore how deep a reorg it can undo alone.
+    ///
+    /// The single owner. The deque cap above, the flat undo log's prune depth, and the depth at
+    /// which a reorg is refused all read this one field rather than keeping constants of their own.
+    pub retention_depth: RetentionDepth,
     /// Header of the block this pair is the state *after*, kept so a child can be checked against
     /// it.
     ///
@@ -111,9 +307,13 @@ impl CoordinatedPair {
                 .accepted_head
                 .as_ref()
                 .map(|header| (header.number(), header.hash())),
+            // The newest generation only, which is exactly what the single-slot field meant. The
+            // bootstrap gate compares two pairs' *positions*, and a pair's position is its parent
+            // — how many further generations it happens to hold behind that is a memory setting,
+            // not a difference in where it is.
             retained_generation: self
-                .previous_generation
-                .as_ref()
+                .retained
+                .back()
                 .map(|retained| (retained.block_number, retained.block_hash)),
         }
     }
@@ -144,13 +344,24 @@ impl CoordinatedPair {
         // transition still copies the parent trie and still hands the copy back, so the control
         // arm pays exactly the work the production arm pays and differs only in what it keeps.
         // A control that also skipped the copy would be measuring two changes at once.
-        self.previous_generation =
-            enabled.then_some(displaced).flatten().map(|trie_cache| RetainedGeneration {
-                trie_cache,
-                block_hash,
-                block_number,
-                accepted_head: displaced_accepted_head,
-            });
+        let Some(trie_cache) = enabled.then_some(displaced).flatten() else {
+            // Retention is off, or the transition did not commit. Either way this pair can no
+            // longer vouch for an unbroken run of generations down from its parent, and a deque
+            // with a hole at its newest end is worse than an empty one: a depth-D undo would walk
+            // straight past the gap. The K = 1 form dropped its single slot here for the same
+            // reason, stated as "a generation two blocks back, which K = 1 does not promise".
+            self.retained.clear();
+            return
+        };
+        self.retained.push_back(RetainedGeneration {
+            trie_cache,
+            block_hash,
+            block_number,
+            accepted_head: displaced_accepted_head,
+        });
+        while self.retained.len() > self.retention_depth.as_usize() {
+            self.retained.pop_front();
+        }
     }
 
     /// Installs the displaced generation and records the transition with readiness, as one step.
@@ -185,7 +396,7 @@ impl CoordinatedPair {
     /// displaced — the steady state a run spends every block in, rather than the instant after a
     /// transition when the live cache has not yet diverged from it.
     pub fn retained_generation_bytes(&self, enabled: bool) -> RetainedGenerationBytes {
-        let Some(retained) = &self.previous_generation else {
+        let Some(retained) = self.retained.back() else {
             return RetainedGenerationBytes { enabled, ..Default::default() }
         };
         let breakdown = retained.trie_cache.memory_breakdown();
@@ -205,8 +416,21 @@ impl CoordinatedPair {
     /// Called wherever the pair is replaced wholesale — cold reset, snapshot restore, canonical
     /// rebuild. The arithmetic and hash checks in [`Self::restore_retained_generation`] would
     /// reject a stale retention anyway; clearing it is the cheaper, more obvious guard.
-    pub fn forget_retained_generation(&mut self) {
-        self.previous_generation = None;
+    pub fn forget_retained_generations(&mut self) {
+        self.retained.clear();
+    }
+
+    /// The newest retained generation, which is the pair's parent.
+    ///
+    /// The read the single-slot field used to serve directly. Kept as a method so callers that
+    /// only ever wanted "the parent" do not have to know the deque exists.
+    pub fn retained_generation(&self) -> Option<&RetainedGeneration> {
+        self.retained.back()
+    }
+
+    /// How many generations are held right now, which is at most [`Self::retention_depth`].
+    pub fn retained_depth(&self) -> u64 {
+        self.retained.len() as u64
     }
 
     /// Return both caches and the tracker to their empty state, keeping nothing.
@@ -220,7 +444,7 @@ impl CoordinatedPair {
         self.trie_cache = PartialTrieNodeCache::new_with_repr(self.trie_cache.repr());
         self.cache.reset();
         self.readiness.reset();
-        self.forget_retained_generation();
+        self.forget_retained_generations();
         // A pair that has accepted nothing has no parent to offer. `accepted_parent` would refuse
         // a stale header anyway once the cache height drops to zero; clearing it is the honest
         // representation rather than one the guard happens to catch.
@@ -246,123 +470,161 @@ impl CoordinatedPair {
     /// retained trie's own root against it is what makes this an authentication rather than a
     /// tautology — the same reason installing a rebuilt pair leans on the header's state root
     /// rather than on the self-derived cache root.
+    /// The depth-1 restore, kept at its original signature.
+    ///
+    /// Every caller that has a target hash and nothing else routes through here: the ExEx's
+    /// notification hook, and the K = 1 suite that is this change's own regression test. It states
+    /// the one-block lineage from the pair's own newest generation and hands it to the general
+    /// form, so "K = 1 behaves exactly as it did" is a property of there being one implementation
+    /// rather than of two implementations agreeing.
     pub fn restore_retained_generation(
         &mut self,
         target_hash: B256,
         target_state_root: B256,
         cache_policy_id: B256,
     ) -> Option<ReadyParent> {
-        // Everything down to the commit marker below reads and never writes, and the tracker's own
-        // verdict is taken on a copy — so the mutations, once they start, cannot be refused
-        // half-way. The retention itself is not consumed until then.
-        let (retained_hash, retained_number, retained_root) = {
-            let retained = self.previous_generation.as_ref()?;
-            (retained.block_hash, retained.block_number, retained.trie_cache.state_root())
-        };
-        // Checked before anything is mutated, and before the cheap hash checks are even worth
-        // running: a pair that is still warming has no `Ready` to return to, so undoing into it
-        // would trade a rebuild that genuinely fills the window for a claim nothing backs.
-        if !self.readiness.stays_warm_after_one_undo() {
+        let ancestor_number = self.retained_generation()?.block_number;
+        let lineage = ExpectedLineage::depth_one((ancestor_number, target_hash));
+        self.restore_retained_generations(&lineage, target_state_root, cache_policy_id)
+    }
+
+    pub fn restore_retained_generations(
+        &mut self,
+        lineage: &ExpectedLineage,
+        ancestor_state_root: B256,
+        cache_policy_id: B256,
+    ) -> Option<ReadyParent> {
+        let depth = lineage.depth();
+        let (ancestor_number, ancestor_hash) = lineage.ancestor();
+
+        // ---- phase 1: read-only ------------------------------------------------------------
+        // Every check below reads, and the tracker's verdict is taken on a copy. Nothing is
+        // consumed until the commit marker, because a standalone validator has nothing to replace
+        // a half-restored pair with.
+        if depth > self.retention_depth.get() {
             debug!(
                 target: "partial_stateless",
+                depth,
+                retention_depth = %self.retention_depth,
+                "A reorg deeper than this pair retains cannot be undone from its own generations"
+            );
+            return None
+        }
+        let Some(base) = self.retained.len().checked_sub(depth as usize) else {
+            debug!(
+                target: "partial_stateless",
+                depth,
+                held = self.retained.len(),
+                "The pair holds fewer generations than the reorg gives back; rebuilding"
+            );
+            return None
+        };
+
+        // Checked before the cheap hash checks are even worth running: a pair that is still
+        // warming has no `Ready` to return to, so undoing into it would trade a rebuild that
+        // genuinely fills the window for a claim nothing backs. Ordered ahead of the lineage check
+        // on purpose — this refusal keeps the deque, and the lineage refusal below destroys it.
+        if !self.readiness.stays_warm_after_undo(depth) {
+            debug!(
+                target: "partial_stateless",
+                depth,
                 replay_depth = self.readiness.replay_depth(),
                 required = self.readiness.required_replay_depth(),
-                "Pair is still warming, so undoing one block cannot restore Ready; rebuilding"
+                "Pair is still warming, so undoing {depth} blocks cannot restore Ready; rebuilding"
             );
             return None
         }
-        if retained_hash != target_hash {
-            debug!(
-                target: "partial_stateless",
-                retained_block = retained_number,
-                retained_hash = ?retained_hash,
-                ?target_hash,
-                "Retained generation belongs to a different block; falling back to a rebuild"
-            );
-            // The one lifecycle change a refusal makes, and it is deliberate: this retention
-            // describes a branch the caller has just been told is not canonical, so nothing will
-            // ask for it again. The caches and the tracker are still exactly as they were.
-            self.forget_retained_generation();
-            return None
+
+        // The deque against the lineage, oldest of the run first. A generation is tagged with the
+        // block it is the state after, so the run consumed by a depth-D undo is tagged
+        // `ancestor ..= ancestor + D - 1`: the ancestor itself, plus every abandoned block except
+        // the tip, whose generation is the live cache rather than a retained one.
+        for offset in 0..depth as usize {
+            let held = &self.retained[base + offset];
+            let expected = lineage.generation_tag(offset).expect("offset is below the depth");
+            if (held.block_number, held.block_hash) != expected {
+                debug!(
+                    target: "partial_stateless",
+                    held_block = held.block_number,
+                    held_hash = ?held.block_hash,
+                    expected_block = expected.0,
+                    expected_hash = ?expected.1,
+                    "A retained generation does not match the lineage; falling back to a rebuild"
+                );
+                // The whole deque, not the mismatching part. Every generation above the mismatch
+                // describes the branch the caller has just been told is not canonical, and the
+                // ones below cannot be reached without walking through it — so partial truncation
+                // would leave a run whose newest end nothing vouches for. The caches, the undo log
+                // and the tracker are still exactly as they were.
+                self.forget_retained_generations();
+                return None
+            }
         }
-        // Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has
-        // to move as one generation.
-        let undone = self.cache.current_block();
-        if undone != retained_number + 1 {
-            return None
-        }
-        if retained_root != Some(target_state_root) {
+
+        // The flat side, proved to the same depth and mutating nothing. This is where a pruned
+        // middle record or a missing memoized root is caught.
+        let plan = match self.cache.can_rollback_to(ancestor_number) {
+            Ok(plan) => plan,
+            Err(err) => {
+                debug!(
+                    target: "partial_stateless",
+                    ancestor = ancestor_number,
+                    %err,
+                    "The flat undo log cannot give back the reorg's depth; rebuilding"
+                );
+                return None
+            }
+        };
+        if plan.depth() != depth {
+            // The two halves disagree about how many blocks separate the pair from the ancestor,
+            // which means one of them is describing a chain the other never applied.
             warn!(
                 target: "partial_stateless",
-                block = retained_number,
-                retained_state_root = ?retained_root,
-                canonical_state_root = ?target_state_root,
+                trie_depth = depth,
+                flat_depth = plan.depth(),
+                "The flat undo log and the reorg disagree about the depth; rebuilding"
+            );
+            return None
+        }
+
+        let landed_root = self.retained[base].trie_cache.state_root();
+        if landed_root != Some(ancestor_state_root) {
+            warn!(
+                target: "partial_stateless",
+                block = ancestor_number,
+                retained_state_root = ?landed_root,
+                canonical_state_root = ?ancestor_state_root,
                 "Retained generation does not match the canonical state root at its own block; \
                  falling back to a rebuild"
             );
             return None
         }
 
-        // What the rollback will install, taken from the record it will consume. Comparing it here
-        // is the same check `rollback_block` would make, moved ahead of the mutation, and it is
-        // what lets the commit below treat the rollback as infallible.
-        let Some(preview) = self.cache.undo_preview() else {
-            debug!(
-                target: "partial_stateless",
-                block = undone,
-                "No undo record to give back; falling back to a rebuild"
-            );
-            return None
-        };
-        if preview.block_number != undone || preview.previous_block != retained_number {
-            debug!(
-                target: "partial_stateless",
-                block = undone,
-                undo_block = preview.block_number,
-                undo_previous = preview.previous_block,
-                retained_block = retained_number,
-                "The newest undo record does not describe the block the retention undoes"
-            );
-            return None
-        }
-        // The post-undo cache root has to be known *before* the undo for this to be a transaction,
-        // and the record carries it only when the parent's root had already been computed. Every
-        // path that reaches here in production computes it every block — the coordinated
-        // fingerprint and the ready parent's anchor both do. A pair that applied a block without
-        // ever rooting its parent falls back instead, which is the fail-closed direction.
-        let Some(previous_cache_root) = preview.previous_cache_root else {
-            debug!(
-                target: "partial_stateless",
-                block = undone,
-                "The parent's cache root was never computed, so the undo cannot be made atomic; \
-                 falling back to a rebuild"
-            );
-            return None
-        };
-
+        let previous_cache_root = plan.previous_cache_root();
         let checkpoint = TrustedCheckpoint {
-            block_number: retained_number,
-            block_hash: retained_hash,
-            state_root: target_state_root,
+            block_number: ancestor_number,
+            block_hash: ancestor_hash,
+            state_root: ancestor_state_root,
             cache_root: previous_cache_root,
             cache_policy_id,
         };
         // Exactly what `CacheObservation::capture` will report once the commit below runs: the
         // rollback restores `previous_block` and the memoized root verbatim, and the trie is
-        // replaced by the retained one whose root was just checked. So the tracker's answer here
-        // is its answer there, taken while a refusal still costs nothing.
+        // replaced by the landed generation whose root was just checked. So the tracker's answer
+        // here is its answer there, taken while a refusal still costs nothing.
         let predicted = CacheObservation {
-            cache_block: preview.previous_block,
+            cache_block: plan.previous_block(),
             cache_root: previous_cache_root,
-            trie_state_root: retained_root,
+            trie_state_root: landed_root,
         };
         let mut next_readiness = self.readiness.clone();
-        let ready = match next_readiness.restore_from_undone_block(&checkpoint, &predicted) {
+        let ready = match next_readiness.restore_from_undone_blocks(depth, &checkpoint, &predicted)
+        {
             Ok(ready) => ready.clone(),
             Err(err) => {
                 warn!(
                     target: "partial_stateless",
-                    block = retained_number,
+                    block = ancestor_number,
                     ?err,
                     "Readiness rejected the restored generation; falling back to a rebuild"
                 );
@@ -370,25 +632,20 @@ impl CoordinatedPair {
             }
         };
 
-        // ---- commit ----
-        if let Err(err) = self.cache.rollback_block(undone) {
-            // Unreachable: the preview above named this exact block, and nothing between then and
-            // now touches the undo log. Reported rather than asserted because a validator that got
-            // here has a broken invariant, not a block to reject — and the early return is still
-            // sound, since `rollback_block` refuses before it pops.
-            error!(
-                target: "partial_stateless",
-                block = undone,
-                ?err,
-                "Flat rollback refused a block its own undo record named; falling back to a rebuild"
-            );
-            return None
-        }
-        let retained = self.previous_generation.take().expect("checked present above");
-        self.trie_cache = retained.trie_cache;
+        // ---- phase 2: commit, infallible ---------------------------------------------------
+        // `rollback` cannot refuse: the plan proved the records present and contiguous, and the
+        // borrow checker guarantees nothing touched the log between building it and consuming it.
+        self.cache.rollback(plan);
+        // Split rather than looped. The generations above the landing one are dropped and the ones
+        // below are kept, so a second, shallower undo can still run against what this one left —
+        // and the landing generation is identified by index rather than by counting pops, which is
+        // where a D-times loop gets the off-by-one wrong.
+        let mut given_back = self.retained.split_off(base);
+        let landed = given_back.pop_front().expect("the lineage check proved this index is held");
+        self.trie_cache = landed.trie_cache;
         // Restored together with the caches. Between here and the tracker swap the pair holds the
-        // parent's header over the parent's caches, and both name the same generation.
-        self.accepted_head = retained.accepted_head;
+        // ancestor's header over the ancestor's caches, and both name the same generation.
+        self.accepted_head = landed.accepted_head;
         self.readiness = next_readiness;
         Some(ready)
     }
@@ -503,6 +760,10 @@ pub fn inject_recovery(
 
 /// Undoes exactly one block to return the pair to `target_hash`, or `None` to fall back.
 ///
+/// The depth-1 entry point, kept because the ExEx's notification hook has a target hash and no
+/// list of abandoned blocks. It reads the ancestor's height off the pair's own newest generation —
+/// the same thing the single-slot form did — and states the rest as a one-block lineage.
+///
 /// Split out so that everything between a notification and the restored pair can run against a
 /// fake chain. Nothing here touches a database, and the fallback — which for a full node does — is
 /// deliberately left on the caller's side of the seam.
@@ -512,12 +773,33 @@ pub fn try_depth_one_recovery(
     target_hash: B256,
     cache_policy_id: B256,
 ) -> Option<ReadyParent> {
-    let state_root = match chain.state_root_of(target_hash) {
+    let ancestor_number = pair.retained_generation()?.block_number;
+    let lineage = ExpectedLineage::depth_one((ancestor_number, target_hash));
+    try_deep_recovery(pair, chain, &lineage, cache_policy_id)
+}
+
+/// Undoes the whole of `lineage` to return the pair to its ancestor, or `None` to fall back.
+///
+/// The general form. `lineage` states which blocks are being given back and which generations the
+/// pair must be holding for them; the pair checks both halves against its own deque and undo log
+/// before it moves anything, so a refusal here costs a rebuild and never a half-restored pair.
+///
+/// The canonical state root is looked up here rather than passed in, so that the one external fact
+/// a recovery depends on — what the canonical header says the ancestor's state root is — enters
+/// through a single seam that a fake chain can stand in for.
+pub fn try_deep_recovery(
+    pair: &mut CoordinatedPair,
+    chain: &impl CanonicalStateRoots,
+    lineage: &ExpectedLineage,
+    cache_policy_id: B256,
+) -> Option<ReadyParent> {
+    let (ancestor_number, ancestor_hash) = lineage.ancestor();
+    let state_root = match chain.state_root_of(ancestor_hash) {
         Ok(Some(state_root)) => state_root,
         Ok(None) => {
             debug!(
                 target: "partial_stateless",
-                ?target_hash,
+                target_hash = ?ancestor_hash,
                 "No canonical header for the recovery target; rebuilding"
             );
             return None
@@ -525,7 +807,7 @@ pub fn try_depth_one_recovery(
         Err(err) => {
             debug!(
                 target: "partial_stateless",
-                ?target_hash,
+                target_hash = ?ancestor_hash,
                 %err,
                 "Could not read the recovery target's header; rebuilding"
             );
@@ -533,14 +815,17 @@ pub fn try_depth_one_recovery(
         }
     };
 
+    let depth = lineage.depth();
     let started = Instant::now();
-    let ready = pair.restore_retained_generation(target_hash, state_root, cache_policy_id)?;
+    let ready = pair.restore_retained_generations(lineage, state_root, cache_policy_id)?;
     info!(
         target: "partial_stateless",
         block = ready.anchor.block_number,
         block_hash = ?ready.anchor.block_hash,
+        ancestor = ancestor_number,
+        depth,
         restore_us = started.elapsed().as_micros() as u64,
-        "Recovered by undoing one block from the retained generation instead of rebuilding"
+        "Recovered by undoing {depth} block(s) from the retained generations instead of rebuilding"
     );
     Some(ready)
 }

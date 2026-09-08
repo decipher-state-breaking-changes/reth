@@ -26,9 +26,11 @@ pub mod timings;
 
 pub use admission::{AdmissionError, AdmittedBlock, UntrustedAdmission};
 pub use coordination::{
-    admit_block, block_context, inject_recovery, try_depth_one_recovery, BlockAdmission,
+    admit_block, block_context, inject_recovery, try_deep_recovery, try_depth_one_recovery,
+    BlockAdmission,
     CanonicalStateRoots, CoordinatedFingerprint, CoordinatedPair, LifecycleFingerprint,
-    RetainedGeneration, RetainedGenerationBytes,
+    ExpectedLineage, LineageError, RetainedGeneration, RetainedGenerationBytes, RetentionDepth,
+    RetentionDepthError, MAX_RETENTION_DEPTH,
 };
 pub use reexec::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, NoRootOracle,

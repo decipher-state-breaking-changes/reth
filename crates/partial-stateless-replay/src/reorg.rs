@@ -18,7 +18,8 @@
 use alloy_primitives::B256;
 use partial_stateless_stream::{BlockRef, Reorg};
 use partial_stateless_validator::{
-    coordination::ProviderResult, try_depth_one_recovery, CanonicalStateRoots,
+    coordination::ProviderResult, try_deep_recovery, CanonicalStateRoots, ExpectedLineage,
+    MAX_RETENTION_DEPTH,
 };
 use std::collections::VecDeque;
 use tracing::{info, warn};
@@ -27,10 +28,19 @@ use crate::driver::ReplayState;
 
 /// How many verified blocks are kept for recovery questions.
 ///
-/// A depth-1 undo needs two. The rest is there so that a deeper reorg can still be *checked*
-/// against this consumer's own branch before it is refused — a refusal that names the right
-/// ancestor is what lets recovery ask for a snapshot at that exact block.
+/// A depth-D undo needs D + 1. The rest is there so that a reorg deeper than this consumer can
+/// undo can still be *checked* against its own branch before it is refused — a refusal that names
+/// the right ancestor is what lets recovery ask for a snapshot at that exact block.
+///
+/// Deliberately larger than `MAX_RETENTION_DEPTH + 1` rather than equal to it. Sizing it to the
+/// retention depth would tie the window in which a deep reorg can be *recognised* to the window in
+/// which it can be *undone*, and those are different jobs: the second is a memory setting, the
+/// first is what keeps a refusal informative.
 const HISTORY_DEPTH: usize = 128;
+
+// The undo needs D + 1 entries to check a depth-D run against, so a retention depth the history
+// cannot cover would be a configuration that passes validation and then always refuses.
+const _: () = assert!(HISTORY_DEPTH > MAX_RETENTION_DEPTH as usize);
 
 /// The blocks this consumer verified, and the state roots it computed for them.
 ///
@@ -130,8 +140,13 @@ pub(crate) enum ReorgOutcome {
     Applied {
         /// The block both branches share, and the pair's new head.
         ancestor: BlockRef,
-        /// The block that was given back.
-        undone: BlockRef,
+        /// The blocks that were given back, lowest first — `Reorg.abandoned`'s own order.
+        ///
+        /// A list rather than a block because a depth-D undo gives back D of them, and a caller
+        /// that logged only one would under-report every reorg deeper than one. Lowest first so
+        /// that `first()` is the block just above the ancestor and `last()` is the abandoned tip,
+        /// which is the order every existing log line and JSONL field already prints.
+        undone: Vec<BlockRef>,
         /// True when nothing replaces the abandoned blocks.
         revert: bool,
         /// The tip the producer is moving to, so the caller can tell when the branch is complete.
@@ -232,35 +247,55 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
             detail: "the abandoned blocks are not the branch this consumer verified".to_string(),
         }
     }
-    if depth != 1 {
+    let retention_depth = state.pair.retention_depth;
+    if depth > retention_depth.get() {
         return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
             detail: format!(
-                "a reorg {depth} blocks deep needs a snapshot at the common ancestor; the \
-                 retained generation reaches exactly one block"
+                "a reorg {depth} blocks deep needs a snapshot at the common ancestor; this \
+                 consumer retains {retention_depth} generation(s)"
             ),
         }
     }
 
+    // Built from this consumer's own frame *after* the suffix check has proved the run is its own
+    // branch, so what the pair receives is a lineage the caller already stands behind. Its shape
+    // was checked by `check_shape` above; `ExpectedLineage::new` re-derives that independently
+    // rather than trusting it, because the pair's guarantee has to hold for every caller.
+    let abandoned: Vec<(u64, B256)> =
+        reorg.abandoned.iter().map(|block| (block.number, block.hash)).collect();
+    let lineage = match ExpectedLineage::new((ancestor.number, ancestor.hash), &abandoned) {
+        Ok(lineage) => lineage,
+        Err(err) => {
+            return ReorgOutcome::Unrecoverable { ancestor, depth, detail: err.to_string() }
+        }
+    };
+
     let ReplayState { pair, history, config, .. } = state;
     let policy_id = config.cache_policy_id();
-    if try_depth_one_recovery(pair, &*history, ancestor.hash, policy_id).is_none() {
+    if try_deep_recovery(pair, &*history, &lineage, policy_id).is_none() {
         return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
-            detail: "the retained generation could not restore the common ancestor".to_string(),
+            detail: format!(
+                "the retained generations could not restore the common ancestor {} blocks back",
+                depth
+            ),
         }
     }
-    let undone = reorg.abandoned[0];
+    let undone = reorg.abandoned.clone();
     history.rewind_above(ancestor.number);
     let revert = reorg.winning_tip.is_none();
     info!(
         target: "ps_replay",
         ancestor = ancestor.number,
-        undone = undone.number,
+        undone_from = undone.first().map(|block| block.number),
+        undone_to = undone.last().map(|block| block.number),
+        depth,
         revert,
-        "Undid one block against the retained generation; the pair is back at the common ancestor"
+        "Undid {depth} block(s) against the retained generations; the pair is back at the common \
+         ancestor"
     );
     ReorgOutcome::Applied { ancestor, undone, revert, winning_tip: reorg.winning_tip }
 }
@@ -334,6 +369,7 @@ pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bo
 mod tests {
     use super::*;
     use crate::driver::restore;
+    use partial_stateless_validator::RetentionDepth;
     use alloy_primitives::{keccak256, Address, U256};
     use alloy_rlp::Encodable;
     use partial_stateless::{
@@ -375,6 +411,11 @@ mod tests {
     /// root, and a fixture whose trie cannot produce one would be testing the arithmetic around
     /// a check rather than the check.
     fn restored_state() -> (ReplayState, B256) {
+        restored_state_at_depth(RetentionDepth::ONE)
+    }
+
+    /// The same fixture, configured to retain `depth` generations.
+    fn restored_state_at_depth(depth: RetentionDepth) -> (ReplayState, B256) {
         let address = Address::repeat_byte(0x11);
         let account = Account { nonce: 7, balance: U256::from(1_000u64), bytecode_hash: None };
         let address_path = Nibbles::unpack(keccak256(address));
@@ -432,7 +473,8 @@ mod tests {
             snapshot_digest: B256::ZERO,
         };
         let chunks = checkpoint.chunk(&package_bytes, 4096);
-        let state = restore(&manifest(), &checkpoint, &chunks).expect("the fixture restores");
+        let state = restore(&manifest(), &checkpoint, &chunks, depth)
+            .expect("the fixture restores");
         (state, state_root)
     }
 
@@ -478,6 +520,236 @@ mod tests {
         Reorg { common_ancestor: ancestor, abandoned, winning_tip: tip }
     }
 
+    /// Advances `count` blocks and returns them lowest first, which is `Reorg.abandoned`'s order.
+    fn advance_run(state: &mut ReplayState, count: u64) -> Vec<BlockRef> {
+        (0..count)
+            .map(|offset| {
+                let number = ANCHOR_BLOCK + 1 + offset;
+                advance(state, number, 0xa0 + offset as u8, true)
+            })
+            .collect()
+    }
+
+    fn depth(n: u64) -> RetentionDepth {
+        RetentionDepth::new(n).expect("a test depth is in range")
+    }
+
+    #[test]
+    fn a_depth_two_reorg_is_undone_when_the_pair_retains_two() {
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let ancestor = state.history.tip().expect("seeded");
+        let undone = advance_run(&mut state, 2);
+        assert_eq!(state.pair.retained_depth(), 2, "both displaced generations are held");
+        assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK + 2);
+
+        let winning = BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::with_last_byte(0xbb) };
+        let outcome =
+            apply_reorg(&mut state, &reorg_of(ancestor, undone.clone(), Some(winning)));
+
+        let ReorgOutcome::Applied { ancestor: at, undone: gave_back, .. } = outcome else {
+            panic!("a depth-2 reorg is exactly what a pair retaining two can undo")
+        };
+        assert_eq!(at, ancestor);
+        assert_eq!(gave_back, undone, "both abandoned blocks are reported, lowest first");
+        assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK, "the flat cache gave two back");
+        assert!(matches!(state.pair.readiness.state(), CacheReadiness::Ready(_)));
+        assert_eq!(state.history.tip(), Some(ancestor));
+        assert_eq!(
+            state.pair.retained_depth(),
+            0,
+            "the run consumed the landing generation and dropped the one above it"
+        );
+    }
+
+    #[test]
+    fn a_depth_three_reorg_is_undone_when_the_pair_retains_three() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let undone = advance_run(&mut state, 3);
+        assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK + 3);
+
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, undone.clone(), None));
+
+        let ReorgOutcome::Applied { undone: gave_back, revert, .. } = outcome else {
+            panic!("a depth-3 reorg is exactly what a pair retaining three can undo")
+        };
+        assert_eq!(gave_back, undone);
+        assert!(revert, "no winning tip is a pure revert, at any depth");
+        assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK);
+        assert!(matches!(state.pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
+    #[test]
+    fn a_reorg_one_deeper_than_the_pair_retains_is_refused_and_names_the_ancestor() {
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let ancestor = state.history.tip().expect("seeded");
+        // Three blocks against a pair that keeps two: the deque has already dropped the ancestor's
+        // own generation, so there is nothing to land on however good the rest of the frame is.
+        let undone = advance_run(&mut state, 3);
+        assert_eq!(state.pair.retained_depth(), 2, "the deque is capped at the configured depth");
+
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, undone, None));
+
+        let ReorgOutcome::Unrecoverable { ancestor: at, depth: reported, detail } = outcome else {
+            panic!("a reorg deeper than the pair retains cannot be undone")
+        };
+        assert_eq!(at, ancestor, "the refusal names the block a snapshot must be taken at");
+        assert_eq!(reported, 3);
+        assert!(detail.contains("retains 2"), "the refusal says what this consumer can do: {detail}");
+        assert_eq!(
+            state.pair.cache.current_block(),
+            ANCHOR_BLOCK + 3,
+            "a refusal gives nothing back"
+        );
+    }
+
+    #[test]
+    fn a_second_undo_runs_against_the_generations_the_first_left() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+
+        // Give back the top two, landing on the ancestor's child.
+        let mid = run[0];
+        let outcome = apply_reorg(&mut state, &reorg_of(mid, run[1..].to_vec(), None));
+        assert!(matches!(outcome, ReorgOutcome::Applied { .. }), "the first undo applies");
+        assert_eq!(state.pair.cache.current_block(), mid.number);
+        assert_eq!(
+            state.pair.retained_depth(),
+            1,
+            "the generation below the landing one survived the split"
+        );
+
+        // Now give back the last one, against what the first undo left. This is where popping from
+        // the wrong end, or truncating the whole deque, would show.
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, vec![mid], None));
+        let ReorgOutcome::Applied { ancestor: at, .. } = outcome else {
+            panic!("the surviving generation is exactly what a second undo needs")
+        };
+        assert_eq!(at, ancestor);
+        assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK);
+        assert!(matches!(state.pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
+    #[test]
+    fn a_deep_frame_describing_a_branch_this_consumer_never_held_keeps_everything() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let mut run = advance_run(&mut state, 3);
+        let before = state.pair.cache.current_block();
+
+        // A substituted middle block. The suffix check catches this before any restore is
+        // attempted, which is the earliest of the two layers that can — so the deque survives.
+        run[1] = BlockRef { number: run[1].number, hash: B256::with_last_byte(0xf0) };
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, run, None));
+
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+        assert_eq!(state.pair.cache.current_block(), before, "the caches are untouched");
+        assert_eq!(
+            state.pair.retained_depth(),
+            3,
+            "a frame refused before the restore runs costs the pair nothing"
+        );
+        assert!(
+            matches!(state.pair.readiness.state(), CacheReadiness::Recovering { .. }),
+            "the one lifecycle change a bound-but-refused frame makes"
+        );
+    }
+
+    #[test]
+    fn a_lineage_the_generations_do_not_match_clears_the_whole_deque() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+        let before = state.pair.cache.current_block();
+
+        // Straight at the pair, past `apply_reorg`'s suffix check. That check is the replay
+        // driver's own history speaking, and the ExEx's notification hook has no equivalent — so
+        // the pair has to hold this line for itself, and this is the test that says it does.
+        let mut abandoned: Vec<(u64, B256)> =
+            run.iter().map(|block| (block.number, block.hash)).collect();
+        abandoned[1].1 = B256::with_last_byte(0xf0);
+        let lineage = ExpectedLineage::new((ancestor.number, ancestor.hash), &abandoned)
+            .expect("the shape is still a chain");
+
+        let policy_id = state.config.cache_policy_id();
+        let ReplayState { pair, history, .. } = &mut state;
+        assert!(
+            try_deep_recovery(pair, &*history, &lineage, policy_id).is_none(),
+            "a generation the lineage does not describe cannot be landed on"
+        );
+
+        assert_eq!(pair.cache.current_block(), before, "the caches are untouched");
+        assert_eq!(
+            pair.retained_depth(),
+            0,
+            "every generation is on the branch the caller withdrew, and partial truncation would \
+             leave a run whose newest end nothing vouches for"
+        );
+    }
+
+    #[test]
+    fn a_missing_middle_undo_record_refuses_and_keeps_everything() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 3);
+        let before = state.pair.cache.current_block();
+
+        // The trie half can still reach the ancestor; the flat half cannot. Both have to, and the
+        // preflight is where that is found — not half way through the rollback.
+        state.pair.cache.prune_undo_below(ANCHOR_BLOCK + 2);
+
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, run, None));
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+        assert_eq!(state.pair.cache.current_block(), before, "the caches are untouched");
+        assert_eq!(
+            state.pair.retained_depth(),
+            3,
+            "the flat log's gap says nothing about the generations, so they are kept"
+        );
+    }
+
+    #[test]
+    fn a_generation_whose_root_disagrees_with_the_canonical_header_is_refused() {
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = advance_run(&mut state, 2);
+        let before = state.pair.cache.current_block();
+
+        // The authentication this whole path rests on: the landing generation's own state root has
+        // to equal what the canonical header says the ancestor's root is. Moved on the chain's
+        // side rather than the pair's, because that is the direction a real disagreement comes
+        // from — the pair derived its root, the header is what it is checked against.
+        let entry = state
+            .history
+            .entries
+            .iter_mut()
+            .find(|entry| entry.hash == ancestor.hash)
+            .expect("the ancestor is in the history");
+        entry.state_root = B256::with_last_byte(0x99);
+
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, run, None));
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+        assert_eq!(state.pair.cache.current_block(), before, "the caches are untouched");
+        assert_eq!(
+            state.pair.retained_depth(),
+            2,
+            "a root mismatch is not evidence the branch was withdrawn, so the deque survives"
+        );
+    }
+
+    #[test]
+    fn a_retention_depth_is_refused_outside_its_range() {
+        assert!(RetentionDepth::new(0).is_err(), "zero is retention off, not a depth");
+        assert!(RetentionDepth::new(1).is_ok());
+        assert!(RetentionDepth::new(MAX_RETENTION_DEPTH).is_ok());
+        assert!(RetentionDepth::new(MAX_RETENTION_DEPTH + 1).is_err());
+        // The history window has to cover the deepest configurable undo, or a legal configuration
+        // would pass validation and then always refuse. Asserted at compile time beside
+        // `HISTORY_DEPTH`; restated here so the reason is discoverable from the test suite.
+        assert!(HISTORY_DEPTH > MAX_RETENTION_DEPTH as usize);
+    }
+
     #[test]
     fn a_depth_one_reorg_is_undone_against_the_retained_generation() {
         let (mut state, _) = restored_state();
@@ -494,7 +766,7 @@ mod tests {
             panic!("a depth-1 reorg of this consumer's own branch is exactly what it can undo")
         };
         assert_eq!(at, ancestor);
-        assert_eq!(gave_back, undone);
+        assert_eq!(gave_back, vec![undone], "a depth-1 undo gives back one block");
         assert!(!revert, "a reorg replaces the branch it abandons");
         assert_eq!(winning_tip, Some(winning));
         assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK, "the flat cache gave one back");
@@ -618,7 +890,7 @@ mod tests {
 
         assert!(ReorgOutcome::Applied {
             ancestor: block,
-            undone: block,
+            undone: vec![block],
             revert: false,
             winning_tip: None
         }

@@ -62,6 +62,7 @@ use partial_stateless_replay::{
     follow, replay, FollowOptions, FollowOutcome, FollowReport, ReplayOptions, ReplayReport,
 };
 use partial_stateless_stream::EndKind;
+use partial_stateless_validator::RetentionDepth;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -463,6 +464,30 @@ enum Mode {
     },
 }
 
+/// `PS_RETAIN_DEPTH`, or the default of one.
+///
+/// An environment variable as well as a flag because the depth has to reach runs that are launched
+/// by a harness script rather than typed, and those scripts already carry a `PS_`-prefixed
+/// environment. Read before the flags are parsed, so `--retain-depth` on the command line wins
+/// over the environment — the usual precedence, and the one a run sheet assumes when it exports a
+/// default and then overrides one arm.
+///
+/// An unparseable or out-of-range value is an error rather than a fall back to the default: a run
+/// that asked for depth 5 and silently got 1 would produce a cohort that answers a question nobody
+/// asked, and the flag exists precisely to change what is measured.
+fn retain_depth_from_env() -> eyre::Result<RetentionDepth> {
+    match std::env::var("PS_RETAIN_DEPTH") {
+        Ok(raw) => {
+            let depth: u64 = raw
+                .trim()
+                .parse()
+                .map_err(|err| eyre::eyre!("PS_RETAIN_DEPTH={raw:?} is not a depth: {err}"))?;
+            Ok(RetentionDepth::new(depth)?)
+        }
+        Err(_) => Ok(RetentionDepth::ONE),
+    }
+}
+
 fn parse_args() -> eyre::Result<Mode> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.iter().any(|arg| arg == "--follow") {
@@ -480,6 +505,7 @@ fn parse_args() -> eyre::Result<Mode> {
     let mut args = raw.into_iter();
     let mut dir = None;
     let mut options = ReplayOptions::default();
+    options.retain_depth = retain_depth_from_env()?;
     let mut json = None;
     let mut label = "unlabelled".to_string();
     while let Some(arg) = args.next() {
@@ -510,6 +536,11 @@ fn parse_args() -> eyre::Result<Mode> {
                     .ok_or_else(|| eyre::eyre!("--force-restore-at needs a frame sequence"))?;
                 options.force_restore_at = Some(raw.parse()?);
             }
+            "--retain-depth" => {
+                let raw =
+                    args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
+                options.retain_depth = RetentionDepth::new(raw.parse()?)?;
+            }
             "--json" => {
                 json = Some(PathBuf::from(
                     args.next().ok_or_else(|| eyre::eyre!("--json needs a path"))?,
@@ -522,10 +553,11 @@ fn parse_args() -> eyre::Result<Mode> {
                 println!(
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--mutations-transition [N]] \
-                     [--force-restore-at <sequence>] [--json <path>] \
+                     [--force-restore-at <sequence>] [--retain-depth N] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
-                     [--resume] [--mutations] [--json <path>] [--label <name>]"
+                     [--resume] [--mutations] [--retain-depth N] [--json <path>] \
+                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth; the flag wins."
                 );
                 std::process::exit(0);
             }
@@ -541,6 +573,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
     let mut args = raw.into_iter();
     let mut dir = None;
     let mut options = FollowOptions::default();
+    options.retain_depth = retain_depth_from_env()?;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--follow" => {}
@@ -572,6 +605,11 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
             }
             "--label" => {
                 options.label = args.next().ok_or_else(|| eyre::eyre!("--label needs a name"))?;
+            }
+            "--retain-depth" => {
+                let raw =
+                    args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
+                options.retain_depth = RetentionDepth::new(raw.parse()?)?;
             }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),
             other => return Err(eyre::eyre!("unexpected argument {other}")),

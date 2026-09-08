@@ -33,7 +33,7 @@ use partial_stateless_stream::{
     BlockRef, Checkpoint, EndKind, FrameKind, FrameLimits, Manifest, ResetReason, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
-use partial_stateless_validator::{PayloadProvenance, SidecarReexecLimits};
+use partial_stateless_validator::{PayloadProvenance, RetentionDepth, SidecarReexecLimits};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -73,6 +73,10 @@ pub struct FollowOptions {
     pub resume: bool,
     /// Label stamped into every record.
     pub label: String,
+    /// How many trie generations the pair retains, and so the deepest reorg it can undo alone.
+    ///
+    /// Defaults to one, which is production's setting and today's behaviour exactly.
+    pub retain_depth: RetentionDepth,
 }
 
 impl Default for FollowOptions {
@@ -89,6 +93,7 @@ impl Default for FollowOptions {
             ack_fsync: false,
             resume: false,
             label: "unlabelled".to_string(),
+            retain_depth: RetentionDepth::ONE,
         }
     }
 }
@@ -645,6 +650,10 @@ impl<'a> Follower<'a> {
                 // Not reached from here — the follower drives its own window — but set to the
                 // shared bound so the two can never be read as different policies.
                 max_rewind_frames: MAX_REWIND_FRAMES,
+                // Carried through rather than defaulted: the follower restores its pair through
+                // the same `restore` the batch driver uses, and a depth set on the command line
+                // has to reach it or the flag would be silently ignored in follow mode.
+                retain_depth: options.retain_depth,
             },
             tail: SpoolTail::new(dir, options.frame_limits),
             sink: VerdictSink::open(options)?,
@@ -1479,7 +1488,9 @@ impl<'a> Follower<'a> {
                         info!(
                             target: "ps_follow",
                             ancestor = ancestor.number,
-                            undone = undone.number,
+                            undone_from = undone.first().map(|block| block.number),
+                            undone_to = undone.last().map(|block| block.number),
+                            depth = undone.len(),
                             revert,
                             "Undid the reorg against the retained generation; verdicts continue"
                         );
@@ -1836,7 +1847,7 @@ impl<'a> Follower<'a> {
         chunks: Vec<SnapshotChunk>,
         checkpoint_sequence: u64,
     ) -> eyre::Result<Step> {
-        match restore(&manifest, &checkpoint, &chunks) {
+        match restore(&manifest, &checkpoint, &chunks, self.replay_options.retain_depth) {
             Ok(state) => {
                 self.restores += 1;
                 let expected_child = Some((checkpoint.block.number + 1, checkpoint.block.hash));

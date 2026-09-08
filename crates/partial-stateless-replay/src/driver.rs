@@ -27,7 +27,7 @@ use partial_stateless_validator::{
     admit_block, block_context,
     timings::{AdmissionTimings, ValidationPhaseTimings},
     verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedPair, PayloadProvenance,
-    SidecarReexecLimits, TrieCacheDisposition, UntrustedAdmission, ValidatorRules,
+    RetentionDepth, SidecarReexecLimits, TrieCacheDisposition, UntrustedAdmission, ValidatorRules,
     POST_EXECUTION_REJECTION,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
@@ -76,6 +76,13 @@ pub struct ReplayOptions {
     /// window is *refused*, and building four thousand frames to reach it would test the
     /// arithmetic rather than the classification.
     pub max_rewind_frames: u64,
+    /// How many trie generations the pair retains, and so the deepest reorg it can undo alone.
+    ///
+    /// Defaults to one, which is production's setting and today's behaviour exactly. Raising it
+    /// costs memory per generation and buys depth-2-and-deeper recovery — a trade the operator
+    /// makes, not the binary: in 10,000 recorded verdicts every reorg was depth-1, so the default
+    /// is not the deepest thing that works but the cheapest thing that suffices.
+    pub retain_depth: RetentionDepth,
 }
 
 impl Default for ReplayOptions {
@@ -88,6 +95,7 @@ impl Default for ReplayOptions {
             reexec_limits: SidecarReexecLimits::default(),
             force_restore_at: None,
             max_rewind_frames: MAX_REWIND_FRAMES,
+            retain_depth: RetentionDepth::ONE,
         }
     }
 }
@@ -842,6 +850,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     &mut report,
                     &mut rewind,
                     options.max_rewind_frames,
+                    options.retain_depth,
                 )?
             }
             (
@@ -866,6 +875,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     &mut report,
                     &mut rewind,
                     options.max_rewind_frames,
+                    options.retain_depth,
                 )?
             }
             (phase, StreamEvent::SnapshotChunk(_)) => {
@@ -962,7 +972,9 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         info!(
                             target: "ps_replay",
                             ancestor = ancestor.number,
-                            undone = undone.number,
+                            undone_from = undone.first().map(|block| block.number),
+                            undone_to = undone.last().map(|block| block.number),
+                            depth = undone.len(),
                             revert,
                             "Applied a recorded reorg; the replay continues on the winning branch"
                         );
@@ -1196,18 +1208,23 @@ pub(crate) const MAX_REWIND_FRAMES: u64 = 4_096;
 
 /// Undo generations a consumer keeps after a commit.
 ///
-/// One. A consumer can only self-recover a reorg exactly one block deep: `reorg.rs` refuses
-/// anything deeper with "a reorg {depth} blocks deep needs a snapshot at the common ancestor; the
-/// retained generation reaches exactly one block", and the coordination layer says the same --
-/// "Only depth 1. The flat undo log reaches further, but the trie does not, and the pair has to
-/// move as one generation." Every read of the log is `back()`, so a record below the tip is
-/// unreachable by any supported recovery path.
+/// The pair's own retention depth, read off the pair rather than fixed here. A consumer can
+/// self-recover a reorg exactly as deep as it retains trie generations for, and `can_rollback_to`
+/// walks the flat log to the same depth — so a log pruned shallower than the deque would make the
+/// trie half of a recovery available and the flat half not, which is a refusal the operator never
+/// configured. Keeping them equal is the whole reason the depth has a single owner.
+///
+/// This was a constant `1` while the deque was a single slot, with the reasoning that "every read
+/// of the log is `back()`". That is no longer true: `can_rollback_to` reads as far back as the
+/// requested depth.
 ///
 /// The producer sets its own retention by a different rule — finality, with a fixed-depth floor
 /// when no finality is available (`partial-stateless-exex/src/lib.rs`). That is not a bound this
 /// side inherits. Whatever the producer keeps its log for, retaining as much here would hold
 /// records nothing on this side can read.
-pub(crate) const CONSUMER_UNDO_RETAIN_BLOCKS: u64 = 1;
+fn consumer_undo_retain_blocks(pair: &CoordinatedPair) -> u64 {
+    pair.retention_depth.get()
+}
 
 /// How often the memory probe reports, in blocks. `0` (the default) disables it.
 ///
@@ -1314,6 +1331,7 @@ fn finish_collection_if_complete(
     report: &mut ReplayReport,
     rewind: &mut Option<RewindWindow>,
     max_rewind_frames: u64,
+    retain_depth: RetentionDepth,
 ) -> eyre::Result<BatchPhase> {
     let BatchPhase::Collecting { manifest, checkpoint, checkpoint_sequence, chunks, purpose } =
         phase
@@ -1331,7 +1349,7 @@ fn finish_collection_if_complete(
     }
     match purpose {
         CollectPurpose::Install => {
-            let state = restore(&manifest, &checkpoint, &chunks)?;
+            let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
             Ok(BatchPhase::Live {
                 manifest,
                 state: Box::new(state),
@@ -1362,7 +1380,7 @@ fn finish_collection_if_complete(
                     // independent second finding from the first one cascading. Installing
                     // isolates the finding to the block it is about; the interval it covers is an
                     // explicit reset, never a continuous recovery.
-                    let state = restore(&manifest, &checkpoint, &chunks)?;
+                    let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
                     report.resyncs.push(ResyncRecord {
                         at_sequence: checkpoint_sequence,
                         block: checkpoint.block.number,
@@ -1419,7 +1437,7 @@ fn finish_collection_if_complete(
             })
         }
         CollectPurpose::Resync { target_ancestor, window_from } => {
-            let state = restore(&manifest, &checkpoint, &chunks)?;
+            let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
             // Only a checkpoint that landed on the block recovery asked for licenses a replay of
             // the commits below it: those are the winning branch by construction. A checkpoint
             // that landed anywhere else is an explicit reset, and re-reading frames under it
@@ -1729,6 +1747,7 @@ pub(crate) fn restore(
     manifest: &Manifest,
     checkpoint: &Checkpoint,
     chunks: &[SnapshotChunk],
+    retain_depth: RetentionDepth,
 ) -> eyre::Result<ReplayState> {
     let package_bytes = checkpoint
         .reassemble(chunks)
@@ -1771,7 +1790,11 @@ pub(crate) fn restore(
         pair: CoordinatedPair {
             cache: restored.cache,
             trie_cache: restored.trie_cache,
-            previous_generation: None,
+            // A restored pair retains nothing yet — the snapshot reproduced the caches without
+            // reproducing how they were reached — but it is configured to the same depth the run
+            // is, so it starts retaining at that depth from its first commit.
+            retained: Default::default(),
+            retention_depth: retain_depth,
             accepted_head,
             readiness: restored.readiness,
         },
@@ -2021,7 +2044,8 @@ pub(crate) fn replay_commit(
     // (`partial-stateless-exex/src/lib.rs`); this side has no provider to ask, and needs far less.
     let prune_started = Instant::now();
     let height = state.pair.cache.current_block();
-    state.pair.cache.prune_undo_below(height.saturating_sub(CONSUMER_UNDO_RETAIN_BLOCKS));
+    let retain = consumer_undo_retain_blocks(&state.pair);
+    state.pair.cache.prune_undo_below(height.saturating_sub(retain));
     timer.undo_prune_us = Some(prune_started.elapsed().as_micros() as u64);
     // The core's instrumentation, completed the way the paired harness completes it: admission
     // and the sidecar decode happened out here in the driver, so the core record carries them
@@ -2047,8 +2071,7 @@ pub(crate) fn replay_commit(
 
     // Sampled here and not at the prune: until `commit_transition` above ran, three trie
     // generations were reachable at once — the new one, the parent the transition displaced and
-    // handed back, and the one still sitting in the retained-generation slot. A sample taken
-    // there reads
+    // handed back, and the one still sitting in the retained-generation deque. A sample taken there reads
     // a transition, not a steady state, and would have counted a generation about to be dropped as
     // live. Being past `close_validation` also keeps the probe's own cost — a `/proc` read and six
     // mallctl calls — out of the primary boundary.
@@ -2317,7 +2340,8 @@ mod tests {
         CoordinatedPair {
             cache: config.new_cache(),
             trie_cache: PartialTrieNodeCache::new(),
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
             readiness: config.new_readiness_tracker(),
         }

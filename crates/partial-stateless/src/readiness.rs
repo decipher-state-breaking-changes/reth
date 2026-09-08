@@ -209,14 +209,15 @@ impl CacheReadinessTracker {
     /// leaving the tracker untouched so the caller can fall back to a rebuild — which is the only
     /// thing that genuinely fills the window. Every other rejection resets to
     /// [`Cold`](CacheReadiness::Cold), matching a checkpoint restore.
-    pub fn restore_from_undone_block(
+    pub fn restore_from_undone_blocks(
         &mut self,
+        depth: u64,
         checkpoint: &TrustedCheckpoint,
         observed: &CacheObservation,
     ) -> Result<&ReadyParent, ReadinessError> {
-        let Some((replay_depth, window_filled_at)) = self.depth_after_one_undo() else {
+        let Some((replay_depth, window_filled_at)) = self.depth_after_undo(depth) else {
             return Err(ReadinessError::UndoneBlockStillWarming {
-                replay_depth: self.replay_depth.saturating_sub(1),
+                replay_depth: self.replay_depth.saturating_sub(depth),
                 required: self.window_filled_at.unwrap_or_else(|| self.required_replay_depth()),
             })
         };
@@ -228,22 +229,32 @@ impl CacheReadinessTracker {
         Ok(self.ready_parent().expect("just set to Ready"))
     }
 
-    /// Whether undoing the last applied block would leave the window still whole.
+    /// Whether undoing the last `depth` applied blocks would leave the window still whole.
     ///
     /// Exposed so a caller can decline the undo before it mutates anything, rather than rolling
-    /// the caches back and learning from [`restore_from_undone_block`](
-    /// Self::restore_from_undone_block) that the result has no `Ready` to return to.
-    pub const fn stays_warm_after_one_undo(&self) -> bool {
-        self.depth_after_one_undo().is_some()
+    /// the caches back and learning from [`restore_from_undone_blocks`](
+    /// Self::restore_from_undone_blocks) that the result has no `Ready` to return to.
+    ///
+    /// Monotone in `depth` by construction: a deeper undo lands on a smaller replay depth against
+    /// the same floor, so a depth that refuses is refused at every greater depth too. That is the
+    /// property a caller relies on when it offers the deepest recovery it can and settles for a
+    /// rebuild rather than trying shallower ones.
+    pub const fn stays_warm_after_undo(&self, depth: u64) -> bool {
+        self.depth_after_undo(depth).is_some()
     }
 
-    /// The replay depth an undo would land on, and the depth the window became whole at.
+    /// The replay depth an undo of `depth` blocks would land on, and the depth the window became
+    /// whole at.
     ///
-    /// `None` when the undo is not available at all: either nothing was replayed to give back —
-    /// a checkpoint is a floor, not a block this run applied — or giving one back would drop the
-    /// pair below where its window became whole.
-    const fn depth_after_one_undo(&self) -> Option<(u64, u64)> {
-        match (self.replay_depth.checked_sub(1), self.window_filled_at) {
+    /// `None` when the undo is not available at all: either fewer than `depth` blocks were
+    /// replayed to give back — a checkpoint is a floor, not a block this run applied — or giving
+    /// them back would drop the pair below where its window became whole.
+    ///
+    /// `depth` of zero answers `Some` for a pair that is warm at all, which is vacuously right
+    /// and never asked: the validator's `RetentionDepth` refuses zero at construction, so every
+    /// caller in this workspace passes at least one.
+    const fn depth_after_undo(&self, depth: u64) -> Option<(u64, u64)> {
+        match (self.replay_depth.checked_sub(depth), self.window_filled_at) {
             (Some(replay_depth), Some(filled_at)) if replay_depth >= filled_at => {
                 Some((replay_depth, filled_at))
             }
@@ -1158,7 +1169,7 @@ mod tests {
 
         let checkpoint = checkpoint_at(undone_to);
         let parent = tracker
-            .restore_from_undone_block(&checkpoint, &restored(&checkpoint))
+            .restore_from_undone_blocks(1, &checkpoint, &restored(&checkpoint))
             .expect("still warm after giving one block back");
 
         assert_eq!(parent.anchor.block_number, undone_to);
@@ -1185,7 +1196,7 @@ mod tests {
 
         let checkpoint = checkpoint_at(undone_to);
         let error = tracker
-            .restore_from_undone_block(&checkpoint, &restored(&checkpoint))
+            .restore_from_undone_blocks(1, &checkpoint, &restored(&checkpoint))
             .expect_err("one block short of a window");
 
         assert_eq!(
@@ -1212,7 +1223,7 @@ mod tests {
         tracker.begin_recovery(5_001);
 
         let parent = tracker
-            .restore_from_undone_block(&restore, &restored(&restore))
+            .restore_from_undone_blocks(1, &restore, &restored(&restore))
             .expect("the generation underneath is the checkpointed one");
 
         assert_eq!(parent.anchor.block_number, 5_000);
@@ -1221,7 +1232,7 @@ mod tests {
         // But only back to the checkpoint: there is nothing underneath it to undo into.
         tracker.begin_recovery(5_000);
         let error = tracker
-            .restore_from_undone_block(&checkpoint_at(4_999), &restored(&checkpoint_at(4_999)))
+            .restore_from_undone_blocks(1, &checkpoint_at(4_999), &restored(&checkpoint_at(4_999)))
             .expect_err("the checkpoint is the floor");
         assert!(matches!(error, ReadinessError::UndoneBlockStillWarming { .. }));
     }
@@ -1239,7 +1250,7 @@ mod tests {
 
         let mut undone = tracker();
         apply_contiguous(&mut undone, 96, 1);
-        assert!(undone.restore_from_undone_block(&checkpoint, &restored(&checkpoint)).is_err());
+        assert!(undone.restore_from_undone_blocks(1, &checkpoint, &restored(&checkpoint)).is_err());
     }
 
     #[test]
@@ -1254,7 +1265,7 @@ mod tests {
             trie_state_root: Some(B256::repeat_byte(0xfe)),
             ..restored(&checkpoint)
         };
-        let error = tracker.restore_from_undone_block(&checkpoint, &observation).unwrap_err();
+        let error = tracker.restore_from_undone_blocks(1, &checkpoint, &observation).unwrap_err();
 
         assert!(matches!(error, ReadinessError::CheckpointRootMismatch { .. }));
         assert_eq!(

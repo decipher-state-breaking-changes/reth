@@ -197,3 +197,98 @@ fn test_deep_reorg_beyond_history_cold_resets() {
     assert!(!cache.contains_account(&Address::repeat_byte(1)), "cold reset must clear old state");
     assert_eq!(cache.current_block(), 103);
 }
+
+// ---- depth-D rollback planning ----------------------------------------------------------------
+
+/// Applies `count` blocks from height 1, rooting the cache after each so every undo record
+/// memoizes its parent's cache root — the condition `can_rollback_to` refuses without.
+fn commit_rooted_chain(cache: &mut NetworkStateCache, count: u64) {
+    let address = Address::repeat_byte(0x11);
+    cache.cache_root();
+    for number in 1..=count {
+        let state = block_state(&[(address, account(number, number * 10))], &[]);
+        cache.on_block_executed(number, &state);
+        cache.cache_root();
+    }
+}
+
+#[test]
+fn a_plan_covers_the_whole_run_and_lands_where_it_was_asked_to() {
+    let mut cache = make_cache(60, 30);
+    commit_rooted_chain(&mut cache, 5);
+
+    let plan = cache.can_rollback_to(2).expect("blocks 3, 4 and 5 are all in the log");
+    assert_eq!(plan.depth(), 3);
+    assert_eq!(plan.previous_block(), 2);
+
+    // Nothing moved: a plan is a read.
+    assert_eq!(cache.current_block(), 5);
+
+    let landing_root = plan.previous_cache_root();
+    cache.rollback(plan);
+    assert_eq!(cache.current_block(), 2);
+    assert_eq!(cache.cache_root(), landing_root, "the plan named the root the undo installs");
+}
+
+#[test]
+fn a_plan_refuses_rather_than_landing_somewhere_it_was_not_asked_to() {
+    let mut cache = make_cache(60, 30);
+    commit_rooted_chain(&mut cache, 5);
+
+    // Height 0 is reachable, not an error: the cache starts there, so block 1's record steps back
+    // to it like any other. What is unreachable is a height whose records finality already pruned.
+    assert!(cache.can_rollback_to(0).is_ok(), "the pre-chain height is a real landing");
+    cache.prune_undo_below(3);
+
+    // Now the log reaches back to 3 and no further. "Too short", which a longer log would fix —
+    // and the error says how far back it does reach, so a caller can ask for something it can get.
+    match cache.can_rollback_to(1) {
+        Err(partial_stateless::network_cache::CacheError::RollbackExhausted {
+            requested,
+            oldest,
+        }) => {
+            assert_eq!(requested, 1);
+            assert_eq!(oldest, Some(3));
+        }
+        other => panic!("expected RollbackExhausted, got {other:?}"),
+    }
+
+    assert!(cache.can_rollback_to(5).is_err(), "the cache is already at 5");
+    assert!(cache.can_rollback_to(9).is_err(), "9 is above the head");
+
+    // Every refusal above left the cache where it was.
+    assert_eq!(cache.current_block(), 5);
+}
+
+#[test]
+fn a_pruned_middle_record_is_caught_before_anything_moves() {
+    let mut cache = make_cache(60, 30);
+    commit_rooted_chain(&mut cache, 5);
+
+    // Exactly what finality pruning does, and the case arithmetic on the endpoints would accept:
+    // `5 - 2 == 3` still holds while the record that links 3 to 2 is gone.
+    cache.prune_undo_below(3);
+
+    assert!(cache.can_rollback_to(2).is_err(), "the run is no longer contiguous");
+    assert_eq!(cache.current_block(), 5);
+
+    // The part of the log that survived still plans.
+    let plan = cache.can_rollback_to(4).expect("blocks 5 is still recorded");
+    assert_eq!(plan.depth(), 1);
+    assert_eq!(plan.previous_block(), 4);
+}
+
+#[test]
+fn a_depth_one_plan_says_what_undo_preview_says() {
+    let mut cache = make_cache(60, 30);
+    commit_rooted_chain(&mut cache, 4);
+
+    let preview = cache.undo_preview().expect("a record exists");
+    let plan = cache.can_rollback_to(3).expect("the newest block is always rollbackable");
+
+    // The generalisation has to agree with what it generalises, or a depth-1 recovery routed
+    // through the new path would land differently than the one it replaced.
+    assert_eq!(plan.depth(), 1);
+    assert_eq!(plan.previous_block(), preview.previous_block);
+    assert_eq!(Some(plan.previous_cache_root()), preview.previous_cache_root);
+}

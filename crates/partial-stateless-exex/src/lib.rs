@@ -1470,7 +1470,8 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                         return LivePair::new(CoordinatedPair {
                             cache: restored.cache,
                             trie_cache: restored.trie_cache,
-                            previous_generation: None,
+                            retained: Default::default(),
+                            retention_depth: Default::default(),
                             accepted_head: None,
                             readiness: restored.readiness,
                         })
@@ -1563,7 +1564,8 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
         cache,
         trie_cache: PartialTrieNodeCache::new_with_repr(options.trie_repr),
         readiness: config.new_readiness_tracker(),
-        previous_generation: None,
+        retained: Default::default(),
+        retention_depth: Default::default(),
         accepted_head: None,
     })
 }
@@ -1701,7 +1703,7 @@ where
             *failures = 0;
             // The rebuild replaced the pair from canonical state; whatever was retained described
             // a generation this one does not descend from, so it goes.
-            pair.forget_retained_generation();
+            pair.forget_retained_generations();
             // The header that *was* left behind is the sharper problem: a reorg rebuild installs
             // the winning sibling at the same number the abandoned block had, so keeping the old
             // one leaves a header `accepted_parent` has to reject on hash rather than on height.
@@ -2446,7 +2448,8 @@ where
             pair: LivePair::new(CoordinatedPair {
                 cache: restored.cache,
                 trie_cache: restored.trie_cache,
-                previous_generation: None,
+                retained: Default::default(),
+                retention_depth: Default::default(),
                 accepted_head: None,
                 readiness: restored.readiness,
             }),
@@ -3128,7 +3131,8 @@ mod tests {
             cache: config.new_cache(),
             trie_cache: PartialTrieNodeCache::new(),
             readiness: config.new_readiness_tracker(),
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
         })
     }
@@ -3437,7 +3441,8 @@ mod tests {
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
         });
         // Advance the flat cache one block, which is what leaves the undo record the rollback
@@ -3487,7 +3492,7 @@ mod tests {
         assert_eq!(pair.trie_cache.state_root(), Some(state_root));
         assert!(matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
         assert!(
-            pair.previous_generation.is_none(),
+            pair.retained_generation().is_none(),
             "the retention is consumed: what it described is now the live generation"
         );
     }
@@ -3500,8 +3505,8 @@ mod tests {
         // Both pairs took the same route to the same block, so the caches themselves must agree.
         // A control that also changed the state would not isolate the memory it saves.
         assert_eq!(control.fingerprint(), retaining.fingerprint());
-        assert!(control.previous_generation.is_none());
-        assert!(retaining.previous_generation.is_some());
+        assert!(control.retained_generation().is_none());
+        assert!(retaining.retained_generation().is_some());
 
         let control_bytes = control.retained_generation_bytes(false);
         assert!(!control_bytes.enabled);
@@ -3539,7 +3544,7 @@ mod tests {
             "a retention tagged with a different hash must never be installed"
         );
         assert_eq!(pair.cache.current_block(), SNAP_BLOCK + 1, "and nothing may be mutated");
-        assert!(pair.previous_generation.is_none(), "the rejected retention is dropped");
+        assert!(pair.retained_generation().is_none(), "the rejected retention is dropped");
     }
 
     #[test]
@@ -3575,13 +3580,13 @@ mod tests {
     #[test]
     fn a_transition_that_did_not_commit_leaves_nothing_retained() {
         let (mut pair, _, _) = pair_one_block_past_a_snapshot();
-        assert!(pair.previous_generation.is_some());
+        assert!(pair.retained_generation().is_some());
 
         // `None` is what the builder reports when the transition rolled back, and the old
         // retention describes a generation two blocks back that K = 1 does not promise.
         pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1, sealed(&ctx(SNAP_BLOCK + 2)), true);
 
-        assert!(pair.previous_generation.is_none());
+        assert!(pair.retained_generation().is_none());
     }
 
     #[test]
@@ -3605,7 +3610,7 @@ mod tests {
         assert_eq!(pair.fingerprint(), before, "both caches are where the refusal found them");
         assert_eq!(pair.lifecycle_fingerprint(), lifecycle_before, "and so is the retention");
         assert_eq!(pair.readiness.state().label(), state_before, "and the tracker was not reset");
-        assert!(pair.previous_generation.is_some(), "the retention is still the caller's to use");
+        assert!(pair.retained_generation().is_some(), "the retention is still the caller's to use");
     }
 
     #[test]
@@ -3626,7 +3631,7 @@ mod tests {
 
         assert_eq!(pair.fingerprint(), before, "nothing moved");
         assert_eq!(pair.readiness.state().label(), state_before);
-        assert!(pair.previous_generation.is_some(), "and the retention was not consumed");
+        assert!(pair.retained_generation().is_some(), "and the retention was not consumed");
     }
 
     #[test]
@@ -3677,7 +3682,8 @@ mod tests {
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
         });
         // Restoring computed the anchor's cache root, which is what the *next* block would carry
@@ -3717,7 +3723,7 @@ mod tests {
         assert_eq!(pair.fingerprint(), before, "both caches are where the refusal found them");
         assert_eq!(pair.lifecycle_fingerprint(), lifecycle_before, "and so is the retention");
         assert_eq!(pair.readiness.state().label(), state_before, "and the tracker was not reset");
-        assert!(pair.previous_generation.is_some(), "the retention is still the caller's to use");
+        assert!(pair.retained_generation().is_some(), "the retention is still the caller's to use");
     }
 
     #[test]
@@ -3857,14 +3863,16 @@ mod tests {
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
         });
         let reference = LivePair::new(CoordinatedPair {
             cache: reference.cache,
             trie_cache: reference.trie_cache,
             readiness: reference.readiness,
-            previous_generation: None,
+            retained: Default::default(),
+            retention_depth: Default::default(),
             accepted_head: None,
         });
 
@@ -3965,7 +3973,7 @@ mod tests {
         // stood in for by taking the same header the provider would have returned.
         let (mut pair, ..) = pair_and_reference_before_a_reorg();
         let canonical = pair.accepted_head.clone().expect("the fixture advanced a block");
-        pair.forget_retained_generation();
+        pair.forget_retained_generations();
         pair.accepted_head = None;
         assert_eq!(pair.accepted_parent(), None, "a headless pair offers nothing");
 
@@ -4024,7 +4032,7 @@ mod tests {
 
         finish_committed_transition(&mut pair, None, &next, sealed(&next), false);
 
-        assert!(pair.previous_generation.is_none(), "retention is off in this arm");
+        assert!(pair.retained_generation().is_none(), "retention is off in this arm");
         // The field, not `accepted_parent()`. This fixture advances the pair with a synthesized
         // state root the trie cache cannot reproduce, so the pair is no longer `Ready` and the
         // guard correctly declines to vouch for the header. What is under test is that the head
@@ -4152,13 +4160,13 @@ mod tests {
     #[test]
     fn a_cold_reset_forgets_the_retained_generation() {
         let (mut pair, _, _) = pair_one_block_past_a_snapshot();
-        assert!(pair.previous_generation.is_some());
+        assert!(pair.retained_generation().is_some());
 
         admit_after_cold_reset(&mut pair, &ctx(SNAP_BLOCK + 2))
             .expect("a cold reset always readmits");
 
         assert!(
-            pair.previous_generation.is_none(),
+            pair.retained_generation().is_none(),
             "the reset pair does not descend from the retained generation"
         );
     }

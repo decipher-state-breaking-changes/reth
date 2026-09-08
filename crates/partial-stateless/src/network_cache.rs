@@ -1007,6 +1007,96 @@ impl NetworkStateCache {
         })
     }
 
+    /// What rolling back to `target_block` would restore, without rolling anything back.
+    ///
+    /// The depth-D generalisation of [`undo_preview`](Self::undo_preview), and the reason a
+    /// multi-block recovery can be a transaction: it walks the undo log from the newest record
+    /// down to the one landing on `target_block`, proves every record on the way is present and
+    /// contiguous, and reports what the whole run would install — all before a single entry moves.
+    ///
+    /// Contiguity is checked link by link rather than by arithmetic on the endpoints. The log is
+    /// a deque of records that each name their own block and their own parent, and a gap in it is
+    /// exactly the condition that would leave the cache half-rolled-back; comparing only
+    /// `newest - target == depth` would accept a log whose middle record was pruned.
+    ///
+    /// Refuses rather than truncating when `target_block` is not reachable, so a caller that asked
+    /// for more than the log holds falls back to a rebuild instead of landing somewhere it did not
+    /// name.
+    pub fn can_rollback_to(&self, target_block: u64) -> Result<RollbackPlan, CacheError> {
+        if self.current_block == target_block {
+            return Err(CacheError::RollbackNotNeeded { block: target_block })
+        }
+        if target_block > self.current_block {
+            return Err(CacheError::RollbackAboveHead {
+                requested: target_block,
+                head: self.current_block,
+            })
+        }
+
+        // Newest first, which is both the order `rollback_block` consumes them in and the order
+        // the retained-generation deque pops in. `expected` walks down with the records so a
+        // pruned middle is caught where it is, not inferred at the end.
+        let mut blocks = Vec::new();
+        let mut expected = self.current_block;
+        let mut landing = None;
+        for undo in self.undo_log.iter().rev() {
+            if undo.block_number != expected {
+                return Err(CacheError::RollbackGap { expected, found: undo.block_number })
+            }
+            blocks.push(undo.block_number);
+            if undo.previous_block == target_block {
+                landing = Some(undo);
+                break
+            }
+            if undo.previous_block < target_block {
+                // The record steps past the target, which means the target is not a height this
+                // cache was ever at. Distinct from running out of records, and a different repair.
+                return Err(CacheError::RollbackOvershoot {
+                    requested: target_block,
+                    landed_on: undo.previous_block,
+                })
+            }
+            expected = undo.previous_block;
+        }
+
+        let Some(landing) = landing else {
+            return Err(CacheError::RollbackExhausted {
+                requested: target_block,
+                oldest: self.undo_log.front().map(|undo| undo.previous_block),
+            })
+        };
+        // The post-undo cache root has to be known before the undo for the caller's restore to be
+        // a transaction. Refused here rather than reported as `None`, because every caller of this
+        // method needs it and a plan that cannot supply it is not a plan they can commit.
+        let Some(previous_cache_root) = landing.previous_cache_root else {
+            return Err(CacheError::RollbackRootUnknown { block: landing.block_number })
+        };
+
+        Ok(RollbackPlan {
+            blocks,
+            previous_block: landing.previous_block,
+            previous_cache_root,
+        })
+    }
+
+    /// Roll back every block a [`RollbackPlan`] named, newest first.
+    ///
+    /// Infallible by construction and typed that way: the plan proved the records present and
+    /// contiguous, and nothing between building it and consuming it can touch the log — the
+    /// borrow checker sees to that, since `can_rollback_to` borrows `&self` and this takes
+    /// `&mut self`, so no `apply` can run in between.
+    ///
+    /// One call rather than a D-times loop over [`rollback_block`](Self::rollback_block) on
+    /// purpose: the caller's retained-generation deque has to pop the same D and keep the *last*
+    /// one popped, and splitting the two halves across a loop is exactly where that off-by-one
+    /// goes wrong.
+    pub fn rollback(&mut self, plan: RollbackPlan) {
+        for block in plan.blocks {
+            self.rollback_block(block).expect("the plan proved this record is the newest");
+        }
+        debug_assert_eq!(self.current_block, plan.previous_block);
+    }
+
     pub fn rollback_block(&mut self, block_number: u64) -> Result<(), CacheError> {
         match self.undo_log.back() {
             Some(undo) if undo.block_number == block_number => {}
@@ -1119,6 +1209,40 @@ pub struct UndoPreview {
     pub previous_cache_root: Option<B256>,
 }
 
+/// A proved-out multi-block rollback, ready to be consumed by [`NetworkStateCache::rollback`].
+///
+/// Opaque on purpose. Its fields describe a log that has already been walked, and a caller that
+/// built one by hand could hand `rollback` a run the log does not hold — which is the single
+/// failure mode the type exists to remove. What a caller legitimately needs to check before
+/// committing is exposed as methods.
+#[derive(Debug, Clone)]
+pub struct RollbackPlan {
+    /// The blocks to undo, newest first — the order `rollback_block` accepts them in.
+    blocks: Vec<u64>,
+    /// The height the cache lands on.
+    previous_block: u64,
+    /// The cache root the landing record reinstalls. Never `None`: a plan that could not name it
+    /// is refused at construction, because no caller can commit a transaction without it.
+    previous_cache_root: B256,
+}
+
+impl RollbackPlan {
+    /// How many blocks this plan gives back.
+    pub fn depth(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
+    /// The height the cache lands on.
+    pub const fn previous_block(&self) -> u64 {
+        self.previous_block
+    }
+
+    /// The cache root the landing record reinstalls.
+    pub const fn previous_cache_root(&self) -> B256 {
+        self.previous_cache_root
+    }
+}
+
 /// Result of computing cache misses for a block.
 #[derive(Debug, Clone)]
 pub struct MissResult {
@@ -1214,6 +1338,19 @@ pub enum CacheError {
     /// Rollback was requested for a block that is not the newest undo record.
     /// `found` is the newest retained undo block (or `None` if no history remains).
     RollbackMismatch { requested: u64, found: Option<u64> },
+    /// The cache is already at the requested height, so there is nothing to give back.
+    RollbackNotNeeded { block: u64 },
+    /// The requested height is above the cache's own head.
+    RollbackAboveHead { requested: u64, head: u64 },
+    /// The undo log skips a block between the head and the target, so the run is not contiguous.
+    RollbackGap { expected: u64, found: u64 },
+    /// A record steps past the target, so the target is not a height this cache was ever at.
+    RollbackOvershoot { requested: u64, landed_on: u64 },
+    /// The undo log ran out before reaching the target. `oldest` is as far back as it reaches.
+    RollbackExhausted { requested: u64, oldest: Option<u64> },
+    /// The landing record never memoized its parent's cache root, so the undo cannot be made
+    /// atomic.
+    RollbackRootUnknown { block: u64 },
 }
 
 impl std::fmt::Display for CacheError {
@@ -1222,6 +1359,30 @@ impl std::fmt::Display for CacheError {
             CacheError::RollbackMismatch { requested, found } => write!(
                 f,
                 "cache rollback mismatch: requested block {requested}, newest undo record is {found:?}"
+            ),
+            CacheError::RollbackNotNeeded { block } => {
+                write!(f, "cache is already at block {block}; there is nothing to roll back")
+            }
+            CacheError::RollbackAboveHead { requested, head } => write!(
+                f,
+                "cannot roll back to block {requested}: the cache head is {head}"
+            ),
+            CacheError::RollbackGap { expected, found } => write!(
+                f,
+                "the undo log skips block {expected}; the next record back is {found}"
+            ),
+            CacheError::RollbackOvershoot { requested, landed_on } => write!(
+                f,
+                "no undo record lands on block {requested}; the run steps to {landed_on}"
+            ),
+            CacheError::RollbackExhausted { requested, oldest } => write!(
+                f,
+                "the undo log does not reach block {requested}; it reaches back to {oldest:?}"
+            ),
+            CacheError::RollbackRootUnknown { block } => write!(
+                f,
+                "the undo record for block {block} never memoized its parent's cache root, so the \
+                 rollback cannot be made atomic"
             ),
         }
     }

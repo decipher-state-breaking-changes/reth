@@ -45,7 +45,8 @@ pub use cold_admission::{
 pub use config::CacheConfig;
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{
-    CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache, UndoPreview,
+    CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache, RollbackPlan,
+    UndoPreview,
 };
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
