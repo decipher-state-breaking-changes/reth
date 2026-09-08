@@ -457,6 +457,11 @@ impl CoordinatedPair {
             shared_pool_bytes,
             shared_allocations: pool.len(),
             total_bytes: unshared.saturating_add(shared_pool_bytes),
+            generation_sum_bytes: self
+                .retained
+                .iter()
+                .map(|generation| generation.trie_cache.memory_breakdown().total_bytes())
+                .fold(0usize, usize::saturating_add),
         }
     }
 
@@ -804,7 +809,23 @@ pub struct RetainedDequeBytes {
     /// is doing any work at all: equal to the per-generation count times K means it is not.
     pub shared_allocations: usize,
     /// What dropping the whole deque would return.
+    ///
+    /// Not the same question as "what does the process hold". An allocation the live cache also
+    /// points at is not freed by dropping the deque, so it is excluded here — and it is still
+    /// resident. Use [`Self::generation_sum_bytes`] for a budget.
     pub total_bytes: usize,
+    /// Each generation's own complete size, added with no deduplication at all.
+    ///
+    /// The other end of the range `total_bytes` opens. It over-counts anything two generations
+    /// genuinely share and under-counts nothing, so the true resident cost of the deque is between
+    /// the two — and a run that reports both can say where, instead of leaving a reader to pick
+    /// the flattering one.
+    ///
+    /// Reported because the first K=3 measurement found the gap is not small: three independent
+    /// readings (RSS delta, jemalloc `allocated` delta, and a generation's own complete total) put
+    /// the marginal cost of a generation at ~186 MiB while `total_bytes` charged ~128. Whatever
+    /// explains that, an operator's budget cannot be set from the smaller number.
+    pub generation_sum_bytes: usize,
 }
 
 /// The one canonical-chain question depth-1 recovery has to ask.

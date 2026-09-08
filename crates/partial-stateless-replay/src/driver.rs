@@ -1321,7 +1321,8 @@ retained_account_paths={account_paths}\tretained_storage_paths_map={storage_path
 retained_storage_paths_slices={storage_paths_slices}\t\
 deque_depth={deque_depth}\tdeque_generations={deque_generations}\t\
 deque_unshared={deque_unshared}\tdeque_shared_pool={deque_shared_pool}\t\
-deque_shared_allocations={deque_shared_allocations}\tdeque_total={deque_total}",
+deque_shared_allocations={deque_shared_allocations}\tdeque_total={deque_total}\t\
+deque_generation_sum={deque_generation_sum}",
         present = retained.present,
         total = retained.total_bytes,
         exclusive = retained.exclusive_bytes,
@@ -1343,6 +1344,9 @@ deque_shared_allocations={deque_shared_allocations}\tdeque_total={deque_total}",
         deque_shared_pool = deque.shared_pool_bytes,
         deque_shared_allocations = deque.shared_allocations,
         deque_total = deque.total_bytes,
+        // The union and the naive sum, side by side. They bracket the resident cost, and the first
+        // K=3 run found them 46% apart — a gap no single-number report would have shown.
+        deque_generation_sum = deque.generation_sum_bytes,
     );
 }
 

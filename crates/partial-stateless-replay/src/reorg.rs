@@ -819,6 +819,10 @@ mod tests {
         assert_eq!(deque.generations, 3);
         assert!(deque.shared_pool_bytes > 0, "these generations really do share something");
 
+        // The two figures bracket the resident cost from either side, and the ordering is the
+        // whole point of reporting both: the union can only be smaller.
+        assert!(deque.total_bytes <= deque.generation_sum_bytes);
+
         // The claim §4.3 rests on, now on a population that can show it: the union is strictly
         // less than the sum, and the gap is exactly the sharing counted once instead of K times.
         // Measured on a clone, not on `warm` itself. The deque holds clones, and a clone is
@@ -856,6 +860,7 @@ mod tests {
         assert_eq!(deque.generations, 0, "a restored pair has not retained anything yet");
         assert_eq!(deque.total_bytes, 0);
         assert_eq!(deque.shared_allocations, 0);
+        assert_eq!(deque.generation_sum_bytes, 0);
     }
 
     /// Everything §4.4's invariance table calls "untouched", in one comparable value.
