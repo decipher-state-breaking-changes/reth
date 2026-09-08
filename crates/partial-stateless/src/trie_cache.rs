@@ -733,12 +733,13 @@ impl PartialTrieNodeCache {
     /// real bytes that no consumer measurement has ever included. This reports all of them, so a
     /// retained generation's true cost is known rather than bounded below.
     ///
-    /// Heuristic in the same sense as `memory_size`: containers are charged their *capacity*, not
-    /// their length, because that is what they hold from the allocator.
+    /// Heuristic in the same sense as `memory_size`, and charged against what each container holds
+    /// from the allocator rather than what it currently stores. For a `Vec` that is `capacity`.
+    /// For a hash table it is neither `len` nor `capacity` — see [`hashbrown_table_bytes`], which
+    /// is where that distinction turned out to matter.
     pub fn memory_breakdown(&self) -> TrieCacheMemory {
-        // hashbrown carries one control byte per slot beside the bucket itself.
-        const CTRL: usize = 1;
         let nibble = std::mem::size_of::<Nibbles>();
+        let table = |capacity: usize, entry: usize| hashbrown_table_bytes(capacity, entry);
 
         let shared_storage_trie_bytes = self
             .sparse
@@ -752,13 +753,20 @@ impl PartialTrieNodeCache {
         TrieCacheMemory {
             sparse_bytes: self.sparse.memory_size(),
             shared_storage_trie_bytes,
-            warm_accounts_bytes: self.warm_accounts.capacity() *
-                (std::mem::size_of::<Address>() + CTRL),
-            warm_storage_bytes: self.warm_storage.capacity() *
-                (std::mem::size_of::<(Address, B256)>() + CTRL),
+            warm_accounts_bytes: table(
+                self.warm_accounts.capacity(),
+                std::mem::size_of::<Address>(),
+            ),
+            warm_storage_bytes: table(
+                self.warm_storage.capacity(),
+                std::mem::size_of::<(Address, B256)>(),
+            ),
+            // `Vec::capacity` *is* the allocation, so this one needs no reconstruction.
             retained_account_paths_bytes: self.retained_account_paths.capacity() * nibble,
-            retained_storage_paths_map_bytes: self.retained_storage_paths.capacity() *
-                (std::mem::size_of::<B256>() + std::mem::size_of::<Arc<[Nibbles]>>() + CTRL),
+            retained_storage_paths_map_bytes: table(
+                self.retained_storage_paths.capacity(),
+                std::mem::size_of::<B256>() + std::mem::size_of::<Arc<[Nibbles]>>(),
+            ),
             retained_storage_paths_slice_bytes: self
                 .retained_storage_paths
                 .values()
@@ -1340,6 +1348,36 @@ pub struct TrieBranchCensus {
     pub storage_tries: u64,
 }
 
+/// What a hashbrown table of this reported capacity actually holds from the allocator.
+///
+/// `HashMap::capacity` is *not* the allocation. hashbrown reports `items + growth_left`, and
+/// erasing an entry leaves a tombstone that consumes a bucket without returning growth — so a
+/// table that has had entries removed reports less capacity than it has buckets, while the bucket
+/// array is unchanged. Retention removes warm accounts every block, so this cache is exactly the
+/// shape that drifts: a measured run saw the warm-account table report anywhere from 54,079 to
+/// 57,344 while holding 65,536 buckets throughout.
+///
+/// Reconstructed from the reported capacity rather than from `len`, because both errors exist and
+/// they point opposite ways: `len` misses the buckets a table keeps after shrinking, and
+/// `capacity` misses the ones tombstones hide. Rounding up to hashbrown's own power-of-two bucket
+/// count absorbs the second — the tombstone deficit has to exceed half the table before it changes
+/// which power of two you land on, and a table that far gone has bigger problems.
+///
+/// Still a heuristic: it is hashbrown's sizing rule restated, not a reading of the allocation, and
+/// it omits the trailing control group hashbrown replicates for its SIMD probe. Both are small
+/// against a table of this size, and neither is a reason to report a number that is knowably low.
+fn hashbrown_table_bytes(capacity: usize, entry_bytes: usize) -> usize {
+    // hashbrown's `capacity_to_buckets`, which is the only place the mapping is defined.
+    let buckets = match capacity {
+        0 => return 0,
+        1..=3 => 4,
+        4..=7 => 8,
+        capacity => (capacity * 8 / 7).next_power_of_two(),
+    };
+    // One control byte per bucket, beside the bucket itself.
+    buckets * (entry_bytes + 1)
+}
+
 /// Where one trie cache's memory is, component by component.
 ///
 /// Exists because `estimated_memory_bytes` is the sparse trie alone: the four structures beside it
@@ -1857,6 +1895,31 @@ mod tests {
             "a clone cannot hold more path capacity than its source"
         );
         assert!(retained.total_bytes() <= live.total_bytes());
+    }
+
+    #[test]
+    fn a_hash_table_is_charged_its_buckets_and_not_its_reported_capacity() {
+        // hashbrown's own sizing rule at the boundaries it defines.
+        assert_eq!(hashbrown_table_bytes(0, 21), 0, "an unallocated table costs nothing");
+        assert_eq!(hashbrown_table_bytes(3, 21), 4 * 22);
+        assert_eq!(hashbrown_table_bytes(4, 21), 8 * 22);
+        assert_eq!(hashbrown_table_bytes(7, 21), 8 * 22);
+
+        // The case this function exists for, from a measured run: retention erases warm accounts
+        // every block, and each erasure leaves a tombstone that consumes a bucket without
+        // returning growth. The reported capacity drifted across 194 distinct values between
+        // 54,079 and 57,344 while the bucket array never moved off 65,536.
+        let full = hashbrown_table_bytes(57_344, 21);
+        assert_eq!(full, 65_536 * 22, "57,344 is exactly 65,536 buckets' worth");
+        assert_eq!(
+            hashbrown_table_bytes(54_079, 21),
+            full,
+            "a table riddled with tombstones holds the same buckets it always did"
+        );
+
+        // And the rounding does not swallow a genuine growth step: one item past what 65,536
+        // buckets can hold is a table twice the size, and it is charged as one.
+        assert_eq!(hashbrown_table_bytes(57_345, 21), 131_072 * 22);
     }
 
     #[test]

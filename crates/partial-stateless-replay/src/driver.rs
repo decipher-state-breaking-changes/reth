@@ -1291,9 +1291,13 @@ fn memory_probe(height: u64, pair: &CoordinatedPair) {
         }
     }
     let process = match jemalloc_stats() {
+        // `jemalloc_retained`, not `retained`: the generation fields below are all `retained_*`,
+        // and a parser keying on that prefix would otherwise pick up jemalloc's retained *virtual
+        // address space* as though it were a property of the retained trie generation. Two
+        // unrelated senses of one word, adjacent on the same line.
         Some([allocated, active, resident, mapped, retained]) => format!(
             "allocated={allocated}\tactive={active}\tresident={resident}\t\
-mapped={mapped}\tretained={retained}"
+mapped={mapped}\tjemalloc_retained={retained}"
         ),
         None => "jemalloc_stats=unavailable".to_string(),
     };
