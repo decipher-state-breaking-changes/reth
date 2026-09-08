@@ -2,7 +2,7 @@
 #
 # Build-profile guard for the standalone database-free validator.
 #
-# Four invariants, all of which have to hold for the standalone claim to mean anything, and none
+# Five invariants, all of which have to hold for the standalone claim to mean anything, and none
 # of which any test can observe:
 #
 #   1. No Reth provider or database implementation is reachable from the package's *normal*
@@ -50,10 +50,41 @@
 #
 # Usage: check_validator_isolation.sh [package-name ...]
 #
+# All four are read off the *source* with `cargo tree`, which answers "would a build from this tree
+# be correct?" -- not "is the binary about to be measured correct?". So there is a fifth check, on
+# the artifact:
+#
+#   5. The built binary carries this commit. Every binary embeds `PS_BUILD_COMMIT` at compile time,
+#      so a binary built from other code than the tree just checked is detectable, and that is the
+#      whole gap: with `std` selected unconditionally in `partial-stateless/Cargo.toml` and the
+#      keccak features in each binary crate's `default`, a binary built from a commit whose graph
+#      passes invariants 2 to 4 has them. Commit plus graph is the property; nothing further needs
+#      asking of the binary. It is not hypothetical -- on 2026-09-08 the graph check passed while
+#      `target/release/ps-replay` predated the fix it was passing on, and a measurement was nearly
+#      taken from it. §5 of the runbook already carried this check as a one-line `grep` on one
+#      binary; this generalises it to all of them, `partial-stateless-exex` included, which no
+#      other invariant reaches.
+#
+# The allocator is deliberately not checked here. It *is* a build-time choice that a commit does
+# not imply, being `--features jemalloc` on the command line -- but `RunProvenance` already records
+# it in every run manifest, and the runbook reads it there. A second copy in this script would be
+# a second thing to keep true.
+#
+# `PS_ISOLATION_REQUIRE_BINARY=1` turns a missing binary from a warning into a failure. Use it
+# wherever the artifact is about to be measured; the default warns, because the guard is also run
+# before anything is built.
+#
 # `PS_ISOLATION_FEATURES` passes a feature list through to every `cargo tree` below, so an arm
 # built with non-default features is checked as the graph it actually links rather than as the
 # default one. A build profile that differs from the checked profile is precisely the defect
 # invariants 2 to 4 exist to catch, and an allocator arm is a build profile.
+#
+# It is filtered per package before use. It is one string for a run spanning several packages, and
+# they do not all declare the same features -- `jemalloc` is a binary crate's selection and the two
+# library packages have no such feature. Passing it to a package that does not declare it makes
+# `cargo tree` refuse the whole invocation, and a guard that fails for a reason unrelated to any
+# invariant is a guard that gets skipped. The drop is announced rather than silent: a run believing
+# it checked a profile it did not is the failure this script exists to prevent.
 #
 # Every feature check below passes `-e normal,build,features` rather than `-e features`. That is
 # not cosmetic: `-e features` alone leaves cargo's dev edges in, so a feature reachable *only*
@@ -65,10 +96,33 @@
 
 set -euo pipefail
 
+DECLARED_FEATURES="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+  | python3 -c 'import json,sys
+for pkg in json.load(sys.stdin)["packages"]:
+    print(pkg["name"], " ".join(sorted(pkg["features"])))' || true)"
+
 FEATURE_ARGS=()
-if [ -n "${PS_ISOLATION_FEATURES:-}" ]; then
-  FEATURE_ARGS=(--features "${PS_ISOLATION_FEATURES}")
-fi
+feature_args_for() {
+  local PKG="$1"
+  FEATURE_ARGS=()
+  [ -n "${PS_ISOLATION_FEATURES:-}" ] || return 0
+
+  local declared kept=() dropped=() feature
+  declared=" $(printf '%s\n' "${DECLARED_FEATURES}" | awk -v p="${PKG}" '$1 == p {$1=""; print}') "
+  for feature in ${PS_ISOLATION_FEATURES//,/ }; do
+    if [ "${declared}" != "  " ] && [[ "${declared}" != *" ${feature} "* ]]; then
+      dropped+=("${feature}")
+    else
+      kept+=("${feature}")
+    fi
+  done
+  if [ ${#dropped[@]} -gt 0 ]; then
+    echo "note: ${PKG} declares no ${dropped[*]}; checking its own graph instead" >&2
+  fi
+  if [ ${#kept[@]} -gt 0 ]; then
+    FEATURE_ARGS=(--features "$(IFS=,; echo "${kept[*]}")")
+  fi
+}
 
 if [ "$#" -gt 0 ]; then
   PACKAGES=("$@")
@@ -78,6 +132,7 @@ else
     partial-stateless-stream
     partial-stateless-replay
     partial-stateless-frontier
+    partial-stateless-exex
   )
 fi
 
@@ -91,6 +146,17 @@ status=0
 
 check_package() {
   local PKG="$1"
+
+# Stage A cannot speak about the ExEx: invariant 1 forbids a provider and an ExEx *in a node*
+# necessarily links one, and the features it resolves are the node's rather than its own -- which
+# is exactly why "it happens to be right" has held there by accident three times. Invariant 5 can,
+# and is the only thing that ever has.
+if [ "${PKG}" = "partial-stateless-exex" ]; then
+  echo "==> ${PKG}: dependency graph not checked (an ExEx in a node necessarily links a provider)"
+  return
+fi
+
+feature_args_for "${PKG}"
 
 echo "==> ${PKG}: normal dependency graph"
 if ! deps="$(cargo tree -p "${PKG}" -e normal --prefix none "${FEATURE_ARGS[@]}" 2>/dev/null)"; then
@@ -141,8 +207,63 @@ else
 fi
 }
 
+# Invariant 5: the artifact. `partial-stateless-validator` and `partial-stateless-stream` are
+# libraries with no binary to check, and are absent on purpose -- their code ships inside the
+# binaries below, so a defect in their build shows up in one of these rows.
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+HEAD_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo "")"
+
+binary_for() {
+  case "$1" in
+    partial-stateless-replay) echo "${REPO_ROOT}/target/release/ps-replay" ;;
+    partial-stateless-frontier) echo "${REPO_ROOT}/target/release/ps-policy-frontier" ;;
+    partial-stateless-exex) echo "${REPO_ROOT}/target/release/reth-partial-stateless" ;;
+    *) echo "" ;;
+  esac
+}
+
+check_binary() {
+  local PKG BIN
+  PKG="$1"
+  BIN="$(binary_for "${PKG}")"
+  [ -n "${BIN}" ] || return 0
+
+  echo "==> ${PKG}: artifact (${BIN##*/})"
+  if [ ! -x "${BIN}" ]; then
+    if [ "${PS_ISOLATION_REQUIRE_BINARY:-0}" = "1" ]; then
+      echo "FAIL: ${BIN} is missing; the graph above describes the source, nothing describes the artifact." >&2
+      status=1
+    else
+      echo "warn: ${BIN} not built; the graph above describes the source, not any artifact" >&2
+    fi
+    return
+  fi
+
+  if [ -z "${HEAD_COMMIT}" ]; then
+    echo "warn: not a git checkout; the artifact cannot be tied to a commit" >&2
+    return
+  fi
+
+  # `grep -a` because the binary is not text. The commit is embedded by `option_env!` at compile
+  # time, so this asks one question with one answer: does the artifact carry the commit whose graph
+  # was just checked? A binary that does not is either stale or was built without the provenance
+  # exports, and neither can be shown to be the code above -- so both fail, and the message names
+  # both. There is no third state to detect: "no stamp at all" is not distinguishable by grep,
+  # because a stripped binary contains 40-hex-digit byte sequences by chance.
+  if grep -qa "${HEAD_COMMIT}" "${BIN}"; then
+    echo "ok: the artifact was built from this commit (${HEAD_COMMIT:0:12})"
+  else
+    echo "FAIL: ${BIN} does not carry ${HEAD_COMMIT:0:12}." >&2
+    echo "      Either it is stale, or it was built without PS_BUILD_COMMIT exported. Either way" >&2
+    echo "      it is not the code the graph check above passed on. Rebuild with the three" >&2
+    echo "      provenance exports before measuring." >&2
+    status=1
+  fi
+}
+
 for pkg in "${PACKAGES[@]}"; do
   check_package "${pkg}"
+  check_binary "${pkg}"
 done
 
 exit "${status}"
