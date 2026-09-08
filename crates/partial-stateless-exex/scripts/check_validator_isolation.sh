@@ -2,7 +2,7 @@
 #
 # Build-profile guard for the standalone database-free validator.
 #
-# Three invariants, all of which have to hold for the standalone claim to mean anything, and none
+# Four invariants, all of which have to hold for the standalone claim to mean anything, and none
 # of which any test can observe:
 #
 #   1. No Reth provider or database implementation is reachable from the package's *normal*
@@ -26,6 +26,15 @@
 #      graph check on the ExEx would have passed. Same shape of defect as invariant 2, on a
 #      different hot path.
 #
+#   4. The sparse trie's parallelism is actually compiled in. `std` on reth-trie-sparse is not a
+#      portability knob: `is_reveal_parallelism_enabled` and `is_update_parallelism_enabled` are
+#      `false` in nostd builds, so proof reveal and subtrie hash updates run serially. The
+#      workspace declares the crate `default-features = false`, and the ExEx turns it on only by
+#      accident of linking the node graph -- so, once more, a graph check on the ExEx would have
+#      passed while the standalone binary ran a different trie. It did: every consumer cohort up to
+#      2026-09-08 was measured serial, `account_trie_us` reported zero throughout because `timed()`
+#      is gated on the same feature, and nothing failed. Third instance of invariant 2's defect.
+#
 # The packages below are checked together because the claim is about the *binaries*, and each is
 # built from several of them. `partial-stateless-stream` is where the frame format and the recorded
 # oracle live, and `partial-stateless-replay` is the standalone process itself — the first thing
@@ -44,7 +53,15 @@
 # `PS_ISOLATION_FEATURES` passes a feature list through to every `cargo tree` below, so an arm
 # built with non-default features is checked as the graph it actually links rather than as the
 # default one. A build profile that differs from the checked profile is precisely the defect
-# invariants 2 and 3 exist to catch, and an allocator arm is a build profile.
+# invariants 2 to 4 exist to catch, and an allocator arm is a build profile.
+#
+# Every feature check below passes `-e normal,build,features` rather than `-e features`. That is
+# not cosmetic: `-e features` alone leaves cargo's dev edges in, so a feature reachable *only*
+# through a dev-dependency satisfies the grep while the shipped binary does not have it -- the
+# exact false pass these invariants exist to prevent, and the same reason invariant 1 has always
+# used `-e normal`. Measured on this workspace 2026-09-08: `reth-trie` is a dev-dependency of
+# `partial-stateless` and nothing else, and it appears twice under `-e features` and zero times
+# under `-e normal,build,features`.
 
 set -euo pipefail
 
@@ -68,6 +85,7 @@ fi
 FORBIDDEN='^(reth-provider|reth-db|reth-db-common|reth-libmdbx|reth-mdbx-sys|reth-exex|reth-node-builder)$'
 REQUIRED_FEATURES='feature "(asm-keccak|keccak-cache-global)"'
 REQUIRED_RECOVERY='feature "secp256k1"'
+REQUIRED_TRIE_PARALLELISM='reth-trie-sparse feature "std"'
 
 status=0
 
@@ -90,7 +108,7 @@ else
 fi
 
 echo "==> ${PKG}: keccak build profile"
-edges="$(cargo tree -p "${PKG}" -e features -i alloy-primitives "${FEATURE_ARGS[@]}" 2>/dev/null \
+edges="$(cargo tree -p "${PKG}" -e normal,build,features -i alloy-primitives "${FEATURE_ARGS[@]}" 2>/dev/null \
   | grep -cE "${REQUIRED_FEATURES}" || true)"
 if [ "${edges}" -eq 0 ]; then
   echo "FAIL: ${PKG} selects neither asm-keccak nor keccak-cache-global on alloy-primitives." >&2
@@ -101,7 +119,7 @@ else
 fi
 
 echo "==> ${PKG}: signature recovery backend"
-recovery="$(cargo tree -p "${PKG}" -e features -i reth-primitives-traits "${FEATURE_ARGS[@]}" 2>/dev/null \
+recovery="$(cargo tree -p "${PKG}" -e normal,build,features -i reth-primitives-traits "${FEATURE_ARGS[@]}" 2>/dev/null \
   | grep -cE "${REQUIRED_RECOVERY}" || true)"
 if [ "${recovery}" -eq 0 ]; then
   echo "FAIL: ${PKG} does not select secp256k1 on reth-primitives-traits." >&2
@@ -109,6 +127,17 @@ if [ "${recovery}" -eq 0 ]; then
   status=1
 else
   echo "ok: ${recovery} secp256k1 feature edges on reth-primitives-traits"
+fi
+
+echo "==> ${PKG}: sparse trie parallelism"
+parallelism="$(cargo tree -p "${PKG}" -e normal,build,features -i reth-trie-sparse "${FEATURE_ARGS[@]}" 2>/dev/null \
+  | grep -cE "${REQUIRED_TRIE_PARALLELISM}" || true)"
+if [ "${parallelism}" -eq 0 ]; then
+  echo "FAIL: ${PKG} does not select std on reth-trie-sparse." >&2
+  echo "      Proof reveal and subtrie hash updates would run serially, which production does not." >&2
+  status=1
+else
+  echo "ok: ${parallelism} std feature edges on reth-trie-sparse"
 fi
 }
 

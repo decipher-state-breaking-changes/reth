@@ -15,7 +15,13 @@ revm-primitives = { workspace = true, features = ["std"] }
 reth-execution-access = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-trie-common = { workspace = true }
-reth-trie-sparse = { workspace = true }
+# `std` is not a portability knob here: it is the sparse trie's parallelism switch. Without it
+# `is_reveal_parallelism_enabled` and `is_update_parallelism_enabled` are compiled to `false`, so
+# proof reveal and subtrie hash updates run serially no matter how many cores the host has. The
+# workspace declares this dependency `default-features = false`, and the standalone binaries link
+# none of the node graph that would otherwise turn it on — so a package that does not ask for it
+# here measures a trie production does not run. Same defect class as the keccak features below.
+reth-trie-sparse = { workspace = true, features = ["std"] }
 
 # serialization
 serde = { workspace = true, features = ["derive"] }
@@ -42,9 +48,10 @@ tracing = { workspace = true }
 # defect that invalidated every absolute benchmark number before 2026-08-06.
 asm-keccak = ["alloy-primitives/asm-keccak"]
 keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
-# Gates the representation probe binary. `reth-trie-sparse/std` is what exposes the arena trie
-# the probe compares against; the library itself never needs it, so ordinary builds of this
-# crate must not drag the feature in.
+# Gates the representation probe binary, which compares against the arena trie that
+# `reth-trie-sparse/std` exposes. The feature is now on unconditionally above — the claim this
+# comment used to make, that "the library itself never needs it", was wrong and cost the
+# standalone binaries their trie parallelism.
 repr-probe = ["reth-trie-sparse/std"]
 
 [[bin]]
