@@ -45,8 +45,7 @@ pub use cold_admission::{
 pub use config::CacheConfig;
 pub use fixture::{load_fixtures, save_fixture, AccessedStateFixture, LoadedFixtures};
 pub use network_cache::{
-    CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache, RollbackPlan,
-    UndoPreview,
+    CacheRootTimings, CachedEntry, MembershipDelta, NetworkStateCache, RollbackPlan, UndoPreview,
 };
 pub use participant::ParticipantCache;
 pub use persistence::CacheState;
@@ -86,8 +85,7 @@ pub use transition_build::{
 pub use trie_cache::{
     PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation, TrieBranchCensus,
     TrieCacheMemory, TrieCacheValidationError, TrieChangeSet, TrieCloneTimings,
-    TrieMutationMetrics,
-    TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
+    TrieMutationMetrics, TrieShapeMetrics, TRIE_SHAPE_PREFIX_LEVELS,
 };
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use witness_check::{

@@ -1305,6 +1305,12 @@ mapped={mapped}\tjemalloc_retained={retained}"
     // per-run choice. `present` is the field that says whether a generation was actually held.
     let retained = pair.retained_generation_bytes(true);
     let b = retained.breakdown;
+    // The newest generation above, the whole deque here, and they answer different questions. At
+    // K = 1 the two agree by construction; at K > 1 the first says what one generation costs and
+    // only the second says what retaining K of them costs — and the second is not K times the
+    // first, because a third of a generation is storage tries shared by `Arc`. A K = 3 run that
+    // reported only the newest generation could show the total RSS move and not say what moved it.
+    let deque = pair.retained_deque_bytes();
     eprintln!(
         "PS_MEMORY\tblock={height}\trss_kib={rss_kib}\t{process}\t\
 retained_present={present}\tretained_total={total}\tretained_exclusive={exclusive}\t\
@@ -1312,7 +1318,10 @@ retained_complete_total={complete_total}\tretained_complete_exclusive={complete_
 retained_sparse={sparse}\tretained_shared_storage={shared_storage}\t\
 retained_warm_accounts={warm_accounts}\tretained_warm_storage={warm_storage}\t\
 retained_account_paths={account_paths}\tretained_storage_paths_map={storage_paths_map}\t\
-retained_storage_paths_slices={storage_paths_slices}",
+retained_storage_paths_slices={storage_paths_slices}\t\
+deque_depth={deque_depth}\tdeque_generations={deque_generations}\t\
+deque_unshared={deque_unshared}\tdeque_shared_pool={deque_shared_pool}\t\
+deque_shared_allocations={deque_shared_allocations}\tdeque_total={deque_total}",
         present = retained.present,
         total = retained.total_bytes,
         exclusive = retained.exclusive_bytes,
@@ -1325,9 +1334,17 @@ retained_storage_paths_slices={storage_paths_slices}",
         account_paths = b.retained_account_paths_bytes,
         storage_paths_map = b.retained_storage_paths_map_bytes,
         storage_paths_slices = b.retained_storage_paths_slice_bytes,
+        // The configured depth beside the achieved one: a pair that is still warming holds fewer
+        // generations than it retains for, and a reading that showed only the second would look
+        // like a K = 1 run.
+        deque_depth = pair.retention_depth.get(),
+        deque_generations = deque.generations,
+        deque_unshared = deque.unshared_bytes,
+        deque_shared_pool = deque.shared_pool_bytes,
+        deque_shared_allocations = deque.shared_allocations,
+        deque_total = deque.total_bytes,
     );
 }
-
 
 /// Restores or cross-checks a checkpoint once every chunk it declared has arrived.
 fn finish_collection_if_complete(
@@ -2042,10 +2059,11 @@ pub(crate) fn replay_commit(
     };
 
     // The commit above pushed one undo record. Drop every older one: without this the log grows by
-    // one record per block for the life of the run -- each holding the prior value of every account,
-    // storage slot and code the block touched or evicted -- which is what took a 53-hour follower
-    // from 0.8 GiB to 13.3 GiB of resident memory. The producer prunes to finality
-    // (`partial-stateless-exex/src/lib.rs`); this side has no provider to ask, and needs far less.
+    // one record per block for the life of the run -- each holding the prior value of every
+    // account, storage slot and code the block touched or evicted -- which is what took a
+    // 53-hour follower from 0.8 GiB to 13.3 GiB of resident memory. The producer prunes to
+    // finality (`partial-stateless-exex/src/lib.rs`); this side has no provider to ask, and
+    // needs far less.
     let prune_started = Instant::now();
     let height = state.pair.cache.current_block();
     let retain = consumer_undo_retain_blocks(&state.pair);
@@ -2075,10 +2093,10 @@ pub(crate) fn replay_commit(
 
     // Sampled here and not at the prune: until `commit_transition` above ran, three trie
     // generations were reachable at once — the new one, the parent the transition displaced and
-    // handed back, and the one still sitting in the retained-generation deque. A sample taken there reads
-    // a transition, not a steady state, and would have counted a generation about to be dropped as
-    // live. Being past `close_validation` also keeps the probe's own cost — a `/proc` read and six
-    // mallctl calls — out of the primary boundary.
+    // handed back, and the one still sitting in the retained-generation deque. A sample taken there
+    // reads a transition, not a steady state, and would have counted a generation about to be
+    // dropped as live. Being past `close_validation` also keeps the probe's own cost — a
+    // `/proc` read and six mallctl calls — out of the primary boundary.
     memory_probe(height, &state.pair);
 
     let compare_started = Instant::now();

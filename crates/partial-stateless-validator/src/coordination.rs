@@ -242,7 +242,8 @@ pub struct CoordinatedPair {
     /// How deep this pair retains, and therefore how deep a reorg it can undo alone.
     ///
     /// The single owner. The deque cap above, the flat undo log's prune depth, and the depth at
-    /// which a reorg is refused all read this one field rather than keeping constants of their own.
+    /// which a reorg is refused all read this one field rather than keeping constants of their
+    /// own.
     pub retention_depth: RetentionDepth,
     /// Header of the block this pair is the state *after*, kept so a child can be checked against
     /// it.
@@ -680,10 +681,23 @@ impl CoordinatedPair {
             }
         };
 
-        // ---- phase 2: commit, infallible ---------------------------------------------------
-        // `rollback` cannot refuse: the plan proved the records present and contiguous, and the
-        // borrow checker guarantees nothing touched the log between building it and consuming it.
-        self.cache.rollback(plan);
+        // ---- phase 2: commit -----------------------------------------------------------------
+        // The rollback goes first because it is the one step that can still refuse, and it refuses
+        // before it mutates: `rollback` re-derives the plan and compares before touching a record.
+        // So a refusal here is a clean fallback with nothing given back, exactly as the K = 1
+        // form's was — and everything after this line cannot fail.
+        if let Err(err) = self.cache.rollback(&plan) {
+            // Unreachable on this path: nothing between the preflight and here touches the cache.
+            // Reported rather than asserted because a validator that got here has a broken
+            // invariant, not a block to reject.
+            warn!(
+                target: "partial_stateless",
+                ancestor = ancestor_number,
+                %err,
+                "Flat rollback refused a plan it had just proved; falling back to a rebuild"
+            );
+            return None
+        }
         // Split rather than looped. The generations above the landing one are dropped and the ones
         // below are kept, so a second, shallower undo can still run against what this one left —
         // and the landing generation is identified by index rather than by counting pops, which is

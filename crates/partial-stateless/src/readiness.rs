@@ -1226,7 +1226,10 @@ mod tests {
         // Monotone, which is the property a caller relies on when it offers the deepest recovery
         // it can and settles for a rebuild rather than retrying at shallower depths.
         for deeper in 3..=8 {
-            assert!(!tracker.stays_warm_after_undo(deeper), "refused at 3 stays refused at {deeper}");
+            assert!(
+                !tracker.stays_warm_after_undo(deeper),
+                "refused at 3 stays refused at {deeper}"
+            );
         }
 
         // And the predicate agrees with the restore it exists to front-run: the depth it refuses
@@ -1239,10 +1242,7 @@ mod tests {
             .expect_err("three is one past the floor");
         assert_eq!(
             error,
-            ReadinessError::UndoneBlockStillWarming {
-                replay_depth: REPLAY - 1,
-                required: REPLAY
-            }
+            ReadinessError::UndoneBlockStillWarming { replay_depth: REPLAY - 1, required: REPLAY }
         );
     }
 

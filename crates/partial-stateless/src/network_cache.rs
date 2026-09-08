@@ -1072,29 +1072,38 @@ impl NetworkStateCache {
             return Err(CacheError::RollbackRootUnknown { block: landing.block_number })
         };
 
-        Ok(RollbackPlan {
-            blocks,
-            previous_block: landing.previous_block,
-            previous_cache_root,
-        })
+        Ok(RollbackPlan { blocks, previous_block: landing.previous_block, previous_cache_root })
     }
 
     /// Roll back every block a [`RollbackPlan`] named, newest first.
     ///
-    /// Infallible by construction and typed that way: the plan proved the records present and
-    /// contiguous, and nothing between building it and consuming it can touch the log — the
-    /// borrow checker sees to that, since `can_rollback_to` borrows `&self` and this takes
-    /// `&mut self`, so no `apply` can run in between.
+    /// Refuses before it mutates, which is the property that matters and the one a caller cannot
+    /// get from [`rollback_block`](Self::rollback_block) in a loop. That method checks each record
+    /// as it consumes it, so a run that goes wrong at step three has already given back two.
     ///
-    /// One call rather than a D-times loop over [`rollback_block`](Self::rollback_block) on
-    /// purpose: the caller's retained-generation deque has to pop the same D and keep the *last*
-    /// one popped, and splitting the two halves across a loop is exactly where that off-by-one
-    /// goes wrong.
-    pub fn rollback(&mut self, plan: RollbackPlan) {
-        for block in plan.blocks {
-            self.rollback_block(block).expect("the plan proved this record is the newest");
+    /// The plan is re-derived and required to be identical rather than trusted. A `RollbackPlan`
+    /// is an owned value with no borrow on the cache — an earlier version of this comment claimed
+    /// the borrow checker kept it fresh, and it does not: `can_rollback_to` takes `&self` and the
+    /// borrow ends when it returns, so a caller can apply a block, prune the log, or roll back by
+    /// hand and then present a stale plan. Re-deriving is O(depth) against a log this side keeps
+    /// to the retention depth, which is a price worth paying to make the guarantee real rather
+    /// than asserted.
+    ///
+    /// One call rather than a D-times loop on purpose: the caller's retained-generation deque has
+    /// to pop the same D and keep the *last* one popped, and splitting the two halves across a
+    /// loop is exactly where that off-by-one goes wrong.
+    pub fn rollback(&mut self, plan: &RollbackPlan) -> Result<(), CacheError> {
+        let current = self.can_rollback_to(plan.previous_block)?;
+        if current.blocks != plan.blocks || current.previous_cache_root != plan.previous_cache_root
+        {
+            return Err(CacheError::RollbackPlanStale { target: plan.previous_block })
+        }
+        for block in &plan.blocks {
+            self.rollback_block(*block)
+                .expect("re-derived immediately above, and nothing has run since");
         }
         debug_assert_eq!(self.current_block, plan.previous_block);
+        Ok(())
     }
 
     pub fn rollback_block(&mut self, block_number: u64) -> Result<(), CacheError> {
@@ -1384,6 +1393,9 @@ pub enum CacheError {
     /// The landing record never memoized its parent's cache root, so the undo cannot be made
     /// atomic.
     RollbackRootUnknown { block: u64 },
+    /// The plan still describes a reachable run, but not the one the cache would take now — the
+    /// log changed between building the plan and consuming it.
+    RollbackPlanStale { target: u64 },
 }
 
 impl std::fmt::Display for CacheError {
@@ -1416,6 +1428,11 @@ impl std::fmt::Display for CacheError {
                 f,
                 "the undo record for block {block} never memoized its parent's cache root, so the \
                  rollback cannot be made atomic"
+            ),
+            CacheError::RollbackPlanStale { target } => write!(
+                f,
+                "the rollback plan to block {target} was built against a different undo log; the \
+                 cache changed between planning and rolling back"
             ),
         }
     }

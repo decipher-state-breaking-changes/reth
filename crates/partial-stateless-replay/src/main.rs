@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--mutations-transition [N]]
-//!           [--json <path>] [--label <name>]
+//!           [--retain-depth N] [--json <path>] [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
-//!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--json <path>] [--label <name>]
+//!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--retain-depth N]
+//!           [--json <path>] [--label <name>]
 //! ```
 //!
 //! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
@@ -91,7 +92,7 @@ fn main() -> eyre::Result<()> {
         return run_follow(&dir, &options)
     };
     if let Some(path) = &json {
-        write_manifest(path, "standalone_replay_v1", &label, &dir)?;
+        write_manifest(path, "standalone_replay_v1", &label, &dir, options.retain_depth)?;
     }
     let started = std::time::Instant::now();
     let report = replay(&dir, &options)?;
@@ -244,6 +245,7 @@ fn write_manifest(
     benchmark: &str,
     label: &str,
     dir: &std::path::Path,
+    retain_depth: RetentionDepth,
 ) -> eyre::Result<()> {
     use std::io::Write;
     let provenance = partial_stateless_stream::RunProvenance::collect(
@@ -265,6 +267,10 @@ fn write_manifest(
         // it is a build axis, so a file that does not carry it is a build from before the axis
         // existed, which is exactly the distinction a reader needs.
         "allocator": ALLOCATOR_NAME,
+        // A configuration axis, like the allocator above and for the same reason: two runs of this
+        // binary over one corpus differ in what they retain, and a record that does not say which
+        // is not attributable to a configuration. Absent on files written before the axis existed.
+        "retain_depth": retain_depth.get(),
         "provenance": provenance,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -278,7 +284,7 @@ fn write_manifest(
 /// Runs the live follower and maps its outcome onto the documented exit codes.
 fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
     if let Some(path) = &options.verdicts {
-        write_manifest(path, "standalone_follow_v1", &options.label, dir)?;
+        write_manifest(path, "standalone_follow_v1", &options.label, dir, options.retain_depth)?;
     }
     let started = std::time::Instant::now();
     let report = follow(dir, options)?;
@@ -504,8 +510,8 @@ fn parse_args() -> eyre::Result<Mode> {
     }
     let mut args = raw.into_iter();
     let mut dir = None;
-    let mut options = ReplayOptions::default();
-    options.retain_depth = retain_depth_from_env()?;
+    let mut options =
+        ReplayOptions { retain_depth: retain_depth_from_env()?, ..ReplayOptions::default() };
     let mut json = None;
     let mut label = "unlabelled".to_string();
     while let Some(arg) = args.next() {
@@ -537,8 +543,7 @@ fn parse_args() -> eyre::Result<Mode> {
                 options.force_restore_at = Some(raw.parse()?);
             }
             "--retain-depth" => {
-                let raw =
-                    args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
+                let raw = args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
                 options.retain_depth = RetentionDepth::new(raw.parse()?)?;
             }
             "--json" => {
@@ -572,8 +577,8 @@ fn parse_args() -> eyre::Result<Mode> {
 fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
     let mut args = raw.into_iter();
     let mut dir = None;
-    let mut options = FollowOptions::default();
-    options.retain_depth = retain_depth_from_env()?;
+    let mut options =
+        FollowOptions { retain_depth: retain_depth_from_env()?, ..FollowOptions::default() };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--follow" => {}
@@ -607,8 +612,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                 options.label = args.next().ok_or_else(|| eyre::eyre!("--label needs a name"))?;
             }
             "--retain-depth" => {
-                let raw =
-                    args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
+                let raw = args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
                 options.retain_depth = RetentionDepth::new(raw.parse()?)?;
             }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),

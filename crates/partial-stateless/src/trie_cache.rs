@@ -18,11 +18,11 @@ use alloy_primitives::{
     Address, B256,
 };
 use reth_trie_common::{DecodedMultiProofV2, HashedPostState, Nibbles};
-use serde::Serialize;
 use reth_trie_sparse::{
     BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, RetainWitnessPathsMetrics,
     RetentionOptions, RevealableSparseTrie, SparseStateTrie, SparseTrie,
 };
+use serde::Serialize;
 use std::{
     fmt,
     sync::{Arc, OnceLock},

@@ -225,7 +225,7 @@ fn a_plan_covers_the_whole_run_and_lands_where_it_was_asked_to() {
     assert_eq!(cache.current_block(), 5);
 
     let landing_root = plan.previous_cache_root();
-    cache.rollback(plan);
+    cache.rollback(&plan).expect("the plan is fresh");
     assert_eq!(cache.current_block(), 2);
     assert_eq!(cache.cache_root(), landing_root, "the plan named the root the undo installs");
 }
@@ -291,4 +291,32 @@ fn a_depth_one_plan_says_what_undo_preview_says() {
     assert_eq!(plan.depth(), 1);
     assert_eq!(plan.previous_block(), preview.previous_block);
     assert_eq!(Some(plan.previous_cache_root()), preview.previous_cache_root);
+}
+
+#[test]
+fn a_stale_plan_is_refused_before_a_single_block_is_given_back() {
+    let mut cache = make_cache(60, 30);
+    commit_rooted_chain(&mut cache, 5);
+    let plan = cache.can_rollback_to(2).expect("blocks 3, 4 and 5 are in the log");
+
+    // A `RollbackPlan` is an owned value with no borrow on the cache, so nothing in the type
+    // system stops this. What must not happen is a partial rollback: the plan still names three
+    // reachable blocks, and a loop that checked each record as it consumed it would give back 6
+    // and 5 before discovering that 4 is not what the plan said.
+    let address = Address::repeat_byte(0x11);
+    cache.on_block_executed(6, &block_state(&[(address, account(6, 60))], &[]));
+    cache.cache_root();
+    assert_eq!(cache.current_block(), 6);
+
+    let err = cache.rollback(&plan).expect_err("the plan describes a log that no longer exists");
+    assert!(
+        matches!(err, partial_stateless::network_cache::CacheError::RollbackPlanStale { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(cache.current_block(), 6, "not one block was given back");
+
+    // And a plan taken now still works, so the refusal is about staleness and not about the log.
+    let fresh = cache.can_rollback_to(2).expect("the log still reaches back to 2");
+    cache.rollback(&fresh).expect("a fresh plan applies");
+    assert_eq!(cache.current_block(), 2);
 }

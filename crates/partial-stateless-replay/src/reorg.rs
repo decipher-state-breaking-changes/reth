@@ -267,9 +267,7 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
         reorg.abandoned.iter().map(|block| (block.number, block.hash)).collect();
     let lineage = match ExpectedLineage::new((ancestor.number, ancestor.hash), &abandoned) {
         Ok(lineage) => lineage,
-        Err(err) => {
-            return ReorgOutcome::Unrecoverable { ancestor, depth, detail: err.to_string() }
-        }
+        Err(err) => return ReorgOutcome::Unrecoverable { ancestor, depth, detail: err.to_string() },
     };
 
     let ReplayState { pair, history, config, .. } = state;
@@ -369,7 +367,6 @@ pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bo
 mod tests {
     use super::*;
     use crate::driver::restore;
-    use partial_stateless_validator::{CoordinatedPair, RetentionDepth};
     use alloy_primitives::{keccak256, Address, U256};
     use alloy_rlp::Encodable;
     use partial_stateless::{
@@ -381,7 +378,9 @@ mod tests {
         BlockAccessedState,
     };
     use partial_stateless_stream::{Checkpoint, Manifest};
-    use partial_stateless_validator::{admit_block, BlockAdmission};
+    use partial_stateless_validator::{
+        admit_block, BlockAdmission, CoordinatedPair, RetainedGeneration, RetentionDepth,
+    };
     use reth_chainspec::{EthChainSpec, MAINNET};
     use reth_primitives_traits::{Account, SealedHeader};
     use reth_trie::HashBuilder;
@@ -473,8 +472,8 @@ mod tests {
             snapshot_digest: B256::ZERO,
         };
         let chunks = checkpoint.chunk(&package_bytes, 4096);
-        let state = restore(&manifest(), &checkpoint, &chunks, depth)
-            .expect("the fixture restores");
+        let state =
+            restore(&manifest(), &checkpoint, &chunks, depth).expect("the fixture restores");
         (state, state_root)
     }
 
@@ -543,8 +542,7 @@ mod tests {
         assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK + 2);
 
         let winning = BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::with_last_byte(0xbb) };
-        let outcome =
-            apply_reorg(&mut state, &reorg_of(ancestor, undone.clone(), Some(winning)));
+        let outcome = apply_reorg(&mut state, &reorg_of(ancestor, undone.clone(), Some(winning)));
 
         let ReorgOutcome::Applied { ancestor: at, undone: gave_back, .. } = outcome else {
             panic!("a depth-2 reorg is exactly what a pair retaining two can undo")
@@ -595,7 +593,10 @@ mod tests {
         };
         assert_eq!(at, ancestor, "the refusal names the block a snapshot must be taken at");
         assert_eq!(reported, 3);
-        assert!(detail.contains("retains 2"), "the refusal says what this consumer can do: {detail}");
+        assert!(
+            detail.contains("retains 2"),
+            "the refusal says what this consumer can do: {detail}"
+        );
         assert_eq!(
             state.pair.cache.current_block(),
             ANCHOR_BLOCK + 3,
@@ -763,13 +764,8 @@ mod tests {
 
         // Nothing the live cache still points at is charged to the deque — it would not be freed
         // by dropping it. Asserted by identity rather than by arithmetic on the totals.
-        let live: std::collections::HashSet<usize> = state
-            .pair
-            .trie_cache
-            .shared_allocations()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let live: std::collections::HashSet<usize> =
+            state.pair.trie_cache.shared_allocations().into_iter().map(|(id, _)| id).collect();
         let charged: std::collections::HashSet<usize> = state
             .pair
             .retained
@@ -783,6 +779,74 @@ mod tests {
             deque.shared_allocations,
             "the pool is exactly the allocations the live cache does not hold"
         );
+    }
+
+    #[test]
+    fn a_deque_of_generations_that_really_share_costs_less_than_their_sum() {
+        let (mut state, _) = restored_state_at_depth(depth(3));
+
+        // The checkpoint fixture's blocks touch no storage, so its caches have nothing shareable
+        // and the union degenerates to a sum. Build a cache that does: a warm slot gives it a
+        // `retained_storage_paths` entry, whose `Arc<[Nibbles]>` slice a clone shares rather than
+        // copies. Installed directly, because what is under test is the accounting and not the
+        // path that produces it.
+        let address = Address::repeat_byte(0x11);
+        let slot = B256::repeat_byte(0x22);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(address, AccountData { nonce: 3, balance: U256::from(7), code_hash: None });
+        accessed.storage.insert((address, slot), U256::from(1));
+        let mut values = NetworkStateCache::new(
+            Box::new(LastNBlocksPolicy::new(60)),
+            Box::new(LastNBlocksPolicy::new(30)),
+        );
+        values.on_block_executed(1, &accessed);
+        let mut warm = partial_stateless::PartialTrieNodeCache::new();
+        warm.retain_from_value_cache(&values);
+
+        state.pair.retained.clear();
+        for offset in 0..3u64 {
+            state.pair.retained.push_back(RetainedGeneration {
+                trie_cache: warm.clone(),
+                block_hash: B256::with_last_byte(offset as u8),
+                block_number: offset,
+                accepted_head: None,
+            });
+        }
+
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!(deque.generations, 3);
+        assert!(deque.shared_pool_bytes > 0, "these generations really do share something");
+
+        // The claim §4.3 rests on, now on a population that can show it: the union is strictly
+        // less than the sum, and the gap is exactly the sharing counted once instead of K times.
+        // Measured on a clone, not on `warm` itself. The deque holds clones, and a clone is
+        // strictly smaller: `Vec::clone` allocates for the length rather than the capacity, so
+        // `retained_account_paths` compacts across the copy. Using the original as the baseline
+        // here overstates the sum by that difference and the identity below misses by exactly it —
+        // which is the same reason §4.3 has to measure a union rather than multiply one reading.
+        let one_total = warm.clone().memory_breakdown().total_bytes();
+        assert!(
+            deque.total_bytes < one_total * 3,
+            "union {} should be under 3x one generation {}",
+            deque.total_bytes,
+            one_total * 3
+        );
+        let shared_once: usize =
+            warm.clone().shared_allocations().iter().map(|(_, bytes)| bytes).sum::<usize>();
+        assert_eq!(
+            deque.total_bytes + shared_once * 2,
+            one_total * 3,
+            "the whole gap is the shared allocations charged twice too often by a sum"
+        );
+
+        // And the live cache's own share is excluded: install the same cache live and the pool
+        // empties, because dropping the deque would not free what the pair still points at.
+        state.pair.trie_cache = warm;
+        let with_live = state.pair.retained_deque_bytes();
+        assert_eq!(with_live.shared_pool_bytes, 0);
+        assert!(with_live.total_bytes < deque.total_bytes);
     }
 
     #[test]
