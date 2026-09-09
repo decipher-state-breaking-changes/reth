@@ -22,13 +22,14 @@ use crate::{
     driver::{
         chain_spec_for, config_for, consumer_is_at, cross_check_recovery_checkpoint,
         decode_accepted_head, replay_commit, restore, BlockTiming, CommitOutcome, FrameCosts,
-        ReplayOptions, ReplayReport, ReplayState, MAX_REWIND_FRAMES,
+        PairConfig, ReplayOptions, ReplayReport, ReplayState, MAX_REWIND_FRAMES,
     },
     reorg::{apply_reorg, check_shape, warn_inapplicable, ReorgOutcome},
     spool::SpooledFrame,
     tail::{SpoolTail, TailEvent, TailFault},
 };
 use alloy_primitives::{Keccak256, B256};
+use partial_stateless::WarmSetShrinkPolicy;
 use partial_stateless_stream::{
     BlockRef, Checkpoint, EndKind, FrameKind, FrameLimits, Manifest, ResetReason, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
@@ -77,6 +78,17 @@ pub struct FollowOptions {
     ///
     /// Defaults to one, which is production's setting and today's behaviour exactly.
     pub retain_depth: RetentionDepth,
+    /// How often the pair's warm sets are returned to a size fitted to their contents.
+    ///
+    /// Defaults to never, which is today's behaviour. See [`ReplayOptions::warm_shrink`].
+    pub warm_shrink: WarmSetShrinkPolicy,
+}
+
+impl FollowOptions {
+    /// The subset of these options that configures the coordinated pair itself.
+    pub const fn pair_config(&self) -> PairConfig {
+        PairConfig { retain_depth: self.retain_depth, warm_shrink: self.warm_shrink }
+    }
 }
 
 impl Default for FollowOptions {
@@ -94,6 +106,7 @@ impl Default for FollowOptions {
             resume: false,
             label: "unlabelled".to_string(),
             retain_depth: RetentionDepth::ONE,
+            warm_shrink: WarmSetShrinkPolicy::default(),
         }
     }
 }
@@ -654,6 +667,7 @@ impl<'a> Follower<'a> {
                 // the same `restore` the batch driver uses, and a depth set on the command line
                 // has to reach it or the flag would be silently ignored in follow mode.
                 retain_depth: options.retain_depth,
+                warm_shrink: options.warm_shrink,
             },
             tail: SpoolTail::new(dir, options.frame_limits),
             sink: VerdictSink::open(options)?,
@@ -1847,7 +1861,7 @@ impl<'a> Follower<'a> {
         chunks: Vec<SnapshotChunk>,
         checkpoint_sequence: u64,
     ) -> eyre::Result<Step> {
-        match restore(&manifest, &checkpoint, &chunks, self.replay_options.retain_depth) {
+        match restore(&manifest, &checkpoint, &chunks, self.replay_options.pair_config()) {
             Ok(state) => {
                 self.restores += 1;
                 let expected_child = Some((checkpoint.block.number + 1, checkpoint.block.hash));

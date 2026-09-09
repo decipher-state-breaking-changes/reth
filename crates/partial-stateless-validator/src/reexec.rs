@@ -519,6 +519,8 @@ where
         retention_storage_trie_drop_us: cache_timings.retention.storage_trie_drop_us,
         retention_storage_tries_dropped: cache_timings.retention.storage_tries_dropped,
         retention_full_rebuild: u64::from(cache_timings.retention.full_rebuild),
+        retention_warm_shrink_us: cache_timings.retention.warm_shrink_us,
+        retention_warm_shrinks: u64::from(cache_timings.retention.warm_shrink),
         next_cache_anchor_us: cache_timings.anchor_us,
         next_cache_anchor_detail: CacheRootMetrics::from(&cache_timings.anchor),
         trie_commit_us: cache_timings.commit_us,
