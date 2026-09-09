@@ -1413,6 +1413,7 @@ impl RetentionTimings {
         self.preparation_us()
             .saturating_add(self.account_trie_us)
             .saturating_add(self.storage_tries_us)
+            .saturating_add(self.warm_shrink_us)
     }
 }
 
@@ -2295,6 +2296,100 @@ mod tests {
             "the two agree on everything committed and differ only in what they hold from the \
              allocator, which is the whole point of the change"
         );
+    }
+
+    fn block_touching_slots(indices: std::ops::Range<usize>) -> BlockAccessedState {
+        let owner = Address::repeat_byte(0x77);
+        let mut accessed = BlockAccessedState::default();
+        accessed
+            .accounts
+            .insert(owner, AccountData { nonce: 0, balance: U256::ZERO, code_hash: None });
+        for index in indices {
+            let mut slot = [0u8; 32];
+            slot[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            accessed.storage.insert((owner, B256::from(slot)), U256::from(1));
+        }
+        accessed
+    }
+
+    #[test]
+    fn shrinking_the_storage_set_changes_nothing_the_cache_commits_to() {
+        // The storage set is 83% of the bytes and the one whose allocation crosses the size that
+        // matters, so the equivalence has to be shown on it and not only on the account set.
+        let mut values = fast_forgetting_value_cache();
+        let mut control_values = fast_forgetting_value_cache();
+        let mut shrinking = PartialTrieNodeCache::new();
+        shrinking.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(2).expect("2 is not zero"),
+        ));
+        let mut left_alone = PartialTrieNodeCache::new();
+
+        let mut shrank = false;
+        for block in 1..=9usize {
+            let touched = if block == 1 { 0..5_000 } else { 5_000 + block..5_001 + block };
+            values.on_block_executed(block as u64, &block_touching_slots(touched.clone()));
+            control_values.on_block_executed(block as u64, &block_touching_slots(touched));
+            shrank |= shrinking.retain_from_value_cache(&values).warm_shrink;
+            left_alone.retain_from_value_cache(&control_values);
+
+            assert_eq!(shrinking.cache_root(), left_alone.cache_root());
+            assert_eq!(shrinking.retention_fingerprint(), left_alone.retention_fingerprint());
+            assert_eq!(
+                shrinking.tracked_storage_slot_count(),
+                left_alone.tracked_storage_slot_count()
+            );
+            assert_eq!(shrinking.synced_to_block, left_alone.synced_to_block);
+        }
+
+        assert!(shrank, "the fixture has to actually shrink or it proves nothing");
+        assert!(
+            shrinking.memory_breakdown().warm_storage_bytes <
+                left_alone.memory_breakdown().warm_storage_bytes / 100,
+            "five thousand slots aged out; the shrunk set should fit the handful that remain"
+        );
+    }
+
+    #[test]
+    fn a_candidate_refused_on_an_interval_boundary_leaves_its_parent_untouched() {
+        // Retention runs on the candidate snapshot, so a refused block's interval advance and any
+        // shrink it took are discarded with the candidate. The parent must neither lose its
+        // allocation nor have its count moved — the second would close its own interval early.
+        let mut values = fast_forgetting_value_cache();
+        let mut parent = PartialTrieNodeCache::new();
+        parent.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(4).expect("4 is not zero"),
+        ));
+        // Interval one (blocks 1-4) sees the peak and protects it. Its boundary lands at block 4,
+        // after the value cache has aged the peak out, so the mark it seeds the next interval
+        // with is one account — a boundary any earlier would seed the peak and make interval two
+        // protect it as well. Interval two (blocks 5-8) only ever sees one account.
+        advance(&mut parent, &mut values, 1, 0..5_000);
+        for block in 2..=7 {
+            advance(&mut parent, &mut values, block, 5_000..5_001);
+        }
+        let held = parent.memory_breakdown().warm_accounts_bytes;
+
+        // Block 8 is validated on a snapshot: it closes interval two there and shrinks to one
+        // account. Then it is refused, and the snapshot is dropped.
+        let mut candidate = parent.clone();
+        values.on_block_executed(8, &block_touching(5_000..5_001));
+        assert!(candidate.retain_from_value_cache(&values).warm_shrink);
+        assert!(candidate.memory_breakdown().warm_accounts_bytes < held / 100);
+        drop(candidate);
+
+        assert_eq!(
+            parent.memory_breakdown().warm_accounts_bytes,
+            held,
+            "the parent kept its table"
+        );
+        // The parent's own block 8 is the one that closes its interval. Had the candidate's tick
+        // moved the parent's count, this would already be a fresh interval and would not close.
+        let timings = parent.retain_from_value_cache(&values);
+        assert!(
+            timings.warm_shrink,
+            "the parent's count was not advanced by the refused candidate"
+        );
+        assert!(parent.memory_breakdown().warm_accounts_bytes < held / 100);
     }
 
     #[test]

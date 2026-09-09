@@ -494,8 +494,12 @@ impl CoordinatedPair {
     /// which is why no decision is taken here.
     pub fn cold_reset(&mut self) {
         // Cold means empty, not reconfigured: the pair keeps running on whatever trie
-        // representation it was constructed with, exactly as a fresh process would build it.
-        self.trie_cache = PartialTrieNodeCache::new_with_repr(self.trie_cache.repr());
+        // representation and warm-set sizing policy it was constructed with, exactly as a fresh
+        // process would build it. The policy's interval state is not carried — the tables it was
+        // counting against no longer exist, so the reset starts a new interval.
+        let mut trie_cache = PartialTrieNodeCache::new_with_repr(self.trie_cache.repr());
+        trie_cache.set_warm_shrink_policy(self.trie_cache.warm_shrink_policy());
+        self.trie_cache = trie_cache;
         self.cache.reset();
         self.readiness.reset();
         self.forget_retained_generations();

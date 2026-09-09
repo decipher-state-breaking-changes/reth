@@ -375,7 +375,7 @@ mod tests {
         policy::{AccountData, LastNBlocksPolicy},
         readiness::{BlockContext, CacheReadiness},
         sidecar::last_n_blocks_cache_policy_id,
-        BlockAccessedState,
+        BlockAccessedState, WarmSetShrinkPolicy,
     };
     use partial_stateless_stream::{Checkpoint, Manifest};
     use partial_stateless_validator::{
@@ -385,7 +385,7 @@ mod tests {
     use reth_primitives_traits::{Account, SealedHeader};
     use reth_trie::HashBuilder;
     use reth_trie_common::{proof::ProofRetainer, MultiProof, Nibbles};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, num::NonZeroU64};
 
     const ANCHOR_BLOCK: u64 = 100;
     const ACCOUNT_WINDOW: u64 = 64;
@@ -415,6 +415,10 @@ mod tests {
 
     /// The same fixture, configured to retain `depth` generations.
     fn restored_state_at_depth(depth: RetentionDepth) -> (ReplayState, B256) {
+        restored_state_with(PairConfig { retain_depth: depth, ..Default::default() })
+    }
+
+    fn restored_state_with(pair: PairConfig) -> (ReplayState, B256) {
         let address = Address::repeat_byte(0x11);
         let account = Account { nonce: 7, balance: U256::from(1_000u64), bytecode_hash: None };
         let address_path = Nibbles::unpack(keccak256(address));
@@ -472,14 +476,18 @@ mod tests {
             snapshot_digest: B256::ZERO,
         };
         let chunks = checkpoint.chunk(&package_bytes, 4096);
-        let state = restore(
-            &manifest(),
-            &checkpoint,
-            &chunks,
-            PairConfig { retain_depth: depth, ..Default::default() },
-        )
-        .expect("the fixture restores");
+        let state = restore(&manifest(), &checkpoint, &chunks, pair).expect("the fixture restores");
         (state, state_root)
+    }
+
+    /// One retention pass on the live trie, which `advance` leaves out because it tests the
+    /// lifecycle and not the trie. The warm-set interval advances here and nowhere else.
+    fn tick(state: &mut ReplayState) -> bool {
+        state.pair.trie_cache.retain_from_value_cache(&state.pair.cache).warm_shrink
+    }
+
+    fn shrink_every(blocks: u64) -> WarmSetShrinkPolicy {
+        WarmSetShrinkPolicy::EveryBlocks(NonZeroU64::new(blocks).expect("a non-zero interval"))
     }
 
     /// Advances the pair one block the way a commit would, retaining the displaced generation.
@@ -1028,6 +1036,62 @@ mod tests {
             Some(ancestor),
             "and the consumer no longer stands behind the abandoned block"
         );
+    }
+
+    #[test]
+    fn a_rollback_resumes_the_interval_the_retained_generation_was_counting() {
+        let (mut state, _) = restored_state_with(PairConfig {
+            retain_depth: depth(1),
+            warm_shrink: shrink_every(3),
+        });
+
+        // +1: the live trie counts one. The generation retained at this commit was cloned before
+        // the tick and holds zero. +2: live counts two; the generation retained holds one.
+        let first = advance(&mut state, ANCHOR_BLOCK + 1, 0xa1, true);
+        assert!(!tick(&mut state));
+        let second = advance(&mut state, ANCHOR_BLOCK + 2, 0xa2, true);
+        assert!(!tick(&mut state));
+
+        // Undo +2. The live trie is now the generation retained at +2's commit, holding one.
+        let winning = BlockRef { number: ANCHOR_BLOCK + 2, hash: B256::with_last_byte(0xb2) };
+        let outcome = apply_reorg(&mut state, &reorg_of(first, vec![second], Some(winning)));
+        assert!(matches!(outcome, ReorgOutcome::Applied { .. }), "a depth-1 undo of its own block");
+
+        // From a restored count of one, two more ticks reach the boundary. A count that restarted
+        // at zero would need three; one inherited from the abandoned child would close after one.
+        advance(&mut state, ANCHOR_BLOCK + 2, 0xb2, true);
+        assert!(!tick(&mut state), "restored at one, this tick is two");
+        advance(&mut state, ANCHOR_BLOCK + 3, 0xb3, true);
+        assert!(tick(&mut state), "restored at one, this tick is three and closes the interval");
+    }
+
+    #[test]
+    fn a_cold_reset_keeps_the_warm_shrink_policy_and_starts_a_fresh_interval() {
+        let (mut state, _) = restored_state_with(PairConfig {
+            retain_depth: depth(1),
+            warm_shrink: shrink_every(2),
+        });
+        advance(&mut state, ANCHOR_BLOCK + 1, 0xa1, true);
+        assert!(!tick(&mut state), "one block into a two-block interval");
+
+        // Cold means empty, not reconfigured — the same sentence `cold_reset` uses for the trie
+        // representation, and it has to hold for the sizing policy or a gap silently turns a
+        // shrink arm into the control.
+        state.pair.cold_reset();
+        assert_eq!(state.pair.trie_cache.warm_shrink_policy(), shrink_every(2));
+
+        // The interval starts over: the block already counted before the reset is gone with the
+        // tables it was counted against. `advance` cannot be used here — a cold pair admits
+        // nothing until it is warm again — so the trie is driven directly.
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            Address::repeat_byte(0x11),
+            AccountData { nonce: 1, balance: U256::from(1u64), code_hash: None },
+        );
+        state.pair.cache.on_block_executed(ANCHOR_BLOCK + 2, &accessed);
+        assert!(!tick(&mut state), "a reset starts a new interval; one block does not close it");
+        state.pair.cache.on_block_executed(ANCHOR_BLOCK + 3, &accessed);
+        assert!(tick(&mut state), "and the second block does");
     }
 
     #[test]
