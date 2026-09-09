@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--mutations-transition [N]]
-//!           [--retain-depth N] [--json <path>] [--label <name>]
+//!           [--retain-depth N] [--warm-shrink N|never] [--json <path>] [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
 //!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--retain-depth N]
+//!           [--warm-shrink N|never]
 //!           [--json <path>] [--label <name>]
 //! ```
 //!
@@ -59,12 +60,14 @@ pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
     "system"
 };
 
+use partial_stateless::WarmSetShrinkPolicy;
 use partial_stateless_replay::{
-    follow, replay, FollowOptions, FollowOutcome, FollowReport, ReplayOptions, ReplayReport,
+    follow, replay, FollowOptions, FollowOutcome, FollowReport, PairConfig, ReplayOptions,
+    ReplayReport,
 };
 use partial_stateless_stream::EndKind;
 use partial_stateless_validator::RetentionDepth;
-use std::path::PathBuf;
+use std::{num::NonZeroU64, path::PathBuf};
 use tracing::{error, info, warn};
 
 fn main() -> eyre::Result<()> {
@@ -92,7 +95,7 @@ fn main() -> eyre::Result<()> {
         return run_follow(&dir, &options)
     };
     if let Some(path) = &json {
-        write_manifest(path, "standalone_replay_v1", &label, &dir, options.retain_depth)?;
+        write_manifest(path, "standalone_replay_v1", &label, &dir, options.pair_config())?;
     }
     let started = std::time::Instant::now();
     let report = replay(&dir, &options)?;
@@ -245,7 +248,7 @@ fn write_manifest(
     benchmark: &str,
     label: &str,
     dir: &std::path::Path,
-    retain_depth: RetentionDepth,
+    pair: PairConfig,
 ) -> eyre::Result<()> {
     use std::io::Write;
     let provenance = partial_stateless_stream::RunProvenance::collect(
@@ -270,7 +273,11 @@ fn write_manifest(
         // A configuration axis, like the allocator above and for the same reason: two runs of this
         // binary over one corpus differ in what they retain, and a record that does not say which
         // is not attributable to a configuration. Absent on files written before the axis existed.
-        "retain_depth": retain_depth.get(),
+        "retain_depth": pair.retain_depth.get(),
+        // `null` when the sets are left at whatever size hashbrown settled them to, which is the
+        // default and every run written before this axis existed. A number is the interval in
+        // blocks, so the two arms of the shrink A/B are distinguishable from the manifest alone.
+        "warm_shrink_blocks": pair.warm_shrink.interval().map(NonZeroU64::get),
         "provenance": provenance,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -284,7 +291,7 @@ fn write_manifest(
 /// Runs the live follower and maps its outcome onto the documented exit codes.
 fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
     if let Some(path) = &options.verdicts {
-        write_manifest(path, "standalone_follow_v1", &options.label, dir, options.retain_depth)?;
+        write_manifest(path, "standalone_follow_v1", &options.label, dir, options.pair_config())?;
     }
     let started = std::time::Instant::now();
     let report = follow(dir, options)?;
@@ -494,6 +501,34 @@ fn retain_depth_from_env() -> eyre::Result<RetentionDepth> {
     }
 }
 
+/// The warm-set shrink policy from `PS_WARM_SHRINK`, or the default of never.
+///
+/// Read before the flags, so `--warm-shrink` on the command line wins over the environment — the
+/// same precedence `--retain-depth` takes and for the same reason. An unparseable value is an
+/// error rather than a fall back to the default: an arm that asked to shrink and silently did not
+/// would be reported as a null result for the change rather than as the misconfiguration it is.
+fn warm_shrink_from_env() -> eyre::Result<WarmSetShrinkPolicy> {
+    match std::env::var("PS_WARM_SHRINK") {
+        Ok(raw) => parse_warm_shrink(&raw)
+            .map_err(|err| eyre::eyre!("PS_WARM_SHRINK={raw:?} is not an interval: {err}")),
+        Err(_) => Ok(WarmSetShrinkPolicy::Never),
+    }
+}
+
+/// `never`, `off` and `0` all switch shrinking off; anything else is an interval in blocks.
+///
+/// Three spellings for off because this is a measurement arm that run sheets set from a variable,
+/// and a sheet that exports `PS_WARM_SHRINK=0` to mean "control" should get the control rather
+/// than an error at the end of a two-hour corpus.
+fn parse_warm_shrink(raw: &str) -> eyre::Result<WarmSetShrinkPolicy> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("never") || raw.eq_ignore_ascii_case("off") {
+        return Ok(WarmSetShrinkPolicy::Never)
+    }
+    let blocks: u64 = raw.parse()?;
+    Ok(NonZeroU64::new(blocks).map_or(WarmSetShrinkPolicy::Never, WarmSetShrinkPolicy::EveryBlocks))
+}
+
 fn parse_args() -> eyre::Result<Mode> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.iter().any(|arg| arg == "--follow") {
@@ -510,8 +545,11 @@ fn parse_args() -> eyre::Result<Mode> {
     }
     let mut args = raw.into_iter();
     let mut dir = None;
-    let mut options =
-        ReplayOptions { retain_depth: retain_depth_from_env()?, ..ReplayOptions::default() };
+    let mut options = ReplayOptions {
+        retain_depth: retain_depth_from_env()?,
+        warm_shrink: warm_shrink_from_env()?,
+        ..ReplayOptions::default()
+    };
     let mut json = None;
     let mut label = "unlabelled".to_string();
     while let Some(arg) = args.next() {
@@ -546,6 +584,12 @@ fn parse_args() -> eyre::Result<Mode> {
                 let raw = args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
                 options.retain_depth = RetentionDepth::new(raw.parse()?)?;
             }
+            "--warm-shrink" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--warm-shrink needs an interval or 'never'"))?;
+                options.warm_shrink = parse_warm_shrink(&raw)?;
+            }
             "--json" => {
                 json = Some(PathBuf::from(
                     args.next().ok_or_else(|| eyre::eyre!("--json needs a path"))?,
@@ -558,11 +602,14 @@ fn parse_args() -> eyre::Result<Mode> {
                 println!(
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--mutations-transition [N]] \
-                     [--force-restore-at <sequence>] [--retain-depth N] [--json <path>] \
+                     [--force-restore-at <sequence>] [--retain-depth N] \
+                     [--warm-shrink N|never] [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
-                     [--resume] [--mutations] [--retain-depth N] [--json <path>] \
-                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth; the flag wins."
+                     [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
+                     [--json <path>] \
+                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth and PS_WARM_SHRINK \
+                     sets --warm-shrink; the flags win."
                 );
                 std::process::exit(0);
             }
@@ -577,8 +624,11 @@ fn parse_args() -> eyre::Result<Mode> {
 fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
     let mut args = raw.into_iter();
     let mut dir = None;
-    let mut options =
-        FollowOptions { retain_depth: retain_depth_from_env()?, ..FollowOptions::default() };
+    let mut options = FollowOptions {
+        retain_depth: retain_depth_from_env()?,
+        warm_shrink: warm_shrink_from_env()?,
+        ..FollowOptions::default()
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--follow" => {}
@@ -615,10 +665,46 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                 let raw = args.next().ok_or_else(|| eyre::eyre!("--retain-depth needs a depth"))?;
                 options.retain_depth = RetentionDepth::new(raw.parse()?)?;
             }
+            "--warm-shrink" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--warm-shrink needs an interval or 'never'"))?;
+                options.warm_shrink = parse_warm_shrink(&raw)?;
+            }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),
             other => return Err(eyre::eyre!("unexpected argument {other}")),
         }
     }
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay --follow <spool-dir>"))?;
     Ok(Mode::Follow { dir, options })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_spelling_of_off_reaches_the_control_arm() {
+        // A run sheet that exports `PS_WARM_SHRINK=0` for its control arm should get the control,
+        // not an error discovered at the end of a two-hour corpus.
+        for raw in ["never", "NEVER", "off", "0", " never ", " 0 "] {
+            assert_eq!(
+                parse_warm_shrink(raw).expect("an off spelling parses"),
+                WarmSetShrinkPolicy::Never,
+                "{raw:?} should switch shrinking off"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interval_parses_to_the_interval_it_names() {
+        assert_eq!(
+            parse_warm_shrink("100").expect("an interval parses"),
+            WarmSetShrinkPolicy::EveryBlocks(NonZeroU64::new(100).expect("100 is not zero"))
+        );
+        // Not a fall back to the default: an arm that asked to shrink and silently did not would
+        // be read as a null result for the change rather than as a misconfigured run.
+        assert!(parse_warm_shrink("every-block").is_err());
+        assert!(parse_warm_shrink("-1").is_err());
+    }
 }

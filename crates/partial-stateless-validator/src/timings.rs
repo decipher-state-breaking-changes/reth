@@ -484,6 +484,18 @@ pub struct ValidationPhaseTimings {
     /// Summed over a run this is the fallback count: the delta path is correct either way, so
     /// this measures how much of the optimization a run actually got.
     pub retention_full_rebuild: u64,
+    /// Returning the warm sets to a fitted size, when a shrink policy asked for one.
+    ///
+    /// Zero on every block of a default run, since the policy is off. On an arm that shrinks it is
+    /// concentrated on the blocks that close an interval, so a run's mean is the amortised price
+    /// and `retention_warm_shrinks` is what it was amortised over.
+    pub retention_warm_shrink_us: u64,
+    /// 1 on a block that closed a shrink interval.
+    ///
+    /// Summed over a run it is the number of shrinks taken. Reported separately from the cost
+    /// because an arm configured to shrink whose sum is zero never reached an interval boundary,
+    /// which is a misconfigured arm rather than a change that did nothing.
+    pub retention_warm_shrinks: u64,
     pub next_cache_anchor_us: u64,
     /// The anchor's internal split; included in `next_cache_anchor_us`, never summed into a total.
     pub next_cache_anchor_detail: CacheRootMetrics,

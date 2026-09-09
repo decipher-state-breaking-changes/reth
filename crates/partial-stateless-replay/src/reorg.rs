@@ -366,7 +366,7 @@ pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::restore;
+    use crate::driver::{restore, PairConfig};
     use alloy_primitives::{keccak256, Address, U256};
     use alloy_rlp::Encodable;
     use partial_stateless::{
@@ -472,8 +472,13 @@ mod tests {
             snapshot_digest: B256::ZERO,
         };
         let chunks = checkpoint.chunk(&package_bytes, 4096);
-        let state =
-            restore(&manifest(), &checkpoint, &chunks, depth).expect("the fixture restores");
+        let state = restore(
+            &manifest(),
+            &checkpoint,
+            &chunks,
+            PairConfig { retain_depth: depth, ..Default::default() },
+        )
+        .expect("the fixture restores");
         (state, state_root)
     }
 

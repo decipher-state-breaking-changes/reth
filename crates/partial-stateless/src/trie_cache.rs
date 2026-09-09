@@ -25,6 +25,7 @@ use reth_trie_sparse::{
 use serde::Serialize;
 use std::{
     fmt,
+    num::NonZeroU64,
     sync::{Arc, OnceLock},
     time::Instant,
 };
@@ -148,6 +149,16 @@ pub struct PartialTrieNodeCache {
     /// log can describe; every other distance — a gap, a rollback, a restore — falls back to the
     /// full rebuild rather than patching state whose base is unproven.
     synced_to_block: Option<u64>,
+    /// Warm-set sizing policy and the interval state it needs.
+    ///
+    /// Carried through a clone so a snapshot continues its parent's interval instead of restarting
+    /// it, and restored with a generation on a reorg — which is the consistent choice, since the
+    /// bucket counts the interval is tracking are restored with it too.
+    ///
+    /// Living inside the cache rather than beside it is also what makes a rejected block free:
+    /// retention runs on the candidate snapshot, so a block that is refused discards the interval
+    /// advance along with the trie it was counted against, and the parent's count is untouched.
+    warm_shrink: WarmShrink,
 }
 
 impl Clone for PartialTrieNodeCache {
@@ -219,6 +230,7 @@ impl PartialTrieNodeCache {
                 retained_storage_paths,
                 retained_account_paths,
                 synced_to_block: self.synced_to_block,
+                warm_shrink: self.warm_shrink,
             },
             timings,
         )
@@ -251,7 +263,21 @@ impl PartialTrieNodeCache {
             retained_storage_paths: B256Map::default(),
             retained_account_paths: Vec::new(),
             synced_to_block: None,
+            warm_shrink: WarmShrink::default(),
         }
+    }
+
+    /// Configures how often the warm sets are returned to a fitted size.
+    ///
+    /// Resets the interval state, so a policy changed mid-run measures its own interval rather
+    /// than inheriting a high-water mark taken under the previous one.
+    pub fn set_warm_shrink_policy(&mut self, policy: WarmSetShrinkPolicy) {
+        self.warm_shrink = WarmShrink { policy, ..WarmShrink::default() };
+    }
+
+    /// The warm-set sizing policy this cache and its snapshots run under.
+    pub const fn warm_shrink_policy(&self) -> WarmSetShrinkPolicy {
+        self.warm_shrink.policy
     }
 
     /// The trie representation this cache runs on.
@@ -322,7 +348,7 @@ impl PartialTrieNodeCache {
             (Some(synced), Some(delta)) if delta.block_number == synced + 1 => Some(delta),
             _ => None,
         };
-        let timings = match delta {
+        let mut timings = match delta {
             Some(delta) => self.retain_incrementally(&delta),
             None => {
                 let mut timings = self.retain_fully(value_cache);
@@ -331,7 +357,42 @@ impl PartialTrieNodeCache {
             }
         };
         self.synced_to_block = Some(value_cache.current_block());
+        (timings.warm_shrink_us, timings.warm_shrink) = self.maintain_warm_capacity();
         timings
+    }
+
+    /// Records this block against the interval's high-water mark, and returns the warm sets to a
+    /// fitted size when the interval closes.
+    ///
+    /// Runs after retention rather than before it, so the mark describes membership as the block
+    /// left it and a shrink is not immediately undone by the removals of the block that triggered
+    /// it. Deliberately absent from [`Self::retain_reference`]: that path is the differential
+    /// oracle for what the sets *contain*, and capacity is in neither fingerprint it is compared
+    /// on, so running a sizing policy there would add cost to the reference without adding
+    /// coverage.
+    fn maintain_warm_capacity(&mut self) -> (u64, bool) {
+        let Some(interval) = self.warm_shrink.policy.interval() else { return (0, false) };
+
+        self.warm_shrink.accounts_high_water =
+            self.warm_shrink.accounts_high_water.max(self.warm_accounts.len());
+        self.warm_shrink.storage_high_water =
+            self.warm_shrink.storage_high_water.max(self.warm_storage.len());
+        self.warm_shrink.blocks_since_shrink += 1;
+        if self.warm_shrink.blocks_since_shrink < interval.get() {
+            return (0, false)
+        }
+
+        let start = Instant::now();
+        self.warm_accounts.shrink_to(self.warm_shrink.accounts_high_water);
+        self.warm_storage.shrink_to(self.warm_shrink.storage_high_water);
+        let elapsed = start.elapsed().as_micros() as u64;
+
+        // The next interval starts its mark from what is held now rather than from what the last
+        // one peaked at, so membership that has genuinely fallen is allowed to keep the ground.
+        self.warm_shrink.blocks_since_shrink = 0;
+        self.warm_shrink.accounts_high_water = self.warm_accounts.len();
+        self.warm_shrink.storage_high_water = self.warm_storage.len();
+        (elapsed, true)
     }
 
     /// Retains from scratch, discarding any incremental state.
@@ -1170,6 +1231,67 @@ fn splice_sorted(target: &mut Vec<Nibbles>, added: &mut Vec<Nibbles>, removed: &
     *target = merged;
 }
 
+/// How often the warm sets are returned to a size fitted to their contents.
+///
+/// hashbrown sizes a table for the churn it has seen rather than for what it holds. When growth
+/// pressure arrives it rehashes in place if the live items still fit in half the buckets, and
+/// otherwise resizes to the next power of two — "conservatively resize to at least the next size
+/// up to avoid churning deletes into frequent rehashes", in `reserve_rehash_inner`'s own words.
+/// Steady-state warm membership sits above that half line, so each set settles at the smallest
+/// power of two above `max_items * 16/7`, exactly one doubling past the `max_items * 8/7` its
+/// contents need, and stays there. Measured on the 10,000-block corpus: 2^17 and 2^18 buckets
+/// against 41,000 and 71,000 entries — 15.88 MiB where 8.32 MiB fits, an 18-27% load factor. Since
+/// a clone copies `buckets()` and never reads `items`, the whole doubling is paid again on every
+/// block's snapshot, which is what makes the sizing a latency question and not only a memory one.
+///
+/// Shrinking takes the doubling back and buys into the regime that rule exists to avoid: at the
+/// fitted size the live items no longer fit in half the buckets, so the next growth pressure
+/// resizes instead of rehashing in place, and the shrink has to be repeated. Whether the per-block
+/// copy saved outweighs those resizes is a property of the workload's removal rate and is not
+/// derivable from the sizes alone — so this is a measured knob, and [`Self::Never`] is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WarmSetShrinkPolicy {
+    /// Leave hashbrown's own sizing alone. Today's behaviour, and the production default.
+    #[default]
+    Never,
+    /// Shrink both sets every `n` blocks, to the high-water mark of the interval just ended.
+    ///
+    /// The high-water mark rather than the current length, because membership oscillates within a
+    /// run — 23,000-41,000 warm accounts and 51,000-71,000 warm slots on the measured corpus — and
+    /// fitting a trough only guarantees a resize on the way back up.
+    EveryBlocks(NonZeroU64),
+}
+
+impl WarmSetShrinkPolicy {
+    /// The interval in blocks, or `None` when shrinking is off.
+    pub const fn interval(self) -> Option<NonZeroU64> {
+        match self {
+            Self::Never => None,
+            Self::EveryBlocks(n) => Some(n),
+        }
+    }
+}
+
+impl fmt::Display for WarmSetShrinkPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Never => f.write_str("never"),
+            Self::EveryBlocks(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+/// [`WarmSetShrinkPolicy`] together with the interval state it needs.
+///
+/// `Copy`, so carrying it through a clone is a field assignment rather than a decision.
+#[derive(Debug, Clone, Copy, Default)]
+struct WarmShrink {
+    policy: WarmSetShrinkPolicy,
+    blocks_since_shrink: u64,
+    accounts_high_water: usize,
+    storage_high_water: usize,
+}
+
 /// Where [`PartialTrieNodeCache::retain_from_value_cache`] spent a block's retention budget.
 ///
 /// Retention is the largest validator phase, and its published cost has only ever been one
@@ -1221,6 +1343,14 @@ pub struct RetentionTimings {
     /// fallback is correct but expensive, so its *rate* is the thing worth watching in production:
     /// a run where it fires often has lost the optimization without losing correctness.
     pub full_rebuild: bool,
+    /// Returning the warm sets to a fitted size, when [`WarmSetShrinkPolicy`] asked for one.
+    pub warm_shrink_us: u64,
+    /// True on the block that closed a shrink interval.
+    ///
+    /// Reported so a run can divide the cost by the blocks it was amortised over, and so an arm
+    /// configured to shrink but never reaching an interval boundary reads as a misconfiguration
+    /// rather than as a null result.
+    pub warm_shrink: bool,
 }
 
 /// One storage-prune pass, split into the parts that scale differently.
@@ -1965,5 +2095,179 @@ mod tests {
 
         a.set_state_root(B256::repeat_byte(0x44));
         assert_eq!(a.cache_root(), b.cache_root());
+    }
+
+    /// A value cache that forgets an untouched account after two blocks.
+    ///
+    /// Short on purpose: the production ratchet takes ~1,600 blocks to saturate, and no unit test
+    /// can wait for that. What a fast window buys is the shape the policy has to handle — a set
+    /// whose length collapses while the table it lives in does not follow.
+    fn fast_forgetting_value_cache() -> NetworkStateCache {
+        NetworkStateCache::new(
+            Box::new(LastNBlocksPolicy::new(2)),
+            Box::new(LastNBlocksPolicy::new(2)),
+        )
+    }
+
+    fn account_at(index: usize) -> Address {
+        let mut bytes = [0u8; 20];
+        bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        Address::from(bytes)
+    }
+
+    fn block_touching(indices: std::ops::Range<usize>) -> BlockAccessedState {
+        let mut accessed = BlockAccessedState::default();
+        for index in indices {
+            accessed.accounts.insert(
+                account_at(index),
+                AccountData { nonce: 0, balance: U256::ZERO, code_hash: None },
+            );
+        }
+        accessed
+    }
+
+    /// Drives one block through both caches and hands back what retention reported.
+    fn advance(
+        trie: &mut PartialTrieNodeCache,
+        values: &mut NetworkStateCache,
+        block: u64,
+        touched: std::ops::Range<usize>,
+    ) -> RetentionTimings {
+        values.on_block_executed(block, &block_touching(touched));
+        trie.retain_from_value_cache(values)
+    }
+
+    #[test]
+    fn the_default_policy_leaves_a_table_exactly_where_it_found_it() {
+        let mut values = fast_forgetting_value_cache();
+        let mut trie = PartialTrieNodeCache::new();
+        assert_eq!(trie.warm_shrink_policy(), WarmSetShrinkPolicy::Never);
+
+        let timings = advance(&mut trie, &mut values, 1, 0..5_000);
+        assert!(!timings.warm_shrink, "the default policy has no interval to close");
+        assert_eq!(timings.warm_shrink_us, 0);
+        let peak_bytes = trie.memory_breakdown().warm_accounts_bytes;
+        assert_eq!(trie.tracked_account_count(), 5_000);
+
+        for block in 2..=8 {
+            assert!(!advance(&mut trie, &mut values, block, 5_000..5_001).warm_shrink);
+        }
+
+        // The membership collapsed by three orders of magnitude and the allocation did not move.
+        // This is the ratchet in miniature, and it is what `Never` is a decision to keep.
+        assert_eq!(trie.tracked_account_count(), 1);
+        assert_eq!(trie.memory_breakdown().warm_accounts_bytes, peak_bytes);
+    }
+
+    #[test]
+    fn an_interval_protects_the_peak_it_covered_and_takes_the_ground_in_the_next_one() {
+        let mut values = fast_forgetting_value_cache();
+        let mut trie = PartialTrieNodeCache::new();
+        trie.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(5).expect("5 is not zero"),
+        ));
+
+        advance(&mut trie, &mut values, 1, 0..5_000);
+        let peak_bytes = trie.memory_breakdown().warm_accounts_bytes;
+        for block in 2..=4 {
+            assert!(!advance(&mut trie, &mut values, block, 5_000..5_001).warm_shrink);
+        }
+
+        // Block 5 closes an interval whose high-water mark is the 5,000 of block 1, even though
+        // the set holds one account by the time it lands. Fitting what is held here would size the
+        // table for a trough the workload has already left.
+        let closing = advance(&mut trie, &mut values, 5, 5_000..5_001);
+        assert!(closing.warm_shrink);
+        assert_eq!(trie.tracked_account_count(), 1);
+        assert_eq!(
+            trie.memory_breakdown().warm_accounts_bytes,
+            peak_bytes,
+            "the interval that saw the peak must not shrink below it"
+        );
+
+        // The next interval saw only the trough, so it is the one entitled to the ground.
+        for block in 6..=9 {
+            assert!(!advance(&mut trie, &mut values, block, 5_000..5_001).warm_shrink);
+        }
+        assert!(advance(&mut trie, &mut values, 10, 5_000..5_001).warm_shrink);
+        assert!(
+            trie.memory_breakdown().warm_accounts_bytes < peak_bytes / 100,
+            "an interval that only ever saw one account should fit one account"
+        );
+    }
+
+    #[test]
+    fn shrinking_the_warm_sets_changes_nothing_the_cache_commits_to() {
+        // `tests/delta_retention.rs` compares the full and incremental retention paths through
+        // `cache_root` and `retention_fingerprint`, and capacity appears in neither — so a sizing
+        // policy is invisible to the differential oracle that covers everything else about these
+        // sets, and needs its own statement of what it must not disturb.
+        let mut values = fast_forgetting_value_cache();
+        let mut shrinking = PartialTrieNodeCache::new();
+        shrinking.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(2).expect("2 is not zero"),
+        ));
+        let mut left_alone = PartialTrieNodeCache::new();
+        // A second value cache driven identically, because `NetworkStateCache` is not `Clone` and
+        // the two tries have to be fed from equal-but-separate state to be compared at all.
+        let mut control_values = fast_forgetting_value_cache();
+
+        let mut shrank = false;
+        for block in 1..=9usize {
+            let touched = if block == 1 { 0..5_000 } else { 5_000 + block..5_001 + block };
+            shrank |=
+                advance(&mut shrinking, &mut values, block as u64, touched.clone()).warm_shrink;
+            advance(&mut left_alone, &mut control_values, block as u64, touched);
+
+            assert_eq!(shrinking.cache_root(), left_alone.cache_root());
+            assert_eq!(shrinking.retention_fingerprint(), left_alone.retention_fingerprint());
+            assert_eq!(shrinking.tracked_account_count(), left_alone.tracked_account_count());
+            assert_eq!(shrinking.synced_to_block, left_alone.synced_to_block);
+        }
+
+        assert!(shrank, "the fixture has to actually shrink or it proves nothing");
+        assert!(
+            shrinking.memory_breakdown().warm_accounts_bytes <
+                left_alone.memory_breakdown().warm_accounts_bytes,
+            "the two agree on everything committed and differ only in what they hold from the \
+             allocator, which is the whole point of the change"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_continues_its_parent_interval_rather_than_restarting_it() {
+        let mut values = fast_forgetting_value_cache();
+        let mut trie = PartialTrieNodeCache::new();
+        trie.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(3).expect("3 is not zero"),
+        ));
+
+        advance(&mut trie, &mut values, 1, 0..64);
+        advance(&mut trie, &mut values, 2, 64..128);
+
+        // A commit replaces the live cache with a snapshot of it every block. If the interval
+        // restarted there, a policy with an interval longer than one block would never close one.
+        let mut snapshot = trie.clone();
+        assert_eq!(snapshot.warm_shrink_policy(), trie.warm_shrink_policy());
+        assert!(advance(&mut snapshot, &mut values, 3, 128..192).warm_shrink);
+    }
+
+    #[test]
+    fn setting_a_policy_starts_its_own_interval() {
+        let mut values = fast_forgetting_value_cache();
+        let mut trie = PartialTrieNodeCache::new();
+        trie.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(2).expect("2 is not zero"),
+        ));
+        advance(&mut trie, &mut values, 1, 0..64);
+
+        // Re-setting mid-run drops the block already counted, so the new interval is measured
+        // whole. The alternative — inheriting a partial count and a mark taken under the old
+        // setting — would make the first interval after a change describe neither policy.
+        trie.set_warm_shrink_policy(WarmSetShrinkPolicy::EveryBlocks(
+            NonZeroU64::new(2).expect("2 is not zero"),
+        ));
+        assert!(!advance(&mut trie, &mut values, 2, 64..128).warm_shrink);
+        assert!(advance(&mut trie, &mut values, 3, 128..192).warm_shrink);
     }
 }

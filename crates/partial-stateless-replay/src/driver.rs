@@ -17,7 +17,7 @@ use crate::{
 };
 use alloy_rlp::Decodable;
 use partial_stateless::{
-    restore_snapshot, CacheConfig, PartialStatelessSidecar, TrustedCheckpoint,
+    restore_snapshot, CacheConfig, PartialStatelessSidecar, TrustedCheckpoint, WarmSetShrinkPolicy,
 };
 use partial_stateless_stream::{
     BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, SnapshotChunk,
@@ -83,6 +83,34 @@ pub struct ReplayOptions {
     /// makes, not the binary: in 10,000 recorded verdicts every reorg was depth-1, so the default
     /// is not the deepest thing that works but the cheapest thing that suffices.
     pub retain_depth: RetentionDepth,
+    /// How often the pair's warm sets are returned to a size fitted to their contents.
+    ///
+    /// Defaults to never, which is today's behaviour. hashbrown settles each set one doubling
+    /// past what its contents need and a clone copies buckets rather than items, so the doubling
+    /// is paid on every block; shrinking takes it back at the price of resizes the default avoids.
+    /// Which side wins is a property of the workload, so it is an arm of a measurement rather than
+    /// a setting with a known-good value.
+    pub warm_shrink: WarmSetShrinkPolicy,
+}
+
+impl ReplayOptions {
+    /// The subset of these options that configures the coordinated pair itself.
+    pub const fn pair_config(&self) -> PairConfig {
+        PairConfig { retain_depth: self.retain_depth, warm_shrink: self.warm_shrink }
+    }
+}
+
+/// How a restored pair is configured, as one value rather than a growing parameter list.
+///
+/// Both fields are settings on the same object — the depth its retained-generation deque runs at,
+/// and the sizing policy its warm sets run under — and both reach [`restore`] through the same two
+/// hops, so they travel together rather than as parallel scalars that can be threaded out of step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PairConfig {
+    /// How many trie generations the pair retains.
+    pub retain_depth: RetentionDepth,
+    /// How often the pair's warm sets are returned to a fitted size.
+    pub warm_shrink: WarmSetShrinkPolicy,
 }
 
 impl Default for ReplayOptions {
@@ -96,6 +124,7 @@ impl Default for ReplayOptions {
             force_restore_at: None,
             max_rewind_frames: MAX_REWIND_FRAMES,
             retain_depth: RetentionDepth::ONE,
+            warm_shrink: WarmSetShrinkPolicy::default(),
         }
     }
 }
@@ -850,7 +879,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     &mut report,
                     &mut rewind,
                     options.max_rewind_frames,
-                    options.retain_depth,
+                    options.pair_config(),
                 )?
             }
             (
@@ -875,7 +904,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     &mut report,
                     &mut rewind,
                     options.max_rewind_frames,
-                    options.retain_depth,
+                    options.pair_config(),
                 )?
             }
             (phase, StreamEvent::SnapshotChunk(_)) => {
@@ -1356,7 +1385,7 @@ fn finish_collection_if_complete(
     report: &mut ReplayReport,
     rewind: &mut Option<RewindWindow>,
     max_rewind_frames: u64,
-    retain_depth: RetentionDepth,
+    pair: PairConfig,
 ) -> eyre::Result<BatchPhase> {
     let BatchPhase::Collecting { manifest, checkpoint, checkpoint_sequence, chunks, purpose } =
         phase
@@ -1374,7 +1403,7 @@ fn finish_collection_if_complete(
     }
     match purpose {
         CollectPurpose::Install => {
-            let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
+            let state = restore(&manifest, &checkpoint, &chunks, pair)?;
             Ok(BatchPhase::Live {
                 manifest,
                 state: Box::new(state),
@@ -1405,7 +1434,7 @@ fn finish_collection_if_complete(
                     // independent second finding from the first one cascading. Installing
                     // isolates the finding to the block it is about; the interval it covers is an
                     // explicit reset, never a continuous recovery.
-                    let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
+                    let state = restore(&manifest, &checkpoint, &chunks, pair)?;
                     report.resyncs.push(ResyncRecord {
                         at_sequence: checkpoint_sequence,
                         block: checkpoint.block.number,
@@ -1462,7 +1491,7 @@ fn finish_collection_if_complete(
             })
         }
         CollectPurpose::Resync { target_ancestor, window_from } => {
-            let state = restore(&manifest, &checkpoint, &chunks, retain_depth)?;
+            let state = restore(&manifest, &checkpoint, &chunks, pair)?;
             // Only a checkpoint that landed on the block recovery asked for licenses a replay of
             // the commits below it: those are the winning branch by construction. A checkpoint
             // that landed anywhere else is an explicit reset, and re-reading frames under it
@@ -1772,7 +1801,7 @@ pub(crate) fn restore(
     manifest: &Manifest,
     checkpoint: &Checkpoint,
     chunks: &[SnapshotChunk],
-    retain_depth: RetentionDepth,
+    pair: PairConfig,
 ) -> eyre::Result<ReplayState> {
     let package_bytes = checkpoint
         .reassemble(chunks)
@@ -1788,7 +1817,10 @@ pub(crate) fn restore(
         cache_root: checkpoint.cache_root,
         cache_policy_id: checkpoint.cache_policy_id,
     };
-    let restored = restore_snapshot(package, &trusted, &config)?;
+    let mut restored = restore_snapshot(package, &trusted, &config)?;
+    // Set before the pair is built, so the policy is in place for the first block's retention and
+    // is carried into every snapshot cloned from this cache thereafter.
+    restored.trie_cache.set_warm_shrink_policy(pair.warm_shrink);
 
     // The header is installed only because every field a consumer checks it against is in the
     // checkpoint the operator vouched for. A header that fails any of them is dropped, and the
@@ -1819,7 +1851,7 @@ pub(crate) fn restore(
             // reproducing how they were reached — but it is configured to the same depth the run
             // is, so it starts retaining at that depth from its first commit.
             retained: Default::default(),
-            retention_depth: retain_depth,
+            retention_depth: pair.retain_depth,
             accepted_head,
             readiness: restored.readiness,
         },

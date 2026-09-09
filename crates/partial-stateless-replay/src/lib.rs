@@ -35,7 +35,7 @@ pub mod spool;
 pub mod tail;
 
 pub use compare::Disagreement;
-pub use driver::{replay, BlockTiming, ReplayFault, ReplayOptions, ReplayReport};
+pub use driver::{replay, BlockTiming, PairConfig, ReplayFault, ReplayOptions, ReplayReport};
 pub use follow::{follow, FollowOptions, FollowOutcome, FollowReport, NeedsSnapshotReason};
 pub use inspect::{inspect_ready, SpoolReadiness};
 pub use mutate::{Mutation, TransitionMutation};
