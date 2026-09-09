@@ -40,7 +40,8 @@ use alloy_rpc_types_engine::ExecutionData;
 use partial_stateless::{
     full_witness_sidecar_from_nodes, measure_witness_trim, policy_dataset::PolicyDatasetRecord,
     BlockAccessedState, BlockTransitionRef, CacheAwareFlatBuild, PartialStatelessSidecar,
-    PolicySidecarBuild, TransitionBuildContext, TrieBranchCensus, WitnessTrimStats,
+    PolicySidecarBuild, TransitionBuildContext, TrieBranchCensus, TrieChangeSet,
+    TrieMutationMetrics, WitnessTrimStats, TRIE_SHAPE_PREFIX_LEVELS,
 };
 use partial_stateless_validator::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, PostStateRootOracle,
@@ -158,6 +159,67 @@ pub struct PolicyBlockResult {
     /// only when the run asked for trie diagnostics; absent on the Weak arm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_census: Option<BranchCensusReport>,
+    /// How much of the parent trie this block dirties, by account-key prefix depth. Present only
+    /// when the run asked for trie diagnostics; absent on the Weak arm, which retains no trie.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trie_mutation: Option<TrieMutationReport>,
+}
+
+/// Serializable form of [`TrieMutationMetrics`], flattened for the JSONL stream.
+///
+/// Exists to answer one question offline that has only ever been answerable from a running node.
+/// The lower-subtrie sharing proposal turns on how many of the account trie's 256 two-nibble
+/// subtries a block leaves untouched; `account_prefixes[2]` is exactly that, and it has been
+/// `null` in every builder record recorded so far because the diagnostics that produce it are an
+/// ExEx option. Nothing about the quantity needs a node — a parent trie and a change set are
+/// enough, and a dataset replay has both.
+///
+/// Every depth is carried rather than only the second. The shallow levels saturate — every block
+/// touches the root — so which depth still discriminates is a property of the corpus, and a run
+/// that recorded only the depth someone guessed at would have to be taken again.
+///
+/// `per_storage_trie` is deliberately dropped: it is one entry per dirtied trie per block and
+/// would dominate the record for a quantity nothing downstream aggregates.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrieMutationReport {
+    /// Account paths the parent trie retains.
+    pub retained_account_paths: u64,
+    /// Of those, the ones this block re-hashes.
+    pub dirtied_account_paths: u64,
+    /// Distinct account-key prefixes retained at each depth, zero through five.
+    pub account_prefixes_retained: [u64; TRIE_SHAPE_PREFIX_LEVELS],
+    /// Of those, the ones this block dirties. Index 2 is the lower-subtrie question.
+    pub account_prefixes_dirtied: [u64; TRIE_SHAPE_PREFIX_LEVELS],
+    /// Decoded non-hash nodes in the account trie.
+    pub account_revealed_nodes: u64,
+    /// Storage paths the parent trie retains, across every trie.
+    pub retained_storage_paths: u64,
+    /// Of those, the ones this block re-hashes.
+    pub dirtied_storage_paths: u64,
+    /// Storage tries the block dirties at all.
+    pub dirtied_storage_tries: u64,
+    /// Decoded non-hash nodes across every retained storage trie.
+    pub storage_revealed_nodes: u64,
+}
+
+impl From<&TrieMutationMetrics> for TrieMutationReport {
+    fn from(metrics: &TrieMutationMetrics) -> Self {
+        Self {
+            retained_account_paths: metrics.retained_account_paths as u64,
+            dirtied_account_paths: metrics.dirtied_account_paths as u64,
+            account_prefixes_retained: std::array::from_fn(|depth| {
+                metrics.account_prefixes[depth].retained as u64
+            }),
+            account_prefixes_dirtied: std::array::from_fn(|depth| {
+                metrics.account_prefixes[depth].dirtied as u64
+            }),
+            account_revealed_nodes: metrics.account_revealed_nodes as u64,
+            retained_storage_paths: metrics.retained_storage_paths as u64,
+            dirtied_storage_paths: metrics.dirtied_storage_paths as u64,
+            dirtied_storage_tries: metrics.dirtied_storage_tries as u64,
+            storage_revealed_nodes: metrics.storage_revealed_nodes as u64,
+        }
+    }
 }
 
 /// Serializable form of [`TrieBranchCensus`], flattened for the JSONL stream.
@@ -419,6 +481,15 @@ where
                 let witness_trim = rules.trie_diagnostics.then(|| {
                     measure_witness_trim(&state.builder_trie, &build.nodes, &build.decoded_proof)
                 });
+                // Also against the parent generation, and for the same reason: the question is how
+                // much of the trie *this block is applied to* the block goes on to dirty, so the
+                // measurement has to be taken before the commit below replaces it. Taken beside
+                // the trim rather than after the commit, where `builder_trie` would already be the
+                // child and every path would read as dirtied.
+                let trie_mutation = rules.trie_diagnostics.then(|| {
+                    let changed = TrieChangeSet::from_hashed_post_state(&hashed_post_state);
+                    TrieMutationReport::from(&state.builder_trie.mutation_metrics(&changed))
+                });
                 validate_and_commit(
                     rules,
                     &block,
@@ -429,6 +500,7 @@ where
                 )
                 .map(|mut result| {
                     result.witness_trim = witness_trim;
+                    result.trie_mutation = trie_mutation;
                     result.branch_census = rules
                         .trie_diagnostics
                         .then(|| state.builder_trie.branch_slot_census().into());
@@ -651,6 +723,7 @@ where
         offline_build_us,
         witness_trim: None,
         branch_census: None,
+        trie_mutation: None,
     })
 }
 
@@ -710,4 +783,45 @@ pub fn first_access_divergence(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use partial_stateless::PrefixCoverage;
+
+    #[test]
+    fn the_report_keeps_each_prefix_depth_at_its_own_index() {
+        // The whole point of the record is `account_prefixes[2]`. A transposition between the two
+        // arrays, or an off-by-one across depths, would still produce plausible numbers and answer
+        // a different question than the one asked — so the mapping is pinned with values that make
+        // any permutation visible.
+        let mut metrics = TrieMutationMetrics {
+            retained_account_paths: 900,
+            dirtied_account_paths: 90,
+            account_revealed_nodes: 7,
+            retained_storage_paths: 800,
+            dirtied_storage_paths: 80,
+            dirtied_storage_tries: 8,
+            storage_revealed_nodes: 6,
+            ..Default::default()
+        };
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            metrics.account_prefixes[depth] =
+                PrefixCoverage { retained: 100 + depth, dirtied: 10 + depth };
+        }
+
+        let report = TrieMutationReport::from(&metrics);
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            assert_eq!(report.account_prefixes_retained[depth], 100 + depth as u64);
+            assert_eq!(report.account_prefixes_dirtied[depth], 10 + depth as u64);
+        }
+        assert_eq!(report.retained_account_paths, 900);
+        assert_eq!(report.dirtied_account_paths, 90);
+        assert_eq!(report.retained_storage_paths, 800);
+        assert_eq!(report.dirtied_storage_paths, 80);
+        assert_eq!(report.dirtied_storage_tries, 8);
+        assert_eq!(report.account_revealed_nodes, 7);
+        assert_eq!(report.storage_revealed_nodes, 6);
+    }
 }

@@ -1923,6 +1923,69 @@ mod tests {
     }
 
     #[test]
+    fn mutation_metrics_measure_the_block_against_the_trie_it_is_applied_to() {
+        // Eight accounts, so the two-nibble prefix level has something to discriminate on. The
+        // lower-subtrie proposal turns on exactly this level: how many of the 256 two-nibble
+        // subtries a block leaves alone.
+        let addresses: Vec<Address> = (1u8..=8).map(Address::repeat_byte).collect();
+        let mut accessed = BlockAccessedState::default();
+        for (nonce, address) in addresses.iter().enumerate() {
+            accessed.accounts.insert(
+                *address,
+                AccountData { nonce: nonce as u64, balance: U256::from(1), code_hash: None },
+            );
+        }
+        let mut values = value_cache();
+        values.on_block_executed(1, &accessed);
+        let mut trie = PartialTrieNodeCache::new();
+        trie.retain_from_value_cache(&values);
+
+        // A block that changed nothing dirties nothing, at every depth. This is the assertion that
+        // catches the measurement being taken after the commit instead of before it: against the
+        // child generation every retained path reads as dirtied, and depth 0 would be 1 of 1.
+        let untouched = trie.mutation_metrics(&TrieChangeSet::default());
+        assert!(untouched.retained_account_paths > 0, "the fixture retains something to dirty");
+        assert_eq!(untouched.dirtied_account_paths, 0);
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            assert_eq!(untouched.account_prefixes[depth].dirtied, 0);
+        }
+
+        // One account changed. Prefix coverage is monotone in depth on the retained side — deeper
+        // levels split what shallower ones grouped — and one leaf can dirty at most one prefix per
+        // depth.
+        let one = TrieChangeSet {
+            accounts: [keccak256(addresses[0])].into_iter().collect(),
+            ..Default::default()
+        };
+        let one = trie.mutation_metrics(&one);
+        assert_eq!(one.dirtied_account_paths, 1);
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            assert_eq!(
+                one.account_prefixes[depth].dirtied, 1,
+                "one leaf, one prefix at depth {depth}"
+            );
+            assert!(one.account_prefixes[depth].retained >= one.account_prefixes[depth].dirtied);
+        }
+        assert_eq!(one.account_prefixes[0].retained, 1, "depth zero is the root, always one");
+
+        // Everything changed. Dirtied meets retained at every depth, which is the saturation the
+        // proposal predicts for a block that writes enough accounts.
+        let all = TrieChangeSet {
+            accounts: addresses.iter().copied().map(keccak256).collect(),
+            ..Default::default()
+        };
+        let all = trie.mutation_metrics(&all);
+        assert_eq!(all.dirtied_account_paths, all.retained_account_paths);
+        for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+            assert_eq!(all.account_prefixes[depth].dirtied, all.account_prefixes[depth].retained);
+        }
+        assert!(
+            all.account_prefixes[2].retained > 1,
+            "eight distinct accounts should spread over more than one two-nibble prefix"
+        );
+    }
+
+    #[test]
     fn a_clone_shares_its_retained_path_slices_by_identity() {
         let address = Address::repeat_byte(0x11);
         let slot = B256::repeat_byte(0x22);

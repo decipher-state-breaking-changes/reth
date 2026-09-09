@@ -10,6 +10,7 @@ use crate::{
     policy::ArmKind,
 };
 use alloy_primitives::B256;
+use partial_stateless::TRIE_SHAPE_PREFIX_LEVELS;
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -104,6 +105,20 @@ pub struct PolicySummary {
     /// Branch child-slot census after the last measured block, when diagnostics ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_branch_census: Option<BranchCensusReport>,
+    /// Measured blocks whose trie-mutation measurement ran (zero unless diagnostics were on).
+    pub mutation_measured_blocks: u64,
+    /// Distinct account-key prefixes the parent trie retained at each depth, summed over those
+    /// blocks. The denominator for the dirtied share at any depth.
+    pub mutation_account_prefixes_retained: [u64; TRIE_SHAPE_PREFIX_LEVELS],
+    /// Of those, the ones the block dirtied. Index 2 against index 2 of the row above is the
+    /// lower-subtrie sharing question, and the reason this pair is recorded at all.
+    pub mutation_account_prefixes_dirtied: [u64; TRIE_SHAPE_PREFIX_LEVELS],
+    /// Retained and dirtied account leaf paths, summed over those blocks.
+    pub mutation_retained_account_paths: u64,
+    pub mutation_dirtied_account_paths: u64,
+    /// Retained and dirtied storage leaf paths, summed over those blocks.
+    pub mutation_retained_storage_paths: u64,
+    pub mutation_dirtied_storage_paths: u64,
 }
 
 impl PolicySummary {
@@ -260,6 +275,19 @@ impl RunSummary {
                 }
                 if let Some(census) = policy.branch_census {
                     entry.final_branch_census = Some(census);
+                }
+                if let Some(mutation) = &policy.trie_mutation {
+                    entry.mutation_measured_blocks += 1;
+                    for depth in 0..TRIE_SHAPE_PREFIX_LEVELS {
+                        entry.mutation_account_prefixes_retained[depth] +=
+                            mutation.account_prefixes_retained[depth];
+                        entry.mutation_account_prefixes_dirtied[depth] +=
+                            mutation.account_prefixes_dirtied[depth];
+                    }
+                    entry.mutation_retained_account_paths += mutation.retained_account_paths;
+                    entry.mutation_dirtied_account_paths += mutation.dirtied_account_paths;
+                    entry.mutation_retained_storage_paths += mutation.retained_storage_paths;
+                    entry.mutation_dirtied_storage_paths += mutation.dirtied_storage_paths;
                 }
             }
         }
