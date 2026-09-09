@@ -15,6 +15,7 @@
 #[cfg(feature = "trie-debug")]
 use crate::debug_recorder::{LeafUpdateRecord, ProofTrieNodeRecord, RecordedOp, TrieDebugRecorder};
 use crate::{
+    journal::{hashbrown_table_bytes, Entry, JournaledMap, MapJournal},
     parallel::{
         BranchSlotCensus, CloneBreakdown, CloneMeasureOptions, LeafUpdateStep,
         ParallelismThresholds, RetainOutcome, RetainWitnessPathsMetrics, RetentionOptions,
@@ -25,7 +26,7 @@ use crate::{
 };
 use alloc::{borrow::Cow, boxed::Box, vec, vec::Vec};
 use alloy_primitives::{
-    map::{Entry, HashMap, HashSet},
+    map::{HashMap, HashSet},
     B256, U256,
 };
 use alloy_rlp::Decodable;
@@ -169,7 +170,7 @@ struct FinalizationMetrics {
 /// - Each leaf entry in the `subtries` and `upper_trie` collection must have a corresponding entry
 ///   in `values` collection. If the root node is a leaf, it must also have an entry in `values`.
 /// - All keys in `values` collection are full leaf paths.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct ExactSparseTrie {
     /// This contains the trie nodes for the upper part of the trie.
     upper_subtrie: Box<ExactSparseSubtrie>,
@@ -185,10 +186,12 @@ pub struct ExactSparseTrie {
     ///   database.
     /// - `hash_mask`: When a bit is set, the corresponding child is stored as a hash in the
     ///   database.
-    branch_node_masks: BranchNodeMasksMap,
+    branch_node_masks: JournaledMap<Nibbles, BranchNodeMasks>,
     /// Reusable buffer pool used for collecting [`SparseTrieUpdatesAction`]s during hash
     /// computations.
     update_actions_buffers: Vec<Vec<SparseTrieUpdatesAction>>,
+    /// The undo record in progress, when one is being kept. See [`Self::begin_undo`].
+    undo: Option<UndoInProgress>,
     /// Thresholds controlling when parallelism is enabled for different operations.
     parallelism_thresholds: ParallelismThresholds,
     /// Metrics for the parallel sparse trie.
@@ -203,7 +206,7 @@ impl Default for ExactSparseTrie {
     fn default() -> Self {
         Self {
             upper_subtrie: Box::new(ExactSparseSubtrie {
-                nodes: HashMap::from_iter([(Nibbles::default(), ExactSparseNode::Empty)]),
+                nodes: JournaledMap::from_iter([(Nibbles::default(), ExactSparseNode::Empty)]),
                 ..Default::default()
             }),
             lower_subtries: Box::new(
@@ -211,8 +214,9 @@ impl Default for ExactSparseTrie {
             ),
             prefix_set: PrefixSetMut::default(),
             updates: None,
-            branch_node_masks: BranchNodeMasksMap::default(),
+            branch_node_masks: JournaledMap::default(),
             update_actions_buffers: Vec::default(),
+            undo: None,
             parallelism_thresholds: Default::default(),
             #[cfg(feature = "metrics")]
             metrics: Default::default(),
@@ -325,9 +329,10 @@ impl SparseTrie for ExactSparseTrie {
         let reachable_subtries = self.reachable_subtries();
 
         // The lower half of the mask update, now that admission is decidable.
-        for ProofTrieNodeV2 { path, masks, node } in lower_nodes.iter().filter(|n| {
-            reachable_subtries.admits(path_subtrie_index_unchecked(&n.path), &n.path)
-        }) {
+        for ProofTrieNodeV2 { path, masks, node } in lower_nodes
+            .iter()
+            .filter(|n| reachable_subtries.admits(path_subtrie_index_unchecked(&n.path), &n.path))
+        {
             if let Some(branch_masks) = masks {
                 let path = if let TrieNodeV2::Branch(branch) = node &&
                     !branch.key.is_empty()
@@ -394,7 +399,7 @@ impl SparseTrie for ExactSparseTrie {
                     );
                     continue;
                 }
-                self.lower_subtries[idx].reveal(&node.path);
+                self.reveal_lower(idx, &node.path);
                 self.lower_subtries[idx].as_revealed_mut().expect("just revealed").reveal_node(
                     node.path,
                     &node.node,
@@ -484,7 +489,7 @@ impl SparseTrie for ExactSparseTrie {
                     // the first element of each group, the `path` here will necessarily be the
                     // shortest path being revealed for each subtrie. Therefore we can reveal the
                     // subtrie itself using this path and retain correct behavior.
-                    self.lower_subtries[idx].reveal(&node.path);
+                    reveal_lower_split(&mut self.undo, &mut self.lower_subtries, idx, &node.path);
                     Some((
                         idx,
                         self.lower_subtries[idx].take_revealed().expect("just revealed"),
@@ -676,8 +681,13 @@ impl SparseTrie for ExactSparseTrie {
 
     fn wipe(&mut self) {
         self.upper_subtrie.wipe();
-        for trie in &mut *self.lower_subtries {
-            trie.wipe();
+        for idx in 0..NUM_LOWER_SUBTRIES {
+            if self.undo.is_some() {
+                // Keep the allocation: the record owns it now, and an undo hands it back.
+                self.clear_lower(idx);
+            } else {
+                self.lower_subtries[idx].wipe();
+            }
         }
         self.prefix_set = PrefixSetMut::all();
         self.updates = self.updates.is_some().then(SparseTrieUpdates::wiped);
@@ -686,8 +696,8 @@ impl SparseTrie for ExactSparseTrie {
     fn clear(&mut self) {
         self.upper_subtrie.clear();
         self.upper_subtrie.nodes.insert(Nibbles::default(), ExactSparseNode::Empty);
-        for subtrie in &mut *self.lower_subtries {
-            subtrie.clear();
+        for idx in 0..NUM_LOWER_SUBTRIES {
+            self.clear_lower(idx);
         }
         self.prefix_set.clear();
         self.updates = None;
@@ -1962,20 +1972,22 @@ impl ExactSparseTrie {
             if !roots_upper.is_empty() {
                 metrics.lower_subtries_scanned =
                     metrics.lower_subtries_scanned.saturating_add(self.lower_subtries.len() as u64);
-                for subtrie in &mut *self.lower_subtries {
-                    let should_clear = subtrie.as_revealed_ref().is_some_and(|s| {
-                        let search_idx = roots_upper.partition_point(|root| root <= &s.path);
-                        search_idx > 0 && s.path.starts_with(&roots_upper[search_idx - 1])
-                    });
+                for idx in 0..NUM_LOWER_SUBTRIES {
+                    let Some(revealed) = self.lower_subtries[idx].as_revealed_ref() else {
+                        continue;
+                    };
+                    let search_idx = roots_upper.partition_point(|root| root <= &revealed.path);
+                    let should_clear =
+                        search_idx > 0 && revealed.path.starts_with(&roots_upper[search_idx - 1]);
                     if should_clear {
-                        if let Some(revealed) = subtrie.as_revealed_ref() {
-                            metrics.nodes_removed =
-                                metrics.nodes_removed.saturating_add(revealed.nodes.len() as u64);
-                            metrics.values_removed = metrics
-                                .values_removed
-                                .saturating_add(revealed.inner.values.len() as u64);
-                        }
-                        subtrie.clear();
+                        metrics.nodes_removed =
+                            metrics.nodes_removed.saturating_add(revealed.nodes.len() as u64);
+                        metrics.values_removed = metrics
+                            .values_removed
+                            .saturating_add(revealed.inner.values.len() as u64);
+                        // Through `clear_lower`, never `LowerExactSubtrie::clear` directly: the
+                        // undo record has to see the slot leave `Revealed`.
+                        self.clear_lower(idx);
                     }
                 }
             }
@@ -2030,7 +2042,7 @@ impl ExactSparseTrie {
                 };
 
                 if should_clear {
-                    self.lower_subtries[subtrie_idx].clear();
+                    self.clear_lower(subtrie_idx);
                 }
             }
         });
@@ -2059,7 +2071,7 @@ impl ExactSparseTrie {
         match SparseSubtrieType::from_path(path) {
             SparseSubtrieType::Upper => None,
             SparseSubtrieType::Lower(idx) => {
-                self.lower_subtries[idx].reveal(path);
+                self.reveal_lower(idx, path);
                 Some(self.lower_subtries[idx].as_revealed_mut().expect("just revealed"))
             }
         }
@@ -2227,7 +2239,7 @@ impl ExactSparseTrie {
                 // If the leaf was the final node in its lower subtrie then we can blind the
                 // subtrie, effectively marking it as empty.
                 if subtrie.nodes.is_empty() {
-                    self.lower_subtries[idx].clear();
+                    self.clear_lower(idx);
                 }
             }
             Some(ExactSparseNode::Extension { key, .. }) => {
@@ -2716,6 +2728,7 @@ impl ExactSparseTrie {
         breakdown.total_us =
             ((subtries_ns + masks_ns + action_buffers_ns + rest_own_ns) / 1_000) as u64;
 
+        let undo = self.undo.as_ref().map(|_| UndoInProgress::new(&prefix_set, &updates));
         let clone = Self {
             upper_subtrie,
             lower_subtries,
@@ -2724,6 +2737,7 @@ impl ExactSparseTrie {
             branch_node_masks,
             update_actions_buffers,
             parallelism_thresholds,
+            undo,
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
             #[cfg(feature = "trie-debug")]
@@ -3078,7 +3092,7 @@ pub(crate) struct ExactSparseSubtrie {
     /// There should be a node for this path in `nodes` map.
     pub(crate) path: Nibbles,
     /// The map from paths to sparse trie nodes within this subtrie.
-    nodes: HashMap<Nibbles, ExactSparseNode>,
+    nodes: JournaledMap<Nibbles, ExactSparseNode>,
     /// Subset of fields for mutable access while `nodes` field is also being mutably borrowed.
     inner: ExactSubtrieInner,
 }
@@ -3670,14 +3684,24 @@ impl ExactSparseSubtrie {
 
 /// Helper type for [`ExactSparseSubtrie`] to mutably access only a subset of fields from the
 /// original struct.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ExactSubtrieInner {
     /// Map from leaf key paths to their values.
     /// All values are stored here instead of directly in leaf nodes.
-    values: HashMap<Nibbles, Vec<u8>>,
+    values: JournaledMap<Nibbles, Vec<u8>>,
     /// Reusable buffers for [`ExactSparseSubtrie::update_hashes`].
     buffers: ExactSubtrieBuffers,
 }
+
+impl PartialEq for ExactSubtrieInner {
+    /// Content equality: the hashing buffers are scratch left over from the last root
+    /// computation, and two tries representing the same state may hold different leftovers.
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl Eq for ExactSubtrieInner {}
 
 impl ExactSubtrieInner {
     /// Computes the RLP encoding and its hash for a single (trie node)[`ExactSparseNode`].
@@ -4222,11 +4246,25 @@ enum SparseTrieUpdatesAction {
 /// When a [`crate::ParallelSparseTrie`] is initialized/cleared then its `LowerExactSubtrie`s are
 /// all blinded, meaning they have no nodes. A blinded `LowerExactSubtrie` may hold onto a cleared
 /// [`ExactSparseSubtrie`] in order to reuse allocations.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum LowerExactSubtrie {
     Blind(Option<Box<ExactSparseSubtrie>>),
     Revealed(Box<ExactSparseSubtrie>),
 }
+
+impl PartialEq for LowerExactSubtrie {
+    /// Content equality: a blind slot is blind whether or not it keeps a cleared allocation
+    /// around for reuse.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Blind(_), Self::Blind(_)) => true,
+            (Self::Revealed(a), Self::Revealed(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LowerExactSubtrie {}
 
 impl Default for LowerExactSubtrie {
     /// Creates a new blinded subtrie with no allocated storage.
@@ -4545,4 +4583,379 @@ impl ExactSparseNode {
             }
         }
     }
+}
+
+// ---- undo: the record of one block's changes, and its reversal ----
+
+impl Clone for ExactSparseTrie {
+    /// A copy with the same content. If the original is keeping an undo record, the copy keeps
+    /// its own, starting empty: a clone's history begins at the clone.
+    fn clone(&self) -> Self {
+        Self {
+            upper_subtrie: self.upper_subtrie.clone(),
+            lower_subtries: self.lower_subtries.clone(),
+            prefix_set: self.prefix_set.clone(),
+            updates: self.updates.clone(),
+            branch_node_masks: self.branch_node_masks.clone(),
+            update_actions_buffers: self.update_actions_buffers.clone(),
+            parallelism_thresholds: self.parallelism_thresholds,
+            undo: self.undo.as_ref().map(|_| UndoInProgress::new(&self.prefix_set, &self.updates)),
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.clone(),
+            #[cfg(feature = "trie-debug")]
+            debug_recorder: self.debug_recorder.clone(),
+        }
+    }
+}
+
+impl PartialEq for ExactSparseTrie {
+    /// Content equality. Whether either side keeps an undo record, and what it has recorded, is
+    /// bookkeeping about the past and not part of what the trie represents; the update-action
+    /// buffers are scratch.
+    fn eq(&self, other: &Self) -> bool {
+        self.upper_subtrie == other.upper_subtrie &&
+            self.lower_subtries == other.lower_subtries &&
+            self.prefix_set == other.prefix_set &&
+            self.updates == other.updates &&
+            self.branch_node_masks == other.branch_node_masks &&
+            self.parallelism_thresholds == other.parallelism_thresholds
+    }
+}
+
+impl Eq for ExactSparseTrie {}
+
+impl ExactSparseTrie {
+    /// Starts keeping an undo record: from here until [`Self::take_undo`], the first write to
+    /// every node, value and branch mask stores what it replaced, and every lower-subtrie
+    /// reveal or blind stores the state it left. A no-op if a record is already being kept.
+    ///
+    /// The record is a property of the trie, so it survives being moved, and a clone taken while
+    /// recording starts a record of its own. It costs one lookup in the record per write.
+    pub fn begin_undo(&mut self) {
+        if self.undo.is_some() {
+            return;
+        }
+        self.undo = Some(UndoInProgress::new(&self.prefix_set, &self.updates));
+        self.branch_node_masks.begin_recording();
+        self.upper_subtrie.begin_undo();
+        for slot in &mut *self.lower_subtries {
+            if let Some(subtrie) = slot.allocated_mut() {
+                subtrie.begin_undo();
+            }
+        }
+    }
+
+    /// Whether an undo record is being kept.
+    pub const fn is_recording_undo(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// Stops recording and returns the record, or `None` if none was being kept. Applying the
+    /// frame with [`Self::undo`] puts the trie back to its content at [`Self::begin_undo`].
+    pub fn take_undo(&mut self) -> Option<UndoFrame> {
+        let in_progress = self.undo.take()?;
+        let masks = self.branch_node_masks.take_journal().unwrap_or_default();
+        let upper = self.upper_subtrie.take_undo();
+        let mut lower = Vec::new();
+        for (idx, slot) in self.lower_subtries.iter_mut().enumerate() {
+            if let Some(undo) = slot.allocated_mut().and_then(ExactSparseSubtrie::take_undo) {
+                lower.push((idx as u8, undo));
+            }
+        }
+        let metadata_changed =
+            self.prefix_set != in_progress.prefix_set || self.updates != in_progress.updates;
+        Some(UndoFrame {
+            upper,
+            lower,
+            lower_before: in_progress.lower_before,
+            masks,
+            prefix_set: in_progress.prefix_set,
+            updates: in_progress.updates,
+            metadata_changed,
+        })
+    }
+
+    /// Reverses every change `frame` recorded. The frame must have been taken from this trie,
+    /// or from a trie with identical content at the time the frame's recording began, with no
+    /// other change to this trie since — the undo is a replay of preimages, not a merge.
+    ///
+    /// Stops any record in progress: the record described the content this call replaces. Call
+    /// [`Self::begin_undo`] again to record from the restored content.
+    pub fn undo(&mut self, frame: UndoFrame) {
+        self.undo = None;
+        self.branch_node_masks.take_journal();
+        self.branch_node_masks.restore(frame.masks);
+        self.upper_subtrie.take_undo();
+        if let Some(upper) = frame.upper {
+            self.upper_subtrie.undo(upper);
+        }
+        for slot in &mut *self.lower_subtries {
+            if let Some(subtrie) = slot.allocated_mut() {
+                subtrie.take_undo();
+            }
+        }
+        for (idx, undo) in frame.lower {
+            let slot = &mut self.lower_subtries[idx as usize];
+            if matches!(slot, LowerExactSubtrie::Blind(None)) {
+                *slot = LowerExactSubtrie::Blind(Some(Box::new(ExactSparseSubtrie::default())));
+            }
+            slot.allocated_mut().expect("allocated just above").undo(undo);
+        }
+        for (idx, before) in frame.lower_before {
+            let slot = &mut self.lower_subtries[idx as usize];
+            *slot = match (core::mem::take(slot), before) {
+                (
+                    LowerExactSubtrie::Revealed(s) | LowerExactSubtrie::Blind(Some(s)),
+                    LowerBefore::Blind,
+                ) => {
+                    debug_assert!(s.is_empty(), "a subtrie blind at the start undoes to empty");
+                    LowerExactSubtrie::Blind(Some(s))
+                }
+                (LowerExactSubtrie::Blind(None), LowerBefore::Blind) => {
+                    LowerExactSubtrie::Blind(None)
+                }
+                (
+                    LowerExactSubtrie::Revealed(mut s) | LowerExactSubtrie::Blind(Some(mut s)),
+                    LowerBefore::Revealed(path),
+                ) => {
+                    s.path = path;
+                    LowerExactSubtrie::Revealed(s)
+                }
+                (LowerExactSubtrie::Blind(None), LowerBefore::Revealed(path)) => {
+                    // Every transition keeps its allocation while recording, so a revealed
+                    // subtrie's box is still here; this arm is defensive.
+                    LowerExactSubtrie::Revealed(Box::new(ExactSparseSubtrie::new(path)))
+                }
+            };
+        }
+        self.prefix_set = frame.prefix_set;
+        self.updates = frame.updates;
+    }
+
+    /// Reveals lower subtrie `idx` at `path`, recording the state it leaves and making the
+    /// subtrie record from here on if the trie is.
+    fn reveal_lower(&mut self, idx: usize, path: &Nibbles) {
+        reveal_lower_split(&mut self.undo, &mut self.lower_subtries, idx, path);
+    }
+
+    /// Blinds lower subtrie `idx`, keeping its allocation and recording the state it leaves.
+    fn clear_lower(&mut self, idx: usize) {
+        note_lower_before(&mut self.undo, &self.lower_subtries, idx);
+        self.lower_subtries[idx].clear();
+    }
+}
+
+/// [`ExactSparseTrie::reveal_lower`] on the two fields it needs, for callers holding a borrow
+/// of another field.
+fn reveal_lower_split(
+    undo: &mut Option<UndoInProgress>,
+    lower_subtries: &mut [LowerExactSubtrie; NUM_LOWER_SUBTRIES],
+    idx: usize,
+    path: &Nibbles,
+) {
+    note_lower_before(undo, lower_subtries, idx);
+    lower_subtries[idx].reveal(path);
+    if undo.is_some() {
+        lower_subtries[idx].as_revealed_mut().expect("just revealed").begin_undo();
+    }
+}
+
+/// Records what lower subtrie `idx` is before its first transition of the record.
+fn note_lower_before(
+    undo: &mut Option<UndoInProgress>,
+    lower_subtries: &[LowerExactSubtrie; NUM_LOWER_SUBTRIES],
+    idx: usize,
+) {
+    let Some(undo) = undo else { return };
+    let idx = idx as u8;
+    if undo.lower_before.iter().any(|(i, _)| *i == idx) {
+        return;
+    }
+    let before = match lower_subtries[idx as usize].as_revealed_ref() {
+        Some(subtrie) => LowerBefore::Revealed(subtrie.path),
+        None => LowerBefore::Blind,
+    };
+    undo.lower_before.push((idx, before));
+}
+
+impl ExactSparseSubtrie {
+    fn begin_undo(&mut self) {
+        self.nodes.begin_recording();
+        self.inner.values.begin_recording();
+    }
+
+    fn take_undo(&mut self) -> Option<SubtrieUndo> {
+        let nodes = self.nodes.take_journal();
+        let values = self.inner.values.take_journal();
+        if nodes.as_ref().is_none_or(MapJournal::is_empty) &&
+            values.as_ref().is_none_or(MapJournal::is_empty)
+        {
+            return None;
+        }
+        Some(SubtrieUndo { nodes: nodes.unwrap_or_default(), values: values.unwrap_or_default() })
+    }
+
+    fn undo(&mut self, undo: SubtrieUndo) {
+        self.nodes.restore(undo.nodes);
+        self.inner.values.restore(undo.values);
+    }
+}
+
+impl LowerExactSubtrie {
+    /// Mutable twin of [`Self::allocated_ref`].
+    pub(crate) fn allocated_mut(&mut self) -> Option<&mut ExactSparseSubtrie> {
+        match self {
+            Self::Revealed(subtrie) | Self::Blind(Some(subtrie)) => Some(subtrie.as_mut()),
+            Self::Blind(None) => None,
+        }
+    }
+}
+
+/// The trie-level part of an undo record while it is being kept. The map-level parts live in
+/// the maps themselves.
+#[derive(Debug)]
+struct UndoInProgress {
+    /// Lower subtries whose reveal/blind state changed, with the state each left. First change
+    /// per index only.
+    lower_before: Vec<(u8, LowerBefore)>,
+    /// The prefix set as recording began. Small at a block boundary, since computing the root
+    /// consumes it; taken whole rather than journaled.
+    prefix_set: PrefixSetMut,
+    /// The retained updates as recording began, for the same reason.
+    updates: Option<SparseTrieUpdates>,
+}
+
+impl UndoInProgress {
+    fn new(prefix_set: &PrefixSetMut, updates: &Option<SparseTrieUpdates>) -> Self {
+        Self { lower_before: Vec::new(), prefix_set: prefix_set.clone(), updates: updates.clone() }
+    }
+}
+
+/// What a lower subtrie slot was before the block first changed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LowerBefore {
+    Blind,
+    Revealed(Nibbles),
+}
+
+/// One subtrie's part of an [`UndoFrame`].
+#[derive(Debug)]
+struct SubtrieUndo {
+    nodes: MapJournal<Nibbles, ExactSparseNode>,
+    values: MapJournal<Nibbles, Vec<u8>>,
+}
+
+impl SubtrieUndo {
+    fn count(&self, counts: &mut UndoFrameCounts) {
+        counts.nodes += self.nodes.len();
+        counts.values += self.values.len();
+        counts.whole_maps +=
+            usize::from(self.nodes.whole().is_some()) + usize::from(self.values.whole().is_some());
+    }
+
+    /// Heap bytes: both records' tables and what their held values own. `Nibbles` is inline
+    /// and owns nothing.
+    fn allocated_bytes(&self) -> usize {
+        self.nodes
+            .allocated_bytes(|node| node.memory_size() - core::mem::size_of::<ExactSparseNode>()) +
+            self.values.allocated_bytes(Vec::capacity)
+    }
+}
+
+/// Everything an [`ExactSparseTrie`] needs to reverse the changes made between
+/// [`ExactSparseTrie::begin_undo`] and [`ExactSparseTrie::take_undo`].
+///
+/// Sized by what the block touched, not by the trie: one preimage per node, value or mask
+/// written, one entry per lower subtrie whose reveal state changed, plus the prefix set and
+/// retained updates as they stood. [`Self::counts`] reports the size.
+#[derive(Debug)]
+pub struct UndoFrame {
+    upper: Option<SubtrieUndo>,
+    lower: Vec<(u8, SubtrieUndo)>,
+    lower_before: Vec<(u8, LowerBefore)>,
+    masks: MapJournal<Nibbles, BranchNodeMasks>,
+    prefix_set: PrefixSetMut,
+    updates: Option<SparseTrieUpdates>,
+    /// Whether the prefix set or the retained updates differed, when the frame was taken, from
+    /// the snapshot it holds — a change with no map entry behind it.
+    metadata_changed: bool,
+}
+
+impl UndoFrame {
+    /// Whether applying the frame would change nothing: no map entry, no subtrie transition,
+    /// and the prefix set and retained updates as they already are.
+    pub fn is_empty(&self) -> bool {
+        self.upper.is_none() &&
+            self.lower.is_empty() &&
+            self.lower_before.is_empty() &&
+            self.masks.is_empty() &&
+            !self.metadata_changed
+    }
+
+    /// What the frame holds, by kind. Logical counts; bytes are [`Self::allocated_bytes`].
+    pub fn counts(&self) -> UndoFrameCounts {
+        let mut counts = UndoFrameCounts::default();
+        if let Some(upper) = &self.upper {
+            upper.count(&mut counts);
+        }
+        for (_, lower) in &self.lower {
+            lower.count(&mut counts);
+        }
+        counts.lower_transitions = self.lower_before.len();
+        counts.masks = self.masks.len();
+        counts.whole_maps += usize::from(self.masks.whole().is_some());
+        counts.metadata_changed = self.metadata_changed;
+        counts
+    }
+
+    /// Heap bytes the frame holds, as an estimate: every hash table charged its buckets by
+    /// hashbrown's sizing rule, every `Vec` its capacity, plus what the held values own. Not a
+    /// reading of the allocator — a budget decision reads jemalloc `allocated` or RSS around the
+    /// frame — but the number that says what a block's record is made of, with known omissions:
+    /// the trailing control group of each table, and the prefix set's spare capacity, which its
+    /// type does not expose.
+    pub fn allocated_bytes(&self) -> usize {
+        let mut bytes = core::mem::size_of::<Self>();
+        if let Some(upper) = &self.upper {
+            bytes += upper.allocated_bytes();
+        }
+        bytes += self.lower.capacity() * core::mem::size_of::<(u8, SubtrieUndo)>();
+        bytes += self.lower.iter().map(|(_, lower)| lower.allocated_bytes()).sum::<usize>();
+        bytes += self.lower_before.capacity() * core::mem::size_of::<(u8, LowerBefore)>();
+        bytes += self.masks.allocated_bytes(|_| 0);
+        bytes += self.prefix_set.len() * core::mem::size_of::<Nibbles>();
+        if let Some(updates) = &self.updates {
+            bytes += hashbrown_table_bytes(
+                updates.updated_nodes.capacity(),
+                core::mem::size_of::<Nibbles>() + core::mem::size_of::<BranchNodeCompact>(),
+            );
+            bytes += updates
+                .updated_nodes
+                .values()
+                .map(|node| node.hashes.len() * core::mem::size_of::<B256>())
+                .sum::<usize>();
+            bytes += hashbrown_table_bytes(
+                updates.removed_nodes.capacity(),
+                core::mem::size_of::<Nibbles>(),
+            );
+        }
+        bytes
+    }
+}
+
+/// What an [`UndoFrame`] holds, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UndoFrameCounts {
+    /// Node preimages recorded.
+    pub nodes: usize,
+    /// Leaf value preimages recorded.
+    pub values: usize,
+    /// Branch mask preimages recorded.
+    pub masks: usize,
+    /// Lower subtries whose reveal state changed.
+    pub lower_transitions: usize,
+    /// Maps captured whole by a bulk clear.
+    pub whole_maps: usize,
+    /// Whether the prefix set or retained updates changed with no map entry behind it.
+    pub metadata_changed: bool,
 }

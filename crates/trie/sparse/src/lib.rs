@@ -26,7 +26,10 @@ pub use parallel::*;
 
 /// Exact-size blinded-hash sibling of the parallel sparse trie, for long-lived caches.
 mod exact;
-pub use exact::ExactSparseTrie;
+pub use exact::{ExactSparseTrie, UndoFrame, UndoFrameCounts};
+
+/// A hash map that records the preimage of every write, so a block's changes can be undone.
+mod journal;
 
 mod lower;
 
