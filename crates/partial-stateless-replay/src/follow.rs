@@ -668,6 +668,9 @@ impl<'a> Follower<'a> {
                 // has to reach it or the flag would be silently ignored in follow mode.
                 retain_depth: options.retain_depth,
                 warm_shrink: options.warm_shrink,
+                // Follow mode replays a live producer; forcing reorgs on it would be forcing
+                // them on the chain. The batch driver is where the experiment runs.
+                forced_reorgs: Vec::new(),
             },
             tail: SpoolTail::new(dir, options.frame_limits),
             sink: VerdictSink::open(options)?,

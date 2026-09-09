@@ -94,6 +94,23 @@ impl VerifiedHistory {
             .find(|entry| entry.number == block.number && entry.hash == block.hash)
     }
 
+    /// The newest `depth` blocks this consumer verified, lowest first, and the block beneath them.
+    ///
+    /// `None` when the history does not reach `depth + 1` entries: a reorg has to name an
+    /// ancestor this consumer stands behind, and the entry it restored from is the oldest it has.
+    /// This is what a *forced* reorg is built from — the driver's own verified run, so the frame
+    /// it synthesises is one the suffix check below accepts by construction.
+    pub(crate) fn suffix(&self, depth: usize) -> Option<(BlockRef, Vec<BlockRef>)> {
+        if depth == 0 || self.entries.len() <= depth {
+            return None
+        }
+        let split = self.entries.len() - depth;
+        let as_ref = |entry: &VerifiedBlock| BlockRef { number: entry.number, hash: entry.hash };
+        let ancestor = as_ref(self.entries.get(split - 1)?);
+        let abandoned = self.entries.iter().skip(split).map(as_ref).collect();
+        Some((ancestor, abandoned))
+    }
+
     /// Drops everything above `number`, which an applied undo has just left the chain.
     fn rewind_above(&mut self, number: u64) {
         while self.entries.back().is_some_and(|entry| entry.number > number) {
@@ -366,7 +383,7 @@ pub(crate) fn warn_inapplicable(ancestor: BlockRef, depth: u64, detail: &str, bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{restore, PairConfig};
+    use crate::driver::{plan_forced_reorg, restore, PairConfig};
     use alloy_primitives::{keccak256, Address, U256};
     use alloy_rlp::Encodable;
     use partial_stateless::{
@@ -1092,6 +1109,82 @@ mod tests {
         assert!(!tick(&mut state), "a reset starts a new interval; one block does not close it");
         state.pair.cache.on_block_executed(ANCHOR_BLOCK + 3, &accessed);
         assert!(tick(&mut state), "and the second block does");
+    }
+
+    #[test]
+    fn a_suffix_names_the_newest_blocks_and_the_one_beneath_them() {
+        let seed = BlockRef { number: ANCHOR_BLOCK, hash: B256::with_last_byte(0x00) };
+        let mut history = VerifiedHistory::restored_at(seed, B256::ZERO, B256::ZERO);
+        let blocks: Vec<BlockRef> = (1..=3)
+            .map(|i| BlockRef { number: ANCHOR_BLOCK + i, hash: B256::with_last_byte(i as u8) })
+            .collect();
+        for block in &blocks {
+            history.record(*block, B256::ZERO, B256::ZERO);
+        }
+
+        let (ancestor, abandoned) = history.suffix(2).expect("four entries cover depth two");
+        assert_eq!(ancestor, blocks[0]);
+        assert_eq!(abandoned, vec![blocks[1], blocks[2]], "lowest first, as `Reorg.abandoned` is");
+        assert!(
+            history.is_canonical_suffix(&abandoned),
+            "built from the history it is checked against"
+        );
+
+        let (ancestor, abandoned) = history.suffix(3).expect("the seed can be the ancestor");
+        assert_eq!(ancestor, seed);
+        assert_eq!(abandoned, blocks);
+        assert!(history.suffix(4).is_none(), "nothing stands beneath the seed to return to");
+        assert!(history.suffix(0).is_none(), "a reorg of no blocks is not a reorg");
+    }
+
+    #[test]
+    fn a_forced_revert_built_from_the_history_is_one_the_pair_applies() {
+        // The synthesised frame has to pass the same shape, binding and suffix checks a recorded
+        // one does; the one thing the forced path changes is where the frame comes from.
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let blocks = advance_run(&mut state, 3);
+        let reorg = plan_forced_reorg(&state.history, &blocks, 2).expect("two of three held");
+        assert_eq!(reorg.common_ancestor, blocks[0]);
+        assert_eq!(reorg.abandoned, blocks[1..]);
+        assert!(reorg.winning_tip.is_none(), "the blocks given back are the winning branch");
+
+        let outcome = apply_reorg(&mut state, &reorg);
+        assert!(
+            matches!(&outcome, ReorgOutcome::Applied { revert: true, undone, .. } if *undone == blocks[1..]),
+            "a depth-2 revert of its own blocks, within K=2: {outcome:?}"
+        );
+        assert_eq!(state.history.tip(), Some(blocks[0]));
+
+        // One deeper than the pair retains is the D > K case the experiment also has to reach:
+        // refused, naming the ancestor, and nothing undone.
+        let (mut state, _) = restored_state_at_depth(depth(2));
+        let blocks = advance_run(&mut state, 3);
+        let reorg =
+            plan_forced_reorg(&state.history, &blocks, 3).expect("the seed is the ancestor");
+        let outcome = apply_reorg(&mut state, &reorg);
+        assert!(matches!(outcome, ReorgOutcome::Unrecoverable { depth: 3, .. }), "{outcome:?}");
+        assert_eq!(state.history.tip(), Some(blocks[2]), "a refusal gives nothing back");
+    }
+
+    #[test]
+    fn a_forced_reorg_is_not_built_from_frames_that_do_not_describe_the_history() {
+        let (mut state, _) = restored_state();
+        let blocks = advance_run(&mut state, 2);
+
+        assert_eq!(plan_forced_reorg(&state.history, &[], 1).unwrap_err().0, "buffer_mismatch");
+        let wrong = vec![BlockRef { number: blocks[1].number, hash: B256::with_last_byte(0xee) }];
+        assert_eq!(
+            plan_forced_reorg(&state.history, &wrong, 1).unwrap_err().0,
+            "buffer_mismatch",
+            "the same height on a different branch is not the block the history verified"
+        );
+        assert_eq!(
+            plan_forced_reorg(&state.history, &blocks, 3).unwrap_err().0,
+            "not_in_history",
+            "two blocks above the seed cannot name an ancestor three below the tip"
+        );
+        assert!(plan_forced_reorg(&state.history, &blocks, 2).is_ok());
+        assert!(plan_forced_reorg(&state.history, &blocks, 1).is_ok(), "a longer buffer is fine");
     }
 
     #[test]

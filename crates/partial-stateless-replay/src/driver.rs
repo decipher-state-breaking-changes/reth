@@ -13,28 +13,28 @@ use crate::{
     },
     mutate::{Mutation, TransitionMutation},
     reorg::{apply_reorg, warn_inapplicable, ReorgOutcome, VerifiedHistory},
-    spool::SpoolIter,
+    spool::{SpoolIter, SpooledFrame},
 };
 use alloy_rlp::Decodable;
 use partial_stateless::{
     restore_snapshot, CacheConfig, PartialStatelessSidecar, TrustedCheckpoint, WarmSetShrinkPolicy,
 };
 use partial_stateless_stream::{
-    BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, SnapshotChunk,
+    BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, Reorg, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
 use partial_stateless_validator::{
     admit_block, block_context,
     timings::{AdmissionTimings, ValidationPhaseTimings},
-    verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedPair, PayloadProvenance,
-    RetentionDepth, SidecarReexecLimits, TrieCacheDisposition, UntrustedAdmission, ValidatorRules,
-    POST_EXECUTION_REJECTION,
+    verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedFingerprint,
+    CoordinatedPair, PayloadProvenance, RetentionDepth, SidecarReexecLimits, TrieCacheDisposition,
+    UntrustedAdmission, ValidatorRules, POST_EXECUTION_REJECTION,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{Header, SealedHeader};
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{collections::VecDeque, path::Path, sync::Arc, time::Instant};
 use tracing::{error, info, warn};
 
 /// How much of a corpus to replay, and what to do beyond checking it.
@@ -91,6 +91,56 @@ pub struct ReplayOptions {
     /// Which side wins is a property of the workload, so it is an arm of a measurement rather than
     /// a setting with a known-good value.
     pub warm_shrink: WarmSetShrinkPolicy,
+    /// Reorgs to force, each fired after the commit of its block lands. Ascending by block.
+    ///
+    /// Empty by default. A forced reorg is a pure revert of the `depth` blocks the pair just
+    /// verified, followed by re-applying those same blocks from the spool: a recorded corpus
+    /// holds one branch, so the winning branch *is* the canonical one, and the check is that the
+    /// pair lands back on the fingerprint it had before the revert. It is the one way to put a
+    /// depth-K reorg in front of a pair without waiting for the chain to produce one. Holding the
+    /// frames it needs costs one clone per commit, so nothing is buffered unless one is scheduled.
+    pub forced_reorgs: Vec<ForcedReorg>,
+}
+
+/// One reorg a replay is told to force: after the commit of `at` lands, undo `depth` blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForcedReorg {
+    /// The block whose commit triggers it.
+    pub at: u64,
+    /// How many blocks to give back, `at` included.
+    pub depth: u64,
+}
+
+/// What one forced reorg did, and whether the pair came back.
+///
+/// `outcome` is `applied`, `refused` (the pair named the ancestor but could not undo that deep —
+/// the D > K case, which then waits for a checkpoint), `not_in_history` (the run since the last
+/// restore is shorter than `depth + 1`), `buffer_mismatch` (the frames held do not describe the
+/// blocks the history does, which a recorded reorg in between can cause), `not_reached` (the
+/// block was never committed), or `in_rewind_window`. A reorg that was applied but whose blocks
+/// were not all re-applied by the end of the corpus has `reapplied < depth` and no
+/// `resumed_identical`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForcedReorgOutcome {
+    pub at: u64,
+    pub depth: u64,
+    /// The commit frame's sequence it fired after.
+    pub sequence: u64,
+    pub outcome: &'static str,
+    pub detail: Option<String>,
+    /// `apply_reorg`'s wall clock: preflight, rollback, and the history rewind.
+    pub recovery_us: Option<u64>,
+    /// `standalone_validation_us` of the first block re-applied on the winning branch.
+    pub first_reapplied_commit_us: Option<u64>,
+    /// Blocks re-applied so far, and the sequences their timings carry in `blocks`, so an
+    /// aggregator can keep re-verdicts out of a latency population.
+    pub reapplied: u64,
+    pub reapplied_sequences: Vec<u64>,
+    /// Whether the pair's fingerprint and the history's tip after re-application equal what they
+    /// were before the revert. The claim the experiment exists to make.
+    pub resumed_identical: Option<bool>,
+    /// For a refused reorg: commits skipped before a checkpoint made the pair live again.
+    pub resumed_after_commits: Option<u64>,
 }
 
 impl ReplayOptions {
@@ -125,6 +175,7 @@ impl Default for ReplayOptions {
             max_rewind_frames: MAX_REWIND_FRAMES,
             retain_depth: RetentionDepth::ONE,
             warm_shrink: WarmSetShrinkPolicy::default(),
+            forced_reorgs: Vec::new(),
         }
     }
 }
@@ -232,6 +283,8 @@ pub struct ReplayReport {
     pub reorgs_inapplicable: u64,
     /// Commit frames not replayed because the driver was waiting to be re-bootstrapped.
     pub skipped_awaiting_resync: u64,
+    /// Every reorg this replay was told to force, in the order they fired.
+    pub forced_reorgs: Vec<ForcedReorgOutcome>,
     /// Checkpoints the producer published after a reorg this driver had already applied itself,
     /// verified against the pair's own state and then skipped rather than installed.
     pub checkpoints_skimmed: u64,
@@ -671,13 +724,16 @@ impl ReplayReport {
 /// lengths that matter.
 pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport> {
     let mut spool = SpoolIter::open(dir, &options.frame_limits)?;
+    let mut forced = ForcedReorgs::new(options);
 
     let mut report = ReplayReport::default();
     let mut phase = BatchPhase::AwaitingManifest;
     // The window opened by a restore that landed on its target, while it is being replayed.
     let mut rewind: Option<RewindWindow> = None;
 
-    while let Some(frame) = spool.next_frame()? {
+    while let Some(frame) = forced.next_frame(&mut spool)? {
+        forced.observe_phase(&phase, &mut report);
+        let reapply = forced.take_reapplying();
         // Whether the frame about to run is one the window is replaying. The count it feeds is
         // evidence that commits were *verified*, so it is incremented where the verdict is known
         // and not here: a fault on the first window commit skips the rest, and counting on entry
@@ -731,6 +787,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
         }
         let sequence = frame.header.sequence;
         let costs = FrameCosts::of(&frame);
+        forced.remember(&frame);
         let rewind_before = rewind;
         phase = match (phase, frame.event) {
             (phase, StreamEvent::Manifest(found)) => match phase {
@@ -919,7 +976,10 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
             ) => {
                 let (input, oracle) = commit.split();
                 let block = input.block;
-                match replay_commit(&mut state, input, &oracle, options, costs, &mut report) {
+                let outcome =
+                    replay_commit(&mut state, input, &oracle, options, costs, &mut report);
+                let compared = matches!(outcome, CommitOutcome::Compared);
+                match outcome {
                     CommitOutcome::Fault(fault) => {
                         error!(
                             target: "ps_replay",
@@ -961,13 +1021,30 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     }
                     CommitOutcome::Rejected => {}
                 }
-                BatchPhase::Live { manifest, state, announced, announced_at, pending_tip }
+                // A forced reorg fires on the block it names, and never inside a rewind window:
+                // the frames given back would carry sequences the window is already replaying.
+                let next = if compared && rewind.is_none() {
+                    forced.after_commit(&mut state, &mut report, sequence, block, reapply)
+                } else {
+                    Forced::Live
+                };
+                match next {
+                    Forced::Live => {
+                        BatchPhase::Live { manifest, state, announced, announced_at, pending_tip }
+                    }
+                    Forced::Resync { target_ancestor } => BatchPhase::AwaitingResync {
+                        manifest,
+                        target_ancestor: Some(target_ancestor),
+                        announced_at: Some(sequence),
+                    },
+                }
             }
             (
                 BatchPhase::AwaitingResync { manifest, target_ancestor, announced_at },
                 StreamEvent::Commit(_),
             ) => {
                 report.skipped_awaiting_resync += 1;
+                forced.note_skipped();
                 BatchPhase::AwaitingResync { manifest, target_ancestor, announced_at }
             }
             (_, StreamEvent::Commit(_)) => {
@@ -1151,6 +1228,285 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
 /// That arrangement could not represent a second checkpoint at all: the restore was one-shot and
 /// the chunk buffer was never cleared, so a corpus carrying a producer's recovery checkpoint was
 /// read as one checkpoint with two checkpoints' worth of chunks appended to it.
+/// The frames a forced reorg needs, and the verification it leaves pending.
+///
+/// Inert unless the run scheduled one: `remember` clones nothing and `next_frame` reads the
+/// spool straight through when the schedule is empty, so a cohort run carries none of this.
+struct ForcedReorgs {
+    /// What remains to fire, ascending by block.
+    schedule: VecDeque<ForcedReorg>,
+    /// The most recent commit frames, oldest first — as many as the deepest scheduled reorg needs.
+    recent: VecDeque<SpooledFrame>,
+    keep: usize,
+    /// Frames to run before the spool is read again: the blocks a forced reorg gave back.
+    queue: VecDeque<SpooledFrame>,
+    /// Set when the frame just handed out came from `queue`, and consumed by the loop.
+    reapplying: bool,
+    /// A forced reorg that was applied, until its blocks are re-applied and checked.
+    pending: Option<PendingReapply>,
+    /// A forced reorg that was refused, until a checkpoint makes the pair live again.
+    awaiting: Option<AwaitingResume>,
+}
+
+struct PendingReapply {
+    /// Index into `ReplayReport::forced_reorgs`.
+    index: usize,
+    /// What the history stood behind before the revert, and what it must stand behind after.
+    tip: BlockRef,
+    before: CoordinatedFingerprint,
+    remaining: u64,
+}
+
+struct AwaitingResume {
+    index: usize,
+    skipped: u64,
+}
+
+/// What a forced reorg did to the phase.
+enum Forced {
+    Live,
+    Resync { target_ancestor: BlockRef },
+}
+
+impl ForcedReorgs {
+    fn new(options: &ReplayOptions) -> Self {
+        let mut schedule: Vec<ForcedReorg> = options.forced_reorgs.clone();
+        schedule.sort();
+        let keep = schedule.iter().map(|job| job.depth as usize).max().unwrap_or(0);
+        Self {
+            schedule: schedule.into(),
+            recent: VecDeque::with_capacity(keep),
+            keep,
+            queue: VecDeque::new(),
+            reapplying: false,
+            pending: None,
+            awaiting: None,
+        }
+    }
+
+    /// The frames a reorg gave back run first, with their validation boundary reopened: the
+    /// original instant belongs to the first pass, and a re-verdict timed from it would carry
+    /// the whole interval in between.
+    fn next_frame(&mut self, spool: &mut SpoolIter) -> eyre::Result<Option<SpooledFrame>> {
+        if let Some(mut frame) = self.queue.pop_front() {
+            frame.validation_open = Instant::now();
+            frame.read_at = std::time::SystemTime::now();
+            self.reapplying = true;
+            return Ok(Some(frame))
+        }
+        spool.next_frame()
+    }
+
+    fn take_reapplying(&mut self) -> bool {
+        std::mem::take(&mut self.reapplying)
+    }
+
+    /// Holds a copy of every commit frame while something scheduled could still need it.
+    fn remember(&mut self, frame: &SpooledFrame) {
+        if self.keep == 0 || self.schedule.is_empty() && self.pending.is_none() {
+            return
+        }
+        if !matches!(frame.event, StreamEvent::Commit(_)) {
+            return
+        }
+        if self.recent.len() == self.keep {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(frame.clone());
+    }
+
+    fn note_skipped(&mut self) {
+        if let Some(awaiting) = &mut self.awaiting {
+            awaiting.skipped += 1;
+        }
+    }
+
+    /// A refused reorg is resolved the first time the pair is live again.
+    fn observe_phase(&mut self, phase: &BatchPhase, report: &mut ReplayReport) {
+        if matches!(phase, BatchPhase::Live { .. }) &&
+            let Some(awaiting) = self.awaiting.take()
+        {
+            report.forced_reorgs[awaiting.index].resumed_after_commits = Some(awaiting.skipped);
+        }
+    }
+
+    /// Runs after a compared commit of `block`: books a re-applied block against the pending
+    /// verification, or fires the reorg scheduled at this height.
+    fn after_commit(
+        &mut self,
+        state: &mut ReplayState,
+        report: &mut ReplayReport,
+        sequence: u64,
+        block: BlockRef,
+        reapply: bool,
+    ) -> Forced {
+        if reapply && let Some(pending) = &mut self.pending {
+            let outcome = &mut report.forced_reorgs[pending.index];
+            outcome.reapplied += 1;
+            outcome.reapplied_sequences.push(sequence);
+            if outcome.first_reapplied_commit_us.is_none() {
+                outcome.first_reapplied_commit_us =
+                    report.blocks.last().map(|timing| timing.standalone_validation_us);
+            }
+            pending.remaining -= 1;
+            if pending.remaining == 0 {
+                let identical = state.pair.fingerprint() == pending.before &&
+                    state.history.tip() == Some(pending.tip);
+                outcome.resumed_identical = Some(identical);
+                if !identical {
+                    report.failures.push(format!(
+                        "forced reorg at {}: the pair did not return to its pre-revert state                          after re-applying {} block(s)",
+                        outcome.at, outcome.depth
+                    ));
+                }
+                self.pending = None;
+            }
+            return Forced::Live
+        }
+        if self.pending.is_some() {
+            return Forced::Live
+        }
+        // Scheduled blocks the replay went past without committing — skipped while awaiting a
+        // resync, or inside a rewind window — are reported rather than silently dropped.
+        while let Some(job) = self.schedule.front().copied() &&
+            job.at < block.number
+        {
+            self.schedule.pop_front();
+            report.forced_reorgs.push(ForcedReorgOutcome::skipped(job, sequence, "not_reached"));
+        }
+        let Some(job) = self.schedule.front().copied().filter(|job| job.at == block.number) else {
+            return Forced::Live
+        };
+        self.schedule.pop_front();
+        self.fire(job, state, report, sequence, block)
+    }
+
+    fn fire(
+        &mut self,
+        job: ForcedReorg,
+        state: &mut ReplayState,
+        report: &mut ReplayReport,
+        sequence: u64,
+        block: BlockRef,
+    ) -> Forced {
+        let held: Vec<BlockRef> = self.recent.iter().filter_map(commit_block).collect();
+        let reorg = match plan_forced_reorg(&state.history, &held, job.depth) {
+            Ok(reorg) => reorg,
+            Err((outcome, detail)) => {
+                let mut skipped = ForcedReorgOutcome::skipped(job, sequence, outcome);
+                skipped.detail = detail;
+                report.forced_reorgs.push(skipped);
+                return Forced::Live
+            }
+        };
+        let before = state.pair.fingerprint();
+        let started = Instant::now();
+        let outcome = apply_reorg(state, &reorg);
+        let recovery_us = started.elapsed().as_micros() as u64;
+        let index = report.forced_reorgs.len();
+        match outcome {
+            ReorgOutcome::Applied { ancestor: at, undone, .. } => {
+                info!(
+                    target: "ps_replay",
+                    at = job.at,
+                    depth = job.depth,
+                    ancestor = at.number,
+                    recovery_us,
+                    "Forced a reorg; the blocks it gave back are re-applied next"
+                );
+                let frames = self.recent.len() - undone.len();
+                self.queue.extend(self.recent.drain(frames..));
+                self.pending =
+                    Some(PendingReapply { index, tip: block, before, remaining: job.depth });
+                report.forced_reorgs.push(ForcedReorgOutcome {
+                    outcome: "applied",
+                    recovery_us: Some(recovery_us),
+                    ..ForcedReorgOutcome::skipped(job, sequence, "applied")
+                });
+                Forced::Live
+            }
+            ReorgOutcome::Unrecoverable { ancestor: at, depth, detail } => {
+                warn_inapplicable(at, depth, &detail, true);
+                let mut outcome = ForcedReorgOutcome::skipped(job, sequence, "refused");
+                outcome.recovery_us = Some(recovery_us);
+                outcome.detail = Some(detail);
+                report.forced_reorgs.push(outcome);
+                self.awaiting = Some(AwaitingResume { index, skipped: 0 });
+                Forced::Resync { target_ancestor: at }
+            }
+            // A reorg built from this driver's own history cannot be unbound or malformed; if it
+            // is, the fixture that built it is wrong, and that is a failure of this run.
+            ReorgOutcome::Unbound { detail, .. } => {
+                report.failures.push(format!("forced reorg at {}: unbound: {detail}", job.at));
+                report.forced_reorgs.push(ForcedReorgOutcome::skipped(job, sequence, "unbound"));
+                Forced::Live
+            }
+            ReorgOutcome::Malformed { detail } => {
+                report.failures.push(format!("forced reorg at {}: malformed: {detail}", job.at));
+                report.forced_reorgs.push(ForcedReorgOutcome::skipped(job, sequence, "malformed"));
+                Forced::Live
+            }
+        }
+    }
+}
+
+impl ForcedReorgOutcome {
+    fn skipped(job: ForcedReorg, sequence: u64, outcome: &'static str) -> Self {
+        Self {
+            at: job.at,
+            depth: job.depth,
+            sequence,
+            outcome,
+            detail: None,
+            recovery_us: None,
+            first_reapplied_commit_us: None,
+            reapplied: 0,
+            reapplied_sequences: Vec::new(),
+            resumed_identical: None,
+            resumed_after_commits: None,
+        }
+    }
+}
+
+fn commit_block(frame: &SpooledFrame) -> Option<BlockRef> {
+    match &frame.event {
+        StreamEvent::Commit(commit) => Some(commit.input().block),
+        _ => None,
+    }
+}
+
+/// The revert a forced reorg applies, built from this driver's own verified run, or why it
+/// cannot be.
+///
+/// `held` is what the frame buffer describes, newest last. It must end in exactly the blocks the
+/// history's suffix names, compared by number and hash: a recorded reorg between the frames and
+/// now would leave the buffer describing a branch the history no longer stands behind, and
+/// re-applying it would verify the wrong blocks against the right ancestor. The result carries
+/// no winning tip — the blocks given back are re-applied as the winning branch.
+pub(crate) fn plan_forced_reorg(
+    history: &VerifiedHistory,
+    held: &[BlockRef],
+    depth: u64,
+) -> Result<Reorg, (&'static str, Option<String>)> {
+    let Some((ancestor, abandoned)) = history.suffix(depth as usize) else {
+        return Err(("not_in_history", None))
+    };
+    let matches =
+        held.len() >= abandoned.len() && held[held.len() - abandoned.len()..] == *abandoned;
+    if !matches {
+        return Err((
+            "buffer_mismatch",
+            Some(format!(
+                "held {} commit frame(s) ending at {:?}; the history's suffix ends at {:?}",
+                held.len(),
+                held.last().map(|block| block.number),
+                abandoned.last().map(|block| block.number)
+            )),
+        ))
+    }
+    Ok(Reorg { common_ancestor: ancestor, abandoned, winning_tip: None })
+}
+
 enum BatchPhase {
     /// Nothing accepted yet; the first frame must be the manifest.
     AwaitingManifest,

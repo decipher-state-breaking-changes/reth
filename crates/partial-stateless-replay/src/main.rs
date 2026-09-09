@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! ps-replay <spool-dir> [--limit N] [--no-mutations] [--mutations-transition [N]]
-//!           [--retain-depth N] [--warm-shrink N|never] [--json <path>] [--label <name>]
+//!           [--retain-depth N] [--warm-shrink N|never] [--forced-reorg D@N]... [--json <path>]
+//!           [--label <name>]
 //! ps-replay --follow <spool-dir> [--poll-ms N] [--max-blocks N] [--idle-timeout-secs N]
 //!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--retain-depth N]
 //!           [--warm-shrink N|never]
@@ -62,8 +63,8 @@ pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
 
 use partial_stateless::WarmSetShrinkPolicy;
 use partial_stateless_replay::{
-    follow, replay, FollowOptions, FollowOutcome, FollowReport, PairConfig, ReplayOptions,
-    ReplayReport,
+    follow, replay, FollowOptions, FollowOutcome, FollowReport, ForcedReorg, PairConfig,
+    ReplayOptions, ReplayReport,
 };
 use partial_stateless_stream::EndKind;
 use partial_stateless_validator::RetentionDepth;
@@ -95,7 +96,14 @@ fn main() -> eyre::Result<()> {
         return run_follow(&dir, &options)
     };
     if let Some(path) = &json {
-        write_manifest(path, "standalone_replay_v1", &label, &dir, options.pair_config())?;
+        write_manifest(
+            path,
+            "standalone_replay_v1",
+            &label,
+            &dir,
+            options.pair_config(),
+            &options.forced_reorgs,
+        )?;
     }
     let started = std::time::Instant::now();
     let report = replay(&dir, &options)?;
@@ -226,6 +234,7 @@ fn write_record(
         "late_skim_mismatches": report.late_skim_mismatches,
         "recovery_checkpoints_pending_at_end": report.recovery_checkpoints_pending_at_end,
         "skipped_awaiting_resync": report.skipped_awaiting_resync,
+        "forced_reorgs": report.forced_reorgs,
         "winning_branch_incomplete": report.winning_branch_incomplete,
         "winning_branches_superseded": report.winning_branches_superseded,
         "resyncs": report.resyncs,
@@ -249,6 +258,7 @@ fn write_manifest(
     label: &str,
     dir: &std::path::Path,
     pair: PairConfig,
+    forced_reorgs: &[ForcedReorg],
 ) -> eyre::Result<()> {
     use std::io::Write;
     let provenance = partial_stateless_stream::RunProvenance::collect(
@@ -278,6 +288,12 @@ fn write_manifest(
         // default and every run written before this axis existed. A number is the interval in
         // blocks, so the two arms of the shrink A/B are distinguishable from the manifest alone.
         "warm_shrink_blocks": pair.warm_shrink.interval().map(NonZeroU64::get),
+        // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
+        // repeated heights, and every forced reorg is also listed in the report. Empty otherwise.
+        "forced_reorgs": forced_reorgs
+            .iter()
+            .map(|job| format!("{}@{}", job.depth, job.at))
+            .collect::<Vec<_>>(),
         "provenance": provenance,
     });
     if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
@@ -291,7 +307,14 @@ fn write_manifest(
 /// Runs the live follower and maps its outcome onto the documented exit codes.
 fn run_follow(dir: &std::path::Path, options: &FollowOptions) -> eyre::Result<()> {
     if let Some(path) = &options.verdicts {
-        write_manifest(path, "standalone_follow_v1", &options.label, dir, options.pair_config())?;
+        write_manifest(
+            path,
+            "standalone_follow_v1",
+            &options.label,
+            dir,
+            options.pair_config(),
+            &[],
+        )?;
     }
     let started = std::time::Instant::now();
     let report = follow(dir, options)?;
@@ -529,6 +552,51 @@ fn parse_warm_shrink(raw: &str) -> eyre::Result<WarmSetShrinkPolicy> {
     Ok(NonZeroU64::new(blocks).map_or(WarmSetShrinkPolicy::Never, WarmSetShrinkPolicy::EveryBlocks))
 }
 
+/// Forced reorgs from `PS_FORCED_REORGS`, a comma-separated list of `D@N`; empty if unset.
+///
+/// Read before the flags, so `--forced-reorg` on the command line replaces the list rather than
+/// appending to it — a run sheet that exports a schedule and then names one on an arm gets that
+/// one. An unparseable entry is an error: a run that silently forced nothing would report a
+/// corpus with no reorgs as though the pair had survived them.
+fn forced_reorgs_from_env() -> eyre::Result<Vec<ForcedReorg>> {
+    match std::env::var("PS_FORCED_REORGS") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .split(',')
+            .map(|entry| {
+                parse_forced_reorg(entry)
+                    .map_err(|err| eyre::eyre!("PS_FORCED_REORGS entry {entry:?}: {err}"))
+            })
+            .collect(),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// `D@N`: undo `D` blocks after the commit of block `N` lands.
+fn parse_forced_reorg(raw: &str) -> eyre::Result<ForcedReorg> {
+    let raw = raw.trim();
+    let (depth, at) =
+        raw.split_once('@').ok_or_else(|| eyre::eyre!("{raw:?} is not `<depth>@<block>`"))?;
+    let depth: u64 = depth.trim().parse().map_err(|err| eyre::eyre!("depth {depth:?}: {err}"))?;
+    let at: u64 = at.trim().parse().map_err(|err| eyre::eyre!("block {at:?}: {err}"))?;
+    if depth == 0 {
+        eyre::bail!("a forced reorg of depth 0 undoes nothing")
+    }
+    Ok(ForcedReorg { at, depth })
+}
+
+/// Orders a schedule by block and refuses two reorgs at one height.
+///
+/// Two at one block would fire the second on a block the first is in the middle of re-applying,
+/// and its outcome would describe neither. A block inside another reorg's re-application span
+/// is allowed but reported as `not_reached`, since the driver goes past it without a fresh commit.
+fn check_forced_schedule(schedule: &mut [ForcedReorg]) -> eyre::Result<()> {
+    schedule.sort();
+    if let Some(pair) = schedule.windows(2).find(|pair| pair[0].at == pair[1].at) {
+        eyre::bail!("two forced reorgs are scheduled at block {}", pair[0].at)
+    }
+    Ok(())
+}
+
 fn parse_args() -> eyre::Result<Mode> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.iter().any(|arg| arg == "--follow") {
@@ -548,8 +616,10 @@ fn parse_args() -> eyre::Result<Mode> {
     let mut options = ReplayOptions {
         retain_depth: retain_depth_from_env()?,
         warm_shrink: warm_shrink_from_env()?,
+        forced_reorgs: forced_reorgs_from_env()?,
         ..ReplayOptions::default()
     };
+    let mut forced_from_flags: Vec<ForcedReorg> = Vec::new();
     let mut json = None;
     let mut label = "unlabelled".to_string();
     while let Some(arg) = args.next() {
@@ -590,6 +660,12 @@ fn parse_args() -> eyre::Result<Mode> {
                     .ok_or_else(|| eyre::eyre!("--warm-shrink needs an interval or 'never'"))?;
                 options.warm_shrink = parse_warm_shrink(&raw)?;
             }
+            "--forced-reorg" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--forced-reorg needs `<depth>@<block>`"))?;
+                forced_from_flags.push(parse_forced_reorg(&raw)?);
+            }
             "--json" => {
                 json = Some(PathBuf::from(
                     args.next().ok_or_else(|| eyre::eyre!("--json needs a path"))?,
@@ -603,13 +679,14 @@ fn parse_args() -> eyre::Result<Mode> {
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--mutations-transition [N]] \
                      [--force-restore-at <sequence>] [--retain-depth N] \
-                     [--warm-shrink N|never] [--json <path>] \
+                     [--warm-shrink N|never] [--forced-reorg D@N]... [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
                      [--json <path>] \
-                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth and PS_WARM_SHRINK \
-                     sets --warm-shrink; the flags win."
+                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
+                     sets --warm-shrink, and PS_FORCED_REORGS (D@N,D@N,...) sets --forced-reorg; \
+                     the flags win."
                 );
                 std::process::exit(0);
             }
@@ -618,6 +695,10 @@ fn parse_args() -> eyre::Result<Mode> {
         }
     }
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay <spool-dir> [--limit N]"))?;
+    if !forced_from_flags.is_empty() {
+        options.forced_reorgs = forced_from_flags;
+    }
+    check_forced_schedule(&mut options.forced_reorgs)?;
     Ok(Mode::Batch(Args { dir, options, json, label }))
 }
 
@@ -694,6 +775,32 @@ mod tests {
                 "{raw:?} should switch shrinking off"
             );
         }
+    }
+
+    #[test]
+    fn a_forced_reorg_parses_as_depth_at_block() {
+        assert_eq!(
+            parse_forced_reorg(" 3@25889650 ").expect("depth at block"),
+            ForcedReorg { at: 25889650, depth: 3 }
+        );
+        assert!(parse_forced_reorg("0@5").is_err(), "depth 0 undoes nothing");
+        assert!(parse_forced_reorg("3").is_err(), "no block");
+        assert!(parse_forced_reorg("x@5").is_err());
+        assert!(parse_forced_reorg("3@").is_err());
+    }
+
+    #[test]
+    fn a_schedule_is_ordered_and_refuses_two_reorgs_at_one_block() {
+        let mut schedule = vec![
+            ForcedReorg { at: 300, depth: 1 },
+            ForcedReorg { at: 100, depth: 3 },
+            ForcedReorg { at: 200, depth: 2 },
+        ];
+        check_forced_schedule(&mut schedule).expect("distinct blocks");
+        assert_eq!(schedule.iter().map(|job| job.at).collect::<Vec<_>>(), [100, 200, 300]);
+
+        let mut clash = vec![ForcedReorg { at: 100, depth: 1 }, ForcedReorg { at: 100, depth: 2 }];
+        assert!(check_forced_schedule(&mut clash).is_err());
     }
 
     #[test]

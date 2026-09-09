@@ -14,7 +14,10 @@ use partial_stateless_stream::{
 use std::{fs, path::Path, time::Instant};
 
 /// One frame as read back.
-#[derive(Debug)]
+///
+/// `Clone` so a forced reorg can hold the commits it is about to give back and run them again;
+/// the driver clones only when one is scheduled, so the ordinary path pays nothing for it.
+#[derive(Debug, Clone)]
 pub struct SpooledFrame {
     /// The frame's own header, which is where the sequence lives.
     pub header: FrameHeader,
