@@ -137,22 +137,27 @@ impl TrieCacheUndoFrame {
 
     /// Heap bytes the frame holds, as an estimate, storage tries included.
     ///
-    /// Charged the way [`crate::trie_cache::TrieCacheMemory`] charges the cache: every hash table
-    /// its buckets by hashbrown's sizing rule, every `Vec` its capacity. Not a reading of the
-    /// allocator, and it counts an `Arc`'d storage trie in full — several frames holding the same
-    /// old trie each count it, which is why a K-frame total unions
-    /// [`Self::shared_allocations`] instead of adding these.
+    /// [`Self::record_bytes`] plus [`Self::storage_bytes`]. Charged the way
+    /// [`crate::trie_cache::TrieCacheMemory`] charges the cache: every hash table its buckets by
+    /// hashbrown's sizing rule, every `Vec` its capacity. Not a reading of the allocator, and it
+    /// counts an `Arc`'d storage trie in full — several frames holding the same old trie each
+    /// count it, which is why a K-frame total unions [`Self::shared_allocations`] instead of
+    /// adding these.
     pub fn allocated_bytes(&self) -> usize {
+        self.record_bytes() + self.storage_bytes()
+    }
+
+    /// What this block's record itself weighs: everything the block *created*.
+    ///
+    /// The account-trie preimages, the membership preimages, and the frame's own containers —
+    /// bounded by what the block touched, and the half of the estimate that belongs on a per-block
+    /// record. Costs one pass over the recorded entries and nothing else, which is why it is
+    /// computed on every commit while [`Self::storage_bytes`] is not.
+    pub fn record_bytes(&self) -> usize {
         let nibble = std::mem::size_of::<Nibbles>();
         let mut bytes = std::mem::size_of::<Self>();
         bytes += self.account.as_ref().map_or(0, UndoFrame::allocated_bytes);
         bytes += self.storage.capacity() * std::mem::size_of::<(B256, StorageTrieBefore)>();
-        bytes += self
-            .storage
-            .iter()
-            .filter_map(|(_, before)| before.held())
-            .map(SparseTrie::memory_size)
-            .sum::<usize>();
         let delta = &self.membership.delta;
         bytes += hashbrown_table_bytes(
             delta.warm_accounts.capacity(),
@@ -192,6 +197,20 @@ impl TrieCacheUndoFrame {
         bytes
     }
 
+    /// What the frame keeps *alive*: the previous-version storage tries it holds by `Arc`.
+    ///
+    /// Not bytes the block created — those allocations already existed and the frame only stops
+    /// them being freed — which is why they are reported at the deque level rather than per block.
+    /// Costs a walk of every held trie, so it is memory-probe work: `SparseTrie::memory_size` is
+    /// linear in a trie's nodes and a block holds ~100 of them.
+    pub fn storage_bytes(&self) -> usize {
+        self.storage
+            .iter()
+            .filter_map(|(_, before)| before.retained())
+            .map(SparseTrie::memory_size)
+            .sum()
+    }
+
     /// Of [`Self::allocated_bytes`], the part no generation or other frame can be holding.
     ///
     /// The complement of [`Self::shared_allocations`] within the same total, so the two partition
@@ -212,7 +231,7 @@ impl TrieCacheUndoFrame {
     pub fn shared_allocations(&self) -> Vec<(usize, usize)> {
         self.storage
             .iter()
-            .filter_map(|(_, before)| before.held())
+            .filter_map(|(_, before)| before.shared())
             .map(|trie| (trie.allocation_id(), trie.memory_size()))
             .collect()
     }
@@ -268,8 +287,32 @@ pub(crate) enum StorageTrieBefore {
 }
 
 impl StorageTrieBefore {
-    /// The revealed trie behind a held handle, when there is one.
-    fn held(&self) -> Option<&SharedSparseTrie<CacheTrie>> {
+    /// The trie behind a held handle, revealed or blind-with-allocation.
+    ///
+    /// A blind slot that kept its allocation holds real bytes: `SparseStateTrie::memory_size`
+    /// counts it, so anything charging a frame for what it retains has to as well. Reading only
+    /// the revealed ones would let a frame report a storage trie held and no bytes to go with it.
+    fn retained(&self) -> Option<&SharedSparseTrie<CacheTrie>> {
+        match self {
+            Self::Held(trie) => match &**trie {
+                CacheStorageTrie::Revealed(inner) | CacheStorageTrie::Blind(Some(inner)) => {
+                    Some(inner)
+                }
+                CacheStorageTrie::Blind(None) => None,
+            },
+            Self::Absent => None,
+        }
+    }
+
+    /// The revealed trie behind a held handle, for identity.
+    ///
+    /// Revealed only, so a frame's shared half is the same population
+    /// `PartialTrieNodeCache::shared_allocations` reports and the two union without an asymmetry —
+    /// a blind allocation the live cache also holds would otherwise be charged to the deque
+    /// because the live side never listed it. It lands in the frame's unshared half instead, which
+    /// counts it once per frame holding it: an upper bound, in the same direction and for the same
+    /// reason as `exclusive_memory_bytes`'s.
+    fn shared(&self) -> Option<&SharedSparseTrie<CacheTrie>> {
         match self {
             Self::Held(trie) => trie.as_revealed_ref(),
             Self::Absent => None,
@@ -382,5 +425,69 @@ impl CacheUndoRecord {
         if self.membership.whole.is_none() {
             self.membership.whole = Some(Box::new(whole));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_trie_sparse::SparseTrie;
+
+    /// A frame holding one storage trie in the given slot state, and nothing else.
+    fn frame_holding(held: CacheStorageTrie) -> TrieCacheUndoFrame {
+        TrieCacheUndoFrame {
+            source: 2,
+            target: 1,
+            account: None,
+            storage: vec![(B256::ZERO, StorageTrieBefore::Held(Box::new(held)))],
+            membership: MembershipUndo::default(),
+            state_root: None,
+            synced_to_block: None,
+            warm_shrink: WarmShrink::default(),
+        }
+    }
+
+    #[test]
+    fn a_blind_slot_that_kept_its_allocation_is_charged_for_it() {
+        // `SparseStateTrie::memory_size` counts a blind slot that kept its trie, so a frame that
+        // reports the trie held and no bytes to go with it is under-reporting real retention —
+        // and `storage_tries_held` would say one while `allocated_bytes` said none.
+        let trie = SharedSparseTrie::new(CacheTrie::default());
+        let bytes = trie.memory_size();
+        assert!(bytes > 0, "even an empty trie holds something");
+
+        let blind = frame_holding(CacheStorageTrie::Blind(Some(Box::new(trie))));
+        assert_eq!(blind.counts().storage_tries_held, 1);
+        assert_eq!(blind.storage_bytes(), bytes, "the kept allocation is in the estimate");
+        assert_eq!(blind.allocated_bytes(), blind.record_bytes() + bytes);
+        assert!(
+            blind.record_bytes() > 0 && blind.record_bytes() < blind.allocated_bytes(),
+            "a trie the frame keeps alive is not part of what the block recorded"
+        );
+
+        // Identity is revealed-only, so the frame's shared half stays the same population
+        // `PartialTrieNodeCache::shared_allocations` reports and the two union without an
+        // asymmetry. The blind allocation lands in the unshared half instead.
+        assert!(blind.shared_allocations().is_empty());
+        assert!(blind.unshared_bytes() >= bytes);
+
+        // A slot with nothing behind it is charged nothing, and still counts as held: the frame
+        // has to put the absence back.
+        let empty = frame_holding(CacheStorageTrie::Blind(None));
+        assert_eq!(empty.counts().storage_tries_held, 1);
+        assert_eq!(empty.storage_bytes(), 0);
+        assert!(empty.allocated_bytes() < blind.allocated_bytes());
+    }
+
+    #[test]
+    fn a_revealed_slot_is_shared_by_identity_and_charged_once() {
+        let trie = SharedSparseTrie::new(CacheTrie::default());
+        let id = trie.allocation_id();
+        let revealed = frame_holding(CacheStorageTrie::Revealed(Box::new(trie)));
+
+        let shared = revealed.shared_allocations();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0, id);
+        assert_eq!(revealed.allocated_bytes(), revealed.unshared_bytes() + shared[0].1);
     }
 }

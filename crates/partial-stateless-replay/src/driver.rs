@@ -15,6 +15,7 @@ use crate::{
     reorg::{apply_reorg, warn_inapplicable, ReorgOutcome, VerifiedHistory},
     spool::{SpoolIter, SpooledFrame},
 };
+use alloy_primitives::B256;
 use alloy_rlp::Decodable;
 use partial_stateless::{
     restore_snapshot, CacheConfig, PartialStatelessSidecar, TrieCacheUndoCounts, TrustedCheckpoint,
@@ -446,11 +447,10 @@ pub struct BlockTiming {
     pub phases: PhaseLeaves,
     /// Aggregates derived from the leaves, kept so older metrics stay reconstructible.
     pub derived: DerivedTimings,
-    /// The undo frame this commit recorded, and what assembling it cost.
+    /// What ending this block's undo record cost, and the frame it produced.
     ///
-    /// `null` on every commit that kept its predecessor whole, which is every commit of a run that
-    /// is not recording and every commit of a depth-1 run. Not in `phases`: assembling the frame
-    /// happens inside `pair_commit_us`, so adding it beside the leaves would double count.
+    /// `null` unless the pair is recording. Not in `phases`: it happens inside `pair_commit_us`,
+    /// so adding it beside the leaves would double count.
     pub undo: Option<UndoFrameTiming>,
     /// The validator core's own `ValidationPhaseTimings`, verbatim, completed with the admission
     /// and sidecar-decode values the driver measured — the same completion the paired harness
@@ -458,21 +458,41 @@ pub struct BlockTiming {
     pub details: Option<Box<ValidationPhaseTimings>>,
 }
 
-/// One block's undo frame, as a run log records it.
+/// What ending one block's undo record cost, and the frame it produced.
 ///
-/// The distribution §6 step 5 is built from: what a block's record holds, what it is estimated to
-/// weigh, and what assembling it cost. What *recording* cost is not here and cannot be — it is a
-/// lookup per write spread across the whole block, and the A/B against a non-recording arm is what
-/// measures it.
+/// The distribution §6 step 5 is built from. What *recording* cost is not here and cannot be — it
+/// is a lookup per write spread across the whole block, and the A/B against a non-recording arm is
+/// what measures it.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct UndoFrameTiming {
+    /// Ending the block's journals and, when one came out of them, assembling the frame.
+    pub assemble_us: u64,
+    /// The frame, and the block it undoes. `null` when the commit ended a record without keeping
+    /// one — a depth-1 pair, a `Parallel` cache, a record that could not describe its block —
+    /// where `assemble_us` is the cost of ending the journals alone.
+    pub frame: Option<UndoFrameRecord>,
+}
+
+/// One undo frame as a run log records it.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct UndoFrameRecord {
+    /// The block applying this frame would undo, which is **not** the block on this record's line:
+    /// a frame is assembled from the record of the cache the commit displaces, so it describes the
+    /// block before. Carried rather than left to subtraction, which stops working the moment a
+    /// reorg repeats a height.
+    pub block: u64,
+    /// That block's hash, since a height does not name a block across a reorg.
+    pub block_hash: B256,
+    /// What the record itself weighs — the preimages and containers this block created.
+    ///
+    /// Not the frame's whole footprint: the previous-version storage tries it holds by `Arc` were
+    /// allocated by earlier blocks and are shared with older frames, so they are unioned across
+    /// the deque by the memory probe's `deque_frame_bytes` rather than added up per block.
+    /// `storage_tries_held` beside this says how many of them there are.
+    pub record_bytes: usize,
     /// What the frame holds, by kind.
     #[serde(flatten)]
     pub counts: TrieCacheUndoCounts,
-    /// The frame's estimated heap bytes, the storage tries it holds included.
-    pub bytes: usize,
-    /// Ending the journals, compacting them, and the storage-trie pointer diff.
-    pub assemble_us: u64,
 }
 
 /// The disjoint leaf phases of one standalone validation, in execution order.
@@ -1781,6 +1801,12 @@ deque_frames={deque_frames}\tdeque_frame_bytes={deque_frame_bytes}",
         // frames, and those are the two arms being compared.
         deque_full_generations = deque.full_generations,
         deque_frames = deque.frames,
+        // Unioned across the deque rather than reported per frame. A "newest frame" read off the
+        // deque cannot be told from a frame an earlier commit built: after an undo the deque's
+        // newest entry *is* a frame, correctly chained to the generation below it, and the next
+        // commit adds none — so a backwards search would report a stale size as this block's. What
+        // one block's record weighs is on the block's own line, where the commit that built it put
+        // it.
         deque_frame_bytes = deque.frame_bytes,
     );
 }
@@ -2531,10 +2557,17 @@ pub(crate) fn replay_commit(
         admitted.block.clone_sealed_header(),
         true,
     );
-    timer.undo = commit.undo.counts.map(|counts| UndoFrameTiming {
-        counts,
-        bytes: commit.undo.bytes,
+    // Recorded whenever the pair is recording, frame or no frame: at depth 1 no frame is kept and
+    // `assemble_us` is then the whole of what ending the record costs, which is the arm the A/B
+    // reads its baseline from.
+    timer.undo = state.pair.trie_cache.records_undo().then(|| UndoFrameTiming {
         assemble_us: commit.undo.us,
+        frame: commit.undo.frame.map(|frame| UndoFrameRecord {
+            block: frame.block_number,
+            block_hash: frame.block_hash,
+            record_bytes: frame.record_bytes,
+            counts: frame.counts,
+        }),
     });
     // Recorded from this replay's own execution, before the oracle is consulted, so that a reorg
     // arriving later authenticates its target against what this process verified rather than

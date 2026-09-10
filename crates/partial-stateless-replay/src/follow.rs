@@ -2738,6 +2738,10 @@ impl VerdictSink {
             "phases": timing.map(|timing| timing.phases),
             "derived": timing.map(|timing| timing.derived),
             "details": timing.and_then(|timing| timing.details.as_deref()),
+            // Present only on a recording run, and the reason it has to be here: a follower with
+            // `--undo-record` pays for the record every block and this line is the only place its
+            // result is written down.
+            "undo": timing.and_then(|timing| timing.undo),
             // A verdict this run re-derived on its way back to a watermark a previous run left.
             // Labelled rather than withheld: the line is real evidence that the two runs agreed
             // on the block, and a reader aggregating live throughput has to be able to skip it.

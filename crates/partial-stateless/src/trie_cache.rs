@@ -400,13 +400,18 @@ impl PartialTrieNodeCache {
         if record.poisoned || record.parent != parent.undo_id {
             return None
         }
-        // A slot that was blind when recording began and is revealed now moved a whole trie into
-        // existence, which no preimage describes. `account` is `None` on the other side of that
-        // too — a trie blind at both ends — and the two are told apart here and nowhere else.
-        if record.account_blind && account.is_some() {
+        // The slot's reveal state, *read* rather than inferred from whether a record came back. A
+        // trie that was blind when recording began and is revealed now has moved a whole trie into
+        // existence, which no preimage here describes — and its `take_undo` returns `None` exactly
+        // as a still-blind slot's does, because nothing ever told it to record. Inferring from
+        // `account` alone therefore mistakes a reveal for "blind throughout" and produces a frame
+        // that leaves the revealed content in place while claiming to be the generation below it.
+        let blind_now = self.sparse.state_trie_ref().is_none();
+        if blind_now != record.account_blind {
             return None
         }
-        if !record.account_blind && account.is_none() {
+        // Revealed at both ends, but no record: recording never began on this trie.
+        if blind_now != account.is_none() {
             return None
         }
         Some(TrieCacheUndoFrame {
@@ -2216,7 +2221,12 @@ mod tests {
         trie_cache_undo::TrieCacheUndoFrame,
         NetworkStateCache,
     };
-    use alloy_primitives::U256;
+    use alloy_primitives::{map::B256Map, U256};
+    use alloy_rlp::encode_fixed_size;
+    use reth_trie::test_utils::TrieTestHarness;
+    use reth_trie_common::ProofV2Target;
+    use reth_trie_sparse::{ExactSparseTrie, LeafUpdate};
+    use std::collections::BTreeMap;
 
     fn value_cache() -> NetworkStateCache {
         NetworkStateCache::new(
@@ -2935,6 +2945,137 @@ mod tests {
             "a record names the generation it restores, and this is not it"
         );
         assert!(!next.is_recording_undo(), "the record is ended either way");
+    }
+
+    /// A cache whose account trie is revealed over `harness` and holds real leaves.
+    ///
+    /// The fixtures above run on a blind account trie, which is what a cold cache has and what the
+    /// replay fixture's one-account snapshot amounts to. Nothing there moves account-trie
+    /// *content* across an undo, and the plumbing that carries the trie's own record through the
+    /// frame is exactly where a defect hides — so this builds a trie a block can actually change.
+    fn revealed_cache(harness: &TrieTestHarness, revealed: &[B256]) -> PartialTrieNodeCache {
+        let mut trie = ExactSparseTrie::default();
+        let root = harness.root_node();
+        trie.set_root(root.node, root.masks, false).expect("the harness root reveals");
+        let mut targets: Vec<_> = revealed.iter().map(|key| ProofV2Target::new(*key)).collect();
+        let (mut nodes, _) = harness.proof_v2(&mut targets);
+        trie.reveal_nodes(&mut nodes).expect("the harness proof reveals");
+        let state_root = trie.root();
+
+        let mut cache = PartialTrieNodeCache::new();
+        *cache.sparse_mut().trie_mut() =
+            RevealableSparseTrie::Revealed(Box::new(CacheTrie::Exact(trie)));
+        cache.set_state_root(state_root);
+        cache
+    }
+
+    /// Applies leaf changes the way a block does, revealing whatever the update asks for.
+    fn apply_leaves(
+        harness: &TrieTestHarness,
+        cache: &mut PartialTrieNodeCache,
+        changes: &[(B256, U256)],
+    ) -> B256 {
+        let mut updates: B256Map<LeafUpdate> = changes
+            .iter()
+            .map(|(key, value)| {
+                let rlp =
+                    if value.is_zero() { Vec::new() } else { encode_fixed_size(value).to_vec() };
+                (*key, LeafUpdate::Changed(rlp))
+            })
+            .collect();
+        let trie = cache
+            .sparse_mut()
+            .trie_mut()
+            .as_revealed_mut()
+            .expect("the fixture's account trie is revealed");
+        loop {
+            let mut targets = Vec::new();
+            trie.update_leaves(&mut updates, |key, min_len| {
+                targets.push(ProofV2Target::new(key).with_min_len(min_len));
+            })
+            .expect("the update applies");
+            if targets.is_empty() {
+                break
+            }
+            let (mut nodes, _) = harness.proof_v2(&mut targets);
+            trie.reveal_nodes(&mut nodes).expect("the harness answers what the update asked for");
+        }
+        trie.root()
+    }
+
+    #[test]
+    fn a_frame_carries_the_account_tries_own_changes_back() {
+        let entries: BTreeMap<B256, U256> = (0..64usize)
+            .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(i + 1)))
+            .collect();
+        let harness = TrieTestHarness::new(entries.clone());
+        let keys: Vec<B256> = entries.keys().copied().collect();
+        let mut live = revealed_cache(&harness, &keys);
+        live.set_undo_recording(true);
+
+        let control = live.clone();
+        let before_root = live.state_root().expect("the fixture is authenticated");
+
+        // Overwrites, a delete, and an insert of a key the trie has never held — the three shapes
+        // that move a Patricia trie's structure rather than only its values.
+        let (mut next, _) = live.clone_timed();
+        let changes = vec![
+            (keys[3], U256::from(999u64)),
+            (keys[17], U256::ZERO),
+            (keccak256(B256::from(U256::from(4_242usize))), U256::from(7u64)),
+        ];
+        let after_root = apply_leaves(&harness, &mut next, &changes);
+        next.set_state_root(after_root);
+        assert_ne!(
+            after_root, before_root,
+            "the block has to move the root or this proves nothing"
+        );
+
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded it");
+        let counts = frame.counts();
+        assert!(counts.account_nodes > 0, "the frame carries node preimages");
+        assert!(counts.account_values > 0, "and value preimages");
+
+        assert!(live.undo(frame));
+        assert_eq!(live.state_root(), Some(before_root));
+        assert!(
+            live.structurally_eq(&control),
+            "every revealed node and value is back where the block found it"
+        );
+        assert_eq!(
+            live.sparse_mut().trie_mut().as_revealed_mut().expect("revealed").root(),
+            before_root,
+            "and the trie recomputes the root it had, rather than only remembering it"
+        );
+    }
+
+    #[test]
+    fn an_account_trie_revealed_mid_block_produces_no_frame() {
+        // A blind slot has nothing to preimage and a trie still blind at the commit changed
+        // nothing, so both are recorded rather than poisoned. A slot that was blind and is
+        // revealed now is neither: a whole trie came into existence and no preimage describes it.
+        // Its `take_undo` returns `None` exactly as a still-blind slot's does — nothing ever told
+        // it to record — so the two are only distinguishable by asking the slot itself, and a
+        // frame produced here would restore the parent's identity over the child's content.
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        values.on_block_executed(1, &block_touching(0..50));
+        live.retain_from_value_cache(&values);
+        assert!(live.sparse_ref().state_trie_ref().is_none(), "the fixture starts blind");
+
+        let (mut next, _) = live.clone_timed();
+        values.on_block_executed(2, &block_touching(50..100));
+        next.retain_from_value_cache(&values);
+        *next.sparse_mut().trie_mut() = RevealableSparseTrie::revealed_empty();
+
+        let mut displaced = std::mem::replace(&mut live, next);
+        assert!(
+            live.take_undo_frame(&mut displaced).is_none(),
+            "a reveal is not a change any preimage in the record describes"
+        );
+        assert!(!live.is_recording_undo(), "the record is ended either way");
     }
 
     #[test]

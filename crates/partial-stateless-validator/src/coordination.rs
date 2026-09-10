@@ -374,6 +374,13 @@ impl CoordinatedPair {
         // move for each one that changed — and dropped in the same call. So a K=1 pair keeps
         // stage 1's deque exactly, and what recording costs it is the recording alone, which is
         // what makes it the clean baseline for that cost.
+        //
+        // Timed to exactly here and no further: ending both journals, dropping the preimages that
+        // turned out to describe no change, and the pointer comparison over the storage-trie map.
+        // Counting the frame, estimating its bytes and dropping the generation it replaces all
+        // happen below, because none of them is assembly and the byte estimate in particular
+        // walks every storage trie it holds — a cost the control arm does not pay, which inside
+        // this bracket would show up as recording being slower than it is.
         let started = Instant::now();
         let frame = match self.retained.back_mut().map(|held| &mut held.content) {
             Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
@@ -384,18 +391,21 @@ impl CoordinatedPair {
                 None
             }
         };
-        let mut report = CommitUndoReport::default();
+        let mut report = CommitUndoReport { frame: None, us: started.elapsed().as_micros() as u64 };
         if let Some(frame) = frame {
-            report.counts = Some(frame.counts());
-            report.bytes = frame.allocated_bytes();
+            report.frame = Some(CommitUndoFrame {
+                counts: frame.counts(),
+                // The record's own weight, which is one pass over the entries it holds. Its
+                // other half — the previous-version storage tries the frame keeps alive — is a
+                // walk of every one of them, and belongs to the memory probe rather than to
+                // every block.
+                record_bytes: frame.record_bytes(),
+                block_number,
+                block_hash,
+            });
             let held = self.retained.back_mut().expect("a frame is produced against a generation");
             held.content = RetainedContent::Frame(Box::new(frame));
         }
-        // Assembling the frame only: ending both journals, dropping the preimages that turned out
-        // to describe no change, and the pointer comparison over the storage-trie map. What
-        // *recording* costs is a lookup per write spread across the whole block and cannot be
-        // bracketed — §6 step 5 measures that as an A/B against the same binary not recording.
-        report.us = started.elapsed().as_micros() as u64;
 
         self.retained.push_back(RetainedGeneration::full(
             trie_cache,
@@ -570,11 +580,18 @@ impl CoordinatedPair {
     /// which is why no decision is taken here.
     pub fn cold_reset(&mut self) {
         // Cold means empty, not reconfigured: the pair keeps running on whatever trie
-        // representation and warm-set sizing policy it was constructed with, exactly as a fresh
-        // process would build it. The policy's interval state is not carried — the tables it was
-        // counting against no longer exist, so the reset starts a new interval.
+        // representation, warm-set sizing policy and undo-recording setting it was constructed
+        // with, exactly as a fresh process would build it. The sizing policy's interval state is
+        // not carried — the tables it was counting against no longer exist, so the reset starts a
+        // new interval — and neither is any record in progress, which described a cache that is
+        // gone.
         let mut trie_cache = PartialTrieNodeCache::new_with_repr(self.trie_cache.repr());
         trie_cache.set_warm_shrink_policy(self.trie_cache.warm_shrink_policy());
+        // Carried for the same reason as the sizing policy: a pair that rewarms after a gap has to
+        // come back on the arm it was started on. Silently reverting to whole generations would
+        // leave the manifest saying one thing and the deque doing another, which is exactly what a
+        // measured arm cannot afford.
+        trie_cache.set_undo_recording(self.trie_cache.records_undo());
         self.trie_cache = trie_cache;
         self.cache.reset();
         self.readiness.reset();
@@ -922,23 +939,50 @@ pub struct RetainedGeneration {
 pub struct CommitReport {
     /// Readiness after the transition, as a label.
     pub readiness: &'static str,
-    /// What this commit recorded, and what recording it cost.
+    /// What this commit recorded, and what ending the block's record cost.
     pub undo: CommitUndoReport,
 }
 
 /// The undo frame one commit produced, if it produced one.
 ///
-/// `counts` is `None` on every commit that kept its predecessor whole — recording off, depth 1, a
+/// `frame` is `None` on every commit that kept its predecessor whole — recording off, depth 1, a
 /// `Parallel` cache, or a record that could not describe its block — which is the same condition
-/// the deque's `full_generations` reports from the other side.
+/// the deque's `full_generations` reports from the other side. `us` is measured either way: a
+/// commit that ends a record and keeps nothing still paid for ending it, and at depth 1 that is
+/// the whole of what recording costs at commit time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitUndoReport {
-    /// What the frame holds, by kind.
-    pub counts: Option<TrieCacheUndoCounts>,
-    /// The frame's estimated heap bytes, storage tries included.
-    pub bytes: usize,
-    /// Assembling the frame: ending the journals, compacting them, and the storage pointer diff.
+    /// The frame, and the block it undoes.
+    pub frame: Option<CommitUndoFrame>,
+    /// Ending the block's journals and, when one came out of them, assembling the frame.
+    ///
+    /// Not the cost of *recording*, which is a lookup per write spread across the whole block and
+    /// is not bracketed anywhere — §6 step 5 measures that as an A/B against a non-recording arm.
     pub us: u64,
+}
+
+/// One frame, and which block it undoes.
+///
+/// The block is carried rather than left to the reader because it is **not** the block being
+/// committed: a frame is assembled from the record of the cache this commit displaces, which is
+/// the state after the *previous* block. Subtracting one recovers it only on a run with no reorgs
+/// and no rejections, and this is the code path that exists for runs that have both.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitUndoFrame {
+    /// What the frame holds, by kind.
+    pub counts: TrieCacheUndoCounts,
+    /// What the record itself weighs: the preimages and containers the block created.
+    ///
+    /// Not the frame's whole footprint. The previous-version storage tries it holds by `Arc` are
+    /// bytes the block kept *alive* rather than created, they are shared with older frames and the
+    /// live cache, and pricing them walks every one of them — so they are unioned at the deque
+    /// level by `retained_deque_bytes` instead of added up here.
+    pub record_bytes: usize,
+    /// The block applying this frame would undo.
+    pub block_number: u64,
+    /// That block's hash. A height alone does not name a block across a reorg, which is the same
+    /// reason a retained generation is tagged by hash.
+    pub block_hash: B256,
 }
 
 /// How one retained generation is held: whole, or as the diff that produces it.

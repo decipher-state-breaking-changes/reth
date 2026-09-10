@@ -1405,6 +1405,19 @@ mod tests {
     }
 
     #[test]
+    fn a_cold_reset_keeps_the_undo_recording_arm() {
+        // Same sentence as the sizing policy's: cold means empty, not reconfigured. A recording
+        // pair that rewarms after a gap has to come back on the arm it was started on, or the
+        // manifest says one thing and the deque quietly does another for the rest of the run.
+        let (mut state, _) = recording_state_at_depth(depth(3));
+        assert!(state.pair.trie_cache.records_undo());
+
+        state.pair.cold_reset();
+        assert!(state.pair.trie_cache.records_undo(), "the arm survives the reset");
+        assert_eq!(state.pair.retained_depth(), 0, "and the deque does not");
+    }
+
+    #[test]
     fn a_suffix_names_the_newest_blocks_and_the_one_beneath_them() {
         let seed = BlockRef { number: ANCHOR_BLOCK, hash: B256::with_last_byte(0x00) };
         let mut history = VerifiedHistory::restored_at(seed, B256::ZERO, B256::ZERO);
