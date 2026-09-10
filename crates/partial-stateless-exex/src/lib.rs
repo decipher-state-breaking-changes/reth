@@ -2278,8 +2278,9 @@ fn finish_committed_transition(
     retain_generation: bool,
 ) {
     let before = pair.last_readiness_label;
-    let after =
-        pair.commit_transition(displaced_trie_cache, block, accepted_head, retain_generation);
+    let after = pair
+        .commit_transition(displaced_trie_cache, block, accepted_head, retain_generation)
+        .readiness;
     pair.last_readiness_label = after;
     log_readiness_change(pair, block, before, after);
 }

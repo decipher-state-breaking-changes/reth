@@ -17,7 +17,8 @@ use crate::{
 };
 use alloy_rlp::Decodable;
 use partial_stateless::{
-    restore_snapshot, CacheConfig, PartialStatelessSidecar, TrustedCheckpoint, WarmSetShrinkPolicy,
+    restore_snapshot, CacheConfig, PartialStatelessSidecar, TrieCacheUndoCounts, TrustedCheckpoint,
+    WarmSetShrinkPolicy,
 };
 use partial_stateless_stream::{
     BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, Reorg, SnapshotChunk,
@@ -445,10 +446,33 @@ pub struct BlockTiming {
     pub phases: PhaseLeaves,
     /// Aggregates derived from the leaves, kept so older metrics stay reconstructible.
     pub derived: DerivedTimings,
+    /// The undo frame this commit recorded, and what assembling it cost.
+    ///
+    /// `null` on every commit that kept its predecessor whole, which is every commit of a run that
+    /// is not recording and every commit of a depth-1 run. Not in `phases`: assembling the frame
+    /// happens inside `pair_commit_us`, so adding it beside the leaves would double count.
+    pub undo: Option<UndoFrameTiming>,
     /// The validator core's own `ValidationPhaseTimings`, verbatim, completed with the admission
     /// and sidecar-decode values the driver measured — the same completion the paired harness
     /// performs. `null` when the transition never ran. A superset of `phases`: reference only.
     pub details: Option<Box<ValidationPhaseTimings>>,
+}
+
+/// One block's undo frame, as a run log records it.
+///
+/// The distribution §6 step 5 is built from: what a block's record holds, what it is estimated to
+/// weigh, and what assembling it cost. What *recording* cost is not here and cannot be — it is a
+/// lookup per write spread across the whole block, and the A/B against a non-recording arm is what
+/// measures it.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct UndoFrameTiming {
+    /// What the frame holds, by kind.
+    #[serde(flatten)]
+    pub counts: TrieCacheUndoCounts,
+    /// The frame's estimated heap bytes, the storage tries it holds included.
+    pub bytes: usize,
+    /// Ending the journals, compacting them, and the storage-trie pointer diff.
+    pub assemble_us: u64,
 }
 
 /// The disjoint leaf phases of one standalone validation, in execution order.
@@ -596,6 +620,7 @@ struct AttemptTimer {
     transition_us: Option<u64>,
     pair_commit_us: Option<u64>,
     undo_prune_us: Option<u64>,
+    undo: Option<UndoFrameTiming>,
     oracle_compare_us: Option<u64>,
     /// The primary wall, frozen before the oracle comparison so harness work stays outside it.
     validation_wall_us: Option<u64>,
@@ -617,6 +642,7 @@ impl AttemptTimer {
             transition_us: None,
             pair_commit_us: None,
             undo_prune_us: None,
+            undo: None,
             oracle_compare_us: None,
             validation_wall_us: None,
             core: None,
@@ -690,6 +716,7 @@ impl AttemptTimer {
             unattributed_validation_us: standalone_validation_us.saturating_sub(leaf_sum),
             phases,
             derived,
+            undo: self.undo,
             details: self.core,
         });
     }
@@ -1723,7 +1750,8 @@ retained_storage_paths_slices={storage_paths_slices}\t\
 deque_depth={deque_depth}\tdeque_generations={deque_generations}\t\
 deque_unshared={deque_unshared}\tdeque_shared_pool={deque_shared_pool}\t\
 deque_shared_allocations={deque_shared_allocations}\tdeque_total={deque_total}\t\
-deque_generation_sum={deque_generation_sum}",
+deque_generation_sum={deque_generation_sum}\tdeque_full_generations={deque_full_generations}\t\
+deque_frames={deque_frames}\tdeque_frame_bytes={deque_frame_bytes}",
         present = retained.present,
         total = retained.total_bytes,
         exclusive = retained.exclusive_bytes,
@@ -1748,6 +1776,12 @@ deque_generation_sum={deque_generation_sum}",
         // The union and the naive sum, side by side. They bracket the resident cost, and the first
         // K=3 run found them 46% apart — a gap no single-number report would have shown.
         deque_generation_sum = deque.generation_sum_bytes,
+        // How the deque is actually made up, which is the axis the hybrid moves. Reading the sum
+        // without it cannot tell a K=3 run of whole generations from a K=3 run of one and two
+        // frames, and those are the two arms being compared.
+        deque_full_generations = deque.full_generations,
+        deque_frames = deque.frames,
+        deque_frame_bytes = deque.frame_bytes,
     );
 }
 
@@ -2491,7 +2525,17 @@ pub(crate) fn replay_commit(
     let mut outcome = validated.outcome;
     let displaced = outcome.displaced_trie_cache.take();
     let commit_started = Instant::now();
-    state.pair.commit_transition(displaced, &block_ctx, admitted.block.clone_sealed_header(), true);
+    let commit = state.pair.commit_transition(
+        displaced,
+        &block_ctx,
+        admitted.block.clone_sealed_header(),
+        true,
+    );
+    timer.undo = commit.undo.counts.map(|counts| UndoFrameTiming {
+        counts,
+        bytes: commit.undo.bytes,
+        assemble_us: commit.undo.us,
+    });
     // Recorded from this replay's own execution, before the oracle is consulted, so that a reorg
     // arriving later authenticates its target against what this process verified rather than
     // against what the producer said about it. The cache root rides along because a late

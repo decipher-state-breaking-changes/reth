@@ -24,7 +24,7 @@ use partial_stateless::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
         TrustedCheckpoint,
     },
-    PartialTrieNodeCache, TrieCacheMemory, TrieCacheUndoFrame,
+    PartialTrieNodeCache, TrieCacheMemory, TrieCacheUndoCounts, TrieCacheUndoFrame,
 };
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -334,7 +334,7 @@ impl CoordinatedPair {
         block_number: u64,
         accepted_head: SealedHeader,
         enabled: bool,
-    ) {
+    ) -> CommitUndoReport {
         // Taken before the retention is rebuilt so the generation being kept carries the header it
         // was accepted under. An undo has to restore both together: rolling the caches back to the
         // parent while leaving the child's header in place would validate the replacement block
@@ -355,7 +355,7 @@ impl CoordinatedPair {
             // straight past the gap. The K = 1 form dropped its single slot here for the same
             // reason, stated as "a generation two blocks back, which K = 1 does not promise".
             self.retained.clear();
-            return
+            return CommitUndoReport::default()
         };
         // The generation this one was cloned from is the one its record describes, and this is the
         // one moment both objects exist side by side: the record was taken on the working copy
@@ -374,6 +374,7 @@ impl CoordinatedPair {
         // move for each one that changed — and dropped in the same call. So a K=1 pair keeps
         // stage 1's deque exactly, and what recording costs it is the recording alone, which is
         // what makes it the clean baseline for that cost.
+        let started = Instant::now();
         let frame = match self.retained.back_mut().map(|held| &mut held.content) {
             Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
                 trie_cache.take_undo_frame(parent)
@@ -383,10 +384,18 @@ impl CoordinatedPair {
                 None
             }
         };
+        let mut report = CommitUndoReport::default();
         if let Some(frame) = frame {
+            report.counts = Some(frame.counts());
+            report.bytes = frame.allocated_bytes();
             let held = self.retained.back_mut().expect("a frame is produced against a generation");
             held.content = RetainedContent::Frame(Box::new(frame));
         }
+        // Assembling the frame only: ending both journals, dropping the preimages that turned out
+        // to describe no change, and the pointer comparison over the storage-trie map. What
+        // *recording* costs is a lookup per write spread across the whole block and cannot be
+        // bracketed — §6 step 5 measures that as an A/B against the same binary not recording.
+        report.us = started.elapsed().as_micros() as u64;
 
         self.retained.push_back(RetainedGeneration::full(
             trie_cache,
@@ -397,6 +406,7 @@ impl CoordinatedPair {
         while self.retained.len() > self.retention_depth.as_usize() {
             self.retained.pop_front();
         }
+        report
     }
 
     /// Installs the displaced generation and records the transition with readiness, as one step.
@@ -413,8 +423,8 @@ impl CoordinatedPair {
         block: &BlockContext,
         accepted_head: SealedHeader,
         retain: bool,
-    ) -> &'static str {
-        self.retain_generation(
+    ) -> CommitReport {
+        let undo = self.retain_generation(
             displaced,
             block.parent_hash,
             block.number.saturating_sub(1),
@@ -422,7 +432,7 @@ impl CoordinatedPair {
             retain,
         );
         let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
-        self.readiness.finish_block(block, &observation).label()
+        CommitReport { readiness: self.readiness.finish_block(block, &observation).label(), undo }
     }
 
     /// What the retained generation costs right now, for the K = 1 memory control.
@@ -691,15 +701,24 @@ impl CoordinatedPair {
         // produced the generation now live. A frame applied to the wrong generation is a replay of
         // preimages onto content they do not describe: it corrupts silently and nothing downstream
         // can tell. So the links are proved here, where a refusal still costs nothing.
-        let mut expected = self.trie_cache.undo_id();
+        //
+        // `chain_base` is the cache each frame in the run below it will actually be applied to,
+        // which is what decides whether it *can* be — the representation, and whether the account
+        // trie is revealed. Neither moves when a frame is applied, so one check per run of frames
+        // covers all of them, and phase 2 is then unable to refuse.
+        let mut chain_base = &self.trie_cache;
+        let mut expected = chain_base.undo_id();
         for index in (base..self.retained.len()).rev() {
             let held = &self.retained[index];
             match &held.content {
                 // A whole copy re-bases the chain: everything below it hangs off this generation
                 // and nothing above it matters to the frames beneath.
-                RetainedContent::Full(trie_cache) => expected = trie_cache.undo_id(),
+                RetainedContent::Full(trie_cache) => {
+                    chain_base = trie_cache;
+                    expected = trie_cache.undo_id();
+                }
                 RetainedContent::Frame(frame) => {
-                    if frame.source() != expected || !self.trie_cache.can_undo(frame) {
+                    if frame.source() != expected || !chain_base.can_undo(frame) {
                         warn!(
                             target: "partial_stateless",
                             index,
@@ -892,6 +911,34 @@ pub struct RetainedGeneration {
     /// reset retains a trie it has no header for. Undoing into that is sound: the pair is warming,
     /// and [`CoordinatedPair::accepted_parent`] then reports absence rather than a guess.
     pub accepted_head: Option<SealedHeader>,
+}
+
+/// What one commit did beyond installing the block.
+///
+/// Returned rather than logged, because the two halves have different readers: the readiness label
+/// is what a run log prints per block, and the undo report is what §6 step 5's distribution is
+/// built from. A validator with no run log ignores both.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitReport {
+    /// Readiness after the transition, as a label.
+    pub readiness: &'static str,
+    /// What this commit recorded, and what recording it cost.
+    pub undo: CommitUndoReport,
+}
+
+/// The undo frame one commit produced, if it produced one.
+///
+/// `counts` is `None` on every commit that kept its predecessor whole — recording off, depth 1, a
+/// `Parallel` cache, or a record that could not describe its block — which is the same condition
+/// the deque's `full_generations` reports from the other side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommitUndoReport {
+    /// What the frame holds, by kind.
+    pub counts: Option<TrieCacheUndoCounts>,
+    /// The frame's estimated heap bytes, storage tries included.
+    pub bytes: usize,
+    /// Assembling the frame: ending the journals, compacting them, and the storage pointer diff.
+    pub us: u64,
 }
 
 /// How one retained generation is held: whole, or as the diff that produces it.
