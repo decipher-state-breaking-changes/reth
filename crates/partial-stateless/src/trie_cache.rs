@@ -11,6 +11,10 @@ use crate::{
     network_cache::{MembershipDelta, MissResult, NetworkStateCache},
     participant::ParticipantCache,
     shared_trie::{self, SharedSparseTrie},
+    trie_cache_undo::{
+        next_undo_id, CacheStorageTrie, CacheUndoRecord, MembershipUndo, MembershipWhole,
+        StorageTrieBefore, TrieCacheUndoFrame,
+    },
 };
 use alloy_primitives::{
     keccak256,
@@ -159,6 +163,24 @@ pub struct PartialTrieNodeCache {
     /// retention runs on the candidate snapshot, so a block that is refused discards the interval
     /// advance along with the trie it was counted against, and the parent's count is untouched.
     warm_shrink: WarmShrink,
+    /// Which generation this cache is, so a frame can name the two ends it joins.
+    ///
+    /// Fresh on every construction and on every clone. A retained generation is identified by
+    /// this and not by its block number, for the reason [`crate::trie_cache_undo`] gives:
+    /// mid-reorg a height names whichever block the database currently calls canonical.
+    undo_id: u64,
+    /// Whether a clone of this cache records what the block does to it.
+    ///
+    /// Carried through a clone the way the shrink policy is, so it is set once on the pair's live
+    /// cache and every working copy inherits it. Off by default: recording costs a lookup per
+    /// write on the hot path, and its holder has a correct fallback — keeping whole generations —
+    /// which is what a cache on the `Parallel` representation gets whatever this says.
+    record_undo: bool,
+    /// The record of what this block has done to this cache so far, when one is being kept.
+    ///
+    /// Only ever started by [`Self::clone_timed`]: a record describes the step from one generation
+    /// to the next, and a cache that was not cloned from anything has no such step to describe.
+    undo: Option<CacheUndoRecord>,
 }
 
 impl Clone for PartialTrieNodeCache {
@@ -220,20 +242,29 @@ impl PartialTrieNodeCache {
         timings.retained_paths_us = start.elapsed().as_micros() as u64;
         timings.retained_account_paths = retained_account_paths.len() as u64;
 
-        (
-            Self {
-                sparse,
-                repr: self.repr,
-                warm_accounts,
-                warm_storage,
-                state_root: self.state_root,
-                retained_storage_paths,
-                retained_account_paths,
-                synced_to_block: self.synced_to_block,
-                warm_shrink: self.warm_shrink,
-            },
-            timings,
-        )
+        let mut copy = Self {
+            sparse,
+            repr: self.repr,
+            warm_accounts,
+            warm_storage,
+            state_root: self.state_root,
+            retained_storage_paths,
+            retained_account_paths,
+            synced_to_block: self.synced_to_block,
+            warm_shrink: self.warm_shrink,
+            undo_id: next_undo_id(),
+            record_undo: self.record_undo,
+            undo: None,
+        };
+        // The working copy starts recording here and not a line later, because everything the
+        // block does to it — the transition, the retention pass, the prune — has to be inside the
+        // record for the frame to describe the whole step from this parent. The account trie's own
+        // clone already carries the record forward when the parent was recording; this begins one
+        // when it was not, and is a no-op when it was.
+        if copy.record_undo {
+            copy.begin_undo(self.undo_id);
+        }
+        (copy, timings)
     }
 }
 
@@ -264,6 +295,9 @@ impl PartialTrieNodeCache {
             retained_account_paths: Vec::new(),
             synced_to_block: None,
             warm_shrink: WarmShrink::default(),
+            undo_id: next_undo_id(),
+            record_undo: false,
+            undo: None,
         }
     }
 
@@ -283,6 +317,263 @@ impl PartialTrieNodeCache {
     /// The trie representation this cache runs on.
     pub const fn repr(&self) -> CacheTrieRepr {
         self.repr
+    }
+
+    /// Which generation this cache is.
+    ///
+    /// The identity a [`TrieCacheUndoFrame`] names at both ends. Stable for the life of the
+    /// object, changed only by [`Self::undo`], which makes the cache a different generation.
+    pub const fn undo_id(&self) -> u64 {
+        self.undo_id
+    }
+
+    /// Sets whether clones of this cache record what a block does to them.
+    ///
+    /// Set on the pair's live cache; every working copy inherits it through the clone, and so
+    /// does every generation the pair retains. Turning it off does not end a record already in
+    /// progress on *this* cache — that record describes a step this switch has no opinion about —
+    /// it decides what the next clone does.
+    pub const fn set_undo_recording(&mut self, record: bool) {
+        self.record_undo = record;
+    }
+
+    /// Whether clones of this cache record.
+    pub const fn records_undo(&self) -> bool {
+        self.record_undo
+    }
+
+    /// Whether this cache is keeping a record right now.
+    pub const fn is_recording_undo(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// Starts recording the step from the generation `parent` names.
+    ///
+    /// Private because a record has exactly one legitimate starting point: the clone that begins
+    /// a block. Starting one anywhere else would produce a frame that claims to describe a step
+    /// nothing took, and the whole recovery path downstream trusts that claim.
+    fn begin_undo(&mut self, parent: u64) {
+        let mut record =
+            CacheUndoRecord::new(parent, self.state_root, self.synced_to_block, self.warm_shrink);
+        match self.sparse.trie_mut().as_revealed_mut() {
+            Some(trie) => {
+                trie.begin_undo();
+                // `Parallel` carries no record, so a cache on it poisons here and its holder keeps
+                // whole generations. That is the two-representation split of section 5.1 landing
+                // at runtime rather than a second journal in `parallel.rs`.
+                record.poisoned = !trie.is_recording_undo();
+            }
+            // A blind slot holds nothing to preimage. Recorded rather than poisoned, because a
+            // trie still blind at the commit changed nothing; the reveal that ends that state is
+            // caught where the record is taken.
+            None => record.account_blind = true,
+        }
+        self.undo = Some(record);
+    }
+
+    /// Ends any record in progress, keeping nothing.
+    ///
+    /// The preimages a record holds are the block's, not the cache's, so a generation nobody will
+    /// ask for a frame from should not go on holding them.
+    pub fn clear_undo_record(&mut self) {
+        self.undo = None;
+        if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
+            drop(trie.take_undo());
+        }
+    }
+
+    /// Ends the record and returns the frame that turns this cache back into `parent`.
+    ///
+    /// `parent` is the generation this cache was cloned from and is consumed in the process: the
+    /// storage tries it holds and this cache no longer does are *moved* into the frame, because
+    /// the caller is about to drop it and a refcount bump would be a copy of a decision already
+    /// made. It is left holding blind placeholders for those addresses.
+    ///
+    /// `None` — with the record ended either way — when this cache was not recording, when the
+    /// record was poisoned, or when `parent` is not the generation the record describes. Every one
+    /// of those means the caller keeps `parent` whole instead, which is correct at any depth and
+    /// only costs memory.
+    pub fn take_undo_frame(&mut self, parent: &mut Self) -> Option<TrieCacheUndoFrame> {
+        let record = self.undo.take();
+        let account = self.sparse.trie_mut().as_revealed_mut().and_then(CacheTrie::take_undo);
+        let record = record?;
+        if record.poisoned || record.parent != parent.undo_id {
+            return None
+        }
+        // A slot that was blind when recording began and is revealed now moved a whole trie into
+        // existence, which no preimage describes. `account` is `None` on the other side of that
+        // too — a trie blind at both ends — and the two are told apart here and nowhere else.
+        if record.account_blind && account.is_some() {
+            return None
+        }
+        if !record.account_blind && account.is_none() {
+            return None
+        }
+        Some(TrieCacheUndoFrame {
+            source: self.undo_id,
+            target: parent.undo_id,
+            account,
+            storage: self.storage_undo_against(parent),
+            membership: record.membership,
+            state_root: record.state_root,
+            synced_to_block: record.synced_to_block,
+            warm_shrink: record.warm_shrink,
+        })
+    }
+
+    /// Whether a frame could be applied to this cache at all.
+    ///
+    /// The representation and the account trie's reveal state, checked before [`Self::undo`]
+    /// touches anything, so that call either does the whole undo or none of it.
+    pub fn can_undo(&self, frame: &TrieCacheUndoFrame) -> bool {
+        self.repr == CacheTrieRepr::Exact &&
+            (!frame.records_account_trie() || self.sparse.state_trie_ref().is_some())
+    }
+
+    /// Reverses `frame`, making this cache the generation the frame describes.
+    ///
+    /// The frame must have been taken from a cache whose content equalled this one's — which
+    /// [`TrieCacheUndoFrame::source`] against [`Self::undo_id`] is how a caller checks — with no
+    /// other change since. It is a replay of preimages and not a merge, so applying one to the
+    /// wrong generation corrupts silently; nothing below can detect it.
+    ///
+    /// Returns `false`, having changed nothing, when this cache cannot hold a frame at all. What
+    /// is deliberately *not* restored is the sparse state trie's scratch: the cleared-trie pool,
+    /// the rlp buffer, the deferred drops and the two LFUs. A working copy resets those every
+    /// block by building a fresh `SparseStateTrie`, an undone cache keeps whatever it had, and
+    /// none of them is read by `cache_root`, `retention_fingerprint` or `structurally_eq`. Warm-set
+    /// *capacity* is the same kind of difference and is the known price of a frame over a whole
+    /// generation: a generation carries the bucket count of its own creation, a frame does not
+    /// take one back.
+    #[must_use]
+    pub fn undo(&mut self, frame: TrieCacheUndoFrame) -> bool {
+        if !self.can_undo(&frame) {
+            return false
+        }
+        debug_assert_eq!(
+            self.undo_id, frame.source,
+            "a frame is being applied to a generation it was not recorded against"
+        );
+        // The record in progress described the content this call is about to replace.
+        self.clear_undo_record();
+
+        if let Some(account) = frame.account {
+            let applied = self
+                .sparse
+                .trie_mut()
+                .as_revealed_mut()
+                .expect("can_undo checked the account trie is revealed")
+                .undo(account);
+            debug_assert!(applied, "can_undo checked the representation carries a record");
+        }
+
+        let storage_tries = self.sparse.storage_tries_mut();
+        for (hashed_address, before) in frame.storage {
+            match before {
+                StorageTrieBefore::Held(trie) => {
+                    storage_tries.insert(hashed_address, *trie);
+                }
+                StorageTrieBefore::Absent => {
+                    storage_tries.remove(&hashed_address);
+                }
+            }
+        }
+
+        // The whole preimage first, then the delta recorded before the rebuild that produced it.
+        // With no rebuild there is no whole; with a rebuild before anything else there is no
+        // delta. The order is what makes the two-pass case exact rather than nearly right.
+        let MembershipUndo { whole, delta } = frame.membership;
+        if let Some(whole) = whole {
+            let MembershipWhole {
+                warm_accounts,
+                warm_storage,
+                retained_account_paths,
+                retained_storage_paths,
+            } = *whole;
+            self.warm_accounts = warm_accounts;
+            self.warm_storage = warm_storage;
+            self.retained_account_paths = retained_account_paths;
+            self.retained_storage_paths = retained_storage_paths;
+        }
+        for (address, was_present) in delta.warm_accounts {
+            if was_present {
+                self.warm_accounts.insert(address);
+            } else {
+                self.warm_accounts.remove(&address);
+            }
+        }
+        for (key, was_present) in delta.warm_storage {
+            if was_present {
+                self.warm_storage.insert(key);
+            } else {
+                self.warm_storage.remove(&key);
+            }
+        }
+        let mut restored = Vec::new();
+        let mut dropped = Vec::new();
+        for (path, was_present) in delta.account_paths {
+            if was_present {
+                restored.push(path);
+            } else {
+                dropped.push(path);
+            }
+        }
+        splice_sorted(&mut self.retained_account_paths, &mut restored, &dropped);
+        for (hashed_address, before) in delta.storage_paths {
+            match before {
+                Some(paths) => {
+                    self.retained_storage_paths.insert(hashed_address, paths);
+                }
+                None => {
+                    self.retained_storage_paths.remove(&hashed_address);
+                }
+            }
+        }
+
+        self.state_root = frame.state_root;
+        self.synced_to_block = frame.synced_to_block;
+        self.warm_shrink = frame.warm_shrink;
+        self.undo_id = frame.target;
+        true
+    }
+
+    /// The storage-trie half of the frame that turns this cache back into `parent`.
+    ///
+    /// A pointer comparison per retained trie and a move for the few that moved — 100 of ~3,630
+    /// on the measured corpus, p95 148 — rather than a hook inside `make_mut`, which would need a
+    /// per-block generation stamp on every handle to tell a first touch from a tenth. The two maps
+    /// exist side by side exactly once, at the commit that displaces `parent`, and that is the one
+    /// moment the comparison is available for free.
+    ///
+    /// An entry with no revealed trie behind it has no `Arc` to compare, so it is recorded rather
+    /// than assumed unchanged. Recording it costs nothing here: `parent` is being dropped, so the
+    /// handle is moved out of it.
+    fn storage_undo_against(&self, parent: &mut Self) -> Vec<(B256, StorageTrieBefore)> {
+        fn identity(trie: &CacheStorageTrie) -> Option<usize> {
+            trie.as_revealed_ref().map(SharedSparseTrie::allocation_id)
+        }
+
+        let mut undo = Vec::new();
+        let mine = self.sparse.storage_tries_ref();
+        for (hashed_address, held) in parent.sparse.storage_tries_mut() {
+            let unchanged = match (identity(held), mine.get(hashed_address).and_then(identity)) {
+                (Some(before), Some(now)) => before == now,
+                _ => false,
+            };
+            if !unchanged {
+                undo.push((
+                    *hashed_address,
+                    StorageTrieBefore::Held(Box::new(std::mem::take(held))),
+                ));
+            }
+        }
+        let held_before = parent.sparse.storage_tries_ref();
+        for hashed_address in mine.keys() {
+            if !held_before.contains_key(hashed_address) {
+                undo.push((*hashed_address, StorageTrieBefore::Absent));
+            }
+        }
+        undo
     }
 
     pub(crate) fn restore_from_decoded_multiproof(
@@ -438,6 +729,22 @@ impl PartialTrieNodeCache {
     fn retain_fully(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
         let mut timings = RetentionTimings::default();
 
+        // A rebuild replaces all four derived structures at once, so there is no delta to reverse
+        // and the record takes the whole previous state as one preimage — the same bulk rule
+        // `JournaledMap` applies to a map a `clear` empties. It is the one retention path that
+        // costs the record a copy proportional to the cache, and it is the path that runs on 0 of
+        // 10,005 blocks in the steady state: a rebuild is what a gap, a restore or a rollback
+        // forces, and every one of those clears the deque anyway.
+        let whole = self.undo.is_some().then(|| MembershipWhole {
+            warm_accounts: self.warm_accounts.clone(),
+            warm_storage: self.warm_storage.clone(),
+            retained_account_paths: self.retained_account_paths.clone(),
+            retained_storage_paths: self.retained_storage_paths.clone(),
+        });
+        if let Some((record, whole)) = self.undo.as_mut().zip(whole) {
+            record.record_whole(whole);
+        }
+
         let start = Instant::now();
         self.warm_accounts = value_cache.accounts().keys().copied().collect();
         self.warm_storage = value_cache.storage().keys().copied().collect();
@@ -509,6 +816,7 @@ impl PartialTrieNodeCache {
                 .entry(hashed)
                 .or_insert_with(|| (*address, self.is_retained_address(address, hashed)));
         }
+        self.record_warm_membership(delta);
         for address in &delta.accounts_removed {
             self.warm_accounts.remove(address);
         }
@@ -544,6 +852,7 @@ impl PartialTrieNodeCache {
 
         for (hashed_address, slots) in &moved {
             let updated = self.apply_slot_delta(*hashed_address, slots);
+            self.record_storage_paths(*hashed_address);
             if updated.is_empty() {
                 self.retained_storage_paths.remove(hashed_address);
             } else {
@@ -567,6 +876,7 @@ impl PartialTrieNodeCache {
                 _ => {}
             }
         }
+        self.record_account_paths(paths_added.iter().chain(&paths_removed));
         splice_sorted(&mut self.retained_account_paths, &mut paths_added, &paths_removed);
         timings.account_paths = self.retained_account_paths.len() as u64;
         timings.account_paths_us = start.elapsed().as_micros() as u64;
@@ -574,6 +884,51 @@ impl PartialTrieNodeCache {
         (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
         timings.record_storage_prune(self.prune_storage_tries(&moved, false));
         timings
+    }
+
+    /// Records what warm membership held for every key `delta` is about to move.
+    ///
+    /// First write wins: a key this block has already touched keeps the preimage from that first
+    /// touch, which is the only one that describes the generation the frame restores. Read from
+    /// the sets themselves rather than trusted from the delta's own added/removed split, so a
+    /// delta that disagreed with this cache's membership would produce a record that still puts
+    /// the cache back where it was.
+    fn record_warm_membership(&mut self, delta: &MembershipDelta) {
+        let Self { undo, warm_accounts, warm_storage, .. } = self;
+        let Some(record) = undo.as_mut().and_then(CacheUndoRecord::delta_mut) else { return };
+        for address in delta.accounts_removed.iter().chain(&delta.accounts_added) {
+            record.warm_accounts.entry(*address).or_insert_with(|| warm_accounts.contains(address));
+        }
+        for key in delta.storage_removed.iter().chain(&delta.storage_added) {
+            record.warm_storage.entry(*key).or_insert_with(|| warm_storage.contains(key));
+        }
+    }
+
+    /// Records what `retained_storage_paths` holds for `hashed_address` before it is replaced.
+    fn record_storage_paths(&mut self, hashed_address: B256) {
+        let Self { undo, retained_storage_paths, .. } = self;
+        let Some(record) = undo.as_mut().and_then(CacheUndoRecord::delta_mut) else { return };
+        record
+            .storage_paths
+            .entry(hashed_address)
+            .or_insert_with(|| retained_storage_paths.get(&hashed_address).cloned());
+    }
+
+    /// Records whether each of `paths` was in the retained account-path set before the splice.
+    ///
+    /// The caller has just computed these as the paths that enter and leave, so their preimages
+    /// are known — but they are looked up anyway, for the reason `record_warm_membership` gives
+    /// and because the set is sorted, which makes the lookup a binary search over a few hundred
+    /// keys rather than a scan.
+    fn record_account_paths<'a>(&mut self, paths: impl Iterator<Item = &'a Nibbles>) {
+        let Self { undo, retained_account_paths, .. } = self;
+        let Some(record) = undo.as_mut().and_then(CacheUndoRecord::delta_mut) else { return };
+        for path in paths {
+            record
+                .account_paths
+                .entry(*path)
+                .or_insert_with(|| retained_account_paths.binary_search(path).is_ok());
+        }
     }
 
     /// True when `address` is in the retained account-path set as the cache currently stands.
@@ -1285,7 +1640,7 @@ impl fmt::Display for WarmSetShrinkPolicy {
 ///
 /// `Copy`, so carrying it through a clone is a field assignment rather than a decision.
 #[derive(Debug, Clone, Copy, Default)]
-struct WarmShrink {
+pub(crate) struct WarmShrink {
     policy: WarmSetShrinkPolicy,
     blocks_since_shrink: u64,
     accounts_high_water: usize,
@@ -1497,7 +1852,7 @@ pub struct TrieBranchCensus {
 /// Still a heuristic: it is hashbrown's sizing rule restated, not a reading of the allocation, and
 /// it omits the trailing control group hashbrown replicates for its SIMD probe. Both are small
 /// against a table of this size, and neither is a reason to report a number that is knowably low.
-fn hashbrown_table_bytes(capacity: usize, entry_bytes: usize) -> usize {
+pub(crate) fn hashbrown_table_bytes(capacity: usize, entry_bytes: usize) -> usize {
     // hashbrown's `capacity_to_buckets`, which is the only place the mapping is defined.
     let buckets = match capacity {
         0 => return 0,
@@ -1858,6 +2213,7 @@ mod tests {
     use super::*;
     use crate::{
         policy::{AccountData, LastNBlocksPolicy},
+        trie_cache_undo::TrieCacheUndoFrame,
         NetworkStateCache,
     };
     use alloy_primitives::U256;
@@ -2427,5 +2783,184 @@ mod tests {
         ));
         assert!(!advance(&mut trie, &mut values, 2, 64..128).warm_shrink);
         assert!(advance(&mut trie, &mut values, 3, 128..192).warm_shrink);
+    }
+
+    /// Drives one block the way a commit does — onto a working copy, which then replaces the
+    /// live cache — and hands back the frame that turns the new live cache into the generation it
+    /// displaced, together with that generation.
+    ///
+    /// The frame is taken from the *committed* copy against the cache it was cloned from, which is
+    /// the same call the pair makes one commit later against the generation behind it.
+    fn commit_recorded(
+        live: &mut PartialTrieNodeCache,
+        values: &mut NetworkStateCache,
+        block: u64,
+        accessed: &BlockAccessedState,
+    ) -> (Option<TrieCacheUndoFrame>, PartialTrieNodeCache) {
+        let (mut next, _) = live.clone_timed();
+        values.on_block_executed(block, accessed);
+        next.retain_from_value_cache(values);
+        let mut displaced = std::mem::replace(live, next);
+        let frame = live.take_undo_frame(&mut displaced);
+        (frame, displaced)
+    }
+
+    /// What a frame has to put back, as one value.
+    fn committed_state(cache: &PartialTrieNodeCache) -> (B256, B256, Option<B256>, Option<u64>) {
+        (
+            cache.cache_root(),
+            cache.retention_fingerprint(),
+            cache.state_root(),
+            cache.synced_to_block,
+        )
+    }
+
+    #[test]
+    fn a_frame_puts_the_cache_back_where_the_block_found_it() {
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        // Warmed first, so the measured block moves membership that already exists rather than
+        // creating all of it: the delta path is the one the record has a shape for.
+        values.on_block_executed(1, &block_touching(0..200));
+        live.retain_from_value_cache(&values);
+        values.on_block_executed(2, &block_touching_slots(0..40));
+        live.retain_from_value_cache(&values);
+
+        let control = live.clone();
+        let expected = committed_state(&control);
+
+        // A block that adds accounts, drops others by aging them out of the two-block window, and
+        // moves one address's retained slot set.
+        let mut accessed = block_touching(180..320);
+        for (key, value) in block_touching_slots(20..60).storage {
+            accessed.storage.insert(key, value);
+        }
+        let (frame, displaced) = commit_recorded(&mut live, &mut values, 3, &accessed);
+        let frame = frame.expect("the working copy recorded the block");
+        assert_eq!(frame.source(), live.undo_id());
+        assert_eq!(frame.target(), displaced.undo_id());
+        assert_ne!(committed_state(&live), expected, "the block has to change something");
+
+        let counts = frame.counts();
+        assert!(!counts.membership_whole, "the incremental path leaves a delta, not a preimage");
+        assert!(counts.warm_accounts > 0, "the block moved warm accounts");
+        assert!(counts.storage_paths > 0, "the block moved one address's retained slot set");
+
+        assert!(live.undo(frame));
+        assert_eq!(committed_state(&live), expected);
+        assert_eq!(live.undo_id(), displaced.undo_id(), "the cache is that generation now");
+        assert!(live.structurally_eq(&control));
+    }
+
+    #[test]
+    fn a_retention_rebuild_is_recorded_as_one_whole_preimage() {
+        // The delta path is only taken when the value cache is exactly one block ahead of what the
+        // derived sets describe. Everything else rebuilds, and a rebuild replaces all four
+        // structures at once with no delta to reverse.
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        values.on_block_executed(1, &block_touching(0..200));
+        live.retain_from_value_cache(&values);
+
+        let control = live.clone();
+        let expected = committed_state(&control);
+
+        let (mut next, _) = live.clone_timed();
+        // Two blocks against one retention pass, which is the gap that forces the rebuild.
+        values.on_block_executed(2, &block_touching(200..260));
+        values.on_block_executed(3, &block_touching(260..320));
+        assert!(next.retain_from_value_cache(&values).full_rebuild);
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("a rebuild is still recorded");
+
+        assert!(frame.counts().membership_whole);
+        assert!(live.undo(frame));
+        assert_eq!(committed_state(&live), expected);
+        assert!(live.structurally_eq(&control));
+    }
+
+    #[test]
+    fn a_rebuild_after_a_delta_pass_is_recorded_as_both() {
+        // Two retention passes in one block, the second a rebuild. The whole preimage restores
+        // what that rebuild found — the state the *first* pass left — and only the delta recorded
+        // before it walks the rest of the way back. A record that kept just one of the two would
+        // land a block short or a block long, and both look like a working undo until compared.
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        values.on_block_executed(1, &block_touching(0..200));
+        live.retain_from_value_cache(&values);
+
+        let control = live.clone();
+        let expected = committed_state(&control);
+
+        let (mut next, _) = live.clone_timed();
+        values.on_block_executed(2, &block_touching(200..260));
+        assert!(!next.retain_from_value_cache(&values).full_rebuild, "one block ahead: the delta");
+        // A gap now, which is what sends the second pass down the rebuild path.
+        values.on_block_executed(3, &block_touching(260..320));
+        values.on_block_executed(4, &block_touching(320..380));
+        assert!(next.retain_from_value_cache(&values).full_rebuild, "two ahead: the rebuild");
+
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("both passes are recorded");
+        let counts = frame.counts();
+        assert!(counts.membership_whole, "the rebuild left a whole preimage");
+        assert!(counts.warm_accounts > 0, "and the pass before it left a delta");
+
+        assert!(live.undo(frame));
+        assert_eq!(committed_state(&live), expected);
+        assert!(live.structurally_eq(&control));
+    }
+
+    #[test]
+    fn a_frame_is_not_produced_for_a_generation_the_record_does_not_describe() {
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        values.on_block_executed(1, &block_touching(0..50));
+        live.retain_from_value_cache(&values);
+
+        let (mut next, _) = live.clone_timed();
+        values.on_block_executed(2, &block_touching(50..100));
+        next.retain_from_value_cache(&values);
+
+        // A sibling of the same parent, which is a different generation and not the one the
+        // record describes. Nothing about the two is distinguishable by height or content.
+        let mut stranger = live.clone();
+        assert!(
+            next.take_undo_frame(&mut stranger).is_none(),
+            "a record names the generation it restores, and this is not it"
+        );
+        assert!(!next.is_recording_undo(), "the record is ended either way");
+    }
+
+    #[test]
+    fn a_cache_that_does_not_record_produces_no_frame() {
+        let mut values = fast_forgetting_value_cache();
+        let mut live = PartialTrieNodeCache::new();
+        assert!(!live.records_undo(), "recording is off until a run asks for it");
+        values.on_block_executed(1, &block_touching(0..50));
+        live.retain_from_value_cache(&values);
+
+        let (frame, _) = commit_recorded(&mut live, &mut values, 2, &block_touching(50..100));
+        assert!(frame.is_none(), "no record, no frame — the holder keeps the generation whole");
+    }
+
+    #[test]
+    fn recording_is_inherited_by_a_working_copy_and_is_not_the_parents_record() {
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        assert!(!live.is_recording_undo(), "a cache nothing was cloned from records nothing");
+
+        let (child, _) = live.clone_timed();
+        assert!(child.records_undo());
+        assert!(child.is_recording_undo());
+        assert_ne!(child.undo_id(), live.undo_id(), "a clone is a different generation");
+
+        let (grandchild, _) = child.clone_timed();
+        assert_ne!(grandchild.undo_id(), child.undo_id());
     }
 }

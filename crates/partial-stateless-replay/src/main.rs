@@ -288,6 +288,10 @@ fn write_manifest(
         // default and every run written before this axis existed. A number is the interval in
         // blocks, so the two arms of the shrink A/B are distinguishable from the manifest alone.
         "warm_shrink_blocks": pair.warm_shrink.interval().map(NonZeroU64::get),
+        // The other configuration axis the retained deque has: false is stage 1's deque of whole
+        // generations, true holds everything below the newest as a diff. Absent on files written
+        // before the axis existed.
+        "undo_record": pair.undo_record,
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
         // repeated heights, and every forced reorg is also listed in the report. Empty otherwise.
         "forced_reorgs": forced_reorgs
@@ -552,6 +556,28 @@ fn parse_warm_shrink(raw: &str) -> eyre::Result<WarmSetShrinkPolicy> {
     Ok(NonZeroU64::new(blocks).map_or(WarmSetShrinkPolicy::Never, WarmSetShrinkPolicy::EveryBlocks))
 }
 
+/// Whether to record undo frames, from `PS_UNDO_RECORD`; off unless the run asks.
+///
+/// Read before the flags, like every other arm's variable. `1`, `on`, `true` and `yes` turn it on
+/// and `0`, `off`, `false` and `no` turn it off; anything else is an error rather than a fall back
+/// to the default, for the reason `warm_shrink_from_env` gives — an arm that asked to record and
+/// silently did not would be reported as a null result for the change.
+fn undo_record_from_env() -> eyre::Result<bool> {
+    match std::env::var("PS_UNDO_RECORD") {
+        Ok(raw) => parse_undo_record(&raw)
+            .map_err(|err| eyre::eyre!("PS_UNDO_RECORD={raw:?} is not a switch: {err}")),
+        Err(_) => Ok(false),
+    }
+}
+
+fn parse_undo_record(raw: &str) -> eyre::Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Ok(true),
+        "0" | "off" | "false" | "no" => Ok(false),
+        other => eyre::bail!("expected on or off, got {other:?}"),
+    }
+}
+
 /// Forced reorgs from `PS_FORCED_REORGS`, a comma-separated list of `D@N`; empty if unset.
 ///
 /// Read before the flags, so `--forced-reorg` on the command line replaces the list rather than
@@ -616,6 +642,7 @@ fn parse_args() -> eyre::Result<Mode> {
     let mut options = ReplayOptions {
         retain_depth: retain_depth_from_env()?,
         warm_shrink: warm_shrink_from_env()?,
+        undo_record: undo_record_from_env()?,
         forced_reorgs: forced_reorgs_from_env()?,
         ..ReplayOptions::default()
     };
@@ -660,6 +687,18 @@ fn parse_args() -> eyre::Result<Mode> {
                     .ok_or_else(|| eyre::eyre!("--warm-shrink needs an interval or 'never'"))?;
                 options.warm_shrink = parse_warm_shrink(&raw)?;
             }
+            "--undo-record" => {
+                // The value is optional so the flag alone means on, which is how an arm is usually
+                // written; an explicit `off` is there so one run sheet can drive both arms.
+                let on = match args.clone().next() {
+                    Some(next) if parse_undo_record(&next).is_ok() => {
+                        args.next();
+                        parse_undo_record(&next)?
+                    }
+                    _ => true,
+                };
+                options.undo_record = on;
+            }
             "--forced-reorg" => {
                 let raw = args
                     .next()
@@ -679,14 +718,16 @@ fn parse_args() -> eyre::Result<Mode> {
                     "ps-replay <spool-dir> [--limit N] [--no-mutations] \
                      [--mutations-transition [N]] \
                      [--force-restore-at <sequence>] [--retain-depth N] \
-                     [--warm-shrink N|never] [--forced-reorg D@N]... [--json <path>] \
+                     [--warm-shrink N|never] [--undo-record [on|off]] \
+                     [--forced-reorg D@N]... [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
+                     [--undo-record [on|off]] \
                      [--json <path>] \
                      [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
-                     sets --warm-shrink, and PS_FORCED_REORGS (D@N,D@N,...) sets --forced-reorg; \
-                     the flags win."
+                     sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, and PS_FORCED_REORGS \
+                     (D@N,D@N,...) sets --forced-reorg; the flags win."
                 );
                 std::process::exit(0);
             }
@@ -708,6 +749,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
     let mut options = FollowOptions {
         retain_depth: retain_depth_from_env()?,
         warm_shrink: warm_shrink_from_env()?,
+        undo_record: undo_record_from_env()?,
         ..FollowOptions::default()
     };
     while let Some(arg) = args.next() {
@@ -751,6 +793,18 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                     .next()
                     .ok_or_else(|| eyre::eyre!("--warm-shrink needs an interval or 'never'"))?;
                 options.warm_shrink = parse_warm_shrink(&raw)?;
+            }
+            "--undo-record" => {
+                // The value is optional so the flag alone means on, which is how an arm is usually
+                // written; an explicit `off` is there so one run sheet can drive both arms.
+                let on = match args.clone().next() {
+                    Some(next) if parse_undo_record(&next).is_ok() => {
+                        args.next();
+                        parse_undo_record(&next)?
+                    }
+                    _ => true,
+                };
+                options.undo_record = on;
             }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),
             other => return Err(eyre::eyre!("unexpected argument {other}")),

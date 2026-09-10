@@ -24,7 +24,7 @@ use partial_stateless::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
         TrustedCheckpoint,
     },
-    PartialTrieNodeCache, TrieCacheMemory,
+    PartialTrieNodeCache, TrieCacheMemory, TrieCacheUndoFrame,
 };
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -348,7 +348,7 @@ impl CoordinatedPair {
         // transition still copies the parent trie and still hands the copy back, so the control
         // arm pays exactly the work the production arm pays and differs only in what it keeps.
         // A control that also skipped the copy would be measuring two changes at once.
-        let Some(trie_cache) = enabled.then_some(displaced).flatten() else {
+        let Some(mut trie_cache) = enabled.then_some(displaced).flatten() else {
             // Retention is off, or the transition did not commit. Either way this pair can no
             // longer vouch for an unbroken run of generations down from its parent, and a deque
             // with a hole at its newest end is worse than an empty one: a depth-D undo would walk
@@ -357,12 +357,43 @@ impl CoordinatedPair {
             self.retained.clear();
             return
         };
-        self.retained.push_back(RetainedGeneration {
+        // The generation this one was cloned from is the one its record describes, and this is the
+        // one moment both objects exist side by side: the record was taken on the working copy
+        // that became this cache, and the copy it was taken from is the deque's newest entry. So
+        // the newest entry is demoted to the diff, and this cache takes its place as the one whole
+        // copy the chain of frames hangs off.
+        //
+        // Nothing is demoted when there is no record to demote it with — recording off, a
+        // `Parallel` cache, a retention pass with no delta shape, or a generation this cache was
+        // not cloned from, which is what the deque looks like immediately after an undo. The
+        // record is ended either way: its preimages are the block's, and a generation nobody will
+        // ask a frame from should not go on holding them.
+        //
+        // Not attempted at depth 1, where the entry that would be demoted is the one this push
+        // evicts: the frame would be built — a pointer comparison per retained storage trie and a
+        // move for each one that changed — and dropped in the same call. So a K=1 pair keeps
+        // stage 1's deque exactly, and what recording costs it is the recording alone, which is
+        // what makes it the clean baseline for that cost.
+        let frame = match self.retained.back_mut().map(|held| &mut held.content) {
+            Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
+                trie_cache.take_undo_frame(parent)
+            }
+            _ => {
+                trie_cache.clear_undo_record();
+                None
+            }
+        };
+        if let Some(frame) = frame {
+            let held = self.retained.back_mut().expect("a frame is produced against a generation");
+            held.content = RetainedContent::Frame(Box::new(frame));
+        }
+
+        self.retained.push_back(RetainedGeneration::full(
             trie_cache,
             block_hash,
             block_number,
-            accepted_head: displaced_accepted_head,
-        });
+            displaced_accepted_head,
+        ));
         while self.retained.len() > self.retention_depth.as_usize() {
             self.retained.pop_front();
         }
@@ -403,15 +434,30 @@ impl CoordinatedPair {
         let Some(retained) = self.retained.back() else {
             return RetainedGenerationBytes { enabled, ..Default::default() }
         };
-        let breakdown = retained.trie_cache.memory_breakdown();
-        RetainedGenerationBytes {
-            enabled,
-            present: true,
-            total_bytes: retained.trie_cache.estimated_memory_bytes(),
-            exclusive_bytes: retained.trie_cache.exclusive_memory_bytes(),
-            complete_total_bytes: breakdown.total_bytes(),
-            complete_exclusive_bytes: breakdown.exclusive_bytes(),
-            breakdown,
+        match &retained.content {
+            RetainedContent::Full(trie_cache) => {
+                let breakdown = trie_cache.memory_breakdown();
+                RetainedGenerationBytes {
+                    enabled,
+                    present: true,
+                    total_bytes: trie_cache.estimated_memory_bytes(),
+                    exclusive_bytes: trie_cache.exclusive_memory_bytes(),
+                    complete_total_bytes: breakdown.total_bytes(),
+                    complete_exclusive_bytes: breakdown.exclusive_bytes(),
+                    frame_bytes: 0,
+                    breakdown,
+                }
+            }
+            // Reachable only immediately after an undo, which leaves the deque's newest entry as
+            // the frame that produced the generation now live. Every other field stays zero rather
+            // than being estimated from the frame: they are defined against a whole cache, and a
+            // frame is not one.
+            RetainedContent::Frame(frame) => RetainedGenerationBytes {
+                enabled,
+                present: true,
+                frame_bytes: frame.allocated_bytes(),
+                ..Default::default()
+            },
         }
     }
 
@@ -438,9 +484,30 @@ impl CoordinatedPair {
 
         let mut pool: HashMap<usize, usize> = HashMap::default();
         let mut unshared = 0usize;
+        let mut sum = 0usize;
+        let mut full_generations = 0usize;
+        let mut frames = 0usize;
+        let mut frame_bytes = 0usize;
         for generation in &self.retained {
-            unshared = unshared.saturating_add(generation.trie_cache.unshared_bytes());
-            for (id, bytes) in generation.trie_cache.shared_allocations() {
+            // A frame partitions the same way a generation does — the storage tries it holds are
+            // `Arc`s an older frame or the live cache may hold too, and everything else is its
+            // own — so the two go through one union rather than being reported side by side.
+            let (own, shared) = match &generation.content {
+                RetainedContent::Full(trie_cache) => {
+                    full_generations += 1;
+                    sum = sum.saturating_add(trie_cache.memory_breakdown().total_bytes());
+                    (trie_cache.unshared_bytes(), trie_cache.shared_allocations())
+                }
+                RetainedContent::Frame(frame) => {
+                    frames += 1;
+                    let held = frame.allocated_bytes();
+                    frame_bytes = frame_bytes.saturating_add(held);
+                    sum = sum.saturating_add(held);
+                    (frame.unshared_bytes(), frame.shared_allocations())
+                }
+            };
+            unshared = unshared.saturating_add(own);
+            for (id, bytes) in shared {
                 // Inserted rather than added: the same allocation reached from two generations is
                 // one allocation. `live` is excluded here rather than subtracted afterwards, so a
                 // trie the pair still uses never enters the total in the first place.
@@ -453,15 +520,14 @@ impl CoordinatedPair {
 
         RetainedDequeBytes {
             generations: self.retained.len(),
+            full_generations,
+            frames,
+            frame_bytes,
             unshared_bytes: unshared,
             shared_pool_bytes,
             shared_allocations: pool.len(),
             total_bytes: unshared.saturating_add(shared_pool_bytes),
-            generation_sum_bytes: self
-                .retained
-                .iter()
-                .map(|generation| generation.trie_cache.memory_breakdown().total_bytes())
-                .fold(0usize, usize::saturating_add),
+            generation_sum_bytes: sum,
         }
     }
 
@@ -619,6 +685,45 @@ impl CoordinatedPair {
             }
         }
 
+        // The frames chain: each one names the generation it must be applied to, and the chain
+        // hangs off the deque's newest whole copy — or off the live cache, which is what the
+        // deque looks like immediately after an undo, when its newest entry is the frame that
+        // produced the generation now live. A frame applied to the wrong generation is a replay of
+        // preimages onto content they do not describe: it corrupts silently and nothing downstream
+        // can tell. So the links are proved here, where a refusal still costs nothing.
+        let mut expected = self.trie_cache.undo_id();
+        for index in (base..self.retained.len()).rev() {
+            let held = &self.retained[index];
+            match &held.content {
+                // A whole copy re-bases the chain: everything below it hangs off this generation
+                // and nothing above it matters to the frames beneath.
+                RetainedContent::Full(trie_cache) => expected = trie_cache.undo_id(),
+                RetainedContent::Frame(frame) => {
+                    if frame.source() != expected || !self.trie_cache.can_undo(frame) {
+                        warn!(
+                            target: "partial_stateless",
+                            index,
+                            frame_source = frame.source(),
+                            expected,
+                            "A retained frame does not describe the generation above it; rebuilding"
+                        );
+                        return None
+                    }
+                    expected = frame.target();
+                }
+            }
+            if held.undo_id != expected {
+                warn!(
+                    target: "partial_stateless",
+                    index,
+                    held = held.undo_id,
+                    expected,
+                    "A retained generation disagrees with what its own content produces; rebuilding"
+                );
+                return None
+            }
+        }
+
         // The flat side, proved to the same depth and mutating nothing. This is where a pruned
         // middle record or a missing memoized root is caught.
         let plan = match self.cache.can_rollback_to(ancestor_number) {
@@ -645,7 +750,7 @@ impl CoordinatedPair {
             return None
         }
 
-        let landed_root = self.retained[base].trie_cache.state_root();
+        let landed_root = self.retained[base].state_root;
         if landed_root != Some(ancestor_state_root) {
             warn!(
                 target: "partial_stateless",
@@ -707,16 +812,40 @@ impl CoordinatedPair {
             );
             return None
         }
-        // Split rather than looped. The generations above the landing one are dropped and the ones
-        // below are kept, so a second, shallower undo can still run against what this one left —
-        // and the landing generation is identified by index rather than by counting pops, which is
-        // where a D-times loop gets the off-by-one wrong.
+        // Split rather than looped. The generations above the landing one are consumed and the
+        // ones below are kept, so a second, shallower undo can still run against what this one
+        // left — and the landing generation is identified by index rather than by counting pops,
+        // which is where a D-times loop gets the off-by-one wrong.
         let mut given_back = self.retained.split_off(base);
-        let landed = given_back.pop_front().expect("the lineage check proved this index is held");
-        self.trie_cache = landed.trie_cache;
         // Restored together with the caches. Between here and the tracker swap the pair holds the
         // ancestor's header over the ancestor's caches, and both name the same generation.
-        self.accepted_head = landed.accepted_head;
+        let landed_head = given_back
+            .front_mut()
+            .expect("the lineage check proved this index is held")
+            .accepted_head
+            .take();
+        // Newest first: the whole copy at the top of the range, then every frame between it and
+        // the landing generation, each applied to what the one above it produced. A frame at the
+        // very top applies to the live cache in place, which is only reachable after a previous
+        // undo and is exactly what phase 1's chain check started from. Every step here was proved
+        // possible above and none of them can refuse.
+        let mut landed: Option<PartialTrieNodeCache> = None;
+        while let Some(held) = given_back.pop_back() {
+            match held.content {
+                RetainedContent::Full(trie_cache) => landed = Some(trie_cache),
+                RetainedContent::Frame(frame) => {
+                    let applied = match &mut landed {
+                        Some(landed) => landed.undo(*frame),
+                        None => self.trie_cache.undo(*frame),
+                    };
+                    debug_assert!(applied, "phase 1 proved every frame in the range applies");
+                }
+            }
+        }
+        if let Some(landed) = landed {
+            self.trie_cache = landed;
+        }
+        self.accepted_head = landed_head;
         self.readiness = next_readiness;
         Some(ready)
     }
@@ -742,7 +871,19 @@ pub struct CoordinatedFingerprint {
 /// database currently calls canonical, which is the failure the whole recovery path exists to
 /// avoid. `NetworkStateCache` needs no counterpart here — its undo log already reaches finality.
 pub struct RetainedGeneration {
-    pub trie_cache: PartialTrieNodeCache,
+    /// The generation itself, or the frame that produces it from the one above.
+    pub content: RetainedContent,
+    /// Which generation this is, as [`PartialTrieNodeCache::undo_id`] names it.
+    ///
+    /// What links a frame to the generation it applies to. Kept beside the content rather than
+    /// read out of it, because a frame's own `target` and this have to agree and a check needs two
+    /// sources to compare.
+    pub undo_id: u64,
+    /// The state root this generation is the state at.
+    ///
+    /// Held as a scalar because the depth-D preflight compares it against the canonical header's
+    /// before anything is mutated, and a generation held as a frame has no trie to ask.
+    pub state_root: Option<B256>,
     pub block_hash: B256,
     pub block_number: u64,
     /// Accepted head as of this generation, restored with it by a depth-1 undo.
@@ -751,6 +892,68 @@ pub struct RetainedGeneration {
     /// reset retains a trie it has no header for. Undoing into that is sound: the pair is warming,
     /// and [`CoordinatedPair::accepted_parent`] then reports absence rather than a guess.
     pub accepted_head: Option<SealedHeader>,
+}
+
+/// How one retained generation is held: whole, or as the diff that produces it.
+///
+/// The newest retained generation is always `Full` — it is the copy the block just committed read
+/// as its parent, so it exists whether or not anything keeps it, and the frame that would replace
+/// it is not recorded until the *next* block is committed. Everything older is a `Frame`, which is
+/// what makes depth K cost one copy and K-1 diffs instead of K copies. A pair whose cache does not
+/// record — the `Parallel` representation, or a run with recording off — holds `Full` throughout
+/// and behaves exactly as stage 1 did.
+// The gap between the two is the point: a whole cache measured 186 MiB on the corpus and a frame
+// is sized by one block. Boxing the cache to close a few hundred bytes of enum padding would put
+// an indirection on the path that reads it every block to save nothing measurable.
+#[expect(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum RetainedContent {
+    /// The whole cache.
+    Full(PartialTrieNodeCache),
+    /// What one block changed, applied to the generation above this one to produce it.
+    Frame(Box<TrieCacheUndoFrame>),
+}
+
+impl RetainedContent {
+    /// The whole cache, when this generation is held as one.
+    pub const fn full(&self) -> Option<&PartialTrieNodeCache> {
+        match self {
+            Self::Full(cache) => Some(cache),
+            Self::Frame(_) => None,
+        }
+    }
+
+    /// The frame, when this generation is held as one.
+    pub const fn frame(&self) -> Option<&TrieCacheUndoFrame> {
+        match self {
+            Self::Full(_) => None,
+            Self::Frame(frame) => Some(frame),
+        }
+    }
+}
+
+impl RetainedGeneration {
+    /// A generation held whole, which is how every one of them starts.
+    pub fn full(
+        trie_cache: PartialTrieNodeCache,
+        block_hash: B256,
+        block_number: u64,
+        accepted_head: Option<SealedHeader>,
+    ) -> Self {
+        Self {
+            undo_id: trie_cache.undo_id(),
+            state_root: trie_cache.state_root(),
+            content: RetainedContent::Full(trie_cache),
+            block_hash,
+            block_number,
+            accepted_head,
+        }
+    }
+
+    /// The whole cache, when this generation is held as one.
+    pub const fn trie_cache(&self) -> Option<&PartialTrieNodeCache> {
+        self.content.full()
+    }
 }
 
 /// What two coordinated pairs must agree on to have reached the same point the same way.
@@ -791,6 +994,12 @@ pub struct RetainedGenerationBytes {
     pub complete_total_bytes: usize,
     /// `complete_total_bytes` less the storage tries another generation also holds.
     pub complete_exclusive_bytes: usize,
+    /// What the newest generation's undo frame holds, when it is held as one rather than whole.
+    ///
+    /// Zero in the ordinary case: the newest retained generation is the copy the block just
+    /// committed read as its parent, so it is always whole. Non-zero only immediately after an
+    /// undo, and then every field above is zero — they are defined against a whole cache.
+    pub frame_bytes: usize,
     /// Where the two complete figures came from.
     pub breakdown: TrieCacheMemory,
 }
@@ -803,8 +1012,20 @@ pub struct RetainedGenerationBytes {
 pub struct RetainedDequeBytes {
     /// How many generations the figure covers. Zero means the deque is empty, not that it is free.
     pub generations: usize,
+    /// Of those, how many are held as whole caches.
+    ///
+    /// One in the steady state with recording on, and `generations` with it off. It is the number
+    /// the whole hybrid exists to hold down: a whole generation measured 186 MiB on the corpus,
+    /// and a frame is sized by what one block touched.
+    pub full_generations: usize,
+    /// Of those, how many are held as undo frames.
+    pub frames: usize,
+    /// What those frames hold, added with no deduplication — the frames' share of
+    /// [`Self::generation_sum_bytes`].
+    pub frame_bytes: usize,
     /// Summed over generations: the account trie, both warm sets, the retained account paths, and
-    /// the retained-storage-paths map. Nothing here can be shared, so summing is correct.
+    /// the retained-storage-paths map — and, for a generation held as a frame, everything it holds
+    /// beside the storage tries. Nothing here can be shared, so summing is correct.
     pub unshared_bytes: usize,
     /// Storage tries and retained-path slices reachable from the deque but not from the live
     /// cache, each counted once however many generations hold it.
@@ -818,7 +1039,8 @@ pub struct RetainedDequeBytes {
     /// points at is not freed by dropping the deque, so it is excluded here — and it is still
     /// resident. Use [`Self::generation_sum_bytes`] for a budget.
     pub total_bytes: usize,
-    /// Each generation's own complete size, added with no deduplication at all.
+    /// Each generation's own complete size — a frame's estimated bytes where it is one — added
+    /// with no deduplication at all.
     ///
     /// The other end of the range `total_bytes` opens. It over-counts anything two generations
     /// genuinely share and under-counts nothing, so the true resident cost of the deque is between

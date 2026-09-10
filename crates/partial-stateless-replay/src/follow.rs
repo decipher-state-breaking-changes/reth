@@ -82,12 +82,19 @@ pub struct FollowOptions {
     ///
     /// Defaults to never, which is today's behaviour. See [`ReplayOptions::warm_shrink`].
     pub warm_shrink: WarmSetShrinkPolicy,
+    /// Whether the pair holds its older generations as undo frames. See
+    /// [`ReplayOptions::undo_record`].
+    pub undo_record: bool,
 }
 
 impl FollowOptions {
     /// The subset of these options that configures the coordinated pair itself.
     pub const fn pair_config(&self) -> PairConfig {
-        PairConfig { retain_depth: self.retain_depth, warm_shrink: self.warm_shrink }
+        PairConfig {
+            retain_depth: self.retain_depth,
+            warm_shrink: self.warm_shrink,
+            undo_record: self.undo_record,
+        }
     }
 }
 
@@ -107,6 +114,7 @@ impl Default for FollowOptions {
             label: "unlabelled".to_string(),
             retain_depth: RetentionDepth::ONE,
             warm_shrink: WarmSetShrinkPolicy::default(),
+            undo_record: false,
         }
     }
 }
@@ -668,6 +676,7 @@ impl<'a> Follower<'a> {
                 // has to reach it or the flag would be silently ignored in follow mode.
                 retain_depth: options.retain_depth,
                 warm_shrink: options.warm_shrink,
+                undo_record: options.undo_record,
                 // Follow mode replays a live producer; forcing reorgs on it would be forcing
                 // them on the chain. The batch driver is where the experiment runs.
                 forced_reorgs: Vec::new(),

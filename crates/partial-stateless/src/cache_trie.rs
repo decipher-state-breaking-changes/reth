@@ -19,7 +19,7 @@ use reth_trie_common::{BranchNodeCompact, BranchNodeMasks, Nibbles, ProofTrieNod
 use reth_trie_sparse::{
     errors::SparseTrieResult, BranchSlotCensus, CloneBreakdown, CloneMeasureOptions,
     ExactSparseTrie, LeafLookup, LeafLookupError, LeafUpdate, ParallelSparseTrie, RetainOutcome,
-    RetentionOptions, SparseTrie, SparseTrieUpdates,
+    RetentionOptions, SparseTrie, SparseTrieUpdates, UndoFrame,
 };
 use std::borrow::Cow;
 
@@ -130,6 +130,52 @@ impl CacheTrie {
     /// Calls `f` with the path and cached hash of every node whose hash is current.
     pub fn for_each_cached_node_hash(&self, f: impl FnMut(&Nibbles, B256)) {
         delegate!(self => trie.for_each_cached_node_hash(f))
+    }
+
+    /// Starts keeping an undo record, if this representation has one.
+    ///
+    /// Only `Exact` carries the record. A cache built on `Parallel` reports `false` from
+    /// [`Self::is_recording_undo`] for the rest of the block and its holder keeps whole retained
+    /// generations instead of frames — the fallback the two-representation split has always had,
+    /// rather than a second journal to maintain in `parallel.rs`.
+    pub fn begin_undo(&mut self) {
+        match self {
+            Self::Parallel(_) => {}
+            Self::Exact(trie) => trie.begin_undo(),
+        }
+    }
+
+    /// Whether an undo record is being kept.
+    pub const fn is_recording_undo(&self) -> bool {
+        match self {
+            Self::Parallel(_) => false,
+            Self::Exact(trie) => trie.is_recording_undo(),
+        }
+    }
+
+    /// Stops recording and returns the record, or `None` if none was being kept.
+    pub fn take_undo(&mut self) -> Option<UndoFrame> {
+        match self {
+            Self::Parallel(_) => None,
+            Self::Exact(trie) => trie.take_undo(),
+        }
+    }
+
+    /// Reverses every change `frame` recorded, returning whether it could be applied.
+    ///
+    /// `false` means the frame reached a representation that cannot hold one, which only a caller
+    /// that mixed a frame from one cache with a trie from another can produce: `take_undo` hands
+    /// out a frame on `Exact` alone. Reported rather than asserted, because the recovery path this
+    /// serves has a fallback — rebuild — and no block to reject.
+    #[must_use]
+    pub fn undo(&mut self, frame: UndoFrame) -> bool {
+        match self {
+            Self::Parallel(_) => false,
+            Self::Exact(trie) => {
+                trie.undo(frame);
+                true
+            }
+        }
     }
 
     /// Counts branch child slots, blinded slots, and their depth distribution.

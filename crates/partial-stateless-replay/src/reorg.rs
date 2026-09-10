@@ -392,11 +392,12 @@ mod tests {
         policy::{AccountData, LastNBlocksPolicy},
         readiness::{BlockContext, CacheReadiness},
         sidecar::last_n_blocks_cache_policy_id,
-        BlockAccessedState, WarmSetShrinkPolicy,
+        BlockAccessedState, TrieCacheUndoFrame, WarmSetShrinkPolicy,
     };
     use partial_stateless_stream::{Checkpoint, Manifest};
     use partial_stateless_validator::{
-        admit_block, BlockAdmission, CoordinatedPair, RetainedGeneration, RetentionDepth,
+        admit_block, BlockAdmission, CoordinatedPair, RetainedContent, RetainedGeneration,
+        RetentionDepth,
     };
     use reth_chainspec::{EthChainSpec, MAINNET};
     use reth_primitives_traits::{Account, SealedHeader};
@@ -512,6 +513,25 @@ mod tests {
     /// The block is described as leaving the state root where it was, which is the only root this
     /// fixture's trie can authenticate; what is under test is the lifecycle, not the trie.
     fn advance(state: &mut ReplayState, number: u64, tag: u8, retain: bool) -> BlockRef {
+        advance_inner(state, number, tag, retain, false)
+    }
+
+    /// The same commit with the retention pass the working copy runs before it, which `advance`
+    /// leaves out because the interval tests count ticks by hand.
+    ///
+    /// This is the lifecycle an undo frame is recorded over, so it is what the tests that need a
+    /// frame to *carry* something use. The pass is the only thing between the two.
+    fn advance_retaining(state: &mut ReplayState, number: u64, tag: u8, retain: bool) -> BlockRef {
+        advance_inner(state, number, tag, retain, true)
+    }
+
+    fn advance_inner(
+        state: &mut ReplayState,
+        number: u64,
+        tag: u8,
+        retain: bool,
+        retention: bool,
+    ) -> BlockRef {
         let parent = state.history.tip().expect("seeded at the checkpoint");
         let state_root =
             state.pair.trie_cache.state_root().expect("restored trie is authenticated");
@@ -527,7 +547,16 @@ mod tests {
             AccountData { nonce: number, balance: U256::from(number), code_hash: None },
         );
         state.pair.cache.on_block_executed(number, &accessed);
-        let displaced = state.pair.trie_cache.clone();
+        // The real order, which the undo record depends on: the block is applied to a working copy
+        // of the live cache, the copy becomes live, and the cache it was cloned from is what the
+        // commit displaces. Taking a copy and handing *that* over instead leaves the pair holding
+        // a generation nothing was cloned from, which is content-identical here and not the same
+        // object — and a record names the generation it restores.
+        let (mut next, _) = state.pair.trie_cache.clone_timed();
+        if retention {
+            next.retain_from_value_cache(&state.pair.cache);
+        }
+        let displaced = std::mem::replace(&mut state.pair.trie_cache, next);
         let header = alloy_consensus::Header {
             number,
             parent_hash: parent.hash,
@@ -605,6 +634,245 @@ mod tests {
         assert!(revert, "no winning tip is a pure revert, at any depth");
         assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK);
         assert!(matches!(state.pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
+    /// A pair at `depth`, holding its older generations as frames rather than whole copies.
+    fn recording_state_at_depth(depth: RetentionDepth) -> (ReplayState, B256) {
+        restored_state_with(PairConfig {
+            retain_depth: depth,
+            undo_record: true,
+            ..Default::default()
+        })
+    }
+
+    /// What two pairs have to agree on to be at the same place, whatever their deques are made of.
+    ///
+    /// [`PairSnapshot`] itself cannot be compared across the two: it carries each generation's
+    /// cache root, which only a generation held whole can answer, and the whole point of the
+    /// hybrid is that most of them are not. Everything else in it must match exactly.
+    fn assert_same_place(hybrid: &mut CoordinatedPair, full: &mut CoordinatedPair) {
+        let left = snapshot(hybrid);
+        let right = snapshot(full);
+        assert_eq!(left.cache_block, right.cache_block);
+        assert_eq!(left.cache_root, right.cache_root);
+        assert_eq!(left.undo_log, right.undo_log);
+        assert_eq!(left.trie_state_root, right.trie_state_root);
+        assert_eq!(left.trie_cache_root, right.trie_cache_root);
+        assert_eq!(left.retention, right.retention);
+        assert_eq!(left.readiness, right.readiness);
+        assert_eq!(left.accepted_head, right.accepted_head);
+        let tags = |snapshot: &PairSnapshot| {
+            snapshot
+                .generations
+                .iter()
+                .map(|held| (held.0, held.1, held.2, held.3))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(&left), tags(&right), "the deques describe the same run of generations");
+        assert!(
+            hybrid.trie_cache.structurally_eq(&full.trie_cache),
+            "the account trie, every storage trie and both warm sets agree"
+        );
+        assert_eq!(
+            hybrid.trie_cache.retention_fingerprint(),
+            full.trie_cache.retention_fingerprint()
+        );
+    }
+
+    #[test]
+    fn the_hybrid_holds_one_whole_generation_and_the_rest_as_frames() {
+        let (mut state, _) = recording_state_at_depth(depth(3));
+        advance_retaining(&mut state, ANCHOR_BLOCK + 1, 0xa0, true);
+        advance_retaining(&mut state, ANCHOR_BLOCK + 2, 0xa1, true);
+        advance_retaining(&mut state, ANCHOR_BLOCK + 3, 0xa2, true);
+
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!(deque.generations, 3);
+        assert_eq!(
+            (deque.full_generations, deque.frames),
+            (1, 2),
+            "the newest generation is the copy the block just read as its parent; the rest are diffs"
+        );
+        // Deliberately no size claim. This fixture's whole generation is under 2 KB, so a
+        // frame's fixed struct cost dominates it and the ratio the hybrid exists for — 186 MiB of
+        // generation against a few hundred preimages — is not visible at this scale. The shape is
+        // what is testable here; the sizes are §6 step 5's, on the corpus.
+        assert!(deque.frame_bytes > 0, "a frame that holds nothing at all proves nothing");
+        assert!(
+            state
+                .pair
+                .retained
+                .iter()
+                .filter_map(|held| held.content.frame())
+                .all(TrieCacheUndoFrame::records_account_trie),
+            "the fixture's account trie is revealed, so every frame carries its record"
+        );
+
+        // The chain is what a rollback walks, and it is stated by the frames themselves: each one
+        // names the generation above it, and the newest hangs off the whole copy.
+        let held: Vec<u64> = state.pair.retained.iter().map(|held| held.undo_id).collect();
+        for (index, generation) in state.pair.retained.iter().enumerate() {
+            match &generation.content {
+                RetainedContent::Full(cache) => {
+                    assert_eq!(index, 2, "only the newest is whole");
+                    assert_eq!(cache.undo_id(), held[index]);
+                }
+                RetainedContent::Frame(frame) => {
+                    assert_eq!(frame.source(), held[index + 1]);
+                    assert_eq!(frame.target(), held[index]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_deque_of_frames_gives_back_what_a_deque_of_generations_gives_back() {
+        // The differential §6 step 4 asks for: the same run, undone to the same depth, against a
+        // deque of whole generations and against the hybrid that replaces all but one of them.
+        for undone in 1..=3u64 {
+            let (mut hybrid, _) = recording_state_at_depth(depth(3));
+            let (mut full, _) = restored_state_at_depth(depth(3));
+            let ancestor = hybrid.history.tip().expect("seeded");
+            assert_eq!(ancestor, full.history.tip().expect("seeded"), "one fixture, two pairs");
+
+            let mut run = Vec::new();
+            for offset in 0..3u64 {
+                let number = ANCHOR_BLOCK + 1 + offset;
+                let tag = 0xa0 + offset as u8;
+                run.push(advance_retaining(&mut hybrid, number, tag, true));
+                advance_retaining(&mut full, number, tag, true);
+            }
+            assert_same_place(&mut hybrid.pair, &mut full.pair);
+            assert_eq!(hybrid.pair.retained_deque_bytes().frames, 2);
+            assert_eq!(full.pair.retained_deque_bytes().frames, 0);
+
+            let landing = if undone == 3 { ancestor } else { run[2 - undone as usize] };
+            let abandoned = run[3 - undone as usize..].to_vec();
+            let outcome = apply_reorg(&mut hybrid, &reorg_of(landing, abandoned.clone(), None));
+            assert!(
+                matches!(outcome, ReorgOutcome::Applied { .. }),
+                "a depth-{undone} undo is inside what this pair retains"
+            );
+            let outcome = apply_reorg(&mut full, &reorg_of(landing, abandoned, None));
+            assert!(matches!(outcome, ReorgOutcome::Applied { .. }));
+
+            assert_eq!(hybrid.pair.cache.current_block(), landing.number);
+            assert_same_place(&mut hybrid.pair, &mut full.pair);
+        }
+    }
+
+    #[test]
+    fn a_second_undo_on_the_hybrid_runs_off_the_frame_the_first_left() {
+        // The one case where the deque's newest entry is *not* a whole copy: an undo consumes the
+        // whole copy and leaves the entry below it as a frame against the generation now live. A
+        // second, shallower undo has to hang its chain off the live cache, which is why phase 1's
+        // chain check starts there rather than at the deque's back.
+        let (mut hybrid, _) = recording_state_at_depth(depth(3));
+        let (mut full, _) = restored_state_at_depth(depth(3));
+        let ancestor = hybrid.history.tip().expect("seeded");
+        let mut run = Vec::new();
+        for offset in 0..3u64 {
+            let number = ANCHOR_BLOCK + 1 + offset;
+            let tag = 0xa0 + offset as u8;
+            run.push(advance_retaining(&mut hybrid, number, tag, true));
+            advance_retaining(&mut full, number, tag, true);
+        }
+
+        let mid = run[0];
+        assert!(matches!(
+            apply_reorg(&mut hybrid, &reorg_of(mid, run[1..].to_vec(), None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(mid, run[1..].to_vec(), None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert_eq!(hybrid.pair.retained_depth(), 1);
+        let left = hybrid.pair.retained.back().expect("one generation survived the split");
+        assert!(
+            matches!(left.content, RetainedContent::Frame(_)),
+            "the surviving entry is the frame the consumed copy hung off"
+        );
+        assert_eq!(
+            left.content.frame().expect("a frame").source(),
+            hybrid.pair.trie_cache.undo_id(),
+            "and it names the generation that is now live"
+        );
+        assert_same_place(&mut hybrid.pair, &mut full.pair);
+
+        assert!(matches!(
+            apply_reorg(&mut hybrid, &reorg_of(ancestor, vec![mid], None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(ancestor, vec![mid], None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert_eq!(hybrid.pair.cache.current_block(), ANCHOR_BLOCK);
+        assert_same_place(&mut hybrid.pair, &mut full.pair);
+    }
+
+    #[test]
+    fn a_commit_after_an_undo_puts_a_whole_copy_back_at_the_deques_newest_end() {
+        // The invariant that keeps the chain terminating. After an undo the newest entry is a
+        // frame; the next commit pushes the generation it names, which is the live cache — so the
+        // entry below is a frame against a whole copy again, and nothing was demoted with a record
+        // that describes a different step.
+        let (mut state, _) = recording_state_at_depth(depth(3));
+        let mut run = Vec::new();
+        for offset in 0..3u64 {
+            run.push(advance_retaining(
+                &mut state,
+                ANCHOR_BLOCK + 1 + offset,
+                0xa0 + offset as u8,
+                true,
+            ));
+        }
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(run[0], run[1..].to_vec(), None)),
+            ReorgOutcome::Applied { .. }
+        ));
+
+        advance_retaining(&mut state, ANCHOR_BLOCK + 2, 0xb1, true);
+        assert_eq!(state.pair.retained_depth(), 2);
+        let shape: Vec<bool> = state
+            .pair
+            .retained
+            .iter()
+            .map(|held| matches!(held.content, RetainedContent::Full(_)))
+            .collect();
+        assert_eq!(shape, vec![false, true], "a frame below, the whole copy back on top");
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!((deque.full_generations, deque.frames), (1, 1));
+    }
+
+    #[test]
+    fn a_recording_pair_at_depth_one_holds_what_stage_one_held() {
+        // The measurement's own baseline. At depth 1 the entry a demotion would produce is the one
+        // the next push evicts, so no frame is built and the deque is stage 1's — leaving the
+        // recording cost as the only difference between the two arms.
+        let (mut state, _) = recording_state_at_depth(depth(1));
+        for offset in 0..3u64 {
+            advance_retaining(&mut state, ANCHOR_BLOCK + 1 + offset, 0xa0 + offset as u8, true);
+        }
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (1, 1, 0));
+        assert!(
+            state.pair.trie_cache.records_undo(),
+            "recording is on; it just has no frame to keep"
+        );
+    }
+
+    #[test]
+    fn a_pair_that_is_not_recording_keeps_every_generation_whole() {
+        // The fallback the two-representation split and the measurement's control arm both rely
+        // on: with recording off nothing is demoted, and the deque is stage 1's exactly.
+        let (mut state, _) = restored_state_at_depth(depth(3));
+        assert!(!state.pair.trie_cache.records_undo());
+        advance_run(&mut state, 3);
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!((deque.full_generations, deque.frames), (3, 0));
+        assert_eq!(deque.frame_bytes, 0);
     }
 
     #[test]
@@ -779,9 +1047,10 @@ mod tests {
         assert_eq!(deque.generations, 3);
         assert_eq!(deque.total_bytes, deque.unshared_bytes + deque.shared_pool_bytes);
 
+        assert_eq!(deque.full_generations, 3, "recording is off, so every generation is whole");
+
         // A union can never exceed the sum it replaces, whatever the population.
-        let one = state.pair.retained_generation_bytes(true);
-        assert!(deque.total_bytes <= one.complete_exclusive_bytes * 3);
+        assert!(deque.total_bytes <= deque.generation_sum_bytes);
 
         // This fixture is a one-account snapshot whose blocks touch no storage, so it holds no
         // revealed storage tries and no retained-path slices — there is nothing to share, and the
@@ -790,7 +1059,16 @@ mod tests {
         // The sharing case itself is covered where a cache can actually have it, in
         // `trie_cache`'s `a_clone_shares_its_retained_path_slices_by_identity`.
         assert_eq!(deque.shared_pool_bytes, 0, "this fixture has nothing shareable");
-        assert_eq!(deque.total_bytes, one.complete_exclusive_bytes * 3);
+        assert_eq!(deque.total_bytes, deque.generation_sum_bytes);
+
+        // Three times the newest generation is *not* the yardstick, and the run compares against
+        // the sum instead. The oldest generation here is the cache the pair was restored with and
+        // the ones above it are clones of it; `Vec::clone` allocates for the length rather than the
+        // capacity, so a clone is strictly smaller than what it was cloned from. Multiplying one
+        // reading is exactly the mistake §4.3 has the sum to avoid.
+        let one = state.pair.retained_generation_bytes(true);
+        assert!(one.present && one.frame_bytes == 0);
+        assert!(deque.total_bytes >= one.complete_exclusive_bytes);
 
         // Nothing the live cache still points at is charged to the deque — it would not be freed
         // by dropping it. Asserted by identity rather than by arithmetic on the totals.
@@ -800,7 +1078,12 @@ mod tests {
             .pair
             .retained
             .iter()
-            .flat_map(|generation| generation.trie_cache.shared_allocations())
+            .flat_map(|generation| {
+                generation
+                    .trie_cache()
+                    .expect("recording is off in this fixture, so every generation is whole")
+                    .shared_allocations()
+            })
             .map(|(id, _)| id)
             .filter(|id| !live.contains(id))
             .collect();
@@ -837,12 +1120,12 @@ mod tests {
 
         state.pair.retained.clear();
         for offset in 0..3u64 {
-            state.pair.retained.push_back(RetainedGeneration {
-                trie_cache: warm.clone(),
-                block_hash: B256::with_last_byte(offset as u8),
-                block_number: offset,
-                accepted_head: None,
-            });
+            state.pair.retained.push_back(RetainedGeneration::full(
+                warm.clone(),
+                B256::with_last_byte(offset as u8),
+                offset,
+                None,
+            ));
         }
 
         let deque = state.pair.retained_deque_bytes();
@@ -893,6 +1176,10 @@ mod tests {
         assert_eq!(deque.generation_sum_bytes, 0);
     }
 
+    /// One retained generation as a snapshot describes it: block number, block hash, the header
+    /// it carries, its state root, and its cache root where it is held whole.
+    type GenerationTag = (u64, B256, Option<(u64, B256)>, Option<B256>, Option<B256>);
+
     /// Everything §4.4's invariance table calls "untouched", in one comparable value.
     ///
     /// Wider than `structurally_eq` and `retention_fingerprint` on purpose. Those cover the trie's
@@ -909,8 +1196,10 @@ mod tests {
         retention: B256,
         readiness: String,
         accepted_head: Option<(u64, B256)>,
-        /// Per retained generation: its tag, the header it carries, and its trie's own roots.
-        generations: Vec<(u64, B256, Option<(u64, B256)>, Option<B256>, B256)>,
+        /// Per retained generation: its tag, the header it carries, and its trie's own roots —
+        /// the cache root only where the generation is held whole, which is every generation
+        /// unless a run is recording undo frames.
+        generations: Vec<GenerationTag>,
     }
 
     fn snapshot(pair: &mut CoordinatedPair) -> PairSnapshot {
@@ -925,14 +1214,16 @@ mod tests {
             accepted_head: pair.accepted_head.as_ref().map(|h| (h.number, h.hash())),
             generations: pair
                 .retained
-                .iter_mut()
+                .iter()
                 .map(|generation| {
                     (
                         generation.block_number,
                         generation.block_hash,
                         generation.accepted_head.as_ref().map(|h| (h.number, h.hash())),
-                        generation.trie_cache.state_root(),
-                        generation.trie_cache.cache_root(),
+                        generation.state_root,
+                        generation
+                            .trie_cache()
+                            .map(partial_stateless::PartialTrieNodeCache::cache_root),
                     )
                 })
                 .collect(),
@@ -1060,6 +1351,7 @@ mod tests {
         let (mut state, _) = restored_state_with(PairConfig {
             retain_depth: depth(1),
             warm_shrink: shrink_every(3),
+            ..Default::default()
         });
 
         // +1: the live trie counts one. The generation retained at this commit was cloned before
@@ -1087,6 +1379,7 @@ mod tests {
         let (mut state, _) = restored_state_with(PairConfig {
             retain_depth: depth(1),
             warm_shrink: shrink_every(2),
+            ..Default::default()
         });
         advance(&mut state, ANCHOR_BLOCK + 1, 0xa1, true);
         assert!(!tick(&mut state), "one block into a two-block interval");

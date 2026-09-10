@@ -28,7 +28,7 @@ pub use admission::{AdmissionError, AdmittedBlock, UntrustedAdmission};
 pub use coordination::{
     admit_block, block_context, inject_recovery, try_deep_recovery, try_depth_one_recovery,
     BlockAdmission, CanonicalStateRoots, CoordinatedFingerprint, CoordinatedPair, ExpectedLineage,
-    LifecycleFingerprint, LineageError, RetainedDequeBytes, RetainedGeneration,
+    LifecycleFingerprint, LineageError, RetainedContent, RetainedDequeBytes, RetainedGeneration,
     RetainedGenerationBytes, RetentionDepth, RetentionDepthError, MAX_RETENTION_DEPTH,
 };
 pub use reexec::{

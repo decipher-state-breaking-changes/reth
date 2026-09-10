@@ -91,6 +91,15 @@ pub struct ReplayOptions {
     /// Which side wins is a property of the workload, so it is an arm of a measurement rather than
     /// a setting with a known-good value.
     pub warm_shrink: WarmSetShrinkPolicy,
+    /// Whether every block records what it changed, so the pair can hold its older generations as
+    /// diffs instead of whole copies.
+    ///
+    /// Off by default, which is stage 1's deque of whole generations and the control arm of the
+    /// measurement: recording costs a lookup per write on the hot path and the copies it saves are
+    /// memory, not latency. At `retain_depth` 1 it changes nothing that is kept — the newest
+    /// generation is whole either way — and only the recording cost is left, which is what makes a
+    /// K=1 pair the clean baseline for what recording alone costs.
+    pub undo_record: bool,
     /// Reorgs to force, each fired after the commit of its block lands. Ascending by block.
     ///
     /// Empty by default. A forced reorg is a pure revert of the `depth` blocks the pair just
@@ -146,7 +155,11 @@ pub struct ForcedReorgOutcome {
 impl ReplayOptions {
     /// The subset of these options that configures the coordinated pair itself.
     pub const fn pair_config(&self) -> PairConfig {
-        PairConfig { retain_depth: self.retain_depth, warm_shrink: self.warm_shrink }
+        PairConfig {
+            retain_depth: self.retain_depth,
+            warm_shrink: self.warm_shrink,
+            undo_record: self.undo_record,
+        }
     }
 }
 
@@ -161,6 +174,8 @@ pub struct PairConfig {
     pub retain_depth: RetentionDepth,
     /// How often the pair's warm sets are returned to a fitted size.
     pub warm_shrink: WarmSetShrinkPolicy,
+    /// Whether the pair holds its older generations as undo frames rather than whole copies.
+    pub undo_record: bool,
 }
 
 impl Default for ReplayOptions {
@@ -175,6 +190,7 @@ impl Default for ReplayOptions {
             max_rewind_frames: MAX_REWIND_FRAMES,
             retain_depth: RetentionDepth::ONE,
             warm_shrink: WarmSetShrinkPolicy::default(),
+            undo_record: false,
             forced_reorgs: Vec::new(),
         }
     }
@@ -2177,6 +2193,9 @@ pub(crate) fn restore(
     // Set before the pair is built, so the policy is in place for the first block's retention and
     // is carried into every snapshot cloned from this cache thereafter.
     restored.trie_cache.set_warm_shrink_policy(pair.warm_shrink);
+    // Same reason, and the same place: recording is a property of the cache that every working
+    // copy inherits through the clone, so it has to be set before the first block clones one.
+    restored.trie_cache.set_undo_recording(pair.undo_record);
 
     // The header is installed only because every field a consumer checks it against is in the
     // checkpoint the operator vouched for. A header that fails any of them is dropped, and the
