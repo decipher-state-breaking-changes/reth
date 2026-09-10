@@ -1725,11 +1725,21 @@ fn jemalloc_stats() -> Option<[u64; 5]> {
 /// Both halves are gated on the same interval. Walking the storage-trie map and the retained-path
 /// slices is O(tries) per sample, which is why it is off unless a run asks for it — a timing cohort
 /// must not pay for a memory cohort's instrument.
+///
+/// **The probe costs different amounts in different deque shapes, and says so.**
+/// `retained_deque_bytes` walks every storage trie of every *whole* generation, so a deque of K
+/// whole generations pays K deep walks per sample where a deque of one generation and K-1 undo
+/// frames pays one plus K-1 shallow ones — thousands of tries against hundreds. That is real work
+/// inside the process's wall clock, and a benchmark comparing wall time across those two shapes
+/// reads the difference as a speed-up. It does not reach the per-block timings, because the probe
+/// runs after `close_validation` and outside every phase, so reporting the cost is enough: a
+/// report can subtract it instead of arguing about it.
 fn memory_probe(height: u64, pair: &CoordinatedPair) {
     let interval = memory_probe_interval();
     if interval == 0 || height % interval != 0 {
         return
     }
+    let started = Instant::now();
     let mut rss_kib = 0u64;
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
@@ -1759,8 +1769,9 @@ mapped={mapped}\tjemalloc_retained={retained}"
     // first, because a third of a generation is storage tries shared by `Arc`. A K = 3 run that
     // reported only the newest generation could show the total RSS move and not say what moved it.
     let deque = pair.retained_deque_bytes();
+    let probe_us = started.elapsed().as_micros();
     eprintln!(
-        "PS_MEMORY\tblock={height}\trss_kib={rss_kib}\t{process}\t\
+        "PS_MEMORY\tblock={height}\tprobe_us={probe_us}\trss_kib={rss_kib}\t{process}\t\
 retained_present={present}\tretained_total={total}\tretained_exclusive={exclusive}\t\
 retained_complete_total={complete_total}\tretained_complete_exclusive={complete_exclusive}\t\
 retained_sparse={sparse}\tretained_shared_storage={shared_storage}\t\

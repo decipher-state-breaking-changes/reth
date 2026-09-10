@@ -2864,6 +2864,74 @@ mod tests {
     }
 
     #[test]
+    fn a_frames_held_storage_tries_split_into_the_two_populations_that_are_charged() {
+        // `storage_tries_held` is one number over three map states, and two different accounting
+        // rules read it: `shared_allocations` lists the revealed ones so a deque union charges
+        // each once however many frames hold it, while `storage_bytes` charges the revealed *and*
+        // the blind-with-allocation ones. A frame reporting only the total cannot say which of the
+        // two it is made of, and those halves are what decides whether the union or the naive sum
+        // is the honest figure for a K-frame deque.
+        let revealed = B256::repeat_byte(0x11);
+        let blind_kept = B256::repeat_byte(0x22);
+        let blind_empty = B256::repeat_byte(0x33);
+        let repr = CacheTrieRepr::default();
+
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        {
+            let tries = live.sparse.storage_tries_mut();
+            tries.insert(
+                revealed,
+                CacheStorageTrie::Revealed(Box::new(SharedSparseTrie::new(CacheTrie::new(repr)))),
+            );
+            tries.insert(
+                blind_kept,
+                CacheStorageTrie::Blind(Some(Box::new(SharedSparseTrie::new(CacheTrie::new(
+                    repr,
+                ))))),
+            );
+            tries.insert(blind_empty, CacheStorageTrie::Blind(None));
+        }
+
+        let (mut next, _) = live.clone_timed();
+        // The block writes to the revealed trie, which takes the private copy that makes the
+        // parent's handle a different allocation from the child's — the only way a revealed entry
+        // reaches a frame at all.
+        next.sparse
+            .storage_tries_mut()
+            .get_mut(&revealed)
+            .expect("the clone carries the entry")
+            .as_revealed_mut()
+            .expect("it is revealed")
+            .make_mut();
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+
+        let counts = frame.counts();
+        assert_eq!(counts.storage_tries_held, 3, "all three changed identity or never had one");
+        assert_eq!(
+            counts.storage_tries_held,
+            counts.storage_tries_revealed +
+                counts.storage_tries_blind_retained +
+                counts.storage_tries_blind_empty,
+            "the split has to partition the held entries, not overlap or lose them"
+        );
+        assert_eq!(counts.storage_tries_revealed, 1);
+        assert_eq!(counts.storage_tries_blind_retained, 1);
+        assert_eq!(counts.storage_tries_blind_empty, 1);
+        assert_eq!(
+            frame.shared_allocations().len(),
+            counts.storage_tries_revealed,
+            "the shareable half is exactly the revealed entries: a union over frames and \
+             generations is sound only while the identities it dedups on cover the same \
+             population the count reports"
+        );
+        // The blind slot that kept its allocation is real bytes with no identity to dedup on, so
+        // it lands in the unshared half and every frame holding one is charged for it.
+        assert!(frame.storage_bytes() > 0, "two of the three hold allocations");
+    }
+
+    #[test]
     fn a_retention_rebuild_is_recorded_as_one_whole_preimage() {
         // The delta path is only taken when the value cache is exactly one block ahead of what the
         // derived sets describe. Everything else rebuilds, and a rebuild replaces all four

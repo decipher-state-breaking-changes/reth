@@ -116,7 +116,16 @@ impl TrieCacheUndoFrame {
         };
         for (_, before) in &self.storage {
             match before {
-                StorageTrieBefore::Held(_) => counts.storage_tries_held += 1,
+                StorageTrieBefore::Held(trie) => {
+                    counts.storage_tries_held += 1;
+                    match &**trie {
+                        CacheStorageTrie::Revealed(_) => counts.storage_tries_revealed += 1,
+                        CacheStorageTrie::Blind(Some(_)) => {
+                            counts.storage_tries_blind_retained += 1
+                        }
+                        CacheStorageTrie::Blind(None) => counts.storage_tries_blind_empty += 1,
+                    }
+                }
                 StorageTrieBefore::Absent => counts.storage_tries_absent += 1,
             }
         }
@@ -258,7 +267,26 @@ pub struct TrieCacheUndoCounts {
     /// behind it.
     pub account_metadata_changed: bool,
     /// Storage tries held for an address the block wrote to.
+    ///
+    /// The sum of the three fields below, kept as one number because it is what a reorg-cost
+    /// argument counts: one entry the frame puts back into the map. The split beside it is what a
+    /// *memory* argument counts, and the two are not the same population.
     pub storage_tries_held: usize,
+    /// Of those, the revealed ones: real trie nodes, and the only ones a frame reports as
+    /// shareable allocations.
+    ///
+    /// [`TrieCacheUndoFrame::shared_allocations`] lists exactly these, so a deque union charges
+    /// each once however many frames hold it. Everything below lands in the frame's unshared half
+    /// instead.
+    pub storage_tries_revealed: usize,
+    /// Of those, blind slots that kept their allocation.
+    ///
+    /// Real bytes with no identity to union on: `storage_bytes` charges them,
+    /// `shared_allocations` cannot list them, so every frame holding one is charged separately.
+    /// The distance between this and zero is the size of that upper bound.
+    pub storage_tries_blind_retained: usize,
+    /// Of those, blind slots holding nothing: an entry to restore, and no bytes behind it.
+    pub storage_tries_blind_empty: usize,
     /// Addresses the block added to the storage-trie map, removed again on undo.
     pub storage_tries_absent: usize,
     /// Warm account keys whose membership the block moved.
