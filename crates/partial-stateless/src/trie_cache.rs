@@ -359,8 +359,7 @@ impl PartialTrieNodeCache {
             Some(trie) => {
                 trie.begin_undo();
                 // `Parallel` carries no record, so a cache on it poisons here and its holder keeps
-                // whole generations. That is the two-representation split of section 5.1 landing
-                // at runtime rather than a second journal in `parallel.rs`.
+                // whole generations instead of relying on a journal the representation lacks.
                 record.poisoned = !trie.is_recording_undo();
             }
             // A blind slot holds nothing to preimage. Recorded rather than poisoned, because a
@@ -2384,8 +2383,8 @@ mod tests {
         // The trie itself copies exactly. What does not is `retained_account_paths`: `Vec::clone`
         // allocates for the length, not the capacity, so a retained generation can be strictly
         // smaller than the live cache it was copied from. Retention grows the live vector again
-        // the next block, which is the same ratchet §5.5 names from the other direction — and the
-        // reason a K-generation total has to be measured per generation rather than as K times one.
+        // the next block, so a K-generation total must be measured per generation rather than
+        // as K times one.
         assert_eq!(retained.sparse_bytes, live.sparse_bytes);
         assert!(
             retained.retained_account_paths_bytes <= live.retained_account_paths_bytes,
@@ -2861,6 +2860,67 @@ mod tests {
         assert_eq!(committed_state(&live), expected);
         assert_eq!(live.undo_id(), displaced.undo_id(), "the cache is that generation now");
         assert!(live.structurally_eq(&control));
+    }
+
+    #[test]
+    fn a_frame_restores_changed_inserted_and_removed_storage_tries() {
+        let changed = B256::repeat_byte(0x11);
+        let inserted = B256::repeat_byte(0x22);
+        let removed = B256::repeat_byte(0x33);
+        let storage = |tag: u64| {
+            let entries: BTreeMap<B256, U256> = (0..8u64)
+                .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(tag * 100 + i + 1)))
+                .collect();
+            let harness = TrieTestHarness::new(entries.clone());
+            let template = revealed_cache(&harness, &entries.keys().copied().collect::<Vec<_>>());
+            SharedSparseTrie::new(template.sparse.state_trie_ref().unwrap().clone())
+        };
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        for (address, tag) in [(changed, 1), (removed, 2)] {
+            live.sparse
+                .storage_tries_mut()
+                .insert(address, CacheStorageTrie::Revealed(Box::new(storage(tag))));
+        }
+        let control = live.clone();
+        let identity = |cache: &PartialTrieNodeCache, address| {
+            cache.sparse.storage_tries_ref()[&address].as_revealed_ref().unwrap().allocation_id()
+        };
+        assert_ne!(identity(&control, changed), identity(&control, removed));
+        assert_ne!(
+            control.sparse.storage_tries_ref()[&changed],
+            control.sparse.storage_tries_ref()[&removed]
+        );
+        let (mut next, _) = live.clone_timed();
+        let tries = next.sparse.storage_tries_mut();
+        // Wiping a populated trie both changes its content and takes a private Arc allocation.
+        tries.get_mut(&changed).unwrap().as_revealed_mut().unwrap().make_mut().wipe();
+        tries.insert(inserted, CacheStorageTrie::Revealed(Box::new(storage(3))));
+        tries.remove(&removed);
+        assert_ne!(identity(&next, changed), identity(&control, changed));
+        assert!(!next.structurally_eq(&control));
+
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+        assert_eq!(frame.source(), live.undo_id());
+        assert_eq!(frame.target(), displaced.undo_id());
+        assert_eq!(frame.storage.len(), 3);
+        for address in [changed, removed] {
+            assert!(frame.storage.iter().any(|(key, before)| {
+                *key == address && matches!(before, StorageTrieBefore::Held(_))
+            }));
+        }
+        assert!(frame.storage.iter().any(|(key, before)| {
+            *key == inserted && matches!(before, StorageTrieBefore::Absent)
+        }));
+
+        assert!(live.undo(frame));
+        assert!(live.structurally_eq(&control), "every storage trie and its content is restored");
+        assert_eq!(live.undo_id(), displaced.undo_id());
+        for address in [changed, removed] {
+            assert_eq!(identity(&live, address), identity(&control, address));
+        }
+        assert!(!live.sparse.storage_tries_ref().contains_key(&inserted));
     }
 
     #[test]

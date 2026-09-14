@@ -164,6 +164,8 @@ pub(crate) enum ReorgOutcome {
         /// that `first()` is the block just above the ancestor and `last()` is the abandoned tip,
         /// which is the order every existing log line and JSONL field already prints.
         undone: Vec<BlockRef>,
+        /// Undo frames actually consumed, excluding whole retained generations.
+        frames_applied: u64,
         /// True when nothing replaces the abandoned blocks.
         revert: bool,
         /// The tip the producer is moving to, so the caller can tell when the branch is complete.
@@ -289,7 +291,7 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
 
     let ReplayState { pair, history, config, .. } = state;
     let policy_id = config.cache_policy_id();
-    if try_deep_recovery(pair, &*history, &lineage, policy_id).is_none() {
+    let Some(recovery) = try_deep_recovery(pair, &*history, &lineage, policy_id) else {
         return ReorgOutcome::Unrecoverable {
             ancestor,
             depth,
@@ -298,7 +300,7 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
                 depth
             ),
         }
-    }
+    };
     let undone = reorg.abandoned.clone();
     history.rewind_above(ancestor.number);
     let revert = reorg.winning_tip.is_none();
@@ -312,7 +314,13 @@ pub(crate) fn apply_reorg(state: &mut ReplayState, reorg: &Reorg) -> ReorgOutcom
         "Undid {depth} block(s) against the retained generations; the pair is back at the common \
          ancestor"
     );
-    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip: reorg.winning_tip }
+    ReorgOutcome::Applied {
+        ancestor,
+        undone,
+        frames_applied: recovery.frames_applied,
+        revert,
+        winning_tip: reorg.winning_tip,
+    }
 }
 
 /// Everything about a reorg frame that can be judged without consulting the pair.
@@ -693,10 +701,8 @@ mod tests {
             (1, 2),
             "the newest generation is the copy the block just read as its parent; the rest are diffs"
         );
-        // Deliberately no size claim. This fixture's whole generation is under 2 KB, so a
-        // frame's fixed struct cost dominates it and the ratio the hybrid exists for — 186 MiB of
-        // generation against a few hundred preimages — is not visible at this scale. The shape is
-        // what is testable here; the sizes are §6 step 5's, on the corpus.
+        // This fixture's whole generation is under 2 KB, so a frame's fixed struct cost
+        // dominates it. It tests the deque's shape, not memory savings on a large workload.
         assert!(deque.frame_bytes > 0, "a frame that holds nothing at all proves nothing");
         assert!(
             state
@@ -727,7 +733,7 @@ mod tests {
 
     #[test]
     fn a_deque_of_frames_gives_back_what_a_deque_of_generations_gives_back() {
-        // The differential §6 step 4 asks for: the same run, undone to the same depth, against a
+        // Compare the same run, undone to the same depth, against a
         // deque of whole generations and against the hybrid that replaces all but one of them.
         for undone in 1..=3u64 {
             let (mut hybrid, _) = recording_state_at_depth(depth(3));
@@ -750,11 +756,11 @@ mod tests {
             let abandoned = run[3 - undone as usize..].to_vec();
             let outcome = apply_reorg(&mut hybrid, &reorg_of(landing, abandoned.clone(), None));
             assert!(
-                matches!(outcome, ReorgOutcome::Applied { .. }),
+                matches!(outcome, ReorgOutcome::Applied { frames_applied, .. } if frames_applied == undone - 1),
                 "a depth-{undone} undo is inside what this pair retains"
             );
             let outcome = apply_reorg(&mut full, &reorg_of(landing, abandoned, None));
-            assert!(matches!(outcome, ReorgOutcome::Applied { .. }));
+            assert!(matches!(outcome, ReorgOutcome::Applied { frames_applied: 0, .. }));
 
             assert_eq!(hybrid.pair.cache.current_block(), landing.number);
             assert_same_place(&mut hybrid.pair, &mut full.pair);
@@ -802,7 +808,7 @@ mod tests {
 
         assert!(matches!(
             apply_reorg(&mut hybrid, &reorg_of(ancestor, vec![mid], None)),
-            ReorgOutcome::Applied { .. }
+            ReorgOutcome::Applied { frames_applied: 1, .. }
         ));
         assert!(matches!(
             apply_reorg(&mut full, &reorg_of(ancestor, vec![mid], None)),
@@ -847,9 +853,9 @@ mod tests {
     }
 
     #[test]
-    fn a_recording_pair_at_depth_one_holds_what_stage_one_held() {
+    fn a_recording_pair_at_depth_one_keeps_only_a_whole_generation() {
         // The measurement's own baseline. At depth 1 the entry a demotion would produce is the one
-        // the next push evicts, so no frame is built and the deque is stage 1's — leaving the
+        // the next push evicts, so no frame is built and the deque keeps a whole copy, leaving the
         // recording cost as the only difference between the two arms.
         let (mut state, _) = recording_state_at_depth(depth(1));
         for offset in 0..3u64 {
@@ -866,7 +872,7 @@ mod tests {
     #[test]
     fn a_pair_that_is_not_recording_keeps_every_generation_whole() {
         // The fallback the two-representation split and the measurement's control arm both rely
-        // on: with recording off nothing is demoted, and the deque is stage 1's exactly.
+        // on: with recording off every retained generation stays whole.
         let (mut state, _) = restored_state_at_depth(depth(3));
         assert!(!state.pair.trie_cache.records_undo());
         advance_run(&mut state, 3);
@@ -1065,7 +1071,7 @@ mod tests {
         // the sum instead. The oldest generation here is the cache the pair was restored with and
         // the ones above it are clones of it; `Vec::clone` allocates for the length rather than the
         // capacity, so a clone is strictly smaller than what it was cloned from. Multiplying one
-        // reading is exactly the mistake §4.3 has the sum to avoid.
+        // reading would miss those capacity differences.
         let one = state.pair.retained_generation_bytes(true);
         assert!(one.present && one.frame_bytes == 0);
         assert!(deque.total_bytes >= one.complete_exclusive_bytes);
@@ -1136,13 +1142,12 @@ mod tests {
         // whole point of reporting both: the union can only be smaller.
         assert!(deque.total_bytes <= deque.generation_sum_bytes);
 
-        // The claim §4.3 rests on, now on a population that can show it: the union is strictly
-        // less than the sum, and the gap is exactly the sharing counted once instead of K times.
+        // The union is strictly less than the sum: shared allocations are counted once instead
+        // of K times.
         // Measured on a clone, not on `warm` itself. The deque holds clones, and a clone is
         // strictly smaller: `Vec::clone` allocates for the length rather than the capacity, so
         // `retained_account_paths` compacts across the copy. Using the original as the baseline
-        // here overstates the sum by that difference and the identity below misses by exactly it —
-        // which is the same reason §4.3 has to measure a union rather than multiply one reading.
+        // here overstates the sum by that capacity difference.
         let one_total = warm.clone().memory_breakdown().total_bytes();
         assert!(
             deque.total_bytes < one_total * 3,
@@ -1180,7 +1185,7 @@ mod tests {
     /// it carries, its state root, and its cache root where it is held whole.
     type GenerationTag = (u64, B256, Option<(u64, B256)>, Option<B256>, Option<B256>);
 
-    /// Everything §4.4's invariance table calls "untouched", in one comparable value.
+    /// Cache content, retained generations and lifecycle state, in one comparable value.
     ///
     /// Wider than `structurally_eq` and `retention_fingerprint` on purpose. Those cover the trie's
     /// state root, warm sets, trie maps and retained paths, and a restore that half-applied could
@@ -1328,7 +1333,7 @@ mod tests {
         let winning = BlockRef { number: ANCHOR_BLOCK + 1, hash: B256::with_last_byte(0xbb) };
         let outcome = apply_reorg(&mut state, &reorg_of(ancestor, vec![undone], Some(winning)));
 
-        let ReorgOutcome::Applied { ancestor: at, undone: gave_back, revert, winning_tip } =
+        let ReorgOutcome::Applied { ancestor: at, undone: gave_back, revert, winning_tip, .. } =
             outcome
         else {
             panic!("a depth-1 reorg of this consumer's own branch is exactly what it can undo")
@@ -1606,6 +1611,7 @@ mod tests {
         assert!(ReorgOutcome::Applied {
             ancestor: block,
             undone: vec![block],
+            frames_applied: 0,
             revert: false,
             winning_tip: None
         }

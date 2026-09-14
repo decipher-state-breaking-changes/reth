@@ -1494,7 +1494,7 @@ impl<'a> Follower<'a> {
                     (None, _) => {}
                 }
                 match outcome {
-                    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip } => {
+                    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip, .. } => {
                         if revert {
                             self.reverts_applied += 1;
                         } else {

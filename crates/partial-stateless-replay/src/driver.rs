@@ -36,7 +36,12 @@ use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{Header, SealedHeader};
-use std::{collections::VecDeque, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 use tracing::{error, info, warn};
 
 /// How much of a corpus to replay, and what to do beyond checking it.
@@ -96,8 +101,8 @@ pub struct ReplayOptions {
     /// Whether every block records what it changed, so the pair can hold its older generations as
     /// diffs instead of whole copies.
     ///
-    /// Off by default, which is stage 1's deque of whole generations and the control arm of the
-    /// measurement: recording costs a lookup per write on the hot path and the copies it saves are
+    /// Off by default, retaining whole generations. Recording costs a lookup per write on the
+    /// hot path and the copies it saves are
     /// memory, not latency. At `retain_depth` 1 it changes nothing that is kept — the newest
     /// generation is whole either way — and only the recording cost is left, which is what makes a
     /// K=1 pair the clean baseline for what recording alone costs.
@@ -138,9 +143,13 @@ pub struct ForcedReorgOutcome {
     /// The commit frame's sequence it fired after.
     pub sequence: u64,
     pub outcome: &'static str,
+    /// The authenticated ancestor, for both applied and refused reorgs.
+    pub ancestor: Option<BlockRef>,
     pub detail: Option<String>,
     /// `apply_reorg`'s wall clock: preflight, rollback, and the history rewind.
     pub recovery_us: Option<u64>,
+    /// Undo frames actually applied; `None` when the reorg was not applied.
+    pub frames_applied: Option<u64>,
     /// `standalone_validation_us` of the first block re-applied on the winning branch.
     pub first_reapplied_commit_us: Option<u64>,
     /// Blocks re-applied so far, and the sequences their timings carry in `blocks`, so an
@@ -201,7 +210,7 @@ impl Default for ReplayOptions {
 /// What one replay found.
 #[derive(Debug, Default)]
 pub struct ReplayReport {
-    /// Commits replayed.
+    /// Commits replayed. Batch replay counts each corpus sequence once, even across replays.
     pub commits: u64,
     /// Commits whose payload was the one a consensus client sent.
     pub witnessed: u64,
@@ -352,8 +361,10 @@ pub struct ResyncRecord {
     pub continuous: bool,
     /// The canonical interval this recovery skipped, when it was not continuous.
     pub unverified: Option<(u64, u64)>,
-    /// Commit frames observed between the discontinuity and the checkpoint.
+    /// Commit frames left unverified by this restore; zero when a rewind window covers them.
     pub commits_skipped: u64,
+    /// Commit frames skipped while waiting for this checkpoint, before any rewind replay.
+    pub commits_skipped_before_restore: u64,
 }
 
 /// Why a replay can go no further on this pair. Every variant names the block it stopped on.
@@ -460,9 +471,8 @@ pub struct BlockTiming {
 
 /// What ending one block's undo record cost, and the frame it produced.
 ///
-/// The distribution §6 step 5 is built from. What *recording* cost is not here and cannot be — it
-/// is a lookup per write spread across the whole block, and the A/B against a non-recording arm is
-/// what measures it.
+/// Recording itself performs a lookup per write spread across the whole block. Measuring that
+/// cost requires comparison with recording disabled; this timer covers only ending the record.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct UndoFrameTiming {
     /// Ending the block's journals and, when one came out of them, assembling the frame.
@@ -790,6 +800,8 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
     let mut forced = ForcedReorgs::new(options);
 
     let mut report = ReplayReport::default();
+    // Re-applying a verified frame adds a timing attempt, not another corpus commit.
+    let mut compared_sequences = BTreeSet::new();
     let mut phase = BatchPhase::AwaitingManifest;
     // The window opened by a restore that landed on its target, while it is being replayed.
     let mut rewind: Option<RewindWindow> = None;
@@ -1057,6 +1069,9 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                         report.terminal_kind = Some("replay_fault");
                     }
                     CommitOutcome::Compared => {
+                        if !compared_sequences.insert(sequence) {
+                            report.commits -= 1;
+                        }
                         report.last_verified = Some(block.number);
                         if in_window {
                             report.rewind_replayed_commits += 1;
@@ -1095,11 +1110,13 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     Forced::Live => {
                         BatchPhase::Live { manifest, state, announced, announced_at, pending_tip }
                     }
-                    Forced::Resync { target_ancestor } => BatchPhase::AwaitingResync {
-                        manifest,
-                        target_ancestor: Some(target_ancestor),
-                        announced_at: Some(sequence),
-                    },
+                    Forced::Resync { target_ancestor, first_abandoned_sequence } => {
+                        BatchPhase::AwaitingResync {
+                            manifest,
+                            target_ancestor: Some(target_ancestor),
+                            announced_at: Some(first_abandoned_sequence - 1),
+                        }
+                    }
                 }
             }
             (
@@ -1131,7 +1148,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
                     (None, _) => {}
                 }
                 match outcome {
-                    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip } => {
+                    ReorgOutcome::Applied { ancestor, undone, revert, winning_tip, .. } => {
                         if revert {
                             report.reverts_applied += 1;
                         } else {
@@ -1328,7 +1345,7 @@ struct AwaitingResume {
 /// What a forced reorg did to the phase.
 enum Forced {
     Live,
-    Resync { target_ancestor: BlockRef },
+    Resync { target_ancestor: BlockRef, first_abandoned_sequence: u64 },
 }
 
 impl ForcedReorgs {
@@ -1418,7 +1435,8 @@ impl ForcedReorgs {
                 outcome.resumed_identical = Some(identical);
                 if !identical {
                     report.failures.push(format!(
-                        "forced reorg at {}: the pair did not return to its pre-revert state                          after re-applying {} block(s)",
+                        "forced reorg at {}: the pair did not return to its pre-revert state \
+                         after re-applying {} block(s)",
                         outcome.at, outcome.depth
                     ));
                 }
@@ -1463,12 +1481,17 @@ impl ForcedReorgs {
             }
         };
         let before = state.pair.fingerprint();
+        // The rewind must begin above the ancestor, including the commits just given back.
+        // The plan proved this suffix matches the verified history; a commit follows the
+        // manifest/checkpoint, so its sequence is nonzero.
+        let first_abandoned_sequence =
+            self.recent[self.recent.len() - job.depth as usize].header.sequence;
         let started = Instant::now();
         let outcome = apply_reorg(state, &reorg);
         let recovery_us = started.elapsed().as_micros() as u64;
         let index = report.forced_reorgs.len();
         match outcome {
-            ReorgOutcome::Applied { ancestor: at, undone, .. } => {
+            ReorgOutcome::Applied { ancestor: at, undone, frames_applied, .. } => {
                 info!(
                     target: "ps_replay",
                     at = job.at,
@@ -1483,7 +1506,9 @@ impl ForcedReorgs {
                     Some(PendingReapply { index, tip: block, before, remaining: job.depth });
                 report.forced_reorgs.push(ForcedReorgOutcome {
                     outcome: "applied",
+                    ancestor: Some(at),
                     recovery_us: Some(recovery_us),
+                    frames_applied: Some(frames_applied),
                     ..ForcedReorgOutcome::skipped(job, sequence, "applied")
                 });
                 Forced::Live
@@ -1492,10 +1517,11 @@ impl ForcedReorgs {
                 warn_inapplicable(at, depth, &detail, true);
                 let mut outcome = ForcedReorgOutcome::skipped(job, sequence, "refused");
                 outcome.recovery_us = Some(recovery_us);
+                outcome.ancestor = Some(at);
                 outcome.detail = Some(detail);
                 report.forced_reorgs.push(outcome);
                 self.awaiting = Some(AwaitingResume { index, skipped: 0 });
-                Forced::Resync { target_ancestor: at }
+                Forced::Resync { target_ancestor: at, first_abandoned_sequence }
             }
             // A reorg built from this driver's own history cannot be unbound or malformed; if it
             // is, the fixture that built it is wrong, and that is a failure of this run.
@@ -1520,8 +1546,10 @@ impl ForcedReorgOutcome {
             depth: job.depth,
             sequence,
             outcome,
+            ancestor: None,
             detail: None,
             recovery_us: None,
+            frames_applied: None,
             first_reapplied_commit_us: None,
             reapplied: 0,
             reapplied_sequences: Vec::new(),
@@ -1884,6 +1912,7 @@ fn finish_collection_if_complete(
                         continuous: false,
                         unverified: None,
                         commits_skipped: 0,
+                        commits_skipped_before_restore: 0,
                     });
                     return Ok(BatchPhase::Live {
                         manifest,
@@ -2025,6 +2054,7 @@ fn finish_collection_if_complete(
                 continuous,
                 unverified,
                 commits_skipped: skipped,
+                commits_skipped_before_restore: report.skipped_awaiting_resync,
             });
             report.skipped_awaiting_resync = 0;
             Ok(BatchPhase::Live {

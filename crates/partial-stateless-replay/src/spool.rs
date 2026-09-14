@@ -230,6 +230,44 @@ pub fn read_spool(dir: &Path, limits: &FrameLimits) -> eyre::Result<Spool> {
     Ok(Spool { frames, closed: iter.closed(), bytes: iter.bytes() })
 }
 
+/// Writes one JSON line per decoded frame across every epoch, without restoring or executing.
+/// Uses the same envelope, contiguity, and End checks as replay, holding one frame at a time.
+pub fn list_frames(
+    dir: &Path,
+    limits: &FrameLimits,
+    mut output: impl std::io::Write,
+) -> eyre::Result<()> {
+    let mut spool = SpoolIter::open(dir, limits)?;
+    while let Some(frame) = spool.next_frame()? {
+        let mut row = serde_json::json!({
+            "sequence": frame.header.sequence,
+            "kind": frame.header.kind.as_str(),
+        });
+        match &frame.event {
+            StreamEvent::Manifest(manifest) => {
+                row["epoch"] = manifest.epoch.into();
+            }
+            StreamEvent::Checkpoint(checkpoint) => {
+                row["block"] = serde_json::to_value(checkpoint.block)?;
+                row["snapshot_chunks"] = checkpoint.snapshot_chunks.into();
+            }
+            StreamEvent::Commit(commit) => {
+                row["block"] = serde_json::to_value(commit.input().block)?;
+                row["parent_hash"] = serde_json::to_value(commit.input().parent_hash)?;
+            }
+            StreamEvent::Reorg(reorg) => {
+                row["ancestor"] = serde_json::to_value(reorg.common_ancestor)?;
+                row["abandoned"] = serde_json::to_value(&reorg.abandoned)?;
+                row["winning_tip"] = serde_json::to_value(reorg.winning_tip)?;
+            }
+            _ => {}
+        }
+        serde_json::to_writer(&mut output, &row)?;
+        writeln!(output)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

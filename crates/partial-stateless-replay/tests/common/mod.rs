@@ -2,11 +2,11 @@
 //!
 //! The restorable checkpoint is a real one: a one-account state proved with the same trie
 //! machinery the producer's export uses, so `restore` runs the full verification path rather than
-//! a stub. What no synthetic spool can supply is a commit that passes mainnet admission — that is
-//! the live gate's job — so the tests here exercise the checks that run *before* admission, which
-//! is exactly where the delivery grammar and the reorg lifecycle live.
+//! a stub. `empty_chain` also supplies executable empty post-merge blocks for recovery tests.
 
 #![allow(dead_code)]
+
+pub mod empty_chain;
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_rlp::Encodable;
@@ -86,6 +86,11 @@ pub fn fixture() -> Fixture {
 
 /// The same fixture at any height, so a test can hold two checkpoints that are not the same block.
 pub fn fixture_at(anchor_block: u64) -> Fixture {
+    fixture_with_header(alloy_consensus::Header { number: anchor_block, ..Default::default() })
+}
+
+fn fixture_with_header(mut header: alloy_consensus::Header) -> Fixture {
+    let anchor_block = header.number;
     let address = Address::repeat_byte(0x11);
     let account = Account { nonce: 7, balance: U256::from(1_000u64), bytecode_hash: None };
 
@@ -125,7 +130,7 @@ pub fn fixture_at(anchor_block: u64) -> Fixture {
 
     // The accepted head is the checkpoint's own block: its hash *is* the checkpoint's hash, and
     // its state root is the proved root, which is exactly what the follower verifies.
-    let header = alloy_consensus::Header { number: anchor_block, state_root, ..Default::default() };
+    header.state_root = state_root;
     let sealed = SealedHeader::seal_slow(header.clone());
     let mut accepted_head_rlp = Vec::new();
     header.encode(&mut accepted_head_rlp);

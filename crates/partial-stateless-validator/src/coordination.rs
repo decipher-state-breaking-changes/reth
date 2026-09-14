@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 
 /// The deepest reorg any pair may be configured to undo from its own retained generations.
 ///
-/// A bound rather than a target. The cost of retention is memory that scales with K (§4.3 of the
-/// deep-reorg plan), and the production default is 1; this exists so a misconfigured run is
+/// A bound rather than a target. Retention memory scales with K, and the production default
+/// is 1; this exists so a misconfigured run is
 /// refused at construction rather than discovered as an allocator report. The value is chosen to
 /// sit well inside the replay history window, which is what lets a refusal at depth K still name
 /// the right ancestor.
@@ -371,9 +371,8 @@ impl CoordinatedPair {
         //
         // Not attempted at depth 1, where the entry that would be demoted is the one this push
         // evicts: the frame would be built — a pointer comparison per retained storage trie and a
-        // move for each one that changed — and dropped in the same call. So a K=1 pair keeps
-        // stage 1's deque exactly, and what recording costs it is the recording alone, which is
-        // what makes it the clean baseline for that cost.
+        // move for each one that changed — and dropped in the same call. A K=1 pair therefore
+        // keeps one whole generation whether or not recording is enabled, isolating its cost.
         //
         // Timed to exactly here and no further: ending both journals, dropping the preimages that
         // turned out to describe no change, and the pointer comparison over the storage-trie map.
@@ -637,6 +636,7 @@ impl CoordinatedPair {
         let ancestor_number = self.retained_generation()?.block_number;
         let lineage = ExpectedLineage::depth_one((ancestor_number, target_hash));
         self.restore_retained_generations(&lineage, target_state_root, cache_policy_id)
+            .map(|report| report.ready)
     }
 
     pub fn restore_retained_generations(
@@ -644,7 +644,7 @@ impl CoordinatedPair {
         lineage: &ExpectedLineage,
         ancestor_state_root: B256,
         cache_policy_id: B256,
-    ) -> Option<ReadyParent> {
+    ) -> Option<RecoveryReport> {
         let depth = lineage.depth();
         let (ancestor_number, ancestor_hash) = lineage.ancestor();
 
@@ -866,6 +866,7 @@ impl CoordinatedPair {
         // undo and is exactly what phase 1's chain check started from. Every step here was proved
         // possible above and none of them can refuse.
         let mut landed: Option<PartialTrieNodeCache> = None;
+        let mut frames_applied = 0;
         while let Some(held) = given_back.pop_back() {
             match held.content {
                 RetainedContent::Full(trie_cache) => landed = Some(trie_cache),
@@ -875,6 +876,7 @@ impl CoordinatedPair {
                         None => self.trie_cache.undo(*frame),
                     };
                     debug_assert!(applied, "phase 1 proved every frame in the range applies");
+                    frames_applied += u64::from(applied);
                 }
             }
         }
@@ -883,8 +885,16 @@ impl CoordinatedPair {
         }
         self.accepted_head = landed_head;
         self.readiness = next_readiness;
-        Some(ready)
+        Some(RecoveryReport { ready, frames_applied })
     }
+}
+
+/// The restored readiness and the number of undo frames actually applied during recovery.
+#[derive(Debug, Clone)]
+pub struct RecoveryReport {
+    pub ready: ReadyParent,
+    /// Whole retained generations do not count as frames.
+    pub frames_applied: u64,
 }
 
 /// What two coordinated pairs must agree on to be the same generation.
@@ -933,8 +943,8 @@ pub struct RetainedGeneration {
 /// What one commit did beyond installing the block.
 ///
 /// Returned rather than logged, because the two halves have different readers: the readiness label
-/// is what a run log prints per block, and the undo report is what §6 step 5's distribution is
-/// built from. A validator with no run log ignores both.
+/// is what a run log prints per block, and the undo report describes frame size and assembly
+/// cost. A validator with no run log ignores both.
 #[derive(Debug, Clone, Copy)]
 pub struct CommitReport {
     /// Readiness after the transition, as a label.
@@ -957,7 +967,7 @@ pub struct CommitUndoReport {
     /// Ending the block's journals and, when one came out of them, assembling the frame.
     ///
     /// Not the cost of *recording*, which is a lookup per write spread across the whole block and
-    /// is not bracketed anywhere — §6 step 5 measures that as an A/B against a non-recording arm.
+    /// is not bracketed anywhere. Measuring it requires comparison with recording disabled.
     pub us: u64,
 }
 
@@ -991,11 +1001,9 @@ pub struct CommitUndoFrame {
 /// as its parent, so it exists whether or not anything keeps it, and the frame that would replace
 /// it is not recorded until the *next* block is committed. Everything older is a `Frame`, which is
 /// what makes depth K cost one copy and K-1 diffs instead of K copies. A pair whose cache does not
-/// record — the `Parallel` representation, or a run with recording off — holds `Full` throughout
-/// and behaves exactly as stage 1 did.
-// The gap between the two is the point: a whole cache measured 186 MiB on the corpus and a frame
-// is sized by one block. Boxing the cache to close a few hundred bytes of enum padding would put
-// an indirection on the path that reads it every block to save nothing measurable.
+/// record — the `Parallel` representation, or a run with recording off — holds `Full` throughout.
+// Keep the whole cache inline because the parent-read path accesses it every block. The map
+// allocations dominate the small amount of enum padding that boxing would save.
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum RetainedContent {
@@ -1196,7 +1204,7 @@ pub fn try_depth_one_recovery(
 ) -> Option<ReadyParent> {
     let ancestor_number = pair.retained_generation()?.block_number;
     let lineage = ExpectedLineage::depth_one((ancestor_number, target_hash));
-    try_deep_recovery(pair, chain, &lineage, cache_policy_id)
+    try_deep_recovery(pair, chain, &lineage, cache_policy_id).map(|report| report.ready)
 }
 
 /// Undoes the whole of `lineage` to return the pair to its ancestor, or `None` to fall back.
@@ -1213,7 +1221,7 @@ pub fn try_deep_recovery(
     chain: &impl CanonicalStateRoots,
     lineage: &ExpectedLineage,
     cache_policy_id: B256,
-) -> Option<ReadyParent> {
+) -> Option<RecoveryReport> {
     let (ancestor_number, ancestor_hash) = lineage.ancestor();
     let state_root = match chain.state_root_of(ancestor_hash) {
         Ok(Some(state_root)) => state_root,
@@ -1238,17 +1246,18 @@ pub fn try_deep_recovery(
 
     let depth = lineage.depth();
     let started = Instant::now();
-    let ready = pair.restore_retained_generations(lineage, state_root, cache_policy_id)?;
+    let report = pair.restore_retained_generations(lineage, state_root, cache_policy_id)?;
     info!(
         target: "partial_stateless",
-        block = ready.anchor.block_number,
-        block_hash = ?ready.anchor.block_hash,
+        block = report.ready.anchor.block_number,
+        block_hash = ?report.ready.anchor.block_hash,
         ancestor = ancestor_number,
         depth,
+        frames_applied = report.frames_applied,
         restore_us = started.elapsed().as_micros() as u64,
         "Recovered by undoing {depth} block(s) from the retained generations instead of rebuilding"
     );
-    Some(ready)
+    Some(report)
 }
 
 /// Reports whether a block may be applied, without repairing anything.

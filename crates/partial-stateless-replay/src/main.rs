@@ -8,6 +8,7 @@
 //!           [--ack <path>] [--ack-fsync] [--resume] [--mutations] [--retain-depth N]
 //!           [--warm-shrink N|never]
 //!           [--json <path>] [--label <name>]
+//! ps-replay --list-frames <spool-dir>
 //! ```
 //!
 //! Batch mode exits non-zero when the replay disagreed with the recording anywhere, because the
@@ -80,6 +81,13 @@ fn main() -> eyre::Result<()> {
         .init();
 
     let mode = parse_args()?;
+    if let Mode::ListFrames { dir } = &mode {
+        return partial_stateless_replay::spool::list_frames(
+            dir,
+            &partial_stateless_stream::FrameLimits::default(),
+            std::io::stdout().lock(),
+        )
+    }
     if let Mode::InspectReady { dir } = &mode {
         let readiness = partial_stateless_replay::inspect_ready(dir)?;
         println!("{}", serde_json::to_string(&readiness)?);
@@ -288,8 +296,8 @@ fn write_manifest(
         // default and every run written before this axis existed. A number is the interval in
         // blocks, so the two arms of the shrink A/B are distinguishable from the manifest alone.
         "warm_shrink_blocks": pair.warm_shrink.interval().map(NonZeroU64::get),
-        // The other configuration axis the retained deque has: false is stage 1's deque of whole
-        // generations, true holds everything below the newest as a diff. Absent on files written
+        // False keeps whole generations; true holds everything below the newest as a diff.
+        // Absent on files written
         // before the axis existed.
         "undo_record": pair.undo_record,
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
@@ -502,6 +510,10 @@ enum Mode {
     InspectReady {
         dir: PathBuf,
     },
+    /// Frame-content inventory, one JSON line per frame in every epoch.
+    ListFrames {
+        dir: PathBuf,
+    },
 }
 
 /// `PS_RETAIN_DEPTH`, or the default of one.
@@ -625,6 +637,12 @@ fn check_forced_schedule(schedule: &mut [ForcedReorg]) -> eyre::Result<()> {
 
 fn parse_args() -> eyre::Result<Mode> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|arg| arg == "--list-frames") {
+        if raw.len() != 2 || raw[0] != "--list-frames" || raw[1].starts_with('-') {
+            eyre::bail!("usage: ps-replay --list-frames <spool-dir>")
+        }
+        return Ok(Mode::ListFrames { dir: PathBuf::from(&raw[1]) })
+    }
     if raw.iter().any(|arg| arg == "--follow") {
         return parse_follow_args(raw)
     }
@@ -725,7 +743,7 @@ fn parse_args() -> eyre::Result<Mode> {
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
                      [--undo-record [on|off]] \
                      [--json <path>] \
-                     [--label <name>]\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
+                     [--label <name>]\nps-replay --list-frames <spool-dir>\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
                      sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, and PS_FORCED_REORGS \
                      (D@N,D@N,...) sets --forced-reorg; the flags win."
                 );
