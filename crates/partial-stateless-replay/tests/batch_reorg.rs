@@ -337,6 +337,47 @@ fn an_applied_forced_reorg_serializes_the_smoke_evidence() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A re-applied block is timed from the boundary its re-application opened, so nothing measured on
+/// the first pass may sit among its leaves: the carried decode leaf put the phase sum past the wall
+/// on every re-applied block of the 10k spool's forced runs.
+#[test]
+fn a_reapplied_block_carries_no_first_pass_transport_leaves() {
+    let dir = spool_dir("batch-forced-reapply-timing");
+    let (fixture, commits) = common::empty_chain::chain(8);
+    write_manifest(&dir);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    for commit in &commits {
+        write_frame(&dir, next, FrameKind::Commit, commit);
+        next += 1;
+    }
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+    let report = replay(
+        &dir,
+        &ReplayOptions {
+            retain_depth: RetentionDepth::new(3).unwrap(),
+            undo_record: true,
+            forced_reorgs: vec![ForcedReorg { depth: 2, at: fixture.checkpoint.block.number + 3 }],
+            ..options()
+        },
+    )
+    .expect("the synthetic corpus reads");
+
+    let forced = &report.forced_reorgs[0];
+    assert_eq!(forced.outcome, "applied");
+    assert_eq!(forced.reapplied_sequences.len(), 2);
+    assert_eq!(report.blocks.len(), commits.len() + 2);
+    for sequence in &forced.reapplied_sequences {
+        let attempts: Vec<_> =
+            report.blocks.iter().filter(|block| block.sequence == *sequence).collect();
+        assert_eq!(attempts.len(), 2, "one first pass and one re-application of {sequence}");
+        assert!(attempts[0].phases.frame_decode_us.is_some() && attempts[0].delivery_us.is_some());
+        assert_eq!(attempts[1].phases.frame_decode_us, None, "re-applied {sequence}");
+        assert_eq!(attempts[1].delivery_us, None, "re-applied {sequence}");
+    }
+    assert_eq!(report.timing_anomalies, 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_recovery_checkpoint_at_the_exact_ancestor_is_continuous() {
     let dir = spool_dir("batch-continuous");

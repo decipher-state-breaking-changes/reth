@@ -633,6 +633,14 @@ impl FrameCosts {
             validation_open: Some(frame.validation_open),
         }
     }
+
+    /// A frame a forced reorg gave back, run again from the copy held in memory. Nothing was read
+    /// or decoded for this attempt, so both transport leaves are absent: the first pass's readings
+    /// lie outside the boundary [`ForcedReorgs::next_frame`] reopened, and carrying the decode
+    /// leaf put the phase sum past the wall on every re-applied block.
+    pub(crate) fn reapplied(frame: &crate::spool::SpooledFrame) -> Self {
+        Self { delivery_us: None, frame_decode_us: None, ..Self::of(frame) }
+    }
 }
 
 /// Accumulates one attempt's measurements and closes them into a [`BlockTiming`].
@@ -861,7 +869,7 @@ pub fn replay(dir: &Path, options: &ReplayOptions) -> eyre::Result<ReplayReport>
             break
         }
         let sequence = frame.header.sequence;
-        let costs = FrameCosts::of(&frame);
+        let costs = if reapply { FrameCosts::reapplied(&frame) } else { FrameCosts::of(&frame) };
         forced.remember(&frame);
         let rewind_before = rewind;
         phase = match (phase, frame.event) {
@@ -1366,7 +1374,8 @@ impl ForcedReorgs {
 
     /// The frames a reorg gave back run first, with their validation boundary reopened: the
     /// original instant belongs to the first pass, and a re-verdict timed from it would carry
-    /// the whole interval in between.
+    /// the whole interval in between. The replay loop drops their transport leaves for the same
+    /// reason ([`FrameCosts::reapplied`]).
     fn next_frame(&mut self, spool: &mut SpoolIter) -> eyre::Result<Option<SpooledFrame>> {
         if let Some(mut frame) = self.queue.pop_front() {
             frame.validation_open = Instant::now();
