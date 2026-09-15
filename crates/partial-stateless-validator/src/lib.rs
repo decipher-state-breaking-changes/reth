@@ -30,7 +30,7 @@ pub use coordination::{
     BlockAdmission, CanonicalStateRoots, CommitReport, CommitUndoFrame, CommitUndoReport,
     CoordinatedFingerprint, CoordinatedPair, ExpectedLineage, LifecycleFingerprint, LineageError,
     RecoveryReport, RetainedContent, RetainedDequeBytes, RetainedGeneration,
-    RetainedGenerationBytes, RetentionDepth, RetentionDepthError, MAX_RETENTION_DEPTH,
+    RetainedGenerationBytes, RetentionDepth, RetentionDepthError, UndoLayout, MAX_RETENTION_DEPTH,
 };
 pub use reexec::{
     verify_and_apply_sidecar, verify_and_apply_sidecar_with_oracle, NoRootOracle,

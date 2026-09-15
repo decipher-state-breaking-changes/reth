@@ -405,7 +405,7 @@ mod tests {
     use partial_stateless_stream::{Checkpoint, Manifest};
     use partial_stateless_validator::{
         admit_block, BlockAdmission, CoordinatedPair, RetainedContent, RetainedGeneration,
-        RetentionDepth,
+        RetentionDepth, UndoLayout,
     };
     use reth_chainspec::{EthChainSpec, MAINNET};
     use reth_primitives_traits::{Account, SealedHeader};
@@ -653,6 +653,16 @@ mod tests {
         })
     }
 
+    /// A recording pair that closes each block's record at that block's commit.
+    fn frames_only_state_at_depth(depth: RetentionDepth) -> (ReplayState, B256) {
+        restored_state_with(PairConfig {
+            retain_depth: depth,
+            undo_record: true,
+            undo_layout: UndoLayout::FramesOnly,
+            ..Default::default()
+        })
+    }
+
     /// What two pairs have to agree on to be at the same place, whatever their deques are made of.
     ///
     /// [`PairSnapshot`] itself cannot be compared across the two: it carries each generation's
@@ -765,6 +775,169 @@ mod tests {
             assert_eq!(hybrid.pair.cache.current_block(), landing.number);
             assert_same_place(&mut hybrid.pair, &mut full.pair);
         }
+    }
+
+    #[test]
+    fn frames_only_gives_back_the_same_generations_at_every_depth() {
+        for undone in 1..=3u64 {
+            let (mut frames, _) = frames_only_state_at_depth(depth(3));
+            let (mut full, _) = restored_state_at_depth(depth(3));
+            let ancestor = frames.history.tip().expect("seeded");
+            let mut run = Vec::new();
+            for offset in 0..3u64 {
+                let number = ANCHOR_BLOCK + 1 + offset;
+                let tag = 0xb0 + offset as u8;
+                run.push(advance_retaining(&mut frames, number, tag, true));
+                advance_retaining(&mut full, number, tag, true);
+            }
+            assert_eq!(
+                frames.pair.retained_deque_bytes().frames,
+                3,
+                "every retained generation has its own frame"
+            );
+
+            let landing = if undone == 3 { ancestor } else { run[2 - undone as usize] };
+            let abandoned = run[3 - undone as usize..].to_vec();
+            let outcome = apply_reorg(&mut frames, &reorg_of(landing, abandoned.clone(), None));
+            assert!(
+                matches!(outcome, ReorgOutcome::Applied { frames_applied, .. } if frames_applied == undone),
+                "an all-frame depth-{undone} suffix applies {undone} frames"
+            );
+            assert!(matches!(
+                apply_reorg(&mut full, &reorg_of(landing, abandoned, None)),
+                ReorgOutcome::Applied { frames_applied: 0, .. }
+            ));
+            assert_same_place(&mut frames.pair, &mut full.pair);
+        }
+    }
+
+    #[test]
+    fn frames_only_supports_a_second_undo_and_a_commit_after_undo() {
+        let (mut frames, _) = frames_only_state_at_depth(depth(3));
+        let (mut full, _) = restored_state_at_depth(depth(3));
+        let ancestor = frames.history.tip().expect("seeded");
+        let mut run = Vec::new();
+        for offset in 0..3u64 {
+            let number = ANCHOR_BLOCK + 1 + offset;
+            let tag = 0xc0 + offset as u8;
+            run.push(advance_retaining(&mut frames, number, tag, true));
+            advance_retaining(&mut full, number, tag, true);
+        }
+
+        let mid = run[0];
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(mid, run[1..].to_vec(), None)),
+            ReorgOutcome::Applied { frames_applied: 2, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(mid, run[1..].to_vec(), None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(ancestor, vec![mid], None)),
+            ReorgOutcome::Applied { frames_applied: 1, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(ancestor, vec![mid], None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+
+        advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xd1, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 1, 0xd1, true);
+        let deque = frames.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (1, 0, 1));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+    }
+
+    #[test]
+    fn frames_only_at_depth_one_keeps_one_frame_and_reports_the_committed_block() {
+        let (mut state, _) = frames_only_state_at_depth(depth(1));
+        let number = ANCHOR_BLOCK + 1;
+        let block = advance_retaining(&mut state, number, 0xd2, true);
+        let deque = state.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (1, 0, 1));
+        let held = state.pair.retained.back().expect("one retained frame");
+        let frame = held.content.frame().expect("frames-only keeps a frame");
+        assert_eq!(frame.source(), state.pair.trie_cache.undo_id());
+        assert_eq!(
+            (held.block_number, held.block_hash),
+            (ANCHOR_BLOCK, state.history.entries[0].hash)
+        );
+
+        let mut control = frames_only_state_at_depth(depth(1)).0;
+        let parent = control.history.tip().expect("seeded");
+        let state_root = control.pair.trie_cache.state_root().unwrap();
+        let ctx = BlockContext { number, hash: block.hash, parent_hash: parent.hash, state_root };
+        let (next, _) = control.pair.trie_cache.clone_timed();
+        let displaced = std::mem::replace(&mut control.pair.trie_cache, next);
+        let report = control.pair.retain_generation(
+            Some(displaced),
+            &ctx,
+            SealedHeader::new(
+                alloy_consensus::Header {
+                    number,
+                    parent_hash: parent.hash,
+                    state_root,
+                    ..Default::default()
+                },
+                block.hash,
+            ),
+            true,
+        );
+        let produced = report.frame.expect("the commit closes its own frame");
+        assert_eq!((produced.block_number, produced.block_hash), (number, block.hash));
+    }
+
+    #[test]
+    fn frames_only_falls_back_to_full_and_mixed_suffixes_still_restore() {
+        let (mut frames, _) = frames_only_state_at_depth(depth(3));
+        let (mut full, _) = restored_state_at_depth(depth(3));
+        let ancestor = frames.history.tip().expect("seeded");
+
+        let first = advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xe1, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 1, 0xe1, true);
+        frames.pair.trie_cache.set_undo_recording(false);
+        let second = advance_retaining(&mut frames, ANCHOR_BLOCK + 2, 0xe2, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 2, 0xe2, true);
+        frames.pair.trie_cache.set_undo_recording(true);
+        let third = advance_retaining(&mut frames, ANCHOR_BLOCK + 3, 0xe3, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 3, 0xe3, true);
+
+        let deque = frames.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (3, 1, 2));
+        let abandoned = vec![first, second, third];
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(ancestor, abandoned.clone(), None)),
+            ReorgOutcome::Applied { frames_applied: 2, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Applied { frames_applied: 0, .. }
+        ));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+    }
+
+    #[test]
+    fn frames_only_refuses_a_newest_frame_for_another_live_generation_without_consuming_it() {
+        let (mut state, _) = frames_only_state_at_depth(depth(2));
+        let ancestor = state.history.tip().expect("seeded");
+        let run = vec![
+            advance_retaining(&mut state, ANCHOR_BLOCK + 1, 0xf1, true),
+            advance_retaining(&mut state, ANCHOR_BLOCK + 2, 0xf2, true),
+        ];
+        let retained = state.pair.retained_depth();
+        state.pair.trie_cache = state.pair.trie_cache.clone();
+        let before = state.pair.trie_cache.undo_id();
+
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, run, None)),
+            ReorgOutcome::Unrecoverable { .. }
+        ));
+        assert_eq!(state.pair.retained_depth(), retained);
+        assert_eq!(state.pair.trie_cache.undo_id(), before);
     }
 
     #[test]

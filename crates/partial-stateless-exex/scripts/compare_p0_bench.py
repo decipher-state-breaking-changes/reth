@@ -144,7 +144,7 @@ def proof_source_lines(selected, label):
     if failures:
         lines.append(
             f"  - **{failures} samples fell back to serial after a parallel error**; "
-            "section 5.2 requires zero"
+            "the comparison requires zero"
         )
     return lines
 
@@ -226,7 +226,7 @@ def compare_non_overlapping(control, candidate, warmup, samples, repeat=None):
     """One AB comparison, plus the BA repeat when it is supplied.
 
     The repeat is not optional evidence. Two sequential runs on one datadir differ in time order
-    as well as in configuration, and section 5.2.3 asks for both orderings precisely because that
+    as well as in configuration, and both orderings are required precisely because that
     confound is not otherwise separable. Running only AB produces a number this tool will print
     and label as unseparated.
     """
@@ -543,7 +543,7 @@ def _per_node(selected):
 
 
 def _evidence_verdict(timing_ratio, workload_ratios, fit, adjusted, low, high):
-    """State whether the result clears section 5.2's stated bars, and nothing more."""
+    """State whether the result clears the comparison's stated bars, and nothing more."""
     timing_change = abs(1 - timing_ratio)
     workload_change = max(abs(1 - ratio) for ratio in workload_ratios.values())
     lines = [

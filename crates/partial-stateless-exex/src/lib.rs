@@ -1472,6 +1472,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                             trie_cache: restored.trie_cache,
                             retained: Default::default(),
                             retention_depth: Default::default(),
+                            undo_layout: Default::default(),
                             accepted_head: None,
                             readiness: restored.readiness,
                         })
@@ -1566,6 +1567,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
         readiness: config.new_readiness_tracker(),
         retained: Default::default(),
         retention_depth: Default::default(),
+        undo_layout: Default::default(),
         accepted_head: None,
     })
 }
@@ -2451,6 +2453,7 @@ where
                 trie_cache: restored.trie_cache,
                 retained: Default::default(),
                 retention_depth: Default::default(),
+                undo_layout: Default::default(),
                 accepted_head: None,
                 readiness: restored.readiness,
             }),
@@ -3134,6 +3137,7 @@ mod tests {
             readiness: config.new_readiness_tracker(),
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
         })
     }
@@ -3444,6 +3448,7 @@ mod tests {
             readiness: current.readiness,
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
         });
         // Advance the flat cache one block, which is what leaves the undo record the rollback
@@ -3585,7 +3590,8 @@ mod tests {
 
         // `None` is what the builder reports when the transition rolled back, and the old
         // retention describes a generation two blocks back that K = 1 does not promise.
-        pair.retain_generation(None, SNAP_HASH, SNAP_BLOCK + 1, sealed(&ctx(SNAP_BLOCK + 2)), true);
+        let block = ctx(SNAP_BLOCK + 2);
+        pair.retain_generation(None, &block, sealed(&block), true);
 
         assert!(pair.retained_generation().is_none());
     }
@@ -3685,6 +3691,7 @@ mod tests {
             readiness: current.readiness,
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
         });
         // Restoring computed the anchor's cache root, which is what the *next* block would carry
@@ -3741,13 +3748,9 @@ mod tests {
             process(&mut pair, number);
         }
         apply(&mut pair, SNAP_BLOCK + 1);
-        pair.retain_generation(
-            Some(retained.trie_cache),
-            SNAP_HASH,
-            SNAP_BLOCK,
-            sealed(&ctx(SNAP_BLOCK + 1)),
-            true,
-        );
+        let mut block = ctx(SNAP_BLOCK + 1);
+        block.parent_hash = SNAP_HASH;
+        pair.retain_generation(Some(retained.trie_cache), &block, sealed(&block), true);
 
         assert!(pair
             .restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
@@ -3776,13 +3779,9 @@ mod tests {
         }
         assert!(!pair.readiness.window_filled(), "three blocks is not a window");
         apply(&mut pair, SNAP_BLOCK + 1);
-        pair.retain_generation(
-            Some(retained.trie_cache),
-            SNAP_HASH,
-            SNAP_BLOCK,
-            sealed(&ctx(SNAP_BLOCK + 1)),
-            true,
-        );
+        let mut block = ctx(SNAP_BLOCK + 1);
+        block.parent_hash = SNAP_HASH;
+        pair.retain_generation(Some(retained.trie_cache), &block, sealed(&block), true);
 
         assert!(
             pair.restore_retained_generation(SNAP_HASH, state_root, config.cache_policy_id())
@@ -3866,6 +3865,7 @@ mod tests {
             readiness: current.readiness,
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
         });
         let reference = LivePair::new(CoordinatedPair {
@@ -3874,6 +3874,7 @@ mod tests {
             readiness: reference.readiness,
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
         });
 

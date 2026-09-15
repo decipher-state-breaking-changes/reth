@@ -61,14 +61,12 @@
 #      passes invariants 2 to 4 has them. Commit plus graph is the property; nothing further needs
 #      asking of the binary. It is not hypothetical -- on 2026-09-08 the graph check passed while
 #      `target/release/ps-replay` predated the fix it was passing on, and a measurement was nearly
-#      taken from it. §5 of the runbook already carried this check as a one-line `grep` on one
-#      binary; this generalises it to all of them, `partial-stateless-exex` included, which no
-#      other invariant reaches.
+#      taken from it. This check covers every measured binary, including
+#      `partial-stateless-exex`, which no other invariant reaches.
 #
 # The allocator is deliberately not checked here. It *is* a build-time choice that a commit does
-# not imply, being `--features jemalloc` on the command line -- but `RunProvenance` already records
-# it in every run manifest, and the runbook reads it there. A second copy in this script would be
-# a second thing to keep true.
+# not imply, being `--features jemalloc` on the command line -- but `RunProvenance` records it in
+# every run manifest. A second copy in this script would be a second thing to keep true.
 #
 # `PS_ISOLATION_REQUIRE_BINARY=1` turns a missing binary from a warning into a failure. Use it
 # wherever the artifact is about to be measured; the default warns, because the guard is also run

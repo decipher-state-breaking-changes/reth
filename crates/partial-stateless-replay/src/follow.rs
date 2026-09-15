@@ -34,7 +34,9 @@ use partial_stateless_stream::{
     BlockRef, Checkpoint, EndKind, FrameKind, FrameLimits, Manifest, ResetReason, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
 };
-use partial_stateless_validator::{PayloadProvenance, RetentionDepth, SidecarReexecLimits};
+use partial_stateless_validator::{
+    PayloadProvenance, RetentionDepth, SidecarReexecLimits, UndoLayout,
+};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -82,9 +84,11 @@ pub struct FollowOptions {
     ///
     /// Defaults to never, which is today's behaviour. See [`ReplayOptions::warm_shrink`].
     pub warm_shrink: WarmSetShrinkPolicy,
-    /// Whether the pair holds its older generations as undo frames. See
+    /// Whether blocks record the changes from their parent generation. See
     /// [`ReplayOptions::undo_record`].
     pub undo_record: bool,
+    /// How recorded generations are represented in the retained deque.
+    pub undo_layout: UndoLayout,
 }
 
 impl FollowOptions {
@@ -94,6 +98,7 @@ impl FollowOptions {
             retain_depth: self.retain_depth,
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
+            undo_layout: self.undo_layout,
         }
     }
 }
@@ -115,6 +120,7 @@ impl Default for FollowOptions {
             retain_depth: RetentionDepth::ONE,
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
+            undo_layout: UndoLayout::default(),
         }
     }
 }
@@ -677,6 +683,7 @@ impl<'a> Follower<'a> {
                 retain_depth: options.retain_depth,
                 warm_shrink: options.warm_shrink,
                 undo_record: options.undo_record,
+                undo_layout: options.undo_layout,
                 // Follow mode replays a live producer; forcing reorgs on it would be forcing
                 // them on the chain. The batch driver is where the experiment runs.
                 forced_reorgs: Vec::new(),

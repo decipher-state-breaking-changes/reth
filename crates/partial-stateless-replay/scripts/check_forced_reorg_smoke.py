@@ -19,9 +19,10 @@ def expect(row, **fields):
                 f"{key}: expected {expected!r}, got {row.get(key)!r}")
 
 
-def check_applied(outcome, attempts, *, at, depth):
+def check_applied(outcome, attempts, *, at, depth, layout):
+    expected_frames = depth if layout == "frames" else depth - 1
     expect(outcome, at=at, depth=depth, outcome="applied", reapplied=depth,
-           frames_applied=depth - 1, resumed_identical=True)
+           frames_applied=expected_frames, resumed_identical=True)
     require(outcome["resumed_identical"] is True, "resumed_identical must be true")
     expect(outcome["ancestor"], number=at - depth)
     sequences = outcome["reapplied_sequences"]
@@ -36,7 +37,7 @@ def check_applied(outcome, attempts, *, at, depth):
 
 def check(records, *, at, depth, commits, expected_commit, allocator,
           mode="smoke", refusal_at=None, refusal_depth=None, checkpoint_sequence=None,
-          checkpoints_skimmed=None, frames=None):
+          checkpoints_skimmed=None, frames=None, layout=None):
     require(depth in (2, 3), "the smoke must consume frames: use depth 2 or 3")
     require(re.fullmatch(r"[0-9a-f]{40}", expected_commit) is not None,
             "expected_commit must be a full lowercase Git commit hash")
@@ -56,6 +57,14 @@ def check(records, *, at, depth, commits, expected_commit, allocator,
     expect(manifest, benchmark="standalone_replay_v1", retain_depth=3,
            undo_record=True, forced_reorgs=schedule, allocator=allocator)
     require(manifest["undo_record"] is True, "undo recording must be enabled")
+    # Runs written before the layout axis existed used the hybrid layout. The manifest is the
+    # authority; an explicit argument pins it when a caller registered the expected arm in advance.
+    manifest_layout = manifest.get("undo_layout", "hybrid")
+    require(manifest_layout in ("hybrid", "frames"),
+            f"unknown undo_layout {manifest_layout!r}")
+    layout = manifest_layout if layout is None else layout
+    require(manifest_layout == layout,
+            f"undo_layout: expected {layout!r}, got {manifest.get('undo_layout')!r}")
     provenance = manifest["provenance"]
     require(provenance.get("build_dirty") is False, "build_dirty must be false")
     expect(provenance, build_commit=expected_commit)
@@ -73,7 +82,7 @@ def check(records, *, at, depth, commits, expected_commit, allocator,
     require(len(attempts) == commits, f"expected {commits} distinct verified corpus sequences")
     outcomes = report["forced_reorgs"]
     require(len(outcomes) == len(schedule), "wrong forced-reorg outcome count")
-    check_applied(outcomes[0], attempts, at=at, depth=depth)
+    check_applied(outcomes[0], attempts, at=at, depth=depth, layout=layout)
     if mode == "smoke":
         require(len(blocks) == commits + depth, "wrong original/reapplied attempt count")
         require(all(len(attempts[sequence]) == 2 for sequence in outcomes[0]["reapplied_sequences"]),
@@ -146,6 +155,7 @@ def main():
     parser.add_argument("--commits", type=int, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--allocator", choices=("jemalloc", "system", "snmalloc"), default="jemalloc")
+    parser.add_argument("--layout", choices=("hybrid", "frames"))
     parser.add_argument("--refusal-at", type=int)
     parser.add_argument("--refusal-depth", type=int)
     parser.add_argument("--checkpoint-sequence", type=int)
@@ -157,7 +167,7 @@ def main():
               expected_commit=args.expected_commit, allocator=args.allocator, mode=args.mode,
               refusal_at=args.refusal_at, refusal_depth=args.refusal_depth,
               checkpoint_sequence=args.checkpoint_sequence, checkpoints_skimmed=args.checkpoints_skimmed,
-              frames=read_jsonl(args.frames) if args.frames else None)
+              frames=read_jsonl(args.frames) if args.frames else None, layout=args.layout)
     except (ValueError, KeyError, TypeError, IndexError, StopIteration, OSError) as error:
         parser.exit(1, f"forced-reorg evidence failed: {error}\n")
     print(f"forced-reorg {args.mode} evidence passed: {args.commits} commits")

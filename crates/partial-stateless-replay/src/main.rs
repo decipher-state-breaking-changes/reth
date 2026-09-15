@@ -68,7 +68,7 @@ use partial_stateless_replay::{
     ReplayOptions, ReplayReport,
 };
 use partial_stateless_stream::EndKind;
-use partial_stateless_validator::RetentionDepth;
+use partial_stateless_validator::{RetentionDepth, UndoLayout};
 use std::{num::NonZeroU64, path::PathBuf};
 use tracing::{error, info, warn};
 
@@ -296,10 +296,10 @@ fn write_manifest(
         // default and every run written before this axis existed. A number is the interval in
         // blocks, so the two arms of the shrink A/B are distinguishable from the manifest alone.
         "warm_shrink_blocks": pair.warm_shrink.interval().map(NonZeroU64::get),
-        // False keeps whole generations; true holds everything below the newest as a diff.
-        // Absent on files written
-        // before the axis existed.
+        // Whether blocks record undo data. The layout below says when those records replace whole
+        // generations. Absent on files written before the axis existed.
         "undo_record": pair.undo_record,
+        "undo_layout": pair.undo_layout.as_str(),
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
         // repeated heights, and every forced reorg is also listed in the report. Empty otherwise.
         "forced_reorgs": forced_reorgs
@@ -590,6 +590,30 @@ fn parse_undo_record(raw: &str) -> eyre::Result<bool> {
     }
 }
 
+/// Retained-generation layout from `PS_UNDO_LAYOUT`; hybrid unless the run asks for frames.
+fn undo_layout_from_env() -> eyre::Result<UndoLayout> {
+    match std::env::var("PS_UNDO_LAYOUT") {
+        Ok(raw) => parse_undo_layout(&raw)
+            .map_err(|err| eyre::eyre!("PS_UNDO_LAYOUT={raw:?} is not a layout: {err}")),
+        Err(_) => Ok(UndoLayout::Hybrid),
+    }
+}
+
+fn parse_undo_layout(raw: &str) -> eyre::Result<UndoLayout> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "hybrid" => Ok(UndoLayout::Hybrid),
+        "frames" => Ok(UndoLayout::FramesOnly),
+        other => eyre::bail!("expected hybrid or frames, got {other:?}"),
+    }
+}
+
+fn check_undo_configuration(layout: UndoLayout, record: bool) -> eyre::Result<()> {
+    if layout == UndoLayout::FramesOnly && !record {
+        eyre::bail!("--undo-layout frames requires --undo-record on")
+    }
+    Ok(())
+}
+
 /// Forced reorgs from `PS_FORCED_REORGS`, a comma-separated list of `D@N`; empty if unset.
 ///
 /// Read before the flags, so `--forced-reorg` on the command line replaces the list rather than
@@ -661,6 +685,7 @@ fn parse_args() -> eyre::Result<Mode> {
         retain_depth: retain_depth_from_env()?,
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
+        undo_layout: undo_layout_from_env()?,
         forced_reorgs: forced_reorgs_from_env()?,
         ..ReplayOptions::default()
     };
@@ -717,6 +742,12 @@ fn parse_args() -> eyre::Result<Mode> {
                 };
                 options.undo_record = on;
             }
+            "--undo-layout" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--undo-layout needs 'hybrid' or 'frames'"))?;
+                options.undo_layout = parse_undo_layout(&raw)?;
+            }
             "--forced-reorg" => {
                 let raw = args
                     .next()
@@ -737,14 +768,16 @@ fn parse_args() -> eyre::Result<Mode> {
                      [--mutations-transition [N]] \
                      [--force-restore-at <sequence>] [--retain-depth N] \
                      [--warm-shrink N|never] [--undo-record [on|off]] \
+                     [--undo-layout hybrid|frames] \
                      [--forced-reorg D@N]... [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
-                     [--undo-record [on|off]] \
+                     [--undo-record [on|off]] [--undo-layout hybrid|frames] \
                      [--json <path>] \
                      [--label <name>]\nps-replay --list-frames <spool-dir>\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
-                     sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, and PS_FORCED_REORGS \
+                     sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, PS_UNDO_LAYOUT sets \
+                     --undo-layout, and PS_FORCED_REORGS \
                      (D@N,D@N,...) sets --forced-reorg; the flags win."
                 );
                 std::process::exit(0);
@@ -753,6 +786,7 @@ fn parse_args() -> eyre::Result<Mode> {
             other => return Err(eyre::eyre!("unexpected argument {other}")),
         }
     }
+    check_undo_configuration(options.undo_layout, options.undo_record)?;
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay <spool-dir> [--limit N]"))?;
     if !forced_from_flags.is_empty() {
         options.forced_reorgs = forced_from_flags;
@@ -768,6 +802,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
         retain_depth: retain_depth_from_env()?,
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
+        undo_layout: undo_layout_from_env()?,
         ..FollowOptions::default()
     };
     while let Some(arg) = args.next() {
@@ -824,10 +859,17 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                 };
                 options.undo_record = on;
             }
+            "--undo-layout" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--undo-layout needs 'hybrid' or 'frames'"))?;
+                options.undo_layout = parse_undo_layout(&raw)?;
+            }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),
             other => return Err(eyre::eyre!("unexpected argument {other}")),
         }
     }
+    check_undo_configuration(options.undo_layout, options.undo_record)?;
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay --follow <spool-dir>"))?;
     Ok(Mode::Follow { dir, options })
 }
@@ -847,6 +889,16 @@ mod tests {
                 "{raw:?} should switch shrinking off"
             );
         }
+    }
+
+    #[test]
+    fn undo_layout_names_are_explicit_and_frames_require_recording() {
+        assert_eq!(parse_undo_layout(" hybrid ").unwrap(), UndoLayout::Hybrid);
+        assert_eq!(parse_undo_layout("FRAMES").unwrap(), UndoLayout::FramesOnly);
+        assert!(parse_undo_layout("frame").is_err());
+        assert!(check_undo_configuration(UndoLayout::FramesOnly, false).is_err());
+        assert!(check_undo_configuration(UndoLayout::FramesOnly, true).is_ok());
+        assert!(check_undo_configuration(UndoLayout::Hybrid, false).is_ok());
     }
 
     #[test]

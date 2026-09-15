@@ -88,6 +88,33 @@ impl Default for RetentionDepth {
     }
 }
 
+/// How retained trie generations are represented when undo recording is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum UndoLayout {
+    /// Keep the newest generation whole and demote older generations to frames.
+    #[serde(rename = "hybrid")]
+    Hybrid,
+    /// Turn each committed block's record into a frame immediately.
+    #[serde(rename = "frames")]
+    FramesOnly,
+}
+
+impl UndoLayout {
+    /// Stable spelling used by command-line options and run manifests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::FramesOnly => "frames",
+        }
+    }
+}
+
+impl Default for UndoLayout {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
 impl std::fmt::Display for RetentionDepth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -245,6 +272,8 @@ pub struct CoordinatedPair {
     /// which a reorg is refused all read this one field rather than keeping constants of their
     /// own.
     pub retention_depth: RetentionDepth,
+    /// How generations are retained when the live cache records undo data.
+    pub undo_layout: UndoLayout,
     /// Header of the block this pair is the state *after*, kept so a child can be checked against
     /// it.
     ///
@@ -284,7 +313,8 @@ impl CoordinatedPair {
     ///
     /// Requiring `Ready` falls out of that and is correct on its own terms: a warming or
     /// recovering pair has no authenticated parent to offer, and admitting untrusted input
-    /// against a guess is exactly what section 4.2 exists to forbid. Absence is a rejection.
+    /// against a guess would let unauthenticated parent state reach execution. Absence is a
+    /// rejection.
     pub fn accepted_parent(&self) -> Option<&SealedHeader> {
         let header = self.accepted_head.as_ref()?;
         let ready = self.readiness.ready_parent()?;
@@ -330,8 +360,7 @@ impl CoordinatedPair {
     pub fn retain_generation(
         &mut self,
         displaced: Option<PartialTrieNodeCache>,
-        block_hash: B256,
-        block_number: u64,
+        block: &BlockContext,
         accepted_head: SealedHeader,
         enabled: bool,
     ) -> CommitUndoReport {
@@ -344,6 +373,7 @@ impl CoordinatedPair {
         // run against on the *next* block, so it advances whether or not this run retains for
         // reorgs; the K = 1 memory control turns off retention, not admission.
         let displaced_accepted_head = self.accepted_head.replace(accepted_head);
+        let mut retained_head = Some(displaced_accepted_head);
         // Dropping `displaced` here rather than declining to produce it is deliberate: the
         // transition still copies the parent trie and still hands the copy back, so the control
         // arm pays exactly the work the production arm pays and differs only in what it keeps.
@@ -357,11 +387,10 @@ impl CoordinatedPair {
             self.retained.clear();
             return CommitUndoReport::default()
         };
-        // The generation this one was cloned from is the one its record describes, and this is the
-        // one moment both objects exist side by side: the record was taken on the working copy
-        // that became this cache, and the copy it was taken from is the deque's newest entry. So
-        // the newest entry is demoted to the diff, and this cache takes its place as the one whole
-        // copy the chain of frames hangs off.
+        // A frame always names the generation it restores. The hybrid closes the displaced
+        // generation's older record and demotes the deque entry below it. Frames-only closes the
+        // live generation's current record against `trie_cache` and retains that parent directly
+        // as a frame.
         //
         // Nothing is demoted when there is no record to demote it with — recording off, a
         // `Parallel` cache, a retention pass with no delta shape, or a generation this cache was
@@ -369,10 +398,9 @@ impl CoordinatedPair {
         // record is ended either way: its preimages are the block's, and a generation nobody will
         // ask a frame from should not go on holding them.
         //
-        // Not attempted at depth 1, where the entry that would be demoted is the one this push
-        // evicts: the frame would be built — a pointer comparison per retained storage trie and a
-        // move for each one that changed — and dropped in the same call. A K=1 pair therefore
-        // keeps one whole generation whether or not recording is enabled, isolating its cost.
+        // Hybrid does not attempt demotion at depth 1, where the entry it produced would be evicted
+        // by the same push. Frames-only retains the frame created by the current commit even at
+        // depth 1.
         //
         // Timed to exactly here and no further: ending both journals, dropping the preimages that
         // turned out to describe no change, and the pointer comparison over the storage-trie map.
@@ -381,17 +409,24 @@ impl CoordinatedPair {
         // walks every storage trie it holds — a cost the control arm does not pay, which inside
         // this bracket would show up as recording being slower than it is.
         let started = Instant::now();
-        let frame = match self.retained.back_mut().map(|held| &mut held.content) {
-            Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
-                trie_cache.take_undo_frame(parent)
-            }
-            _ => {
-                trie_cache.clear_undo_record();
-                None
-            }
+        let frame = match self.undo_layout {
+            UndoLayout::Hybrid => match self.retained.back_mut().map(|held| &mut held.content) {
+                Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
+                    trie_cache.take_undo_frame(parent)
+                }
+                _ => {
+                    trie_cache.clear_undo_record();
+                    None
+                }
+            },
+            UndoLayout::FramesOnly => self.trie_cache.take_undo_frame(&mut trie_cache),
         };
         let mut report = CommitUndoReport { frame: None, us: started.elapsed().as_micros() as u64 };
         if let Some(frame) = frame {
+            let (block_number, block_hash) = match self.undo_layout {
+                UndoLayout::Hybrid => (block.number.saturating_sub(1), block.parent_hash),
+                UndoLayout::FramesOnly => (block.number, block.hash),
+            };
             report.frame = Some(CommitUndoFrame {
                 counts: frame.counts(),
                 // The record's own weight, which is one pass over the entries it holds. Its
@@ -402,16 +437,36 @@ impl CoordinatedPair {
                 block_number,
                 block_hash,
             });
-            let held = self.retained.back_mut().expect("a frame is produced against a generation");
-            held.content = RetainedContent::Frame(Box::new(frame));
+            match self.undo_layout {
+                UndoLayout::Hybrid => {
+                    let held = self
+                        .retained
+                        .back_mut()
+                        .expect("a hybrid frame is produced against a retained generation");
+                    held.content = RetainedContent::Frame(Box::new(frame));
+                }
+                UndoLayout::FramesOnly => {
+                    debug_assert_eq!(frame.target(), trie_cache.undo_id());
+                    self.retained.push_back(RetainedGeneration {
+                        undo_id: frame.target(),
+                        state_root: trie_cache.state_root(),
+                        content: RetainedContent::Frame(Box::new(frame)),
+                        block_hash: block.parent_hash,
+                        block_number: block.number.saturating_sub(1),
+                        accepted_head: retained_head.take().expect("the generation head is unused"),
+                    });
+                }
+            }
         }
 
-        self.retained.push_back(RetainedGeneration::full(
-            trie_cache,
-            block_hash,
-            block_number,
-            displaced_accepted_head,
-        ));
+        if self.undo_layout == UndoLayout::Hybrid || report.frame.is_none() {
+            self.retained.push_back(RetainedGeneration::full(
+                trie_cache,
+                block.parent_hash,
+                block.number.saturating_sub(1),
+                retained_head.take().expect("the generation head is unused"),
+            ));
+        }
         while self.retained.len() > self.retention_depth.as_usize() {
             self.retained.pop_front();
         }
@@ -433,13 +488,7 @@ impl CoordinatedPair {
         accepted_head: SealedHeader,
         retain: bool,
     ) -> CommitReport {
-        let undo = self.retain_generation(
-            displaced,
-            block.parent_hash,
-            block.number.saturating_sub(1),
-            accepted_head,
-            retain,
-        );
+        let undo = self.retain_generation(displaced, block, accepted_head, retain);
         let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
         CommitReport { readiness: self.readiness.finish_block(block, &observation).label(), undo }
     }
@@ -467,10 +516,9 @@ impl CoordinatedPair {
                     breakdown,
                 }
             }
-            // Reachable only immediately after an undo, which leaves the deque's newest entry as
-            // the frame that produced the generation now live. Every other field stays zero rather
-            // than being estimated from the frame: they are defined against a whole cache, and a
-            // frame is not one.
+            // Normal on every committed block in the frames-only layout, and reachable after an
+            // undo in the hybrid layout. Every other field stays zero: those fields are defined
+            // against a whole cache, and a frame is not one.
             RetainedContent::Frame(frame) => RetainedGenerationBytes {
                 enabled,
                 present: true,
@@ -955,11 +1003,9 @@ pub struct CommitReport {
 
 /// The undo frame one commit produced, if it produced one.
 ///
-/// `frame` is `None` on every commit that kept its predecessor whole — recording off, depth 1, a
-/// `Parallel` cache, or a record that could not describe its block — which is the same condition
-/// the deque's `full_generations` reports from the other side. `us` is measured either way: a
-/// commit that ends a record and keeps nothing still paid for ending it, and at depth 1 that is
-/// the whole of what recording costs at commit time.
+/// `frame` is `None` on every commit that kept its predecessor whole — recording off, a
+/// `Parallel` cache, or a record that could not describe its block — and also at depth 1 in the
+/// hybrid layout, where a frame would be immediately evicted. `us` is measured either way.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitUndoReport {
     /// The frame, and the block it undoes.
@@ -973,10 +1019,9 @@ pub struct CommitUndoReport {
 
 /// One frame, and which block it undoes.
 ///
-/// The block is carried rather than left to the reader because it is **not** the block being
-/// committed: a frame is assembled from the record of the cache this commit displaces, which is
-/// the state after the *previous* block. Subtracting one recovers it only on a run with no reorgs
-/// and no rejections, and this is the code path that exists for runs that have both.
+/// The block is carried rather than inferred by the reader. A hybrid frame describes the previous
+/// block whose generation is being demoted; a frames-only frame describes the block whose journal
+/// is closed by this commit. In both cases the value is the block applying the frame would undo.
 #[derive(Debug, Clone, Copy)]
 pub struct CommitUndoFrame {
     /// What the frame holds, by kind.
@@ -997,11 +1042,10 @@ pub struct CommitUndoFrame {
 
 /// How one retained generation is held: whole, or as the diff that produces it.
 ///
-/// The newest retained generation is always `Full` — it is the copy the block just committed read
-/// as its parent, so it exists whether or not anything keeps it, and the frame that would replace
-/// it is not recorded until the *next* block is committed. Everything older is a `Frame`, which is
-/// what makes depth K cost one copy and K-1 diffs instead of K copies. A pair whose cache does not
-/// record — the `Parallel` representation, or a run with recording off — holds `Full` throughout.
+/// The hybrid layout keeps the newest generation `Full` and older generations as frames. The
+/// frames-only layout closes the live cache's record at its own commit and can therefore hold the
+/// newest generation as a frame too. A cache that cannot produce a frame is kept `Full` in either
+/// layout.
 // Keep the whole cache inline because the parent-read path accesses it every block. The map
 // allocations dominate the small amount of enum padding that boxing would save.
 #[expect(clippy::large_enum_variant)]
@@ -1095,9 +1139,8 @@ pub struct RetainedGenerationBytes {
     pub complete_exclusive_bytes: usize,
     /// What the newest generation's undo frame holds, when it is held as one rather than whole.
     ///
-    /// Zero in the ordinary case: the newest retained generation is the copy the block just
-    /// committed read as its parent, so it is always whole. Non-zero only immediately after an
-    /// undo, and then every field above is zero — they are defined against a whole cache.
+    /// Non-zero when the newest retained generation is a frame. Every field above is then zero —
+    /// they are defined against a whole cache.
     pub frame_bytes: usize,
     /// Where the two complete figures came from.
     pub breakdown: TrieCacheMemory,
@@ -1113,9 +1156,8 @@ pub struct RetainedDequeBytes {
     pub generations: usize,
     /// Of those, how many are held as whole caches.
     ///
-    /// One in the steady state with recording on, and `generations` with it off. It is the number
-    /// the whole hybrid exists to hold down: a whole generation measured 186 MiB on the corpus,
-    /// and a frame is sized by what one block touched.
+    /// One in the hybrid steady state and zero in a successful frames-only steady state. A frame
+    /// fallback raises it; recording off makes it equal `generations`.
     pub full_generations: usize,
     /// Of those, how many are held as undo frames.
     pub frames: usize,

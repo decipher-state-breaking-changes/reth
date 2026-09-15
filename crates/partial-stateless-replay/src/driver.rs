@@ -30,7 +30,7 @@ use partial_stateless_validator::{
     timings::{AdmissionTimings, ValidationPhaseTimings},
     verify_and_apply_sidecar, AdmissionError, BlockAdmission, CoordinatedFingerprint,
     CoordinatedPair, PayloadProvenance, RetentionDepth, SidecarReexecLimits, TrieCacheDisposition,
-    UntrustedAdmission, ValidatorRules, POST_EXECUTION_REJECTION,
+    UndoLayout, UntrustedAdmission, ValidatorRules, POST_EXECUTION_REJECTION,
 };
 use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum_consensus::EthBeaconConsensus;
@@ -103,10 +103,12 @@ pub struct ReplayOptions {
     ///
     /// Off by default, retaining whole generations. Recording costs a lookup per write on the
     /// hot path and the copies it saves are
-    /// memory, not latency. At `retain_depth` 1 it changes nothing that is kept — the newest
-    /// generation is whole either way — and only the recording cost is left, which is what makes a
-    /// K=1 pair the clean baseline for what recording alone costs.
+    /// memory, not latency. In the default hybrid layout, `retain_depth` 1 keeps the newest
+    /// generation whole and isolates recording cost. The frames-only layout also replaces that
+    /// generation with its frame.
     pub undo_record: bool,
+    /// How recorded generations are represented in the retained deque.
+    pub undo_layout: UndoLayout,
     /// Reorgs to force, each fired after the commit of its block lands. Ascending by block.
     ///
     /// Empty by default. A forced reorg is a pure revert of the `depth` blocks the pair just
@@ -170,23 +172,25 @@ impl ReplayOptions {
             retain_depth: self.retain_depth,
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
+            undo_layout: self.undo_layout,
         }
     }
 }
 
 /// How a restored pair is configured, as one value rather than a growing parameter list.
 ///
-/// Both fields are settings on the same object — the depth its retained-generation deque runs at,
-/// and the sizing policy its warm sets run under — and both reach [`restore`] through the same two
-/// hops, so they travel together rather than as parallel scalars that can be threaded out of step.
+/// These settings reach [`restore`] through the same two hops, so they travel together rather than
+/// as parallel scalars that can be threaded out of step.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PairConfig {
     /// How many trie generations the pair retains.
     pub retain_depth: RetentionDepth,
     /// How often the pair's warm sets are returned to a fitted size.
     pub warm_shrink: WarmSetShrinkPolicy,
-    /// Whether the pair holds its older generations as undo frames rather than whole copies.
+    /// Whether blocks record the changes from their parent generation.
     pub undo_record: bool,
+    /// How recorded generations are represented in the retained deque.
+    pub undo_layout: UndoLayout,
 }
 
 impl Default for ReplayOptions {
@@ -202,6 +206,7 @@ impl Default for ReplayOptions {
             retain_depth: RetentionDepth::ONE,
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
+            undo_layout: UndoLayout::default(),
             forced_reorgs: Vec::new(),
         }
     }
@@ -1765,8 +1770,8 @@ fn jemalloc_stats() -> Option<[u64; 5]> {
 ///
 /// **The probe costs different amounts in different deque shapes, and says so.**
 /// `retained_deque_bytes` walks every storage trie of every *whole* generation, so a deque of K
-/// whole generations pays K deep walks per sample where a deque of one generation and K-1 undo
-/// frames pays one plus K-1 shallow ones — thousands of tries against hundreds. That is real work
+/// whole generations pays K deep walks per sample where a hybrid deque pays one plus K-1 shallow
+/// walks and a frames-only deque pays K shallow walks. That is real work
 /// inside the process's wall clock, and a benchmark comparing wall time across those two shapes
 /// reads the difference as a speed-up. It does not reach the per-block timings, because the probe
 /// runs after `close_validation` and outside every phase, so reporting the cost is enough: a
@@ -1800,11 +1805,9 @@ mapped={mapped}\tjemalloc_retained={retained}"
     // per-run choice. `present` is the field that says whether a generation was actually held.
     let retained = pair.retained_generation_bytes(true);
     let b = retained.breakdown;
-    // The newest generation above, the whole deque here, and they answer different questions. At
-    // K = 1 the two agree by construction; at K > 1 the first says what one generation costs and
-    // only the second says what retaining K of them costs — and the second is not K times the
-    // first, because a third of a generation is storage tries shared by `Arc`. A K = 3 run that
-    // reported only the newest generation could show the total RSS move and not say what moved it.
+    // The newest retained entry above and the whole deque here answer different questions. At K >
+    // 1 only the second says what retaining K entries costs, and it is not K times the first
+    // because storage tries are shared by `Arc`.
     let deque = pair.retained_deque_bytes();
     let probe_us = started.elapsed().as_micros();
     eprintln!(
@@ -2337,6 +2340,7 @@ pub(crate) fn restore(
             // is, so it starts retaining at that depth from its first commit.
             retained: Default::default(),
             retention_depth: pair.retain_depth,
+            undo_layout: pair.undo_layout,
             accepted_head,
             readiness: restored.readiness,
         },
@@ -2607,9 +2611,8 @@ pub(crate) fn replay_commit(
         admitted.block.clone_sealed_header(),
         true,
     );
-    // Recorded whenever the pair is recording, frame or no frame: at depth 1 no frame is kept and
-    // `assemble_us` is then the whole of what ending the record costs, which is the arm the A/B
-    // reads its baseline from.
+    // Recorded whenever the pair is recording, frame or no frame. The hybrid at depth 1 keeps no
+    // frame; frames-only closes and keeps the current block's frame at every depth.
     timer.undo = state.pair.trie_cache.records_undo().then(|| UndoFrameTiming {
         assemble_us: commit.undo.us,
         frame: commit.undo.frame.map(|frame| UndoFrameRecord {
@@ -2902,6 +2905,7 @@ mod tests {
             trie_cache: PartialTrieNodeCache::new(),
             retained: Default::default(),
             retention_depth: Default::default(),
+            undo_layout: Default::default(),
             accepted_head: None,
             readiness: config.new_readiness_tracker(),
         }

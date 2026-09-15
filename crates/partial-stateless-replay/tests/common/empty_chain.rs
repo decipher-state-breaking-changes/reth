@@ -54,6 +54,7 @@ pub fn chain_with_tag(count: u64, tag: u8) -> (Fixture, Vec<StreamEvent>) {
         accepted_head: Some(SealedHeader::seal_slow(parent.clone())),
         retained: Default::default(),
         retention_depth: RetentionDepth::new(3).unwrap(),
+        undo_layout: Default::default(),
     };
     let consensus = EthBeaconConsensus::new(MAINNET.clone());
     let evm = EthEvmConfig::new(MAINNET.clone());

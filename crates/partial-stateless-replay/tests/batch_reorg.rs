@@ -82,6 +82,8 @@ fn check_evidence(
             EVIDENCE_COMMIT,
             "--allocator",
             manifest["allocator"].as_str().unwrap(),
+            "--layout",
+            manifest["undo_layout"].as_str().unwrap(),
         ])
         .args(args)
         .output()
@@ -334,6 +336,53 @@ fn an_applied_forced_reorg_serializes_the_smoke_evidence() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains(message));
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_frames_only_forced_reorg_serializes_layout_aware_evidence() {
+    let dir = spool_dir("batch-forced-frames-json");
+    let (fixture, commits) = common::empty_chain::chain(8);
+    write_manifest(&dir);
+    let mut next = write_checkpoint(&dir, 1, &fixture);
+    for commit in &commits {
+        write_frame(&dir, next, FrameKind::Commit, commit);
+        next += 1;
+    }
+    write_frame(&dir, next, FrameKind::End, &end_frame(next, EndKind::Shutdown));
+    let at = fixture.checkpoint.block.number + 3;
+    let json = dir.join("frames.jsonl");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ps-replay"))
+        .arg(&dir)
+        .args([
+            "--no-mutations",
+            "--retain-depth",
+            "3",
+            "--undo-record",
+            "--undo-layout",
+            "frames",
+            "--forced-reorg",
+            &format!("2@{at}"),
+        ])
+        .arg("--json")
+        .arg(&json)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let rows = evidence_with_test_provenance(&json);
+    assert_eq!(rows[0]["undo_layout"], "frames");
+    assert_eq!(rows[1]["forced_reorgs"][0]["frames_applied"], 2);
+    let checked = dir.join("checked-frames.jsonl");
+    let args = vec!["--at".into(), at.to_string(), "--commits".into(), "8".into()];
+    let output = check_evidence(&checked, &rows, &args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let mut bad = rows.clone();
+    bad[1]["forced_reorgs"][0]["frames_applied"] = serde_json::json!(1);
+    let output = check_evidence(&checked, &bad, &args);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("frames_applied"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
