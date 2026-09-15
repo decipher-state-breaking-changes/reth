@@ -845,10 +845,21 @@ mod tests {
         ));
         assert_same_place(&mut frames.pair, &mut full.pair);
 
-        advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xd1, true);
+        let again = advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xd1, true);
         advance_retaining(&mut full, ANCHOR_BLOCK + 1, 0xd1, true);
         let deque = frames.pair.retained_deque_bytes();
         assert_eq!((deque.generations, deque.full_generations, deque.frames), (1, 0, 1));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+
+        // The frame that commit pushed is the one the next undo applies.
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(ancestor, vec![again], None)),
+            ReorgOutcome::Applied { frames_applied: 1, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(ancestor, vec![again], None)),
+            ReorgOutcome::Applied { frames_applied: 0, .. }
+        ));
         assert_same_place(&mut frames.pair, &mut full.pair);
     }
 
@@ -868,27 +879,52 @@ mod tests {
         );
 
         let mut control = frames_only_state_at_depth(depth(1)).0;
-        let parent = control.history.tip().expect("seeded");
-        let state_root = control.pair.trie_cache.state_root().unwrap();
+        let (_, _, reported) = retain_and_report(&mut control, number, 0xd2);
+        assert_eq!(reported, Some((number, block.hash)), "the commit closes its own frame");
+    }
+
+    /// Commits `number` straight through `retain_generation` and returns the block, its parent's
+    /// hash, and the block the commit's frame report names, if a frame was produced.
+    fn retain_and_report(
+        state: &mut ReplayState,
+        number: u64,
+        tag: u8,
+    ) -> (BlockRef, B256, Option<(u64, B256)>) {
+        let parent = state.history.tip().expect("seeded");
+        let state_root = state.pair.trie_cache.state_root().unwrap();
+        let block = BlockRef { number, hash: B256::with_last_byte(tag) };
         let ctx = BlockContext { number, hash: block.hash, parent_hash: parent.hash, state_root };
-        let (next, _) = control.pair.trie_cache.clone_timed();
-        let displaced = std::mem::replace(&mut control.pair.trie_cache, next);
-        let report = control.pair.retain_generation(
+        let (next, _) = state.pair.trie_cache.clone_timed();
+        let displaced = std::mem::replace(&mut state.pair.trie_cache, next);
+        let header = alloy_consensus::Header {
+            number,
+            parent_hash: parent.hash,
+            state_root,
+            ..Default::default()
+        };
+        let report = state.pair.retain_generation(
             Some(displaced),
             &ctx,
-            SealedHeader::new(
-                alloy_consensus::Header {
-                    number,
-                    parent_hash: parent.hash,
-                    state_root,
-                    ..Default::default()
-                },
-                block.hash,
-            ),
+            SealedHeader::new(header, block.hash),
             true,
         );
-        let produced = report.frame.expect("the commit closes its own frame");
-        assert_eq!((produced.block_number, produced.block_hash), (number, block.hash));
+        (block, parent.hash, report.frame.map(|frame| (frame.block_number, frame.block_hash)))
+    }
+
+    #[test]
+    fn each_layout_reports_the_block_its_frame_undoes() {
+        // The hybrid's frame demotes the generation below the one the commit displaced, so undoing
+        // it undoes the block before the commit. Frames-only closes the committed block's own
+        // record, so its frame undoes the committed block.
+        let (mut hybrid, _) = recording_state_at_depth(depth(3));
+        advance_retaining(&mut hybrid, ANCHOR_BLOCK + 1, 0xa0, true);
+        let (_, parent_hash, reported) = retain_and_report(&mut hybrid, ANCHOR_BLOCK + 2, 0xa1);
+        assert_eq!(reported, Some((ANCHOR_BLOCK + 1, parent_hash)));
+
+        let (mut frames, _) = frames_only_state_at_depth(depth(3));
+        advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xa0, true);
+        let (block, _, reported) = retain_and_report(&mut frames, ANCHOR_BLOCK + 2, 0xa1);
+        assert_eq!(reported, Some((block.number, block.hash)));
     }
 
     #[test]
@@ -921,6 +957,55 @@ mod tests {
     }
 
     #[test]
+    fn frames_only_lands_on_a_whole_fallback_then_commits_and_undoes_again() {
+        // A depth-2 undo whose landing generation is the `Full` fallback: the newest frame is
+        // applied to the live cache in place, then discarded when the whole copy lands, and still
+        // counts as applied. The pair must then commit and undo through the frame below that copy.
+        let (mut frames, _) = frames_only_state_at_depth(depth(3));
+        let (mut full, _) = restored_state_at_depth(depth(3));
+        let ancestor = frames.history.tip().expect("seeded");
+
+        let first = advance_retaining(&mut frames, ANCHOR_BLOCK + 1, 0xe1, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 1, 0xe1, true);
+        frames.pair.trie_cache.set_undo_recording(false);
+        let second = advance_retaining(&mut frames, ANCHOR_BLOCK + 2, 0xe2, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 2, 0xe2, true);
+        frames.pair.trie_cache.set_undo_recording(true);
+        let third = advance_retaining(&mut frames, ANCHOR_BLOCK + 3, 0xe3, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 3, 0xe3, true);
+
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(first, vec![second, third], None)),
+            ReorgOutcome::Applied { frames_applied: 1, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(first, vec![second, third], None)),
+            ReorgOutcome::Applied { frames_applied: 0, .. }
+        ));
+        let deque = frames.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (1, 0, 1));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+
+        // The landed copy still carries the recording flag it was retained with.
+        frames.pair.trie_cache.set_undo_recording(true);
+        let again = advance_retaining(&mut frames, ANCHOR_BLOCK + 2, 0xe4, true);
+        advance_retaining(&mut full, ANCHOR_BLOCK + 2, 0xe4, true);
+        let deque = frames.pair.retained_deque_bytes();
+        assert_eq!((deque.generations, deque.full_generations, deque.frames), (2, 0, 2));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+
+        assert!(matches!(
+            apply_reorg(&mut frames, &reorg_of(ancestor, vec![first, again], None)),
+            ReorgOutcome::Applied { frames_applied: 2, .. }
+        ));
+        assert!(matches!(
+            apply_reorg(&mut full, &reorg_of(ancestor, vec![first, again], None)),
+            ReorgOutcome::Applied { frames_applied: 0, .. }
+        ));
+        assert_same_place(&mut frames.pair, &mut full.pair);
+    }
+
+    #[test]
     fn frames_only_refuses_a_newest_frame_for_another_live_generation_without_consuming_it() {
         let (mut state, _) = frames_only_state_at_depth(depth(2));
         let ancestor = state.history.tip().expect("seeded");
@@ -932,10 +1017,16 @@ mod tests {
         state.pair.trie_cache = state.pair.trie_cache.clone();
         let before = state.pair.trie_cache.undo_id();
 
-        assert!(matches!(
-            apply_reorg(&mut state, &reorg_of(ancestor, run, None)),
-            ReorgOutcome::Unrecoverable { .. }
-        ));
+        let ReorgOutcome::Unrecoverable { ancestor: at, depth: reported, detail } =
+            apply_reorg(&mut state, &reorg_of(ancestor, run, None))
+        else {
+            panic!("a newest frame naming another live generation cannot be applied")
+        };
+        assert_eq!((at, reported), (ancestor, 2));
+        assert!(
+            detail.contains("retained generations could not restore"),
+            "refused by the pair's chain check, not by the depth or suffix checks: {detail}"
+        );
         assert_eq!(state.pair.retained_depth(), retained);
         assert_eq!(state.pair.trie_cache.undo_id(), before);
     }

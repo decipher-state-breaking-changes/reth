@@ -89,9 +89,10 @@ impl Default for RetentionDepth {
 }
 
 /// How retained trie generations are represented when undo recording is enabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum UndoLayout {
     /// Keep the newest generation whole and demote older generations to frames.
+    #[default]
     #[serde(rename = "hybrid")]
     Hybrid,
     /// Turn each committed block's record into a frame immediately.
@@ -106,12 +107,6 @@ impl UndoLayout {
             Self::Hybrid => "hybrid",
             Self::FramesOnly => "frames",
         }
-    }
-}
-
-impl Default for UndoLayout {
-    fn default() -> Self {
-        Self::Hybrid
     }
 }
 

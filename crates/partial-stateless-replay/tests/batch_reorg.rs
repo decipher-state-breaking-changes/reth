@@ -383,6 +383,14 @@ fn a_frames_only_forced_reorg_serializes_layout_aware_evidence() {
     let output = check_evidence(&checked, &bad, &args);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("frames_applied"));
+
+    // `check_evidence` passes the manifest's own layout; a later `--layout` wins, which is how a
+    // runner pins the layout it launched instead of taking the manifest's word for it.
+    let mut pinned = args.clone();
+    pinned.extend(["--layout".to_string(), "hybrid".to_string()]);
+    let output = check_evidence(&checked, &rows, &pinned);
+    assert!(!output.status.success(), "a frames-only run passed a check pinned to hybrid");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("undo_layout"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
