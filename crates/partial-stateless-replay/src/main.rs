@@ -301,7 +301,7 @@ fn write_manifest(
         "undo_record": pair.undo_record,
         "undo_layout": pair.undo_layout.as_str(),
         "undo_dir": pair.undo_dir,
-        "undo_resident_blocks": pair.undo_dir.as_ref().map(|_| 1),
+        "undo_resident_blocks": pair.undo_dir.as_ref().map(|_| 0),
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
         // repeated heights, and every forced reorg is also listed in the report. Empty otherwise.
         "forced_reorgs": forced_reorgs

@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_undo_k32_round_trips_reapplies_and_keeps_one_resident_block() {
+    fn disk_undo_k32_round_trips_reapplies_without_resident_history() {
         for requested in [1, 2, 3, 32] {
             let directory = tempfile::tempdir().unwrap();
             let mut disk = disk_state(directory.path());
@@ -692,7 +692,7 @@ mod tests {
             assert_eq!(disk.pair.retained_depth(), 32);
             assert_eq!(
                 disk.pair.retained.iter().filter(|g| g.content.frame().is_some()).count(),
-                1
+                0
             );
             assert_eq!(
                 disk.pair
@@ -700,9 +700,9 @@ mod tests {
                     .iter()
                     .filter(|g| matches!(g.content, RetainedContent::Disk(_)))
                     .count(),
-                31
+                32
             );
-            assert!(disk.pair.cache.undo_record(ANCHOR_BLOCK + 32).is_some());
+            assert!(disk.pair.cache.undo_record(ANCHOR_BLOCK + 32).is_none());
             assert!(disk.pair.cache.undo_record(ANCHOR_BLOCK + 31).is_none());
             let (ancestor, abandoned) = disk.history.suffix(requested).unwrap();
             let reorg = reorg_of(ancestor, abandoned.clone(), None);
@@ -772,8 +772,8 @@ mod tests {
             ReorgOutcome::Unrecoverable { .. }
         ));
         assert_eq!(state.pair.fingerprint(), before);
-        // Remove every completed file; the resident depth-one undo must still work.
-        for held in &state.pair.retained {
+        // Remove only older files; depth one reads exactly the newest file.
+        for held in state.pair.retained.iter().take(31) {
             if let RetainedContent::Disk(file) = &held.content {
                 file.load().unwrap();
                 std::fs::remove_file(file.path()).unwrap();
@@ -792,6 +792,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut state = disk_state(directory.path());
             disk_run(&mut state, 2);
+            let RetainedContent::Disk(latest) = &state.pair.retained.back().unwrap().content else {
+                panic!("disk")
+            };
+            latest.load().unwrap(); // Quiesce the writer before removing its directory.
             let RetainedContent::Disk(file) = &state.pair.retained[0].content else {
                 panic!("disk")
             };
@@ -806,7 +810,7 @@ mod tests {
             } else {
                 std::fs::remove_dir_all(file.path().parent().unwrap()).unwrap();
                 advance_retaining(&mut state, ANCHOR_BLOCK + 3, 3, true);
-                let RetainedContent::Disk(failed) = &state.pair.retained[1].content else {
+                let RetainedContent::Disk(failed) = &state.pair.retained[2].content else {
                     panic!("disk")
                 };
                 assert!(failed.load().is_err(), "the queued write must fail");
@@ -864,13 +868,61 @@ mod tests {
     }
 
     #[test]
-    fn disk_undo_full_fallback_is_resident_only_and_limits_the_available_suffix() {
+    fn disk_undo_files_are_capped_at_k32_and_k64_and_latest_file_is_required() {
+        for k in [32, 64] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = disk_state(directory.path());
+            state.pair.retention_depth = depth(k);
+            for offset in 1..=2 * k + 3 {
+                advance_retaining(&mut state, ANCHOR_BLOCK + offset, offset as u8, true);
+                let RetainedContent::Disk(latest) = &state.pair.retained.back().unwrap().content
+                else {
+                    panic!("all history is on disk")
+                };
+                latest.load().unwrap(); // Serial writer: all earlier jobs have completed too.
+                let files = std::fs::read_dir(latest.path().parent().unwrap())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| {
+                        entry.path().extension().is_some_and(|ext| ext == "undo" || ext == "tmp")
+                    })
+                    .count();
+                assert_eq!(files, offset.min(k) as usize, "old files must be deleted at K={k}");
+                assert!(state.pair.cache.undo_record(ANCHOR_BLOCK + offset).is_none());
+            }
+            // K=64 is an operational option using the same path, not a finality guarantee.
+            if k == 64 {
+                let (ancestor, abandoned) = state.history.suffix(64).unwrap();
+                assert!(matches!(
+                    apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+                    ReorgOutcome::Applied { frames_applied: 64, .. }
+                ));
+            } else {
+                let RetainedContent::Disk(latest) = &state.pair.retained.back().unwrap().content
+                else {
+                    panic!("disk")
+                };
+                std::fs::remove_file(latest.path()).unwrap();
+                let before = state.pair.fingerprint();
+                let (ancestor, abandoned) = state.history.suffix(1).unwrap();
+                assert!(matches!(
+                    apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+                    ReorgOutcome::Unrecoverable { .. }
+                ));
+                assert_eq!(state.pair.fingerprint(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn disk_undo_full_fallback_discards_unreachable_history_without_residency() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = disk_state(directory.path());
         disk_run(&mut state, 3);
         state.pair.trie_cache.set_undo_recording(false);
         advance_retaining(&mut state, ANCHOR_BLOCK + 4, 4, true);
-        assert!(state.pair.retained.back().unwrap().content.full().is_some());
+        assert_eq!(state.pair.retained_depth(), 0, "Full fallback is not retained in RAM");
+        assert!(state.pair.cache.undo_record(ANCHOR_BLOCK + 4).is_none());
         state.pair.trie_cache.set_undo_recording(true);
         advance_retaining(&mut state, ANCHOR_BLOCK + 5, 5, true);
         assert_eq!(state.pair.retained_depth(), 1, "the Full fallback is never kept cold in RAM");

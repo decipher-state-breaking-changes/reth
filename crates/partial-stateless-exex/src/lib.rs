@@ -238,7 +238,7 @@ pub struct RunOptions {
     /// only reason to turn it off is the memory control — an otherwise identical run that pays no
     /// retention, so the difference in resident memory is attributable to retention alone.
     pub retain_generation: bool,
-    /// Total undo window; production defaults to 32 blocks with one resident bundle.
+    /// Total undo window; production defaults to 32 blocks, all on disk.
     pub retention_depth: RetentionDepth,
     pub undo_record: bool,
     pub undo_layout: UndoLayout,
@@ -297,12 +297,10 @@ pub struct RunOptions {
 
 /// Whether a branch change re-checkpoints the stream at the block the pair recovered to.
 ///
-/// The default is `Always`, and the reason is that the producer cannot know what its consumer can
-/// do for itself. A follower holding a retained generation undoes a depth-1 reorg on its own; one
-/// that just restored, just restarted, or met a deeper reorg cannot, and there is no back-channel
-/// to ask which it is. A checkpoint at the common ancestor is what makes both cases recoverable,
-/// and it is the only route for anything past depth 1. The price is a snapshot's worth of spool
-/// per branch change, which the spool bound already governs.
+/// The default is `Always`: the producer cannot know a follower's available undo depth.
+/// A follower can recover within its retained window; a restarted follower, an unavailable file,
+/// or a reorg beyond that window needs a checkpoint at the common ancestor. There is no
+/// back-channel to ask which case applies. The spool bound governs the checkpoint's disk cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReorgCheckpointPolicy {
     /// Re-checkpoint after every reorg, revert, or recovery discontinuity.
@@ -1500,7 +1498,7 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
     }
     info!(target: "partial_stateless", depth = options.retention_depth.get(),
         recording = options.undo_record, layout = options.undo_layout.as_str(),
-        directory = ?options.undo_dir, resident_blocks = 1, "Configured cache undo retention");
+        directory = ?options.undo_dir, resident_blocks = 0, "Configured cache undo retention");
     Ok(())
 }
 
@@ -1598,8 +1596,8 @@ fn load_initial_pair_unconfigured(
         config.new_cache()
     };
 
-    // This persistent-in-memory sparse trie mirrors value-cache account and storage paths. It has
-    // no persisted snapshot or branch-aware undo log yet, so it must reset together with values.
+    // A persisted flat cache alone has no matching trie snapshot. Session-local undo files
+    // cannot repair this across restart, so reset both halves unless a full snapshot was loaded.
     if cache.current_block() != 0 {
         warn!(
             target: "partial_stateless",

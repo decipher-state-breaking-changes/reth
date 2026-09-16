@@ -1,7 +1,8 @@
 //! Disposable, session-local files for coordinated trie and value-cache undo.
 //!
-//! A rendezvous channel bounds outstanding writes to one worker. A handle owns its file even
-//! while the write is pending: pruning the handle cannot let a late completion resurrect history.
+//! A one-slot queue bounds outstanding writes to one active and one queued bundle. A handle owns
+//! its file even while the write is pending: pruning the handle cannot let a late completion
+//! resurrect history.
 
 use crate::{network_cache::BlockCacheUndo, TrieCacheUndoFrame};
 use alloy_primitives::{keccak256, B256};
@@ -10,10 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 const MAGIC: &[u8; 8] = b"PSUNDO01";
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
+const SPILL_WARN_AFTER: Duration = Duration::from_millis(100);
+const SPILL_TIMEOUT: Duration = Duration::from_secs(1);
+const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Both halves of one block's undo, always written and loaded together.
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,10 +51,25 @@ struct Completion {
     ready: Condvar,
 }
 
+impl Completion {
+    fn wait(&self, timeout: Duration) -> Result<Written, String> {
+        let state = self.written.lock().map_err(|err| err.to_string())?;
+        let (state, _) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| state.is_none())
+            .map_err(|err| err.to_string())?;
+        state.as_ref().cloned().unwrap_or_else(|| Err("undo writer completion timed out".into()))
+    }
+}
+
 impl Drop for FileState {
     fn drop(&mut self) {
-        let _ = reth_fs_util::remove_file(&self.path);
-        let _ = reth_fs_util::remove_file(self.path.with_extension("tmp"));
+        for path in [&self.path, &self.path.with_extension("tmp")] {
+            if let Err(error) = reth_fs_util::remove_file_if_exists(path) {
+                tracing::warn!(target: "partial_stateless", %error, ?path,
+                    "Could not remove expired undo file");
+            }
+        }
     }
 }
 
@@ -60,12 +80,7 @@ pub struct DiskUndoHandle(Arc<FileState>);
 impl DiskUndoHandle {
     /// Load one bundle. A pending writer is joined before reading; errors refuse recovery.
     pub fn load(&self) -> Result<DiskUndoBundle, String> {
-        let mut state = self.0.completion.written.lock().map_err(|err| err.to_string())?;
-        while state.is_none() {
-            state = self.0.completion.ready.wait(state).map_err(|err| err.to_string())?;
-        }
-        let written = state.as_ref().expect("writer completed").clone()?;
-        drop(state);
+        let written = self.0.completion.wait(LOAD_TIMEOUT)?;
         let file = std::fs::File::open(&self.0.path).map_err(|err| err.to_string())?;
         if file.metadata().map_err(|err| err.to_string())?.len() != written.bytes ||
             written.bytes > MAX_BYTES + 40
@@ -145,21 +160,33 @@ impl DiskUndoStore {
                 .map_err(|err| err.to_string())?,
         );
         session_lock.lock().map_err(|err| err.to_string())?;
-        let (writer, reader) = mpsc::sync_channel::<WriteJob>(0);
+        let (writer, reader) = mpsc::sync_channel::<WriteJob>(1);
         std::thread::Builder::new()
             .name("ps-undo-writer".into())
             .spawn(move || {
                 for job in reader {
+                    // A pruned job with no remaining handle has nothing left to serve.
+                    if Arc::strong_count(&job.file) == 1 {
+                        continue
+                    }
+                    let block = job.bundle.flat.block_number();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         write_bundle(&job.file, &job.bundle)
                     }))
                     .unwrap_or_else(|_| Err("undo writer panicked".into()));
+                    if result.is_err() &&
+                        let Err(error) = reth_fs_util::remove_file_if_exists(job.file.path.with_extension("tmp"))
+                    {
+                        tracing::warn!(target: "partial_stateless", block, %error,
+                            "Could not remove failed undo write's temporary file");
+                    }
                     // Release the payload before reporting that the write has completed.
                     drop(job.bundle);
                     let completion = Arc::clone(&job.file.completion);
                     drop(job.file);
                     if let Err(error) = &result {
-                        tracing::warn!(target: "partial_stateless", %error, "Undo spill failed; this history will require recovery fallback");
+                        tracing::warn!(target: "partial_stateless", cause = "disk_write_failed", block, %error,
+                            "Undo coverage interrupted at this block; recovery crossing it requires fallback");
                     }
                     if let Ok(mut state) = completion.written.lock() {
                         *state = Some(result);
@@ -171,8 +198,9 @@ impl DiskUndoStore {
         Ok(Self { session_lock, directory, writer, sequence: 0 })
     }
 
-    /// Transfer the payload to the writer. Backpressure bounds memory if the disk falls behind.
-    pub fn spill(&mut self, bundle: DiskUndoBundle) -> DiskUndoHandle {
+    /// Transfer the payload with bounded backpressure. A stalled disk cannot block commits
+    /// indefinitely: after one second, the caller must discard the unreachable undo suffix.
+    pub fn spill(&mut self, bundle: DiskUndoBundle) -> Result<DiskUndoHandle, String> {
         self.sequence += 1;
         let file = Arc::new(FileState {
             session_lock: Arc::clone(&self.session_lock),
@@ -180,12 +208,39 @@ impl DiskUndoStore {
             path: self.directory.path().join(format!("{}.undo", self.sequence)),
             completion: Arc::default(),
         });
-        if self.writer.send(WriteJob { file: Arc::clone(&file), bundle }).is_err() {
-            *file.completion.written.lock().expect("new file lock") =
-                Some(Err("undo writer stopped".into()));
-            file.completion.ready.notify_all();
+        send_with_timeout(
+            &self.writer,
+            WriteJob { file: Arc::clone(&file), bundle },
+            SPILL_TIMEOUT,
+        )?;
+        Ok(DiskUndoHandle(file))
+    }
+}
+
+/// Keep the normal enqueue nonblocking, warn while stalled, and refuse after a bounded wait.
+fn send_with_timeout<T>(
+    writer: &mpsc::SyncSender<T>,
+    mut job: T,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut warned = false;
+    loop {
+        match writer.try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err("undo writer stopped".into()),
+            Err(mpsc::TrySendError::Full(returned)) => job = returned,
         }
-        DiskUndoHandle(file)
+        let elapsed = started.elapsed();
+        if !warned && elapsed >= SPILL_WARN_AFTER {
+            tracing::warn!(target: "partial_stateless", blocked_ms = elapsed.as_millis() as u64,
+                timeout_ms = timeout.as_millis() as u64, "Undo spill waiting for disk writer");
+            warned = true;
+        }
+        if elapsed >= timeout {
+            return Err(format!("undo spill timed out after {} ms", elapsed.as_millis()))
+        }
+        std::thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(elapsed)));
     }
 }
 
@@ -216,6 +271,26 @@ fn write_bundle(file: &FileState, bundle: &DiskUndoBundle) -> Result<Written, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_undo_writer_queue_has_one_slot_and_refuses_a_stall() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        send_with_timeout(&sender, 1, Duration::ZERO).unwrap();
+        assert!(send_with_timeout(&sender, 2, Duration::ZERO).unwrap_err().contains("timed out"));
+        assert_eq!(receiver.recv().unwrap(), 1);
+        send_with_timeout(&sender, 3, Duration::ZERO).unwrap();
+        assert_eq!(receiver.recv().unwrap(), 3);
+        drop(receiver);
+        assert!(send_with_timeout(&sender, 4, Duration::ZERO).unwrap_err().contains("stopped"));
+    }
+
+    #[test]
+    fn disk_undo_completion_wait_is_bounded_and_can_be_retried() {
+        let completion = Completion::default();
+        assert!(completion.wait(Duration::ZERO).unwrap_err().contains("timed out"));
+        *completion.written.lock().unwrap() = Some(Ok(Written { bytes: 40, checksum: B256::ZERO }));
+        assert_eq!(completion.wait(Duration::ZERO).unwrap().bytes, 40);
+    }
 
     #[test]
     fn disk_undo_startup_cleans_only_inactive_owned_sessions() {

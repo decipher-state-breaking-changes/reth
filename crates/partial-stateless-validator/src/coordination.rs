@@ -270,7 +270,7 @@ pub struct CoordinatedPair {
     pub retention_depth: RetentionDepth,
     /// How generations are retained when the live cache records undo data.
     pub undo_layout: UndoLayout,
-    /// Optional session-local disk retention. Only the newest block stays resident.
+    /// Optional session-local disk retention. All completed undo payloads live on disk.
     pub undo_store: Option<DiskUndoStore>,
     /// Header of the block this pair is the state *after*, kept so a child can be checked against
     /// it.
@@ -296,42 +296,49 @@ impl CoordinatedPair {
         Ok(())
     }
 
-    /// Spill the block that just aged out of the one-block resident window.
+    /// Transfer the newest block's trie and flat records together; keep no resident history.
     fn spill_undo(&mut self) {
         let Some(store) = self.undo_store.as_mut() else { return };
-        // A Full fallback is allowed for the newest block. Once it ages out, discard it and
-        // the older unreachable suffix instead of retaining an unbounded set of whole tries.
-        if self.retained.len() > 1 {
-            let index = self.retained.len() - 2;
-            if !matches!(self.retained[index].content, RetainedContent::Disk(_)) {
-                let block = self.retained[index].block_number + 1;
-                match self.cache.take_undo_record(block) {
-                    Some(flat)
-                        if matches!(self.retained[index].content, RetainedContent::Frame(_)) =>
-                    {
-                        // Move the payload without copying its maps. No observer can see the
-                        // temporary gap during this serial commit operation.
-                        let held = self.retained.remove(index).expect("known index");
-                        let RetainedContent::Frame(frame) = held.content else { unreachable!() };
-                        let handle = store.spill(DiskUndoBundle {
-                            parent_hash: held.block_hash,
-                            trie: *frame,
-                            flat,
-                        });
-                        self.retained.insert(
-                            index,
-                            RetainedGeneration { content: RetainedContent::Disk(handle), ..held },
-                        );
-                    }
-                    _ => {
-                        self.retained.drain(..=index);
+        if let Some(held) = self.retained.back() {
+            let block = held.block_number + 1;
+            let cause = match &held.content {
+                RetainedContent::Full(_) => Some("full_fallback"),
+                RetainedContent::Frame(_) if self.cache.undo_record(block).is_none() => {
+                    Some("missing_flat_record")
+                }
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                warn!(target: "partial_stateless", cause, block,
+                    dropped_generations = self.retained.len(), retained_depth = 0,
+                    configured_depth = self.retention_depth.get(),
+                    "Undo coverage lost; discarding history behind an unspillable block");
+                self.retained.clear();
+            } else if matches!(held.content, RetainedContent::Frame(_)) {
+                // Decide eligibility before taking either half of the bundle.
+                let flat = self.cache.take_undo_record(block).expect("checked above");
+                let held = self.retained.pop_back().expect("checked above");
+                let RetainedContent::Frame(frame) = held.content else { unreachable!() };
+                match store.spill(DiskUndoBundle {
+                    parent_hash: held.block_hash,
+                    trie: *frame,
+                    flat,
+                }) {
+                    Ok(handle) => self.retained.push_back(RetainedGeneration {
+                        content: RetainedContent::Disk(handle),
+                        ..held
+                    }),
+                    Err(error) => {
+                        warn!(target: "partial_stateless", cause = "writer_unavailable", %error,
+                            block, dropped_generations = self.retained.len() + 1,
+                            retained_depth = 0, configured_depth = self.retention_depth.get(),
+                            "Undo coverage lost; writer could not accept this block");
+                        self.retained.clear();
                     }
                 }
             }
         }
-        // The latest block's record is required by membership retention and the depth-1 fast
-        // path. All older records are now in paired files or deliberately unavailable.
-        self.cache.prune_undo_below(self.cache.current_block().saturating_sub(1));
+        self.cache.prune_undo_below(self.cache.current_block());
     }
     pub fn fingerprint(&self) -> CoordinatedFingerprint {
         CoordinatedFingerprint {
@@ -1003,6 +1010,9 @@ impl CoordinatedPair {
 
     /// File I/O can fail at any depth. Work on private live-state copies and hold just one
     /// decoded bundle at a time; the original pair and its history stay intact on every error.
+    /// Peak overhead includes another live flat/trie state plus file bytes and its decoded
+    /// bundle, even at depth one. A verify/drop pass followed by in-place undo cannot preserve
+    /// this guarantee if a second file read fails.
     fn restore_from_disk(
         &mut self,
         base: usize,
@@ -1111,7 +1121,8 @@ pub struct CoordinatedFingerprint {
 ///
 /// The tag is a hash rather than a number on purpose: mid-reorg a height names whichever block the
 /// database currently calls canonical, which is the failure the whole recovery path exists to
-/// avoid. `NetworkStateCache` needs no counterpart here — its undo log already reaches finality.
+/// avoid. Flat undo is paired with trie undo in each disk bundle; without a disk store it
+/// remains in `NetworkStateCache`'s undo log.
 pub struct RetainedGeneration {
     /// The generation itself, or the frame that produces it from the one above.
     pub content: RetainedContent,

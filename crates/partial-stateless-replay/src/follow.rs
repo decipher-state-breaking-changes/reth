@@ -89,7 +89,7 @@ pub struct FollowOptions {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
-    /// Directory for disk undo; only the newest block stays in memory.
+    /// Directory for disk undo; all retained undo payloads are written to disk.
     pub undo_dir: Option<std::path::PathBuf>,
 }
 
