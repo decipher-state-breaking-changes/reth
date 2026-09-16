@@ -371,6 +371,33 @@ an overlap-retaining Engine report, and a structured builder report. Raw records
 as `paired.jsonl`, `engine.jsonl`, `builder.jsonl`, `resources.jsonl`, and
 `reth-partial-stateless.log`.
 
+### Bounded disk-undo acceptance run on zns4
+
+`/data2/bench-runs/run_disk_undo_1000.sh` wraps
+[`run_disk_undo_smoke.py`](scripts/run_disk_undo_smoke.py). It uses the existing paired driver and
+`restore_vanilla_node.sh`, with the existing 90/60, v3, engine-access-on profile and K=32 disk undo.
+
+```sh
+/data2/bench-runs/run_disk_undo_1000.sh check
+/data2/bench-runs/run_disk_undo_1000.sh start
+/data2/bench-runs/run_disk_undo_1000.sh status <run-dir>
+/data2/bench-runs/run_disk_undo_1000.sh stop <run-dir>
+```
+
+`check` is read-only. `start` detaches, builds stamped release binaries from clean main, and
+copies them into the run directory. While the ordinary node stays up, it checks depth-1 and
+depth-32 undo/reapplication on the first 200 commits of the existing spool. It then stops the
+ordinary node, preserves the old ExEx WAL in the run directory, and collects 1,000 valid paired
+samples. `--depth 64` changes the cap and the deeper injection to 64. The six-hour live deadline
+is a backstop; fewer than the requested samples fails acceptance even if the paired driver exits 0.
+
+On completion, failure or graceful stop, the worker stops its child and attempts ordinary-node
+restoration before analysis. Restore failure is explicitly a failed run. `RESULT` holds PASS/FAIL;
+`result.json` records the recovery and live checks. `undo-files.jsonl` samples file counts and
+rotation during the live run, allowing one finishing write beyond K. Residency comes from actual
+per-commit logs. Writer-wait warning counts and `paired/resources.jsonl` are diagnostics; the run
+makes no before/after performance claim. No live reorg is injected.
+
 ### Ordinary-builder comparison benchmark
 
 `scripts/run_live_builder_bench.py` runs `PS_SIDECAR_ROLE=builder`, requires published sidecars,
