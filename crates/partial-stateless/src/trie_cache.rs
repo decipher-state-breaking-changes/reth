@@ -3201,6 +3201,29 @@ mod tests {
     }
 
     #[test]
+    fn disk_undo_codec_omits_cleared_blind_subtrie_allocations() {
+        let entries: BTreeMap<B256, U256> = (0..128u64)
+            .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(i + 1)))
+            .collect();
+        let harness = TrieTestHarness::new(entries.clone());
+        let mut cache = revealed_cache(&harness, &entries.keys().copied().collect::<Vec<_>>());
+        let trie = cache.sparse_mut().trie_mut().as_revealed_mut().unwrap();
+        assert!(trie.prune(&[]) > 0);
+        let CacheTrie::Exact(exact) = trie else { panic!("exact") };
+        let json = serde_json::to_value(&*exact).unwrap();
+        let lower = json["lower_subtries"].as_array().unwrap();
+        assert_eq!(lower.len(), 256);
+        assert!(
+            lower.iter().all(|slot| slot.get("Blind").is_some_and(serde_json::Value::is_null)),
+            "blind slots encode None regardless of reusable empty allocations"
+        );
+        let decoded: ExactSparseTrie =
+            bincode::deserialize(&bincode::serialize(&*exact).unwrap()).unwrap();
+        assert_eq!(*exact, decoded);
+        assert_eq!(exact.root(), harness.original_root());
+    }
+
+    #[test]
     fn disk_undo_restores_branch_leaf_extension_merges_and_empty_root() {
         // Collapse below and across the upper/lower split, including a long shared prefix.
         for byte in [0, 1, 2, 15, 30] {

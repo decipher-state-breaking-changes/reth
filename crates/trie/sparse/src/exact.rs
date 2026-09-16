@@ -48,7 +48,7 @@ use tracing::{instrument, trace};
 // Session-local undo files preserve trie content, not scratch buffers or allocation identities.
 #[cfg(feature = "serde")]
 mod disk_subtries {
-    use super::{LowerExactSubtrie, NUM_LOWER_SUBTRIES};
+    use super::{ExactSparseSubtrie, LowerExactSubtrie, NUM_LOWER_SUBTRIES};
     use alloc::{boxed::Box, vec::Vec};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -57,6 +57,14 @@ mod disk_subtries {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value.as_slice().serialize(serializer)
+    }
+
+    // Allocation reuse is not trie content. Keep the existing Blind(None) wire shape.
+    pub(super) fn serialize_blind<S: Serializer>(
+        _allocation: &Option<Box<ExactSparseSubtrie>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Option::<&ExactSparseSubtrie>::None.serialize(serializer)
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
@@ -4283,7 +4291,10 @@ enum SparseTrieUpdatesAction {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) enum LowerExactSubtrie {
-    Blind(Option<Box<ExactSparseSubtrie>>),
+    Blind(
+        #[cfg_attr(feature = "serde", serde(serialize_with = "disk_subtries::serialize_blind"))]
+        Option<Box<ExactSparseSubtrie>>,
+    ),
     Revealed(Box<ExactSparseSubtrie>),
 }
 
