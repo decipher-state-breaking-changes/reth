@@ -3159,6 +3159,93 @@ mod tests {
         trie.root()
     }
 
+    fn assert_disk_undo_shape(
+        entries: BTreeMap<B256, U256>,
+        revealed: &[B256],
+        changes: &[(B256, U256)],
+    ) {
+        let harness = TrieTestHarness::new(entries.clone());
+        let mut live = revealed_cache(&harness, revealed);
+        live.set_undo_recording(true);
+        let control = live.clone();
+        let mut next = live.clone();
+        let after = apply_leaves(&harness, &mut next, changes);
+        let mut expected = entries;
+        for (key, value) in changes {
+            if value.is_zero() {
+                expected.remove(key);
+            } else {
+                expected.insert(*key, *value);
+            }
+        }
+        assert_eq!(after, TrieTestHarness::new(expected).original_root());
+        next.set_state_root(after);
+        let frame = next.take_undo_frame(&mut live).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shape.undo");
+        std::fs::write(&path, bincode::serialize(&frame).unwrap()).unwrap();
+        drop(frame);
+        let frame = bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
+        assert!(next.undo(frame));
+        assert!(next.structurally_eq(&control), "restore nodes, values, masks and retained paths");
+        assert_eq!(
+            next.sparse_mut().trie_mut().as_revealed_mut().unwrap().root(),
+            harness.original_root()
+        );
+        let mut oracle = control;
+        assert_eq!(
+            apply_leaves(&harness, &mut next, changes),
+            apply_leaves(&harness, &mut oracle, changes)
+        );
+        assert!(next.structurally_eq(&oracle), "the restored trie must accept the next block");
+    }
+
+    #[test]
+    fn disk_undo_restores_branch_leaf_extension_merges_and_empty_root() {
+        // Collapse below and across the upper/lower split, including a long shared prefix.
+        for byte in [0, 1, 2, 15, 30] {
+            let key = |a, b| {
+                let mut key = B256::ZERO;
+                key.0[byte] = a;
+                key.0[byte + 1] = b;
+                key
+            };
+            let a = key(0x50, 0x10);
+            let b = key(0x50, 0x30);
+            let c = key(0x53, 0x70);
+            // Full-width values avoid inline child RLP, which the reference harness cannot
+            // construct under these artificial long shared prefixes.
+            let entries = BTreeMap::from([
+                (a, U256::MAX),
+                (b, U256::MAX - U256::from(1)),
+                (c, U256::MAX - U256::from(2)),
+            ]);
+            // Removing c leaves a branch below a merged extension; removing b as well leaves
+            // a single leaf; removing all three produces the empty root.
+            for deleted in [vec![c], vec![b, c], vec![a, b, c]] {
+                let changes: Vec<_> = deleted.into_iter().map(|key| (key, U256::ZERO)).collect();
+                assert_disk_undo_shape(entries.clone(), &[a, b, c], &changes);
+            }
+        }
+    }
+
+    #[test]
+    fn disk_undo_restores_collapses_that_reveal_a_blinded_sibling() {
+        let key = |byte| {
+            let mut key = B256::ZERO;
+            key.0[0] = byte;
+            key
+        };
+        let a = key(0x10);
+        let b = key(0x11);
+        let mut entries: BTreeMap<_, _> =
+            (0..16u8).map(|i| (key(0x20 | i), U256::from(100 + u64::from(i)))).collect();
+        entries.insert(a, U256::from(1));
+        entries.insert(b, U256::from(2));
+        // Only the disappearing branch is revealed; collapse has to request sibling proofs.
+        assert_disk_undo_shape(entries, &[a, b], &[(a, U256::ZERO), (b, U256::ZERO)]);
+    }
+
     #[test]
     fn a_frame_carries_the_account_tries_own_changes_back() {
         let entries: BTreeMap<B256, U256> = (0..64usize)
