@@ -382,6 +382,7 @@ as `paired.jsonl`, `engine.jsonl`, `builder.jsonl`, `resources.jsonl`, and
 /data2/bench-runs/run_disk_undo_1000.sh start
 /data2/bench-runs/run_disk_undo_1000.sh status <run-dir>
 /data2/bench-runs/run_disk_undo_1000.sh stop <run-dir>
+/data2/bench-runs/run_disk_undo_1000.sh rejudge <run-dir>
 ```
 
 `check` is read-only. `start` detaches, builds stamped release binaries from clean main, and
@@ -397,6 +398,14 @@ restoration before analysis. Restore failure is explicitly a failed run. `RESULT
 rotation during the live run, allowing one finishing write beyond K. Residency comes from actual
 per-commit logs. Writer-wait warning counts and `paired/resources.jsonl` are diagnostics; the run
 makes no before/after performance claim. No live reorg is injected.
+
+`rejudge` checks saved artifacts without starting or stopping a node. It writes
+`REJUDGED_RESULT` and `rejudged-result.json`, preserving the original `RESULT` and recording
+both the executed build and the judging code. For older logs only, the first-block
+`full_fallback` is classified as initialization if it precedes the first commit observation,
+the parent cache was at height zero, readiness changes cold → warming at that block, and the
+next block starts retaining history. All other undo warnings still fail. New builds log this
+initialization separately because an unauthenticated initial parent is not recoverable history.
 
 ### Ordinary-builder comparison benchmark
 

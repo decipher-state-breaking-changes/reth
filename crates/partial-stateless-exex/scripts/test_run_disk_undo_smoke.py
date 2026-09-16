@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Acceptance gates and node cleanup, using fixtures/mocks without launching a node."""
 import copy
+import json
 from pathlib import Path
 import signal
 from types import SimpleNamespace
@@ -38,7 +39,81 @@ def replay_fixture(depth=32):
     return [manifest, report], schedule
 
 
+def cold_start_log():
+    # Keep the production event ordering: commit observation precedes readiness publication.
+    return '\n'.join([
+        'Partial Stateless ExEx started',
+        'Cache is not synced to the parent block. block=100 cache_block=0 expected_parent_block=99',
+        'Undo coverage lost; discarding history behind an unspillable block '
+        'cause="full_fallback" block=100 dropped_generations=1 retained_depth=0 configured_depth=32',
+        'Observed cache undo retention after commit block=100 retained_depth=0 resident_blocks=0',
+        'Cache readiness changed block=100 from="cold" to="warming" replay_depth=1',
+        'Observed cache undo retention after commit block=101 retained_depth=1 resident_blocks=0',
+    ])
+
+
 class AcceptanceTests(unittest.TestCase):
+    def test_old_cold_start_requires_explicit_compatibility_and_correlated_first_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'log'
+            path.write_text(cold_start_log())
+            with self.assertRaisesRegex(RuntimeError, 'undo warnings'):
+                run.check_undo_log(path)
+            _, initial = run.check_undo_log(path, allow_legacy_cold_start=True)
+            self.assertEqual(initial, [100])
+            variants = [
+                cold_start_log().replace('cache_block=0', 'cache_block=99'),
+                cold_start_log().replace('from="cold"', 'from="warming"'),
+                cold_start_log().replace('dropped_generations=1', 'dropped_generations=2'),
+                cold_start_log().replace('cause="full_fallback"', 'cause="missing_flat_record"'),
+                cold_start_log().replace('block=101', 'block=102'),
+                cold_start_log().replace('replay_depth=1', 'replay_depth=2'),
+                cold_start_log().replace('Cache readiness changed', 'missing event'),
+                cold_start_log() + '\nPartial Stateless ExEx started',
+                'Observed cache undo retention after commit block=99 retained_depth=1 '
+                'resident_blocks=0\n' + cold_start_log(),
+            ]
+            for text in variants:
+                with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, 'undo warnings'):
+                    path.write_text(text)
+                    run.check_undo_log(path, allow_legacy_cold_start=True)
+
+    def test_initialization_never_hides_later_coverage_loss_or_disk_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'log'
+            for warning in run.BAD_UNDO:
+                path.write_text(cold_start_log() + '\n' + warning + ' block=102')
+                with self.subTest(warning=warning), self.assertRaisesRegex(RuntimeError, 'undo warnings'):
+                    run.check_undo_log(path, allow_legacy_cold_start=True)
+            path.write_text('Initialized disk undo history; no recoverable parent '
+                            'cause="cold_start" block=100 retained_depth=0 configured_depth=32')
+            self.assertEqual(run.check_undo_log(path)[1], [])
+
+    def test_rejudge_preserves_original_result_and_requires_restoration_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rows, schedule = replay_fixture()
+            run.write_json(base / 'build.json', {'commit': 'commit', 'depth': 32, 'samples': 1000})
+            run.write_json(base / 'schedule.json', schedule)
+            for name, records in [('frames.jsonl', inventory()), ('replay.jsonl', rows)]:
+                (base / name).write_text(''.join(json.dumps(row) + '\n' for row in records))
+            (base / 'replay.log').write_text('')
+            original = 'FAIL RuntimeError: undo warnings\n'
+            (base / 'RESULT').write_text(original)
+            (base / 'restore.log').write_text('restore: vanilla reth relaunched, pid 123\n'
+                                             'restore: pid 123 alive after 15s\n')
+            with patch.object(run, 'git', return_value='judge-commit'), \
+                 patch.object(run, 'judge_live', return_value={'accepted': 1000}):
+                self.assertEqual(run.rejudge(base, base), 0)
+                result = json.loads((base / 'rejudged-result.json').read_text())
+                self.assertEqual(result['run_commit'], 'commit')
+                self.assertEqual(result['judge_commit'], 'judge-commit')
+                self.assertEqual((base / 'RESULT').read_text(), original)
+                (base / 'restore.log').write_text('restore: vanilla reth relaunched, pid 123\n')
+                self.assertEqual(run.rejudge(base, base), 1)
+                self.assertEqual((base / 'REJUDGED_RESULT').read_text(), 'FAIL\n')
+                self.assertEqual((base / 'RESULT').read_text(), original)
+
     def test_replay_accepts_both_caps_and_refuses_missed_or_corrupt_recovery(self):
         for depth in (32, 64):
             rows, schedule = replay_fixture(depth)

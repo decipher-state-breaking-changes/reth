@@ -821,7 +821,7 @@ def build_cache_delta_section(accepted):
 
 
 def retained_generation_lines(accepted):
-    """Report what the K = 1 retained generation costs, or that this run kept none.
+    """Report the newest retained generation's telemetry, without inferring the configured K.
 
     Reported for both arms of the memory control, because "0 blocks retained" is the control's
     result rather than missing data. Records written before the telemetry existed have no field at
@@ -830,15 +830,17 @@ def retained_generation_lines(accepted):
     present = [r["retained_generation"] for r in accepted if "retained_generation" in r]
     if not present:
         return [
-            "## K = 1 retained generation", "",
+            "## Newest retained generation", "",
             "- Not recorded: these records predate retained-generation telemetry.", "",
         ]
     enabled = [r for r in present if r.get("enabled")]
     held = [r for r in present if r.get("present")]
     lines = [
-        "## K = 1 retained generation", "",
+        "## Newest retained generation", "",
         f"- Retention enabled: **{len(enabled)}/{len(present)}** blocks",
         f"- Generation actually held: **{len(held)}/{len(present)}** blocks",
+        "- These fields describe only the newest entry, not the configured retention depth. "
+        "A disk handle counts as present; its on-disk payload is excluded from these memory figures.",
     ]
     if held:
         lines += [

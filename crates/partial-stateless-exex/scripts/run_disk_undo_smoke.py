@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One bounded disk-undo acceptance run on zns4; check/start/status/stop.
+"""One bounded disk-undo acceptance run on zns4; check/start/status/stop/rejudge.
 
 Reuses run_live_paired_bench.py and /data2/bench-runs/restore_vanilla_node.sh.
 The host handoff/profile follow run_zns4_vanilla_arm.sh; prefix inventory and
@@ -230,14 +230,56 @@ def judge_rotation(samples, depth):
     return {'max_observed_files_per_pair': peak, 'rotation_observed': rotated}
 
 
-def check_undo_log(path):
+def log_fields(line):
+    return {name: quoted or bare for name, quoted, bare in
+            re.findall(r'\b(\w+)=(?:"([^"]*)"|(\S+))', line)}
+
+
+def legacy_cold_start(lines):
+    """Recognize only the old first-commit warning, corroborated by lifecycle observations.
+
+    This compatibility rule is used only by rejudge. New runs must emit the initialization
+    event instead. No exemption applies after a commit, on restart, or to another cause.
+    """
+    def events(marker):
+        return [(i, log_fields(line)) for i, line in enumerate(lines) if marker in line]
+
+    starts = events('Partial Stateless ExEx started')
+    parents = events('Cache is not synced to the parent block.')
+    commits = events('Observed cache undo retention after commit')
+    readiness = events('Cache readiness changed')
+    warnings = events('Undo coverage lost; discarding history behind an unspillable block')
+    if (len(starts) != 1 or not parents or len(commits) < 2 or not readiness or not warnings
+            or any('Cold-resetting both caches' in line for line in lines)):
+        return None
+    start, parent, warning, first, ready, second = (
+        starts[0], parents[0], warnings[0], commits[0], readiness[0], commits[1])
+    number = warning[1].get('block', '')
+    if not number.isdigit():
+        return None
+    def has(event, **fields):
+        return all(event[1].get(k) == str(v) for k, v in fields.items())
+    if (start[0] < parent[0] < warning[0] < first[0] < ready[0] < second[0]
+            and has(parent, block=number, cache_block=0, expected_parent_block=int(number) - 1)
+            and has(warning, cause='full_fallback', dropped_generations=1, retained_depth=0)
+            and has(first, block=number, retained_depth=0, resident_blocks=0)
+            and has(ready, block=number, replay_depth=1, **{'from': 'cold', 'to': 'warming'})
+            and has(second, block=int(number) + 1, retained_depth=1, resident_blocks=0)):
+        return warning[0]
+    return None
+
+
+def check_undo_log(path, *, allow_legacy_cold_start=False):
     text = ANSI_ESCAPE.sub('', path.read_text(errors='replace'))
-    failures = [line for line in text.splitlines() if any(mark in line for mark in BAD_UNDO)]
+    lines = text.splitlines()
+    initial = legacy_cold_start(lines) if allow_legacy_cold_start else None
+    failures = [line for i, line in enumerate(lines)
+                if i != initial and any(mark in line for mark in BAD_UNDO)]
     require(not failures, 'undo warnings: ' + '\n'.join(failures[:5]))
-    return text
+    return text, ([int(log_fields(lines[initial])['block'])] if initial is not None else [])
 
 
-def judge_live(base, samples, depth):
+def judge_live(base, samples, depth, *, allow_legacy_cold_start=False):
     paired = base / 'paired'
     log = paired / 'reth-partial-stateless.log'
     raw = load_jsonl(paired / 'paired.jsonl')
@@ -246,7 +288,7 @@ def judge_live(base, samples, depth):
     require(len(accepted) == samples, f'only {len(accepted)}/{samples} accepted samples')
     require(all(row.get('valid') is True for row in raw), 'invalid paired sample was filtered out')
     require(stats.invalid == 0 and stats.missing_log_position == 0, 'unaccounted paired samples')
-    text = check_undo_log(log)
+    text, initial = check_undo_log(log, allow_legacy_cold_start=allow_legacy_cold_start)
     require(re.search(rf'depth={depth}\s+recording=true\s+layout="?frames"?', text),
             'disk-undo startup configuration was not logged')
     observed = [line for line in text.splitlines() if 'Observed cache undo retention after commit' in line]
@@ -255,7 +297,44 @@ def judge_live(base, samples, depth):
             'resident undo payload observed')
     rotation = judge_rotation(load_jsonl(base / 'undo-files.jsonl'), depth)
     return {'accepted': len(accepted), 'selection': asdict(stats), **rotation,
+            'legacy_cold_initialization_blocks': initial,
             'writer_wait_warnings': text.count('Undo spill waiting for disk writer')}
+
+
+def rejudge(base, repo):
+    """Re-evaluate saved artifacts without starting a process or replacing the original verdict."""
+    result = {'judge_commit': git(repo, 'rev-parse', 'HEAD'),
+              'judge_dirty': bool(git(repo, 'status', '--porcelain')),
+              'judge_sha256': sha256(Path(__file__)),
+              'rejudged_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'scope': 'saved artifacts only; no new binary or live run'}
+    try:
+        result['original_result'] = (base / 'RESULT').read_text().strip()
+        build = json.loads((base / 'build.json').read_text())
+        result['run_commit'] = build['commit']
+        schedule = place_reorgs(load_jsonl(base / 'frames.jsonl'), build['depth'])
+        require(json.loads((base / 'schedule.json').read_text()) == [list(item) for item in schedule],
+                'saved schedule differs from prefix inventory')
+        result['replay'] = judge_replay(load_jsonl(base / 'replay.jsonl'), schedule,
+                                        build['depth'], build['commit'])
+        check_undo_log(base / 'replay.log')
+        result['live'] = judge_live(base, build['samples'], build['depth'],
+                                    allow_legacy_cold_start=True)
+        restore = (base / 'restore.log').read_text()
+        relaunched = re.search(r'restore: vanilla reth relaunched, pid (\d+)', restore)
+        require(relaunched and f'restore: pid {relaunched[1]} alive after 15s' in restore,
+                'missing successful vanilla restoration record')
+        require('RESTORE FAILED' not in result['original_result'], 'original restoration failed')
+        result['restoration'] = 'confirmed in saved restore.log; current node not queried'
+        result['verdict'] = 'PASS'
+    except Exception as error:
+        result.update(verdict='FAIL', error=f'{type(error).__name__}: {error}')
+    write_json(base / 'rejudged-result.json', result)
+    (base / 'REJUDGED_RESULT').write_text(result['verdict'] + '\n')
+    print(f'{result["verdict"]}: {base / "rejudged-result.json"}')
+    if 'error' in result:
+        print(result['error'])
+    return int(result['verdict'] != 'PASS')
 
 
 class Runner:
@@ -441,7 +520,7 @@ def worker(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'start', 'status', 'stop', '_worker'))
+    parser.add_argument('action', choices=('check', 'start', 'status', 'stop', 'rejudge', '_worker'))
     parser.add_argument('output', nargs='?', type=Path)
     parser.add_argument('--repo', type=Path, default=Path('/data2/reth'))
     parser.add_argument('--spool', type=Path, default=BENCH / 'zns4-60h-10000-20260902-070355/spool')
@@ -482,6 +561,8 @@ def main():
         print(f'Started: {args.output}\nWatch: tail -f {args.output}/run.log')
         return 0
     require(args.output is not None, 'this action requires RUN_DIR')
+    if args.action == 'rejudge':
+        return rejudge(args.output, args.repo)
     if args.action == '_worker':
         return worker(args)
     identity_path = args.output / 'worker.json'
@@ -492,9 +573,9 @@ def main():
         print('Graceful stop requested; worker will stop its child and restore vanilla.')
     else:
         print(f'running={identity is not None and same_process(identity)}')
-        for name in ('STATUS', 'RESULT'):
+        for name in ('STATUS', 'RESULT', 'REJUDGED_RESULT'):
             if (args.output / name).exists():
-                print((args.output / name).read_text().strip())
+                print(f'{name}: {(args.output / name).read_text().strip()}')
     return 0
 
 
