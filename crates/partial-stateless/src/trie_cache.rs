@@ -327,6 +327,14 @@ impl PartialTrieNodeCache {
         self.undo_id
     }
 
+    /// Private working state for disk recovery, preserving the generation identity.
+    pub fn fork_for_rollback(&self) -> Self {
+        let mut copy = self.clone();
+        copy.clear_undo_record();
+        copy.undo_id = self.undo_id;
+        copy
+    }
+
     /// Sets whether clones of this cache record what a block does to them.
     ///
     /// Set on the pair's live cache; every working copy inherits it through the clone, and so
@@ -1608,7 +1616,7 @@ fn splice_sorted(target: &mut Vec<Nibbles>, added: &mut Vec<Nibbles>, removed: &
 /// resizes instead of rehashing in place, and the shrink has to be repeated. Whether the per-block
 /// copy saved outweighs those resizes is a property of the workload's removal rate and is not
 /// derivable from the sizes alone — so this is a measured knob, and [`Self::Never`] is the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WarmSetShrinkPolicy {
     /// Leave hashbrown's own sizing alone. Today's behaviour, and the production default.
     #[default]
@@ -1643,7 +1651,7 @@ impl fmt::Display for WarmSetShrinkPolicy {
 /// [`WarmSetShrinkPolicy`] together with the interval state it needs.
 ///
 /// `Copy`, so carrying it through a clone is a field assignment rather than a decision.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WarmShrink {
     policy: WarmSetShrinkPolicy,
     blocks_since_shrink: u64,
@@ -2914,6 +2922,21 @@ mod tests {
             *key == inserted && matches!(before, StorageTrieBefore::Absent)
         }));
 
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frame.bin");
+        std::fs::write(&path, bincode::serialize(&frame).unwrap()).unwrap();
+        let disk_frame = bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
+        let mut from_disk = live.fork_for_rollback();
+        assert!(from_disk.undo(disk_frame));
+        assert!(from_disk.structurally_eq(&control));
+        // Deserialization creates fresh allocations. A subsequent block still shares those
+        // allocations with its parent, so unchanged storage must not become a spurious diff.
+        let mut next = from_disk.clone();
+        let next_frame = next.take_undo_frame(&mut from_disk).unwrap();
+        assert!(next_frame.storage.is_empty());
+        assert!(next.undo(next_frame));
+        assert!(next.structurally_eq(&control));
+        // The in-memory path also retains its stronger allocation-identity guarantee.
         assert!(live.undo(frame));
         assert!(live.structurally_eq(&control), "every storage trie and its content is restored");
         assert_eq!(live.undo_id(), displaced.undo_id());
@@ -3048,6 +3071,11 @@ mod tests {
         assert!(counts.membership_whole, "the rebuild left a whole preimage");
         assert!(counts.warm_accounts > 0, "and the pass before it left a delta");
 
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frame.bin");
+        std::fs::write(&path, bincode::serialize(&frame).unwrap()).unwrap();
+        drop(frame);
+        let frame = bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
         assert!(live.undo(frame));
         assert_eq!(committed_state(&live), expected);
         assert!(live.structurally_eq(&control));
@@ -3165,6 +3193,11 @@ mod tests {
         assert!(counts.account_nodes > 0, "the frame carries node preimages");
         assert!(counts.account_values > 0, "and value preimages");
 
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frame.bin");
+        std::fs::write(&path, bincode::serialize(&frame).unwrap()).unwrap();
+        drop(frame);
+        let frame = bincode::deserialize(&std::fs::read(path).unwrap()).unwrap();
         assert!(live.undo(frame));
         assert_eq!(live.state_root(), Some(before_root));
         assert!(

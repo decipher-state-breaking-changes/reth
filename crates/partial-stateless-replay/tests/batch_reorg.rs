@@ -366,12 +366,16 @@ fn a_frames_only_forced_reorg_serializes_layout_aware_evidence() {
         ])
         .arg("--json")
         .arg(&json)
+        .arg("--undo-dir")
+        .arg(dir.join("undo"))
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
     let rows = evidence_with_test_provenance(&json);
     assert_eq!(rows[0]["undo_layout"], "frames");
+    assert_eq!(rows[0]["undo_resident_blocks"], 1);
+    assert_eq!(rows[0]["undo_dir"], dir.join("undo").to_str().unwrap());
     assert_eq!(rows[1]["forced_reorgs"][0]["frames_applied"], 2);
     let checked = dir.join("checked-frames.jsonl");
     let args = vec!["--at".into(), at.to_string(), "--commits".into(), "8".into()];

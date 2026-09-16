@@ -109,6 +109,8 @@ pub struct ReplayOptions {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// Directory for disk undo; only the newest block stays in memory.
+    pub undo_dir: Option<std::path::PathBuf>,
     /// Reorgs to force, each fired after the commit of its block lands. Ascending by block.
     ///
     /// Empty by default. A forced reorg is a pure revert of the `depth` blocks the pair just
@@ -167,12 +169,13 @@ pub struct ForcedReorgOutcome {
 
 impl ReplayOptions {
     /// The subset of these options that configures the coordinated pair itself.
-    pub const fn pair_config(&self) -> PairConfig {
+    pub fn pair_config(&self) -> PairConfig {
         PairConfig {
             retain_depth: self.retain_depth,
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
             undo_layout: self.undo_layout,
+            undo_dir: self.undo_dir.clone(),
         }
     }
 }
@@ -181,7 +184,7 @@ impl ReplayOptions {
 ///
 /// These settings reach [`restore`] through the same two hops, so they travel together rather than
 /// as parallel scalars that can be threaded out of step.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PairConfig {
     /// How many trie generations the pair retains.
     pub retain_depth: RetentionDepth,
@@ -191,6 +194,8 @@ pub struct PairConfig {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// Directory for disk undo; only the newest block stays in memory.
+    pub undo_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ReplayOptions {
@@ -207,6 +212,7 @@ impl Default for ReplayOptions {
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
             undo_layout: UndoLayout::default(),
+            undo_dir: None,
             forced_reorgs: Vec::new(),
         }
     }
@@ -2326,13 +2332,14 @@ pub(crate) fn restore(
         has_accepted_head = accepted_head.is_some(),
         "Restored a coordinated pair from the recorded checkpoint, with no database"
     );
-    Ok(ReplayState {
+    let mut state = ReplayState {
         history: VerifiedHistory::restored_at(
             checkpoint.block,
             checkpoint.state_root,
             checkpoint.cache_root,
         ),
         pair: CoordinatedPair {
+            undo_store: None,
             cache: restored.cache,
             trie_cache: restored.trie_cache,
             // A restored pair retains nothing yet — the snapshot reproduced the caches without
@@ -2348,7 +2355,14 @@ pub(crate) fn restore(
         consensus: EthBeaconConsensus::new(chain_spec.clone()),
         evm_config: EthEvmConfig::new(chain_spec.clone()),
         chain_spec,
-    })
+    };
+    if let Some(directory) = &pair.undo_dir {
+        if !pair.undo_record || pair.undo_layout != UndoLayout::FramesOnly {
+            eyre::bail!("disk undo requires recording on and frames layout")
+        }
+        state.pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
+    }
+    Ok(state)
 }
 
 /// The cache configuration a manifest names, cross-checked against its own policy id.
@@ -2901,6 +2915,7 @@ mod tests {
     fn pair() -> CoordinatedPair {
         let config = CacheConfig::default();
         CoordinatedPair {
+            undo_store: None,
             cache: config.new_cache(),
             trie_cache: PartialTrieNodeCache::new(),
             retained: Default::default(),

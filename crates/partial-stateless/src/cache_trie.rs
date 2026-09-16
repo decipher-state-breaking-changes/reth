@@ -70,6 +70,23 @@ pub enum CacheTrie {
     Exact(ExactSparseTrie),
 }
 
+// Disk undo supports the recording representation. Parallel caches retain a Full fallback;
+// callers must shorten the disk-retained suffix rather than silently encoding another layout.
+impl serde::Serialize for CacheTrie {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Exact(trie) => serde::Serialize::serialize(trie, serializer),
+            Self::Parallel(_) => Err(serde::ser::Error::custom("parallel trie has no disk undo")),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CacheTrie {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::Exact(serde::Deserialize::deserialize(deserializer)?))
+    }
+}
+
 impl Default for CacheTrie {
     fn default() -> Self {
         Self::new(CacheTrieRepr::default())

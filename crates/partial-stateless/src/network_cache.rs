@@ -11,7 +11,7 @@ use crate::{
 use alloy_primitives::{keccak256, Address, Bytes, Keccak256, B256, U256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 use tracing::{debug, info};
@@ -372,9 +372,9 @@ pub struct NetworkStateCache {
     /// Cached bytecodes: code_hash → (bytes, metadata)
     codes: HashMap<B256, CachedEntry<Bytes>>,
     /// Eviction policy for accounts (can differ from storage policy).
-    account_policy: Box<dyn CachePolicy>,
+    account_policy: Arc<dyn CachePolicy>,
     /// Eviction policy for storage & codes (can differ from account policy).
-    storage_policy: Box<dyn CachePolicy>,
+    storage_policy: Arc<dyn CachePolicy>,
     /// Current block number.
     current_block: u64,
     /// Locally derived root for the current cache contents.
@@ -403,14 +403,61 @@ pub struct NetworkStateCache {
 }
 
 impl NetworkStateCache {
+    /// Clone only live state for a fallible disk rollback. Retained history stays with the owner.
+    pub fn fork_for_rollback(&self) -> Self {
+        Self {
+            accounts: self.accounts.clone(),
+            storage: self.storage.clone(),
+            codes: self.codes.clone(),
+            account_policy: Arc::clone(&self.account_policy),
+            storage_policy: Arc::clone(&self.storage_policy),
+            current_block: self.current_block,
+            memoized_cache_root: initialized_cache_root(self.memoized_cache_root.get().copied()),
+            code_leaf_hashers: self.code_leaf_hashers.clone(),
+            digest_index: self.digest_index.clone(),
+            undo_log: VecDeque::new(),
+        }
+    }
+
+    /// Move one record into a coordinated disk bundle.
+    pub fn take_undo_record(&mut self, block: u64) -> Option<BlockCacheUndo> {
+        let index = self.undo_log.iter().position(|record| record.block_number == block)?;
+        self.undo_log.remove(index)
+    }
+
+    /// Borrow a resident record without changing the live undo stack.
+    pub fn undo_record(&self, block: u64) -> Option<&BlockCacheUndo> {
+        self.undo_log.iter().find(|record| record.block_number == block)
+    }
+
+    /// Apply a loaded record to a private recovery candidate.
+    pub fn rollback_record(&mut self, record: BlockCacheUndo) -> Result<(), CacheError> {
+        if record.block_number != self.current_block || record.previous_block >= record.block_number
+        {
+            return Err(CacheError::RollbackMismatch {
+                requested: self.current_block,
+                found: Some(record.block_number),
+            })
+        }
+        self.apply_undo_record(record);
+        Ok(())
+    }
+
+    /// Publish a completed candidate, preserving only the original history below its landing.
+    pub fn install_rollback(&mut self, mut candidate: Self) {
+        self.undo_log.retain(|record| record.block_number <= candidate.current_block);
+        candidate.undo_log = std::mem::take(&mut self.undo_log);
+        *self = candidate;
+    }
+
     /// Create a new cache with separate policies for accounts and storage/codes.
     pub fn new(account_policy: Box<dyn CachePolicy>, storage_policy: Box<dyn CachePolicy>) -> Self {
         Self {
             accounts: HashMap::new(),
             storage: HashMap::new(),
             codes: HashMap::new(),
-            account_policy,
-            storage_policy,
+            account_policy: account_policy.into(),
+            storage_policy: storage_policy.into(),
             current_block: 0,
             memoized_cache_root: OnceLock::new(),
             code_leaf_hashers: HashMap::new(),
@@ -447,8 +494,8 @@ impl NetworkStateCache {
             accounts,
             storage,
             codes,
-            account_policy,
-            storage_policy,
+            account_policy: account_policy.into(),
+            storage_policy: storage_policy.into(),
             current_block,
             memoized_cache_root: OnceLock::new(),
             code_leaf_hashers,
@@ -477,8 +524,8 @@ impl NetworkStateCache {
             accounts: self.accounts.clone(),
             storage: self.storage.clone(),
             codes: self.codes.clone(),
-            account_policy,
-            storage_policy,
+            account_policy: account_policy.into(),
+            storage_policy: storage_policy.into(),
             current_block: self.current_block,
             memoized_cache_root: initialized_cache_root(self.memoized_cache_root.get().copied()),
             code_leaf_hashers: self.code_leaf_hashers.clone(),
@@ -1118,6 +1165,11 @@ impl NetworkStateCache {
         }
 
         let undo = self.undo_log.pop_back().expect("checked non-empty above");
+        self.apply_undo_record(undo);
+        Ok(())
+    }
+
+    fn apply_undo_record(&mut self, undo: BlockCacheUndo) {
         let previous_cache_root = undo.previous_cache_root;
         // The same key set the forward direction patched the index with, kept as the undo record is
         // consumed. Undoing a block changes exactly the entries applying it changed, so the index
@@ -1168,7 +1220,6 @@ impl NetworkStateCache {
         self.resync_digest_index(touched_accounts, touched_storage, touched_codes);
         self.current_block = undo.previous_block;
         self.memoized_cache_root = initialized_cache_root(previous_cache_root);
-        Ok(())
     }
 
     /// Drop undo records at or below `finalized_block`. Reorgs never cross a finalized
@@ -1324,8 +1375,8 @@ impl MissResult {
 /// Each `*_before` map stores the value of a touched or evicted key *before* the
 /// block was applied: `Some(entry)` = the key existed (restore it on rollback),
 /// `None` = the key was absent (remove it on rollback).
-#[derive(Debug, Clone)]
-struct BlockCacheUndo {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BlockCacheUndo {
     /// The block this record can undo.
     block_number: u64,
     /// Cache `current_block` before this block was applied (restored on rollback).
@@ -1338,6 +1389,21 @@ struct BlockCacheUndo {
 }
 
 impl BlockCacheUndo {
+    /// Block undone by this record.
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    /// Block restored by this record.
+    pub const fn previous_block(&self) -> u64 {
+        self.previous_block
+    }
+
+    /// Root authenticated before this block was applied.
+    pub const fn previous_cache_root(&self) -> Option<B256> {
+        self.previous_cache_root
+    }
+
     fn new(block_number: u64, previous_block: u64, previous_cache_root: Option<B256>) -> Self {
         Self {
             block_number,

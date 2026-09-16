@@ -13,6 +13,7 @@ pub mod bootstrap;
 pub mod cache_trie;
 pub mod cold_admission;
 pub mod config;
+pub mod disk_undo;
 pub mod fixture;
 pub mod network_cache;
 pub mod participant;

@@ -19,6 +19,7 @@ use alloy_primitives::{
     B256,
 };
 use partial_stateless::{
+    disk_undo::{DiskUndoBundle, DiskUndoHandle, DiskUndoStore},
     network_cache::NetworkStateCache,
     readiness::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
@@ -269,6 +270,8 @@ pub struct CoordinatedPair {
     pub retention_depth: RetentionDepth,
     /// How generations are retained when the live cache records undo data.
     pub undo_layout: UndoLayout,
+    /// Optional session-local disk retention. Only the newest block stays resident.
+    pub undo_store: Option<DiskUndoStore>,
     /// Header of the block this pair is the state *after*, kept so a child can be checked against
     /// it.
     ///
@@ -282,6 +285,54 @@ pub struct CoordinatedPair {
 }
 
 impl CoordinatedPair {
+    /// Enable the disk-backed frames layout before processing any blocks.
+    pub fn enable_disk_undo(&mut self, directory: &std::path::Path) -> Result<(), String> {
+        if !self.retained.is_empty() {
+            return Err("disk undo must be configured before retaining blocks".into())
+        }
+        self.undo_store = Some(DiskUndoStore::new(directory)?);
+        self.undo_layout = UndoLayout::FramesOnly;
+        self.trie_cache.set_undo_recording(true);
+        Ok(())
+    }
+
+    /// Spill the block that just aged out of the one-block resident window.
+    fn spill_undo(&mut self) {
+        let Some(store) = self.undo_store.as_mut() else { return };
+        // A Full fallback is allowed for the newest block. Once it ages out, discard it and
+        // the older unreachable suffix instead of retaining an unbounded set of whole tries.
+        if self.retained.len() > 1 {
+            let index = self.retained.len() - 2;
+            if !matches!(self.retained[index].content, RetainedContent::Disk(_)) {
+                let block = self.retained[index].block_number + 1;
+                match self.cache.take_undo_record(block) {
+                    Some(flat)
+                        if matches!(self.retained[index].content, RetainedContent::Frame(_)) =>
+                    {
+                        // Move the payload without copying its maps. No observer can see the
+                        // temporary gap during this serial commit operation.
+                        let held = self.retained.remove(index).expect("known index");
+                        let RetainedContent::Frame(frame) = held.content else { unreachable!() };
+                        let handle = store.spill(DiskUndoBundle {
+                            parent_hash: held.block_hash,
+                            trie: *frame,
+                            flat,
+                        });
+                        self.retained.insert(
+                            index,
+                            RetainedGeneration { content: RetainedContent::Disk(handle), ..held },
+                        );
+                    }
+                    _ => {
+                        self.retained.drain(..=index);
+                    }
+                }
+            }
+        }
+        // The latest block's record is required by membership retention and the depth-1 fast
+        // path. All older records are now in paired files or deliberately unavailable.
+        self.cache.prune_undo_below(self.cache.current_block().saturating_sub(1));
+    }
     pub fn fingerprint(&self) -> CoordinatedFingerprint {
         CoordinatedFingerprint {
             cache_block: self.cache.current_block(),
@@ -465,6 +516,7 @@ impl CoordinatedPair {
         while self.retained.len() > self.retention_depth.as_usize() {
             self.retained.pop_front();
         }
+        self.spill_undo();
         report
     }
 
@@ -520,6 +572,9 @@ impl CoordinatedPair {
                 frame_bytes: frame.allocated_bytes(),
                 ..Default::default()
             },
+            RetainedContent::Disk(_) => {
+                RetainedGenerationBytes { enabled, present: true, ..Default::default() }
+            }
         }
     }
 
@@ -566,6 +621,10 @@ impl CoordinatedPair {
                     frame_bytes = frame_bytes.saturating_add(held);
                     sum = sum.saturating_add(held);
                     (frame.unshared_bytes(), frame.shared_allocations())
+                }
+                RetainedContent::Disk(_) => {
+                    frames += 1;
+                    (0, Vec::new())
                 }
             };
             unshared = unshared.saturating_add(own);
@@ -755,6 +814,15 @@ impl CoordinatedPair {
             }
         }
 
+        if self
+            .retained
+            .iter()
+            .skip(base)
+            .any(|held| matches!(held.content, RetainedContent::Disk(_)))
+        {
+            return self.restore_from_disk(base, lineage, ancestor_state_root, cache_policy_id)
+        }
+
         // The frames chain: each one names the generation it must be applied to, and the chain
         // hangs off the deque's newest whole copy — or off the live cache, which is what the
         // deque looks like immediately after an undo, when its newest entry is the frame that
@@ -790,6 +858,7 @@ impl CoordinatedPair {
                     }
                     expected = frame.target();
                 }
+                RetainedContent::Disk(_) => unreachable!("disk suffix handled above"),
             }
             if held.undo_id != expected {
                 warn!(
@@ -921,6 +990,7 @@ impl CoordinatedPair {
                     debug_assert!(applied, "phase 1 proved every frame in the range applies");
                     frames_applied += u64::from(applied);
                 }
+                RetainedContent::Disk(_) => unreachable!("disk suffix handled above"),
             }
         }
         if let Some(landed) = landed {
@@ -928,6 +998,89 @@ impl CoordinatedPair {
         }
         self.accepted_head = landed_head;
         self.readiness = next_readiness;
+        Some(RecoveryReport { ready, frames_applied })
+    }
+
+    /// File I/O can fail at any depth. Work on private live-state copies and hold just one
+    /// decoded bundle at a time; the original pair and its history stay intact on every error.
+    fn restore_from_disk(
+        &mut self,
+        base: usize,
+        lineage: &ExpectedLineage,
+        ancestor_state_root: B256,
+        cache_policy_id: B256,
+    ) -> Option<RecoveryReport> {
+        let mut cache = self.cache.fork_for_rollback();
+        let mut trie = self.trie_cache.fork_for_rollback();
+        let mut frames_applied = 0;
+        for held in self.retained.iter().skip(base).rev() {
+            let (frame, flat) = match &held.content {
+                RetainedContent::Disk(handle) => {
+                    let bundle = match handle.load() {
+                        Ok(bundle) => bundle,
+                        Err(error) => {
+                            warn!(target: "partial_stateless", %error, "Disk undo unavailable; recovering through fallback");
+                            return None
+                        }
+                    };
+                    if bundle.parent_hash != held.block_hash {
+                        return None
+                    }
+                    (Some(bundle.trie), bundle.flat)
+                }
+                RetainedContent::Frame(frame) => (
+                    Some((**frame).clone()),
+                    self.cache.undo_record(held.block_number + 1)?.clone(),
+                ),
+                RetainedContent::Full(parent) => {
+                    trie = parent.fork_for_rollback();
+                    (None, self.cache.undo_record(held.block_number + 1)?.clone())
+                }
+            };
+            if flat.previous_block() != held.block_number || flat.previous_cache_root().is_none() {
+                return None
+            }
+            if let Some(frame) = frame {
+                if frame.source() != trie.undo_id() ||
+                    frame.target() != held.undo_id ||
+                    !trie.undo(frame)
+                {
+                    return None
+                }
+                frames_applied += 1;
+            }
+            if trie.undo_id() != held.undo_id || trie.state_root() != held.state_root {
+                return None
+            }
+            cache.rollback_record(flat).ok()?;
+        }
+        let (number, hash) = lineage.ancestor();
+        if cache.current_block() != number || trie.state_root() != Some(ancestor_state_root) {
+            return None
+        }
+        let checkpoint = TrustedCheckpoint {
+            block_number: number,
+            block_hash: hash,
+            state_root: ancestor_state_root,
+            cache_root: cache.cache_root(),
+            cache_policy_id,
+        };
+        let mut readiness = self.readiness.clone();
+        let ready = readiness
+            .restore_from_undone_blocks(
+                lineage.depth(),
+                &checkpoint,
+                &CacheObservation::capture(&cache, &trie),
+            )
+            .ok()?
+            .clone();
+        let head = self.retained[base].accepted_head.clone();
+        // Publication has no remaining file reads or other fallible operations.
+        self.cache.install_rollback(cache);
+        self.trie_cache = trie;
+        self.retained.truncate(base);
+        self.accepted_head = head;
+        self.readiness = readiness;
         Some(RecoveryReport { ready, frames_applied })
     }
 }
@@ -1050,6 +1203,8 @@ pub enum RetainedContent {
     Full(PartialTrieNodeCache),
     /// What one block changed, applied to the generation above this one to produce it.
     Frame(Box<TrieCacheUndoFrame>),
+    /// Trie and flat preimages in a pending or completed session-local file.
+    Disk(DiskUndoHandle),
 }
 
 impl RetainedContent {
@@ -1057,14 +1212,14 @@ impl RetainedContent {
     pub const fn full(&self) -> Option<&PartialTrieNodeCache> {
         match self {
             Self::Full(cache) => Some(cache),
-            Self::Frame(_) => None,
+            Self::Frame(_) | Self::Disk(_) => None,
         }
     }
 
     /// The frame, when this generation is held as one.
     pub const fn frame(&self) -> Option<&TrieCacheUndoFrame> {
         match self {
-            Self::Full(_) => None,
+            Self::Full(_) | Self::Disk(_) => None,
             Self::Frame(frame) => Some(frame),
         }
     }

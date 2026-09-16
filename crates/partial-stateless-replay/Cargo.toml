@@ -91,6 +91,7 @@ tikv-jemalloc-ctl = { workspace = true, optional = true }
 snmalloc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 reth-chainspec = { workspace = true, features = ["std"] }
 # The follow tests build a real restorable snapshot fixture: a one-account state proved with the
 # same trie machinery the producer's export uses. Dev-only, so the isolation-checked normal graph

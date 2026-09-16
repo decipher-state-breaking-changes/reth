@@ -663,6 +663,231 @@ mod tests {
         })
     }
 
+    fn disk_state(directory: &std::path::Path) -> ReplayState {
+        restored_state_with(PairConfig {
+            retain_depth: depth(32),
+            undo_record: true,
+            undo_layout: UndoLayout::FramesOnly,
+            undo_dir: Some(directory.to_owned()),
+            ..Default::default()
+        })
+        .0
+    }
+
+    fn disk_run(state: &mut ReplayState, count: u64) {
+        for offset in 1..=count {
+            advance_retaining(state, ANCHOR_BLOCK + offset, offset as u8, true);
+        }
+    }
+
+    #[test]
+    fn disk_undo_k32_round_trips_reapplies_and_keeps_one_resident_block() {
+        for requested in [1, 2, 3, 32] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut disk = disk_state(directory.path());
+            let mut memory = frames_only_state_at_depth(depth(32)).0;
+            disk_run(&mut disk, 32);
+            disk_run(&mut memory, 32);
+            let before = disk.pair.fingerprint();
+            assert_eq!(disk.pair.retained_depth(), 32);
+            assert_eq!(
+                disk.pair.retained.iter().filter(|g| g.content.frame().is_some()).count(),
+                1
+            );
+            assert_eq!(
+                disk.pair
+                    .retained
+                    .iter()
+                    .filter(|g| matches!(g.content, RetainedContent::Disk(_)))
+                    .count(),
+                31
+            );
+            assert!(disk.pair.cache.undo_record(ANCHOR_BLOCK + 32).is_some());
+            assert!(disk.pair.cache.undo_record(ANCHOR_BLOCK + 31).is_none());
+            let (ancestor, abandoned) = disk.history.suffix(requested).unwrap();
+            let reorg = reorg_of(ancestor, abandoned.clone(), None);
+            assert!(
+                matches!(apply_reorg(&mut disk, &reorg), ReorgOutcome::Applied { frames_applied, .. } if frames_applied == requested as u64)
+            );
+            assert!(matches!(apply_reorg(&mut memory, &reorg), ReorgOutcome::Applied { .. }));
+            assert_eq!(disk.pair.fingerprint(), memory.pair.fingerprint());
+            assert!(disk.pair.trie_cache.structurally_eq(&memory.pair.trie_cache));
+            assert_eq!(disk.pair.cache.accounts(), memory.pair.cache.accounts());
+            for block in &abandoned {
+                advance_retaining(
+                    &mut disk,
+                    block.number,
+                    (block.number - ANCHOR_BLOCK) as u8,
+                    true,
+                );
+            }
+            assert_eq!(disk.pair.fingerprint(), before);
+            assert!(matches!(apply_reorg(&mut disk, &reorg), ReorgOutcome::Applied { .. }));
+            assert!(disk.pair.trie_cache.structurally_eq(&memory.pair.trie_cache));
+        }
+    }
+
+    #[test]
+    fn disk_undo_corruption_and_missing_files_leave_both_live_caches_unchanged() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = disk_state(directory.path());
+            disk_run(&mut state, 4);
+            let RetainedContent::Disk(file) = &state.pair.retained[0].content else {
+                panic!("disk")
+            };
+            file.load().unwrap(); // Make the write complete before injecting the fault.
+            if corrupt {
+                let mut bytes = std::fs::read(file.path()).unwrap();
+                *bytes.last_mut().unwrap() ^= 1;
+                std::fs::write(file.path(), bytes).unwrap();
+            } else {
+                std::fs::remove_file(file.path()).unwrap();
+            }
+            let before = state.pair.fingerprint();
+            let trie = state.pair.trie_cache.fork_for_rollback();
+            let undo = state.pair.cache.undo_log_fingerprint();
+            let (ancestor, abandoned) = state.history.suffix(4).unwrap();
+            assert!(matches!(
+                apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+                ReorgOutcome::Unrecoverable { .. }
+            ));
+            assert_eq!(state.pair.fingerprint(), before);
+            assert!(state.pair.trie_cache.structurally_eq(&trie));
+            assert_eq!(state.pair.cache.undo_log_fingerprint(), undo);
+            assert_eq!(state.pair.retained_depth(), 4);
+        }
+    }
+
+    #[test]
+    fn disk_undo_depth_one_does_not_read_older_files_and_33_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 33);
+        assert_eq!(state.pair.retained_depth(), 32);
+        let before = state.pair.fingerprint();
+        let (ancestor, abandoned) = state.history.suffix(33).unwrap();
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Unrecoverable { .. }
+        ));
+        assert_eq!(state.pair.fingerprint(), before);
+        // Remove every completed file; the resident depth-one undo must still work.
+        for held in &state.pair.retained {
+            if let RetainedContent::Disk(file) = &held.content {
+                file.load().unwrap();
+                std::fs::remove_file(file.path()).unwrap();
+            }
+        }
+        let (ancestor, abandoned) = state.history.suffix(1).unwrap();
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Applied { frames_applied: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn disk_undo_writer_failure_and_foreign_generation_are_atomic() {
+        for foreign in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = disk_state(directory.path());
+            disk_run(&mut state, 2);
+            let RetainedContent::Disk(file) = &state.pair.retained[0].content else {
+                panic!("disk")
+            };
+            file.load().unwrap();
+            if foreign {
+                let mut other = disk_state(directory.path());
+                disk_run(&mut other, 2);
+                std::mem::swap(
+                    &mut state.pair.retained[0].content,
+                    &mut other.pair.retained[0].content,
+                );
+            } else {
+                std::fs::remove_dir_all(file.path().parent().unwrap()).unwrap();
+                advance_retaining(&mut state, ANCHOR_BLOCK + 3, 3, true);
+                let RetainedContent::Disk(failed) = &state.pair.retained[1].content else {
+                    panic!("disk")
+                };
+                assert!(failed.load().is_err(), "the queued write must fail");
+            }
+            let before = state.pair.fingerprint();
+            let retained = state.pair.retained_depth();
+            let undo = state.pair.cache.undo_log_fingerprint();
+            let (ancestor, abandoned) = state.history.suffix(2).unwrap();
+            assert!(matches!(
+                apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+                ReorgOutcome::Unrecoverable { .. }
+            ));
+            assert_eq!(state.pair.fingerprint(), before);
+            assert_eq!(state.pair.retained_depth(), retained);
+            assert_eq!(state.pair.cache.undo_log_fingerprint(), undo);
+        }
+    }
+
+    #[test]
+    fn disk_undo_prune_and_reset_release_files_and_preserve_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 2);
+        let old_path = match &state.pair.retained[0].content {
+            RetainedContent::Disk(file) => {
+                file.load().unwrap();
+                file.path().to_owned()
+            }
+            _ => panic!("disk"),
+        };
+        for offset in 3..=34 {
+            advance_retaining(&mut state, ANCHOR_BLOCK + offset, offset as u8, true);
+        }
+        assert!(!old_path.exists(), "K bounds file retention as well as the deque");
+        let pending: Vec<_> = state
+            .pair
+            .retained
+            .iter()
+            .filter_map(|held| match &held.content {
+                RetainedContent::Disk(file) => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        let paths: Vec<_> = pending.iter().map(|file| file.path().to_owned()).collect();
+        state.pair.cold_reset();
+        assert_eq!(state.pair.retained_depth(), 0);
+        assert_eq!(state.pair.retention_depth.get(), 32);
+        assert!(state.pair.trie_cache.records_undo());
+        assert_eq!(state.pair.undo_layout, UndoLayout::FramesOnly);
+        for file in &pending {
+            file.load().unwrap();
+        }
+        drop(pending);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn disk_undo_full_fallback_is_resident_only_and_limits_the_available_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 3);
+        state.pair.trie_cache.set_undo_recording(false);
+        advance_retaining(&mut state, ANCHOR_BLOCK + 4, 4, true);
+        assert!(state.pair.retained.back().unwrap().content.full().is_some());
+        state.pair.trie_cache.set_undo_recording(true);
+        advance_retaining(&mut state, ANCHOR_BLOCK + 5, 5, true);
+        assert_eq!(state.pair.retained_depth(), 1, "the Full fallback is never kept cold in RAM");
+        let before = state.pair.fingerprint();
+        let (ancestor, abandoned) = state.history.suffix(2).unwrap();
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Unrecoverable { .. }
+        ));
+        assert_eq!(state.pair.fingerprint(), before);
+        let (ancestor, abandoned) = state.history.suffix(1).unwrap();
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Applied { .. }
+        ));
+    }
+
     /// What two pairs have to agree on to be at the same place, whatever their deques are made of.
     ///
     /// [`PairSnapshot`] itself cannot be compared across the two: it carries each generation's
@@ -737,6 +962,7 @@ mod tests {
                     assert_eq!(frame.source(), held[index + 1]);
                     assert_eq!(frame.target(), held[index]);
                 }
+                RetainedContent::Disk(_) => panic!("memory-only fixture"),
             }
         }
     }

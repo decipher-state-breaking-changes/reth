@@ -10,6 +10,7 @@ use alloy_trie::{nodes::TrieNode, TrieMask};
 /// when storing masks by path. Instead of two separate `HashMap<Nibbles, TrieMask>`,
 /// we use a single `HashMap<Nibbles, BranchNodeMasks>`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BranchNodeMasks {
     /// Hash mask indicating which children are stored as hashes.
     pub hash_mask: TrieMask,

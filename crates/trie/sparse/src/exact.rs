@@ -45,6 +45,30 @@ use smallvec::SmallVec;
 use std::time::Instant as StdInstant;
 use tracing::{instrument, trace};
 
+// Session-local undo files preserve trie content, not scratch buffers or allocation identities.
+#[cfg(feature = "serde")]
+mod disk_subtries {
+    use super::{LowerExactSubtrie, NUM_LOWER_SUBTRIES};
+    use alloc::{boxed::Box, vec::Vec};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &[LowerExactSubtrie; NUM_LOWER_SUBTRIES],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.as_slice().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<[LowerExactSubtrie; NUM_LOWER_SUBTRIES]>, D::Error> {
+        Vec::<LowerExactSubtrie>::deserialize(deserializer)?
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("wrong number of lower subtries"))
+    }
+}
+
 /// Heap bytes a hashbrown table of this capacity occupies, before any per-entry heap.
 ///
 /// The table is sized to the next power of two that keeps the load factor under 7/8, and carries
@@ -171,10 +195,12 @@ struct FinalizationMetrics {
 ///   in `values` collection. If the root node is a leaf, it must also have an entry in `values`.
 /// - All keys in `values` collection are full leaf paths.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExactSparseTrie {
     /// This contains the trie nodes for the upper part of the trie.
     upper_subtrie: Box<ExactSparseSubtrie>,
     /// An array containing the subtries at the second level of the trie.
+    #[cfg_attr(feature = "serde", serde(with = "disk_subtries"))]
     lower_subtries: Box<[LowerExactSubtrie; NUM_LOWER_SUBTRIES]>,
     /// Set of prefixes (key paths) that have been marked as updated.
     /// This is used to track which parts of the trie need to be recalculated.
@@ -189,16 +215,21 @@ pub struct ExactSparseTrie {
     branch_node_masks: JournaledMap<Nibbles, BranchNodeMasks>,
     /// Reusable buffer pool used for collecting [`SparseTrieUpdatesAction`]s during hash
     /// computations.
+    #[cfg_attr(feature = "serde", serde(skip))]
     update_actions_buffers: Vec<Vec<SparseTrieUpdatesAction>>,
     /// The undo record in progress, when one is being kept. See [`Self::begin_undo`].
+    #[cfg_attr(feature = "serde", serde(skip))]
     undo: Option<UndoInProgress>,
     /// Thresholds controlling when parallelism is enabled for different operations.
+    #[cfg_attr(feature = "serde", serde(skip))]
     parallelism_thresholds: ParallelismThresholds,
     /// Metrics for the parallel sparse trie.
     #[cfg(feature = "metrics")]
+    #[cfg_attr(feature = "serde", serde(skip))]
     metrics: crate::metrics::ParallelSparseTrieMetrics,
     /// Debug recorder for tracking mutating operations.
     #[cfg(feature = "trie-debug")]
+    #[cfg_attr(feature = "serde", serde(skip))]
     debug_recorder: TrieDebugRecorder,
 }
 
@@ -3082,6 +3113,7 @@ impl ReachableSubtries {
 /// This is a subtrie of the [`ExactSparseTrie`] that contains a map from path to sparse trie
 /// nodes.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct ExactSparseSubtrie {
     /// The root path of this subtrie.
     ///
@@ -3685,11 +3717,13 @@ impl ExactSparseSubtrie {
 /// Helper type for [`ExactSparseSubtrie`] to mutably access only a subset of fields from the
 /// original struct.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct ExactSubtrieInner {
     /// Map from leaf key paths to their values.
     /// All values are stored here instead of directly in leaf nodes.
     values: JournaledMap<Nibbles, Vec<u8>>,
     /// Reusable buffers for [`ExactSparseSubtrie::update_hashes`].
+    #[cfg_attr(feature = "serde", serde(skip))]
     buffers: ExactSubtrieBuffers,
 }
 
@@ -4247,6 +4281,7 @@ enum SparseTrieUpdatesAction {
 /// all blinded, meaning they have no nodes. A blinded `LowerExactSubtrie` may hold onto a cleared
 /// [`ExactSparseSubtrie`] in order to reuse allocations.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) enum LowerExactSubtrie {
     Blind(Option<Box<ExactSparseSubtrie>>),
     Revealed(Box<ExactSparseSubtrie>),
@@ -4436,6 +4471,7 @@ impl LowerExactSubtrie {
 /// Ranks are computed against `blinded_mask` only, so `state_mask` edits (child added or
 /// removed) never shift entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct BlindedSlots(Box<[B256]>);
 
 impl BlindedSlots {
@@ -4499,6 +4535,7 @@ impl BlindedSlots {
 /// Node representation for [`ExactSparseTrie`]: identical to [`crate::SparseNode`] except the
 /// branch's blinded-hash storage, which is exactly sized instead of a fixed 16-slot box.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) enum ExactSparseNode {
     /// Empty trie node.
     Empty,
@@ -4833,13 +4870,15 @@ impl UndoInProgress {
 
 /// What a lower subtrie slot was before the block first changed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum LowerBefore {
     Blind,
     Revealed(Nibbles),
 }
 
 /// One subtrie's part of an [`UndoFrame`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct SubtrieUndo {
     nodes: MapJournal<Nibbles, ExactSparseNode>,
     values: MapJournal<Nibbles, Vec<u8>>,
@@ -4868,7 +4907,8 @@ impl SubtrieUndo {
 /// Sized by what the block touched, not by the trie: one preimage per node, value or mask
 /// written, one entry per lower subtrie whose reveal state changed, plus the prefix set and
 /// retained updates as they stood. [`Self::counts`] reports the size.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UndoFrame {
     upper: Option<SubtrieUndo>,
     lower: Vec<(u8, SubtrieUndo)>,

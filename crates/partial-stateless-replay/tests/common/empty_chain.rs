@@ -48,6 +48,7 @@ pub fn chain_with_tag(count: u64, tag: u8) -> (Fixture, Vec<StreamEvent>) {
     };
     let restored = restore_snapshot(package, &trusted, &config).unwrap();
     let mut pair = CoordinatedPair {
+        undo_store: None,
         cache: restored.cache,
         trie_cache: restored.trie_cache,
         readiness: restored.readiness,

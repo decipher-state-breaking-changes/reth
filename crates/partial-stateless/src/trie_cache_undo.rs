@@ -59,7 +59,7 @@ pub(crate) fn next_undo_id() -> u64 {
 /// of the generation it replaces rather than copies of anything, so a frame's real weight is the
 /// account-trie preimages plus whatever share of the old storage tries nothing else still points
 /// at — which is why [`Self::shared_allocations`] exists beside [`Self::allocated_bytes`].
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrieCacheUndoFrame {
     /// The generation this frame applies *to*, and the one it produces.
     ///
@@ -303,7 +303,7 @@ pub struct TrieCacheUndoCounts {
 }
 
 /// One storage-trie map entry as the older generation held it.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum StorageTrieBefore {
     /// The map held this trie for the address; put it back.
     ///
@@ -355,7 +355,7 @@ impl StorageTrieBefore {
 /// *first* rebuild found, and the delta recorded before that rebuild walks them the rest of the
 /// way back to where the block started. With no rebuild there is no whole and the delta is the
 /// whole record; with a rebuild first there is no delta to apply.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MembershipUndo {
     /// The four structures as the block's first retention rebuild found them.
     pub(crate) whole: Option<Box<MembershipWhole>>,
@@ -370,7 +370,7 @@ pub(crate) struct MembershipUndo {
 /// block can move the same key twice — an account that leaves warm membership and comes back
 /// within one retention pass — and only the first preimage describes the generation being
 /// restored.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MembershipUndoDelta {
     /// Whether each touched warm account was present before the block.
     pub(crate) warm_accounts: HashMap<Address, bool>,
@@ -383,7 +383,7 @@ pub(crate) struct MembershipUndoDelta {
 }
 
 /// Warm membership and the retained-path indexes copied whole.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MembershipWhole {
     pub(crate) warm_accounts: HashSet<Address>,
     pub(crate) warm_storage: HashSet<(Address, B256)>,

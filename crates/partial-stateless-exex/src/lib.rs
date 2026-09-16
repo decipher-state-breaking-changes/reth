@@ -43,9 +43,12 @@ use partial_stateless_stream::{
     BlockRef as StreamBlockRef, CommitInput, CommitOracle, EndKind, RecordedVerdict, Reorg,
     ResetReason,
 };
+#[cfg(test)]
+use partial_stateless_validator::inject_recovery;
 use partial_stateless_validator::{
-    admit_block, block_context, inject_recovery, BlockAdmission, CanonicalStateRoots,
-    CoordinatedPair, RetainedGenerationBytes, ValidatorRules,
+    admit_block, block_context, try_deep_recovery, BlockAdmission, CanonicalStateRoots,
+    CoordinatedPair, ExpectedLineage, RetainedGenerationBytes, RetentionDepth, UndoLayout,
+    ValidatorRules,
 };
 use reth_ethereum::{
     chainspec::EthChainSpec,
@@ -235,6 +238,12 @@ pub struct RunOptions {
     /// only reason to turn it off is the memory control — an otherwise identical run that pays no
     /// retention, so the difference in resident memory is attributable to retention alone.
     pub retain_generation: bool,
+    /// Total undo window; production defaults to 32 blocks with one resident bundle.
+    pub retention_depth: RetentionDepth,
+    pub undo_record: bool,
+    pub undo_layout: UndoLayout,
+    /// Parent directory of disposable, per-pair undo sessions.
+    pub undo_dir: Option<PathBuf>,
     /// Whether eligible initial V2 multiproofs use reth's proof workers.
     pub parallel_initial_proof: bool,
     /// Whether the paired in-memory validation benchmark is running.
@@ -344,6 +353,29 @@ impl RunOptions {
             ))
         }
         let trie_repr = trie_repr_from_env()?;
+        let retention_depth = RetentionDepth::new(
+            std::env::var("PS_RETAIN_DEPTH").unwrap_or_else(|_| "32".into()).parse()?,
+        )?;
+        let undo_record = match std::env::var("PS_UNDO_RECORD").as_deref() {
+            Ok("off" | "false" | "0" | "no") => false,
+            Ok("on" | "true" | "1" | "yes") | Err(_) => true,
+            Ok(other) => eyre::bail!("invalid PS_UNDO_RECORD={other:?}"),
+        };
+        let undo_layout = match std::env::var("PS_UNDO_LAYOUT").as_deref() {
+            Ok("hybrid") => UndoLayout::Hybrid,
+            Ok("frames") | Err(_) => UndoLayout::FramesOnly,
+            Ok(other) => eyre::bail!("invalid PS_UNDO_LAYOUT={other:?}"),
+        };
+        if undo_layout == UndoLayout::FramesOnly &&
+            (!undo_record || trie_repr != CacheTrieRepr::Exact)
+        {
+            eyre::bail!("frames undo requires recording on and PS_TRIE_REPR=exact")
+        }
+        let undo_dir = (undo_layout == UndoLayout::FramesOnly).then(|| {
+            std::env::var_os("PS_UNDO_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| sidecar_dir.join("undo"))
+        });
         if trie_repr != CacheTrieRepr::default() &&
             (env_flag("PS_BOOTSTRAP_IMPORT") ||
                 env_flag("PS_CANONICAL_REBUILD") ||
@@ -386,6 +418,10 @@ impl RunOptions {
             policy_dataset: policy_dataset_capture::PolicyDatasetCaptureConfig::from_env()?,
             force_previous_cache_snapshot: env_flag("PS_FORCE_PREVIOUS_CACHE_SNAPSHOT"),
             retain_generation: env_flag_enabled_by_default("PS_RETAIN_GENERATION"),
+            retention_depth,
+            undo_record,
+            undo_layout,
+            undo_dir,
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
             validation_bench,
             reexec_limits: SidecarReexecLimits::default(),
@@ -871,7 +907,7 @@ where
     let options = RunOptions::from_env(config)?;
     options.log_summary(&cache_path);
 
-    let mut pair = load_initial_pair(&options, &cache_path, ctx.head.number);
+    let mut pair = load_initial_pair(&options, &cache_path, ctx.head.number)?;
     let mut gate = BootstrapGate::new(&options);
     // Built before the first notification so a misconfigured spool fails the run at startup rather
     // than after the snapshot export has already been paid for.
@@ -1101,14 +1137,7 @@ where
                 // left in place rather than cleared: `Recovering` already refuses every block, and
                 // clearing it here would make a failed recovery look like a clean cold start,
                 // which is exactly the distinction the state exists to preserve.
-                recover_at(
-                    &ctx,
-                    &options,
-                    &mut pair,
-                    *old.range().start(),
-                    ancestor_hash,
-                    &mut rebuild_failures,
-                );
+                recover_at(&ctx, &options, &mut pair, old, &mut rebuild_failures);
                 // Written before the winning branch's commits, so a consumer learns which blocks
                 // left the chain before it is asked to apply the ones that replaced them.
                 if let Some(recorder) = recorder.as_mut() {
@@ -1193,14 +1222,7 @@ where
                     "the chain reverted under the export",
                 );
 
-                let recovered = recover_at(
-                    &ctx,
-                    &options,
-                    &mut pair,
-                    *old.range().start(),
-                    new_tip_hash,
-                    &mut rebuild_failures,
-                );
+                let recovered = recover_at(&ctx, &options, &mut pair, old, &mut rebuild_failures);
                 // A pure revert: the same event with no winning tip, because nothing replaces the
                 // abandoned blocks. Collapsing it into the reorg variant keeps a consumer from
                 // needing two ways to unwind.
@@ -1459,7 +1481,34 @@ fn persist_cache(
 /// A snapshot import takes precedence over the persisted flat cache, which loads values and then
 /// discards them for want of a matching trie snapshot — restoring both halves together is the
 /// whole point of the package.
-fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -> LivePair {
+fn load_initial_pair(
+    options: &RunOptions,
+    cache_path: &Path,
+    head_block: u64,
+) -> eyre::Result<LivePair> {
+    let mut pair = load_initial_pair_unconfigured(options, cache_path, head_block);
+    configure_pair_undo(options, &mut pair)?;
+    Ok(pair)
+}
+
+fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre::Result<()> {
+    pair.retention_depth = options.retention_depth;
+    pair.undo_layout = options.undo_layout;
+    pair.trie_cache.set_undo_recording(options.undo_record);
+    if let Some(directory) = &options.undo_dir {
+        pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
+    }
+    info!(target: "partial_stateless", depth = options.retention_depth.get(),
+        recording = options.undo_record, layout = options.undo_layout.as_str(),
+        directory = ?options.undo_dir, resident_blocks = 1, "Configured cache undo retention");
+    Ok(())
+}
+
+fn load_initial_pair_unconfigured(
+    options: &RunOptions,
+    cache_path: &Path,
+    head_block: u64,
+) -> LivePair {
     let config = &options.config;
     if options.bootstrap_import {
         match bootstrap_io::load_snapshot(&options.bootstrap_dir) {
@@ -1468,6 +1517,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
                     Ok(restored) => {
                         bootstrap_io::warn_on_head_drift(&checkpoint, head_block + 1);
                         return LivePair::new(CoordinatedPair {
+                            undo_store: None,
                             cache: restored.cache,
                             trie_cache: restored.trie_cache,
                             retained: Default::default(),
@@ -1562,6 +1612,7 @@ fn load_initial_pair(options: &RunOptions, cache_path: &Path, head_block: u64) -
     // Tracks whether the two caches together still describe the parent of the block being
     // processed. Both start cold here, and the tracker starts cold with them.
     LivePair::new(CoordinatedPair {
+        undo_store: None,
         cache,
         trie_cache: PartialTrieNodeCache::new_with_repr(options.trie_repr),
         readiness: config.new_readiness_tracker(),
@@ -1605,14 +1656,15 @@ fn recover_at<Node>(
     ctx: &ExExContext<Node>,
     options: &RunOptions,
     pair: &mut LivePair,
-    unwound_from: u64,
-    target_hash: Option<B256>,
+    old: &Chain<EthPrimitives>,
     failures: &mut u32,
 ) -> bool
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
     Node::Provider: BlockReader<Block = BlockTy<EthPrimitives>>,
 {
+    let unwound_from = *old.range().start();
+    let target_hash = old.blocks().values().next().map(|block| block.parent_hash);
     let Some(target_hash) = target_hash else {
         pair.readiness.begin_recovery(unwound_from);
         error!(
@@ -1623,13 +1675,13 @@ where
         return false
     };
 
-    // Depth-1 fast path. Every rejection falls through to the rebuild below, including a failed
-    // header lookup: the rebuild is the correct answer whenever the cheap answer cannot be proven.
-    if inject_recovery(
+    let abandoned =
+        old.blocks().iter().map(|(number, block)| (*number, block.hash())).collect::<Vec<_>>();
+    if recover_notified_branch(
         pair,
         &CanonicalChain(ctx.provider()),
-        unwound_from,
-        target_hash,
+        (unwound_from.saturating_sub(1), target_hash),
+        &abandoned,
         options.config.cache_policy_id(),
     )
     .is_some()
@@ -1639,6 +1691,24 @@ where
     }
 
     rebuild_pair_at(ctx, options, pair, target_hash, failures)
+}
+
+/// Shared by reorg and pure-revert notifications. Bind the abandoned tip to our accepted head;
+/// the coordinated pair separately checks every retained ancestor and disk generation identity.
+fn recover_notified_branch(
+    pair: &mut CoordinatedPair,
+    chain: &impl CanonicalStateRoots,
+    ancestor: (u64, B256),
+    abandoned: &[(u64, B256)],
+    policy: B256,
+) -> Option<partial_stateless_validator::RecoveryReport> {
+    pair.readiness.begin_recovery(ancestor.0.saturating_add(1));
+    let head = pair.accepted_head.as_ref()?;
+    if abandoned.last().copied() != Some((head.number(), head.hash())) {
+        return None
+    }
+    let lineage = ExpectedLineage::new(ancestor, abandoned).ok()?;
+    try_deep_recovery(pair, chain, &lineage, policy)
 }
 
 /// The rules this ExEx validates under: the node's own EVM config and the node's own consensus.
@@ -1703,6 +1773,7 @@ where
     match rebuilt {
         Ok(ready) => {
             *failures = 0;
+            pair.trie_cache.set_undo_recording(options.undo_record);
             // The rebuild replaced the pair from canonical state; whatever was retained described
             // a generation this one does not descend from, so it goes.
             pair.forget_retained_generations();
@@ -2447,8 +2518,9 @@ where
             &exported.checkpoint,
             &options.config,
         )?;
-        let shadow = ShadowPair {
+        let mut shadow = ShadowPair {
             pair: LivePair::new(CoordinatedPair {
+                undo_store: None,
                 cache: restored.cache,
                 trie_cache: restored.trie_cache,
                 retained: Default::default(),
@@ -2460,6 +2532,7 @@ where
             remaining_blocks: gate.self_test_blocks,
             restored_at: ready.anchor.block_number,
         };
+        configure_pair_undo(options, &mut shadow.pair)?;
         let live = pair.fingerprint();
         let bootstrapped = shadow.pair.fingerprint();
         if live != bootstrapped {
@@ -3132,6 +3205,7 @@ mod tests {
     fn cold_pair() -> LivePair {
         let config = CacheConfig::default();
         LivePair::new(CoordinatedPair {
+            undo_store: None,
             cache: config.new_cache(),
             trie_cache: PartialTrieNodeCache::new(),
             readiness: config.new_readiness_tracker(),
@@ -3443,6 +3517,7 @@ mod tests {
             .expect("an honest snapshot restores");
 
         let mut pair = LivePair::new(CoordinatedPair {
+            undo_store: None,
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
@@ -3686,6 +3761,7 @@ mod tests {
         let current = crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config)
             .expect("an honest snapshot restores");
         let mut pair = LivePair::new(CoordinatedPair {
+            undo_store: None,
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
@@ -3818,6 +3894,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disk_undo_exex_notification_recovers_32_and_rejects_another_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CacheConfig::default();
+        let (package, checkpoint, root) = warm_snapshot(&config);
+        let restored =
+            crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config).unwrap();
+        let mut pair = LivePair::new(CoordinatedPair {
+            undo_store: None,
+            cache: restored.cache,
+            trie_cache: restored.trie_cache,
+            readiness: restored.readiness,
+            retained: Default::default(),
+            retention_depth: super::RetentionDepth::new(32).unwrap(),
+            undo_layout: super::UndoLayout::FramesOnly,
+            accepted_head: None,
+        });
+        pair.enable_disk_undo(directory.path()).unwrap();
+        let baseline = pair.fingerprint();
+        let trie = pair.trie_cache.fork_for_rollback();
+        let mut abandoned = Vec::new();
+        let mut parent_hash = SNAP_HASH;
+        for offset in 1..=32 {
+            let number = SNAP_BLOCK + offset;
+            let block = BlockContext {
+                number,
+                hash: numbered(number, 0xbb),
+                parent_hash,
+                state_root: root,
+            };
+            assert!(matches!(
+                admit_block(&mut pair.readiness, &block),
+                BlockAdmission::Admitted(_)
+            ));
+            let mut accessed = BlockAccessedState::default();
+            accessed.accounts.insert(
+                SNAP_ADDRESS,
+                AccountData { nonce: 7, balance: U256::from(1_000), code_hash: None },
+            );
+            pair.cache.on_block_executed(number, &accessed);
+            let mut next = pair.trie_cache.clone();
+            next.retain_from_value_cache(&pair.cache);
+            let displaced = std::mem::replace(&mut pair.trie_cache, next);
+            finish_committed_transition(&mut pair, Some(displaced), &block, sealed(&block), true);
+            pair.cache.cache_root();
+            abandoned.push((number, block.hash));
+            parent_hash = block.hash;
+        }
+        let chain = FakeChain::Canonical(SNAP_HASH, root);
+        let before = pair.fingerprint();
+        let mut foreign = abandoned.clone();
+        foreign.last_mut().unwrap().1 = B256::ZERO;
+        assert!(super::recover_notified_branch(
+            &mut pair,
+            &chain,
+            (SNAP_BLOCK, SNAP_HASH),
+            &foreign,
+            config.cache_policy_id()
+        )
+        .is_none());
+        assert_eq!(pair.fingerprint(), before);
+        let recovery = super::recover_notified_branch(
+            &mut pair,
+            &chain,
+            (SNAP_BLOCK, SNAP_HASH),
+            &abandoned,
+            config.cache_policy_id(),
+        )
+        .unwrap();
+        assert_eq!(recovery.frames_applied, 32);
+        assert_eq!(pair.fingerprint(), baseline);
+        assert!(pair.trie_cache.structurally_eq(&trie));
+        assert!(matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
     /// Advances the flat cache by a block that touches `address`, so two branches can be made to
     /// leave different residue behind.
     fn apply_touching(pair: &mut LivePair, number: u64, address: Address) {
@@ -3860,6 +4011,7 @@ mod tests {
             .expect("an honest snapshot restores");
 
         let mut pair = LivePair::new(CoordinatedPair {
+            undo_store: None,
             cache: current.cache,
             trie_cache: current.trie_cache,
             readiness: current.readiness,
@@ -3869,6 +4021,7 @@ mod tests {
             accepted_head: None,
         });
         let reference = LivePair::new(CoordinatedPair {
+            undo_store: None,
             cache: reference.cache,
             trie_cache: reference.trie_cache,
             readiness: reference.readiness,

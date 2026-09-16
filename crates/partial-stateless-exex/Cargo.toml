@@ -70,3 +70,6 @@ serde.workspace = true
 serde_json.workspace = true
 bincode = { workspace = true }
 libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

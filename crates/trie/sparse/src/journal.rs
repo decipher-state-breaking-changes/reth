@@ -26,8 +26,16 @@ use core::{
 /// yields a recording map with an empty record — a clone starts its own history — and equality
 /// compares content only.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        deserialize = "K: serde::Deserialize<'de> + Eq + Hash, V: serde::Deserialize<'de>"
+    ))
+)]
 pub struct JournaledMap<K, V> {
     map: HashMap<K, V>,
+    #[cfg_attr(feature = "serde", serde(skip))]
     journal: Option<MapJournal<K, V>>,
 }
 
@@ -210,7 +218,14 @@ impl<K: Copy + Eq + Hash, V: Clone + PartialEq> JournaledMap<K, V> {
 /// key that was absent. `whole` holds the entire map as it stood before a bulk clear; once it is
 /// set, later writes need no record because the restore replaces the map wholesale before
 /// applying the preimages recorded ahead of the clear.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        deserialize = "K: serde::Deserialize<'de> + Eq + Hash, V: serde::Deserialize<'de>"
+    ))
+)]
 pub struct MapJournal<K, V> {
     preimages: HashMap<K, Option<V>>,
     whole: Option<HashMap<K, V>>,

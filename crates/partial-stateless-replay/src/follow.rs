@@ -89,16 +89,19 @@ pub struct FollowOptions {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// Directory for disk undo; only the newest block stays in memory.
+    pub undo_dir: Option<std::path::PathBuf>,
 }
 
 impl FollowOptions {
     /// The subset of these options that configures the coordinated pair itself.
-    pub const fn pair_config(&self) -> PairConfig {
+    pub fn pair_config(&self) -> PairConfig {
         PairConfig {
             retain_depth: self.retain_depth,
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
             undo_layout: self.undo_layout,
+            undo_dir: self.undo_dir.clone(),
         }
     }
 }
@@ -121,6 +124,7 @@ impl Default for FollowOptions {
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
             undo_layout: UndoLayout::default(),
+            undo_dir: None,
         }
     }
 }
@@ -684,6 +688,7 @@ impl<'a> Follower<'a> {
                 warm_shrink: options.warm_shrink,
                 undo_record: options.undo_record,
                 undo_layout: options.undo_layout,
+                undo_dir: options.undo_dir.clone(),
                 // Follow mode replays a live producer; forcing reorgs on it would be forcing
                 // them on the chain. The batch driver is where the experiment runs.
                 forced_reorgs: Vec::new(),

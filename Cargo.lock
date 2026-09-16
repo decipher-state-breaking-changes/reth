@@ -6467,6 +6467,7 @@ dependencies = [
  "bincode",
  "eyre",
  "reth-execution-access",
+ "reth-fs-util",
  "reth-primitives-traits",
  "reth-trie",
  "reth-trie-common",
@@ -6476,6 +6477,7 @@ dependencies = [
  "revm-state",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -6509,6 +6511,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -6571,6 +6574,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snmalloc-rs",
+ "tempfile",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",

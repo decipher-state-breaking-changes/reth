@@ -70,6 +70,7 @@ std = [
     "serde_json?/std",
 ]
 metrics = ["dep:reth-metrics", "dep:metrics", "std"]
+serde = ["dep:serde", "alloy-primitives/serde", "alloy-trie/serde", "reth-trie-common/serde"]
 trie-debug = ["std", "dep:serde", "dep:serde_json", "alloy-primitives/serde", "alloy-trie/serde"]
 test-utils = [
     "std",

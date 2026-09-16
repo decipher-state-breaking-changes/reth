@@ -332,6 +332,7 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
 /// Maintains references to both modified and pruned/removed branches, enabling
 /// one to make batch updates to a persistent database.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SparseTrieUpdates {
     /// Collection of updated intermediate nodes indexed by full path.
     pub updated_nodes: HashMap<Nibbles, BranchNodeCompact>,

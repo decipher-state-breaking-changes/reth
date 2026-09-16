@@ -18,6 +18,7 @@ use tracing::instrument;
 /// 3. Incremental operations - nodes can be revealed as needed without loading the entire trie.
 ///    This is what gives rise to the notion of a "sparse" trie.
 #[derive(PartialEq, Eq, Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RevealableSparseTrie<T = ParallelSparseTrie> {
     /// The trie is blind -- no nodes have been revealed
     ///
@@ -451,6 +452,7 @@ impl SparseNode {
 /// Tracks the current state of a node in the trie, specifically regarding whether it's been updated
 /// or not.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SparseNodeState {
     /// The node has been updated and its new `RlpNode` has not yet been calculated.
     ///

@@ -21,10 +21,10 @@ reth-trie-common = { workspace = true }
 # workspace declares this dependency `default-features = false`, and the standalone binaries link
 # none of the node graph that would otherwise turn it on — so a package that does not ask for it
 # here measures a trie production does not run. Same defect class as the keccak features below.
-reth-trie-sparse = { workspace = true, features = ["std"] }
+reth-trie-sparse = { workspace = true, features = ["std", "serde"] }
 
 # serialization
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 bincode = { workspace = true }
 
@@ -36,6 +36,8 @@ bincode = { workspace = true }
 # nothing else. Every consumer of this crate already links `eyre`.
 eyre.workspace = true
 thiserror.workspace = true
+reth-fs-util.workspace = true
+tempfile.workspace = true
 tracing = { workspace = true }
 
 [features]

@@ -300,6 +300,8 @@ fn write_manifest(
         // generations. Absent on files written before the axis existed.
         "undo_record": pair.undo_record,
         "undo_layout": pair.undo_layout.as_str(),
+        "undo_dir": pair.undo_dir,
+        "undo_resident_blocks": pair.undo_dir.as_ref().map(|_| 1),
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
         // repeated heights, and every forced reorg is also listed in the report. Empty otherwise.
         "forced_reorgs": forced_reorgs
@@ -686,6 +688,7 @@ fn parse_args() -> eyre::Result<Mode> {
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
         undo_layout: undo_layout_from_env()?,
+        undo_dir: std::env::var_os("PS_UNDO_DIR").map(PathBuf::from),
         forced_reorgs: forced_reorgs_from_env()?,
         ..ReplayOptions::default()
     };
@@ -742,6 +745,11 @@ fn parse_args() -> eyre::Result<Mode> {
                 };
                 options.undo_record = on;
             }
+            "--undo-dir" => {
+                options.undo_dir = Some(PathBuf::from(
+                    args.next().ok_or_else(|| eyre::eyre!("--undo-dir needs a directory"))?,
+                ));
+            }
             "--undo-layout" => {
                 let raw = args
                     .next()
@@ -773,7 +781,7 @@ fn parse_args() -> eyre::Result<Mode> {
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
-                     [--undo-record [on|off]] [--undo-layout hybrid|frames] \
+                     [--undo-record [on|off]] [--undo-layout hybrid|frames] [--undo-dir <directory>] \
                      [--json <path>] \
                      [--label <name>]\nps-replay --list-frames <spool-dir>\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
                      sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, PS_UNDO_LAYOUT sets \
@@ -787,6 +795,11 @@ fn parse_args() -> eyre::Result<Mode> {
         }
     }
     check_undo_configuration(options.undo_layout, options.undo_record)?;
+    if options.undo_dir.is_some() &&
+        (!options.undo_record || options.undo_layout != UndoLayout::FramesOnly)
+    {
+        eyre::bail!("--undo-dir requires --undo-record on --undo-layout frames")
+    }
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay <spool-dir> [--limit N]"))?;
     if !forced_from_flags.is_empty() {
         options.forced_reorgs = forced_from_flags;
@@ -803,6 +816,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
         undo_layout: undo_layout_from_env()?,
+        undo_dir: std::env::var_os("PS_UNDO_DIR").map(PathBuf::from),
         ..FollowOptions::default()
     };
     while let Some(arg) = args.next() {
@@ -859,6 +873,11 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                 };
                 options.undo_record = on;
             }
+            "--undo-dir" => {
+                options.undo_dir = Some(PathBuf::from(
+                    args.next().ok_or_else(|| eyre::eyre!("--undo-dir needs a directory"))?,
+                ));
+            }
             "--undo-layout" => {
                 let raw = args
                     .next()
@@ -870,6 +889,11 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
         }
     }
     check_undo_configuration(options.undo_layout, options.undo_record)?;
+    if options.undo_dir.is_some() &&
+        (!options.undo_record || options.undo_layout != UndoLayout::FramesOnly)
+    {
+        eyre::bail!("--undo-dir requires --undo-record on --undo-layout frames")
+    }
     let dir = dir.ok_or_else(|| eyre::eyre!("usage: ps-replay --follow <spool-dir>"))?;
     Ok(Mode::Follow { dir, options })
 }

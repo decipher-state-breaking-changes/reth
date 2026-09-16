@@ -148,6 +148,18 @@ impl<T> Clone for SharedSparseTrie<T> {
     }
 }
 
+impl<T: serde::Serialize> serde::Serialize for SharedSparseTrie<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for SharedSparseTrie<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::new(T::deserialize(deserializer)?))
+    }
+}
+
 impl<T: Default> Default for SharedSparseTrie<T> {
     fn default() -> Self {
         Self::new(T::default())
