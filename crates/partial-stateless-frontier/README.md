@@ -9,8 +9,8 @@ A cache-policy comparison measured across separate live runs cannot separate the
 from the run. Two runs see different blocks, a different mempool, and a different machine
 state, and nothing in the result says which of the three moved the number.
 
-Replaying one recorded corpus through every policy removes all of it. The block set is
-identical by construction, so the only thing that varies is the policy — and the tool
+Replaying one recorded corpus through every policy fixes the block set. Host load and
+measurement order still require control in the separate validation passes. The tool
 reports a digest over the measured block hashes so two runs, on two hosts, can prove they
 compared the same corpus.
 
@@ -55,16 +55,14 @@ implementation. Two builders would make a policy comparison a comparison of buil
 ps-policy-frontier \
   --dataset /path/to/dataset \
   --arm weak --arm 60/30 --arm 90/60 --arm 120/45 \
-  --warmup 120 --samples 1000 \
+  --warmup 121 --samples 1000 \
   --out /path/to/frontier-out
 ```
 
 `--arm weak` is the no-cache baseline: a validator holding nothing when each block arrives.
-It runs in the same rotation, over the same blocks, through the same validator as every
-policy, because a baseline measured any other way cannot be checked against the thing it is
-a baseline for. Its sidecar is the recorded policy-neutral full witness — the same one the
-block was executed against in step 2 — so Weak costs the run nothing extra and is measured
-on exactly the bytes the corpus was proved with. Without `--arm weak` the summary makes no
+During input generation it runs in the same rotation over the same blocks and validator
+as every policy. Timing comparisons then replay the saved inputs in independent processes. Its sidecar is the recorded policy-neutral full witness — the same one the
+block was executed against in step 2 — so Weak uses exactly the witness bytes the corpus was proved with. Without `--arm weak` the summary makes no
 Partial-versus-Weak claim; `weak_baseline_present` says which happened.
 
 Per block, in this order:
@@ -84,9 +82,9 @@ Per block, in this order:
 Policy order rotates per block, so no policy keeps the slot that pays the cold read of
 whatever the others then find warm.
 
-Warm-up blocks do exactly the same work and simply do not count; a cache that skipped them
-would not be warm. A `--warmup` shorter than the widest policy window is refused, because a
-policy measured before its window is populated is not the policy the report names.
+Warm-up blocks do exactly the same work and simply do not count. The inclusive readiness
+window requires `max(account_window, storage_window) + 1` blocks; common warm-up is 121
+for 60/30, 90/60, and 120/45. Shorter warm-up is refused.
 
 ## Fail-closed inputs
 
@@ -132,29 +130,19 @@ back. Either is `null` when that build carried no `PS_BUILD_COMMIT`, which is st
 compile time; a capture refuses to start without one, while this tool records the absence and
 runs, so ad-hoc analysis is still possible and still labelled.
 
-Supported: sidecar size for the same block under each arm, cache and trie-cache footprint,
-cache-miss counts, the **policy-dependent part** of validation cost, and arm-versus-arm —
-including Partial versus Weak when `--arm weak` ran — on one identical block set.
+The generation report supports same-block sidecar size, cache footprint, cache misses and
+witness semantics. Its validation times are **diagnostic core measurements**:
+`timing_boundary=generation_core_no_undo`, `operational_latency_eligible=false`.
+They omit coordinated undo commit, and share CPU/cache with proof generation and other arms.
+Obsolete flat undo is cleared after every successfully generated block.
 
-**Not supported: production builder latency.** Selecting nodes out of a decoded witness in
-memory is not generating a multiproof from a state database, and the two differ by orders
-of magnitude. `offline_build_us` is reported under that name for exactly this reason, and
-the summary carries `builder_latency_eligible: false`. Builder cost is measured on a live
-run.
+Production builder latency still requires a live node: selecting recorded witness nodes is
+not generating database multiproofs. `builder_latency_eligible` remains false.
 
-**Not supported: absolute standalone validation latency.** `sidecar_decode_and_commit_us`
-opens at the sidecar decode and closes at the cache commit. That covers everything which
-varies with the cache policy — decoding a witness whose size the policy decided,
-materializing it, re-executing, computing the root, committing — which is what makes an
-arm-versus-arm comparison sound. It excludes what does not vary: payload decode, sender
-recovery, and pre-execution consensus are the same work on the same block for every arm,
-and are reported once per block as `block_admission_us` so a whole-block figure can be
-assembled by addition. Neither is an *absolute* standalone latency: that boundary opens at
-the frame read and includes a delivery path this offline tool does not have. The summary
-carries `standalone_latency_eligible: false`.
-
-Closing that last gap needs a second stage this crate cannot yet provide on its own — see
-[Emitting replayable streams](#emitting-replayable-streams).
+Export `--prepare-inputs` and replay each arm with `--validate-inputs` to measure payload
+decode through coordinated disk-undo commit in one standalone process per arm. Input file
+reads and background writer completion are separate. It is an offline processing boundary;
+live delivery and queue latency still come from `ps-replay --follow`.
 
 `sidecar_digest` is over the sidecar's **semantic** content, not its bytes. A serialized
 sidecar carries the wall-clock and resource measurements of the machine that built it, so
@@ -162,25 +150,18 @@ hashing the bytes would report two hosts as disagreeing about a sidecar they pro
 identically. The digest normalizes exactly those fields and covers everything else,
 including every size — a witness that is a different size is a different witness.
 
-## Emitting replayable streams
+## Prepared inputs and replay streams
 
-Measuring an *absolute* standalone latency means replaying each arm's `(payload, sidecar)`
-pairs through a standalone process whose timing boundary opens where a real consumer's
-does — at the frame read. `ps-replay` already is that process, and it already reads the
-recorded stream format, so the natural design is for this tool to emit one spool per arm.
+`--prepare-inputs DIR` saves payloads, sidecars, an explicit first-parent trust anchor, ordered
+block identities and per-file digests. It publishes each arm's manifest only after all inputs
+are saved. `--validate-inputs DIR` verifies these inputs from a cold pair and enforces N+1
+warm-up before measurements. Partial uses Exact, recording, disk frames and K=32 by default;
+Weak drops its caches after every block. A writer error or final-drain failure fails the pass.
+These are benchmark inputs, not authenticated network bootstrap checkpoints.
 
-**That is not implemented, and it is blocked on the dataset rather than on this crate.**
-`ps-replay` cannot enter its live phase without a checkpoint carrying a snapshot package,
-and a snapshot package must prove every key in the cache against the state root at the
-block it anchors to. This tool holds per-block witnesses, which prove only what each block
-touched — never the whole of a warmed cache window — so it cannot build one.
-
-The cheap way out is on the capture side, and it stays policy-neutral: an *empty* cache
-needs only a single root-anchored exclusion proof, which the capturing node can produce
-from its database in one call and record once. Both sides can then start cold at the
-corpus's first block and warm identically over the stream's own blocks, with no
-policy-specific snapshot anywhere. That is a dataset schema addition and a decision worth
-making deliberately.
+A normal `ps-replay` spool still requires a proven snapshot package. The policy-neutral
+corpus cannot prove all keys in a warmed cache at a single root, so exporting that spool
+remains separate work. Prepared validation avoids inventing such a checkpoint.
 
 ## Isolation
 

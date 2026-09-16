@@ -209,6 +209,7 @@ fn write_record(
         "admission_is_load_bearing": report.admission_is_load_bearing(),
         "disagreements": report.disagreements.len(),
         "failures": report.failures.len(),
+        "undo_writer": report.undo_writer,
         "mutations_checked": report.mutations_checked,
         "mutation_failures": report.mutation_failures.len(),
         "transition_mutations_checked": report.transition_mutations_checked,
@@ -408,6 +409,7 @@ fn write_follow_summary(
         "absent": report.replay.absent,
         "disagreements": report.replay.disagreements.len(),
         "failures": report.replay.failures.len(),
+        "undo_writer": report.replay.undo_writer,
         "mutations_checked": report.replay.mutations_checked,
         "mutation_failures": report.replay.mutation_failures.len(),
         "restores": report.restores,
@@ -563,12 +565,7 @@ fn warm_shrink_from_env() -> eyre::Result<WarmSetShrinkPolicy> {
 /// and a sheet that exports `PS_WARM_SHRINK=0` to mean "control" should get the control rather
 /// than an error at the end of a two-hour corpus.
 fn parse_warm_shrink(raw: &str) -> eyre::Result<WarmSetShrinkPolicy> {
-    let raw = raw.trim();
-    if raw.eq_ignore_ascii_case("never") || raw.eq_ignore_ascii_case("off") {
-        return Ok(WarmSetShrinkPolicy::Never)
-    }
-    let blocks: u64 = raw.parse()?;
-    Ok(NonZeroU64::new(blocks).map_or(WarmSetShrinkPolicy::Never, WarmSetShrinkPolicy::EveryBlocks))
+    raw.parse().map_err(eyre::Report::msg)
 }
 
 /// Recording is enabled by default; legacy off values are rejected during configuration.

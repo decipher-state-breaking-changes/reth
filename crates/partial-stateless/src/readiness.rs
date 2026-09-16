@@ -27,6 +27,11 @@ use crate::{
 use alloy_primitives::B256;
 use tracing::debug;
 
+/// Heights in the inclusive Last-N window, shared by live readiness and offline warm-up.
+pub const fn required_replay_depth(window_size: u64) -> u64 {
+    window_size.saturating_add(1)
+}
+
 /// Tracks whether the joint cache may be used to validate the next block.
 ///
 /// The tracker observes block application; it never mutates the caches. Callers report what they
@@ -86,7 +91,7 @@ impl CacheReadinessTracker {
     /// or above `current_block - window_size`, so a cache at height `H` covers the closed range
     /// `[H - window_size, H]` — `window_size + 1` distinct heights, not `window_size`.
     pub const fn required_replay_depth(&self) -> u64 {
-        self.window_size.saturating_add(1)
+        required_replay_depth(self.window_size)
     }
 
     /// Current classification.

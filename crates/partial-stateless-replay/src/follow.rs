@@ -1499,7 +1499,9 @@ impl<'a> Follower<'a> {
                 // verdict was ever owed on them. It is a hole only when nothing valid takes its
                 // place, which each outcome below decides for itself.
                 let superseded = pending_tip;
+                let recovery_started = Instant::now();
                 let outcome = apply_reorg(&mut state, &found);
+                let recovery_us = recovery_started.elapsed().as_micros() as u64;
                 match (superseded, outcome.withdraws_an_announced_branch()) {
                     (Some(tip), true) => self.note_supersession(tip, found.winning_tip),
                     (Some(_), false) => self.winning_branches_incomplete += 1,
@@ -1522,6 +1524,7 @@ impl<'a> Follower<'a> {
                             &found.abandoned,
                             winning_tip,
                             self.last_verified,
+                            (recovery_started, recovery_us),
                         )?;
                         info!(
                             target: "ps_follow",
@@ -2543,6 +2546,15 @@ impl<'a> Follower<'a> {
     }
 
     fn into_report(mut self, outcome: FollowOutcome) -> FollowReport {
+        match &self.phase {
+            Phase::Streaming { state, .. } => {
+                crate::driver::finish_undo(&state.pair, &mut self.replay)
+            }
+            Phase::SkimmingChunks(skim) => {
+                crate::driver::finish_undo(&skim.state.pair, &mut self.replay)
+            }
+            _ => {}
+        }
         // A run that stops mid-rewind counts the reset here; the ack's recovery transaction is
         // deliberately *not* cleared with it — the file already on disk is what lets the resumed
         // run replay the whole window again.
@@ -2635,6 +2647,8 @@ fn attempt_timing(replay: &ReplayReport, sequence: u64) -> Option<&BlockTiming> 
 
 /// The follower's outputs: a JSONL verdict stream and an atomically rewritten ack file.
 struct VerdictSink {
+    started: Instant,
+    run_id: String,
     verdicts: Option<std::fs::File>,
     ack: Option<PathBuf>,
     ack_fsync: bool,
@@ -2676,6 +2690,8 @@ impl VerdictSink {
             })
             .transpose()?;
         Ok(Self {
+            started: Instant::now(),
+            run_id: format!("{}-{}", now_ms(), std::process::id()),
             verdicts,
             ack: options.ack.clone(),
             ack_fsync: options.ack_fsync,
@@ -2739,6 +2755,7 @@ impl VerdictSink {
             "admission_us": timing.and_then(|timing| timing.admission_us),
             "transition_us": timing.and_then(|timing| timing.transition_us),
             "standalone_validation_us": timing.map(|timing| timing.standalone_validation_us),
+            "verified_us": timing.and_then(|timing| timing.verified_us),
             "delivery_us": timing.and_then(|timing| timing.delivery_us),
             "queue_wait_us": queue_wait_us,
             "decision_latency_us": decision_latency_us,
@@ -2916,6 +2933,7 @@ impl VerdictSink {
         abandoned: &[BlockRef],
         winning_tip: Option<BlockRef>,
         last_verified: Option<BlockRef>,
+        (recovery_started, recovery_us): (Instant, u64),
     ) -> eyre::Result<()> {
         self.write(serde_json::json!({
             "schema_version": 2,
@@ -2931,6 +2949,9 @@ impl VerdictSink {
                 .map(|block| format!("{:?}", block.hash))
                 .collect::<Vec<_>>(),
             "winning_tip": winning_tip.map(|block| block.number),
+            "winning_tip_hash": winning_tip.map(|block| format!("{:?}", block.hash)),
+            "recovery_us": recovery_us,
+            "recovery_started_elapsed_us": recovery_started.duration_since(self.started).as_micros(),
             "last_verified": last_verified.map(|block| block.number),
             "observed_at_ms": now_ms(),
         }))
@@ -2980,8 +3001,10 @@ impl VerdictSink {
         self.write_ack(tail.next_sequence().saturating_sub(1), last_verified, state)
     }
 
-    fn write(&mut self, record: serde_json::Value) -> eyre::Result<()> {
+    fn write(&mut self, mut record: serde_json::Value) -> eyre::Result<()> {
         if let Some(file) = self.verdicts.as_mut() {
+            record["process_elapsed_us"] = (self.started.elapsed().as_micros() as u64).into();
+            record["run_id"] = self.run_id.clone().into();
             writeln!(file, "{record}")?;
         }
         Ok(())

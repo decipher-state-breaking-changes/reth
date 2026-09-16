@@ -18,6 +18,7 @@ from analyze_validation_bench import (
     load_jsonl,
     select_samples,
 )
+from measure_resources import sample as sample_resources
 
 DISABLED_DIAGNOSTICS = (
     "PS_TRIE_CACHE_DIAGNOSTICS",
@@ -30,6 +31,15 @@ DISABLED_DIAGNOSTICS = (
 # deliberately started, and silently turning it off would throw away hours of recording. Failing
 # instead makes the operator choose which job this shell is running.
 FORBIDDEN_ENV = ("PS_POLICY_DATASET_CAPTURE_DIR",)
+
+
+def configured_undo_dirs(env):
+    """Resolve the same explicit-or-sidecar-default path the ExEx uses."""
+    if env.get("PS_UNDO_DIR"):
+        return [Path(env["PS_UNDO_DIR"])]
+    if env.get("PS_SIDECAR_DIR"):
+        return [Path(env["PS_SIDECAR_DIR"]) / "undo"]
+    return []
 
 
 def refuse_conflicting_env():
@@ -275,8 +285,9 @@ class ResourceSampler:
     tracking the figure that is not dominated by reclaimable page cache.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, undo_dirs=()):
         self.path = path
+        self.undo_dirs = tuple(undo_dirs)
         self.peak_anon_kib = 0
 
     def sample(self, pid, accepted):
@@ -295,6 +306,7 @@ class ResourceSampler:
             "rss_file_kib": memory.file_kib,
             "swap_kib": memory.swap_kib,
         }
+        record["resources"] = sample_resources(pid, self.undo_dirs)
         with self.path.open("a") as output:
             json.dump(record, output, separators=(",", ":"))
             output.write("\n")
@@ -415,7 +427,7 @@ def main():
     stopped_on_deadline = False
     deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
     last_progress = None
-    sampler = ResourceSampler(resource_path)
+    sampler = ResourceSampler(resource_path, configured_undo_dirs(env))
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,

@@ -15,6 +15,7 @@ from run_live_paired_bench import (
     DISABLED_DIAGNOSTICS,
     ResourceSampler,
     build_command,
+    configured_undo_dirs,
     default_sample_warmup,
     prepare_output,
     stop_process,
@@ -177,7 +178,7 @@ def main():
     stopped_on_deadline = False
     last_progress = None
     deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
-    sampler = ResourceSampler(resource_path)
+    sampler = ResourceSampler(resource_path, configured_undo_dirs(env))
     with log_path.open("wb") as log_file:
         process = subprocess.Popen(
             command,

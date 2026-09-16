@@ -36,6 +36,7 @@
 
 pub mod generate;
 pub mod policy;
+pub mod prepared;
 pub mod report;
 pub mod source;
 

@@ -872,6 +872,9 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
 
     lines = [
         "# Single-process Vanilla / Partial / Weak benchmark", "",
+        "Partial/Weak timings are a validation-core probe using a discarded tentative trie. "
+        "They exclude production coordinated commit, disk-undo enqueue and background writer completion. "
+        "Whole-step standalone comparisons require the separate follower stream joined by block hash.", "",
         f"Accepted same-block samples: **{len(accepted)}**",
         f"Paired sample-warm-up records excluded: **{stats.warmup}** across "
         f"**{stats.cold_epochs}** re-armed epochs",
@@ -928,7 +931,7 @@ def build_report(accepted, stats: SelectionStats, warmup: int, requested: int):
         format_summary("Weak witness build", [r["weak_witness_build_us"] for r in accepted]),
         format_summary("Partial serialize", [r["partial_serialize_us"] for r in accepted]),
         format_summary("Weak serialize", [r["weak_serialize_us"] for r in accepted]), "",
-        "## Validation totals (secondary)", "",
+        "## Validation core totals (secondary; coordinated commit excluded)", "",
         "| Total | Partial avg | Weak avg |",
         "| --- | ---: | ---: |",
         "| Raw validation | {:.2f} ms | {:.2f} ms |".format(
@@ -1108,11 +1111,58 @@ def build_overlap_report(accepted, stats: SelectionStats, warmup: int):
     return "\n".join(lines) + "\n"
 
 
+def build_standalone_section(accepted, follower):
+    """Join actual committed follower steps; never synthesize them from the discard probe."""
+    summaries = [row for row in follower if row.get("kind") == "summary"]
+    if not summaries or not follower or follower[-1].get("kind") != "summary":
+        raise ValueError("standalone run lacks a final writer-drain summary")
+    for summary in summaries:
+        writer = summary.get("undo_writer")
+        if not isinstance(writer, dict) or summary.get("failures", 0) or summary.get("disagreements", 0):
+            raise ValueError("standalone summary lacks a successful disk-undo drain")
+        if any(writer.get(key, 0) for key in ("failed", "enqueue_failures", "telemetry_failures", "pending")):
+            raise ValueError("standalone writer failed or has undrained work")
+    by_hash = {}
+    for row in follower:
+        if row.get("kind") != "verdict" or row.get("verdict") != "accepted":
+            continue
+        if row.get("catch_up") or row.get("recovery_replay") or not row.get("tail_live"):
+            continue
+        key = (row["block"], row["block_hash"])
+        if key in by_hash:
+            raise ValueError("ambiguous repeated standalone verdict")
+        by_hash[key] = row
+    pairs = []
+    for row in accepted:
+        key = (row["block_number"], row["block_hash"])
+        standalone = by_hash.get(key)
+        if standalone is None:
+            raise ValueError(f"missing live standalone verdict for {key}")
+        disk = (standalone.get("undo") or {}).get("commit", {}).get("disk")
+        if not disk:
+            raise ValueError("standalone record does not prove disk-undo coordinated commit")
+        if any(disk.get(key, 0) for key in ("failed", "enqueue_failures", "telemetry_failures")):
+            raise ValueError("standalone writer failed during the selected population")
+        pairs.append((row["vanilla_engine"]["validation_us"], standalone["standalone_validation_us"]))
+    ratios = [partial / vanilla for vanilla, partial in pairs if vanilla > 0]
+    if len(ratios) != len(pairs):
+        raise ValueError("nonpositive Engine validation time")
+    return "\n".join(["", "## Same-block standalone committed steps", "",
+        f"Joined live samples: **{len(pairs)}**; median standalone/Engine ratio: **{statistics.median(ratios):.3f}x**.", "",
+        "| Mode | Average | p50 | p90 | p95 | p99 | Maximum |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        format_summary("Engine validation", [p[0] for p in pairs]),
+        format_summary("Standalone through coordinated commit", [p[1] for p in pairs]), "",
+        "The node shares resources with the producer and paired probes. This is not an ExEx-free "
+        "Reth comparison. Background undo completion and network delivery are outside the standalone step.", ""])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", required=True, type=Path)
     parser.add_argument("--engine-records", required=True, type=Path)
     parser.add_argument("--log", required=True, type=Path)
+    parser.add_argument("--standalone-follow", type=Path, help="same-window live follower JSONL, joined by hash")
     parser.add_argument(
         "--warmup",
         type=int,
@@ -1141,6 +1191,8 @@ def main():
             if args.include_overlap
             else build_report(accepted, stats, args.warmup, args.samples)
         )
+        if args.standalone_follow:
+            report += build_standalone_section(accepted[:args.samples], load_jsonl(args.standalone_follow))
     except ValueError as error:
         raise SystemExit(str(error)) from error
     print(report, end="")

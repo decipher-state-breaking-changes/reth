@@ -5,6 +5,10 @@ A reth [Execution Extension (ExEx)](../exex/exex) that drives the
 the network-level state cache as the chain advances and, per block, measures the
 witness ("sidecar") a partially-stateless validator would need.
 
+Performance records distinguish sidecar generation, paired validation core, standalone
+coordinated commit, and background writer costs. Paired-node resource samples include the
+node and producer; standalone memory measurements require a separate validator process.
+
 The binary is `reth-partial-stateless` — a full Ethereum node with the ExEx
 installed. The crate is split into a library and a thin binary so that the
 recovery, bootstrap, and admission paths can be tested from `tests/`: each of
@@ -616,7 +620,7 @@ and a small end-to-end replay. The loader verifies every record digest before ap
 "$PS_TARGET_DIR/release/ps-policy-frontier" \
     --dataset /abs/path/policy-dataset \
     --arm weak --arm 60/30 --arm 90/60 --arm 120/45 \
-    --warmup 120 --samples 5 \
+    --warmup 121 --samples 5 \
     --out /abs/path/frontier-smoke
 ```
 

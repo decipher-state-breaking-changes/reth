@@ -553,6 +553,8 @@ def fmt_ratio(row):
 
 def print_human(report):
     print(f"# Frontier arms — {report['candidate']} against {report['baseline']}\n")
+    print("Generation-stage core timings exclude production coordinated undo retention. "
+          "Use analyze_prepared_validation.py for the disk-undo operating profile.\n")
     print(f"Timing run `{report['timing_run']}`")
     if report["size_run"] != report["timing_run"]:
         print(f"Size run   `{report['size_run']}`")

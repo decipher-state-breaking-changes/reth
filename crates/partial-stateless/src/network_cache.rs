@@ -1258,6 +1258,11 @@ impl NetworkStateCache {
         hasher.finalize()
     }
 
+    /// Number of resident rollback records, excluding records transferred to disk.
+    pub fn undo_records_len(&self) -> usize {
+        self.undo_log.len()
+    }
+
     pub fn prune_undo_below(&mut self, finalized_block: u64) {
         while let Some(front) = self.undo_log.front() {
             if front.block_number <= finalized_block {

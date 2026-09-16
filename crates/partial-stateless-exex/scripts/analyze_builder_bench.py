@@ -248,6 +248,8 @@ def build_builder_report(
     )
     lines = [
         "# Partial-stateless builder benchmark", "",
+        "Sidecar creation ends before coordinated undo retention. The companion commit stream "
+        "measures the synchronous tail; background writer completion remains separate.", "",
         f"Accepted builder samples: **{len(selected)}**",
         f"Post-Ready sample-warm-up records excluded: **{warmup}**", "",
     ]
@@ -309,9 +311,35 @@ def build_builder_report(
     return "\n".join(lines) + "\n"
 
 
+def build_commit_section(selected, commits):
+    by_hash = {}
+    for row in commits:
+        key = (row["block_number"], row["block_hash"])
+        if key in by_hash:
+            raise ValueError("duplicate producer commit identity")
+        by_hash[key] = row
+    paired = []
+    for row in selected:
+        key = (row["block_number"], row["block_hash"])
+        if key not in by_hash:
+            raise ValueError(f"missing producer commit for {key}")
+        commit = by_hash[key]
+        if commit["sidecar_build_us"] != row["builder_total_us"] or commit["through_commit_us"] < commit["sidecar_build_us"]:
+            raise ValueError("producer timing boundaries disagree")
+        paired.append(commit)
+    return "\n".join(["", "## Production coordination", "",
+        "Background serialization and write completion are excluded from both wall boundaries.", "",
+        "| Operation | Average | p50 | p90 | p95 | p99 | Maximum |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        format_summary("Creation through coordinated commit", [r["through_commit_us"] for r in paired]),
+        format_summary("Coordinated commit (nested)", [r["commit"]["total_us"] for r in paired]),
+        format_summary("Undo spill call (nested)", [r["commit"]["undo"]["spill_call_us"] for r in paired]), ""])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", required=True, type=Path)
+    parser.add_argument("--commits", type=Path, help="companion builder.commit.jsonl")
     parser.add_argument(
         "--warmup",
         type=int,
@@ -336,6 +364,12 @@ def main():
             expected,
             args.require_published,
         )
+        commits = args.commits or args.records.with_suffix(".commit.jsonl")
+        if commits.exists():
+            selected = select_builder_samples(load_jsonl(args.records), args.warmup, args.samples, args.require_published)
+            report += build_commit_section(selected, load_jsonl(commits))
+        elif args.commits:
+            raise ValueError(f"missing producer commit stream: {commits}")
     except ValueError as error:
         raise SystemExit(str(error)) from error
     print(report, end="")

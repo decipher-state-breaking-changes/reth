@@ -228,6 +228,8 @@ pub struct RunOptions {
     pub undo_layout: UndoLayout,
     /// Parent directory of disposable, per-pair undo sessions.
     pub undo_dir: Option<PathBuf>,
+    /// Capacity policy, shared with standalone replay and offline validation.
+    pub warm_shrink: partial_stateless::WarmSetShrinkPolicy,
     /// Whether eligible initial V2 multiproofs use reth's proof workers.
     pub parallel_initial_proof: bool,
     /// Whether the paired in-memory validation benchmark is running.
@@ -383,6 +385,10 @@ impl RunOptions {
             undo_record,
             undo_layout,
             undo_dir,
+            warm_shrink: std::env::var("PS_WARM_SHRINK")
+                .unwrap_or_else(|_| "never".into())
+                .parse()
+                .map_err(eyre::Report::msg)?,
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
             validation_bench,
             reexec_limits: SidecarReexecLimits::default(),
@@ -1472,10 +1478,12 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
     pair.retention_depth = options.retention_depth;
     pair.undo_layout = options.undo_layout;
     pair.trie_cache.set_undo_recording(options.undo_record);
+    pair.trie_cache.set_warm_shrink_policy(options.warm_shrink);
     pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
     info!(target: "partial_stateless", depth = options.retention_depth.get(),
         recording = options.undo_record, layout = options.undo_layout.as_str(),
-        directory = ?options.undo_dir, resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
+        directory = ?options.undo_dir, warm_shrink_blocks = ?options.warm_shrink.interval(),
+        resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())
 }
 
@@ -2047,6 +2055,8 @@ where
     )
     .map_err(|err| eyre::eyre!("sidecar builder failed: {err}"))?;
     let BuilderBlockReport {
+        builder_started,
+        sidecar_build_us,
         cache_update: _cache_update,
         witness: _witness,
         sidecar_path: _sidecar_path,
@@ -2054,13 +2064,24 @@ where
         displaced_trie_cache,
         policy_dataset_material,
     } = report;
-    finish_committed_transition(
+    let commit = finish_committed_transition(
         pair,
         displaced_trie_cache,
         &block_ctx,
         block.clone_sealed_header(),
         options.retain_generation,
     );
+
+    if let Some(path) = &options.builder_bench_output {
+        benchmark::append_builder_commit(
+            path,
+            block.number(),
+            block.hash(),
+            sidecar_build_us,
+            builder_started.elapsed().as_micros() as u64,
+            commit,
+        )?;
+    }
 
     // Before the stream frame, so a capture that cannot record a block fails the run on that block
     // rather than after a commit has already claimed it. Fail-closed twice over: the dataset gets a
@@ -2324,13 +2345,14 @@ fn finish_committed_transition(
     block: &BlockContext,
     accepted_head: SealedHeader,
     retain_generation: bool,
-) {
+) -> partial_stateless_validator::coordination::CommitReport {
     let before = pair.last_readiness_label;
-    let after = pair
-        .commit_transition(displaced_trie_cache, block, accepted_head, retain_generation)
-        .readiness;
+    let report =
+        pair.commit_transition(displaced_trie_cache, block, accepted_head, retain_generation);
+    let after = report.readiness;
     pair.last_readiness_label = after;
     log_readiness_change(pair, block, before, after);
+    report
 }
 
 /// Runs the bootstrap gate: export at the first usable Ready, then compare or stream.

@@ -134,6 +134,9 @@ impl PolicySummary {
 /// The run's own account of itself.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RunSummary {
+    /// Generation-stage timings omit coordinated retention and are not operating-profile costs.
+    pub timing_boundary: &'static str,
+    pub operational_latency_eligible: bool,
     /// Dataset this run read.
     pub dataset: String,
     /// The dataset's producer, carried forward so a report names the corpus's origin.
@@ -310,6 +313,8 @@ impl RunSummary {
             weak_baseline_present,
             total_block_admission_us,
             builder_latency_eligible: false,
+            timing_boundary: "generation_core_no_undo",
+            operational_latency_eligible: false,
             standalone_latency_eligible: false,
             supported_claims: claims(weak_baseline_present, compressed_sidecars),
         }

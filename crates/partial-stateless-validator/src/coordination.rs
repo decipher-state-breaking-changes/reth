@@ -19,7 +19,7 @@ use alloy_primitives::{
     B256,
 };
 use partial_stateless::{
-    disk_undo::{DiskUndoBundle, DiskUndoHandle, DiskUndoStore},
+    disk_undo::{DiskUndoBundle, DiskUndoHandle, DiskUndoMetrics, DiskUndoStore},
     network_cache::NetworkStateCache,
     readiness::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
@@ -291,6 +291,12 @@ impl CoordinatedPair {
             return Err("disk undo must be configured before retaining blocks".into())
         }
         self.undo_store = Some(DiskUndoStore::new(directory)?);
+        if let Some(directory) = std::env::var_os("PS_UNDO_METRICS_DIR") {
+            self.undo_store
+                .as_ref()
+                .expect("installed above")
+                .enable_metrics(directory.as_ref())?;
+        }
         self.undo_layout = UndoLayout::FramesOnly;
         self.trie_cache.set_undo_recording(true);
         Ok(())
@@ -503,7 +509,9 @@ impl CoordinatedPair {
             },
             UndoLayout::FramesOnly => self.trie_cache.take_undo_frame(&mut trie_cache),
         };
-        let mut report = CommitUndoReport { frame: None, us: started.elapsed().as_micros() as u64 };
+        let mut report =
+            CommitUndoReport { us: started.elapsed().as_micros() as u64, ..Default::default() };
+        let accounting_started = Instant::now();
         if let Some(frame) = frame {
             let (block_number, block_hash) = match self.undo_layout {
                 UndoLayout::Hybrid => (block.number.saturating_sub(1), block.parent_hash),
@@ -541,18 +549,31 @@ impl CoordinatedPair {
             }
         }
 
-        if self.undo_layout == UndoLayout::Hybrid || report.frame.is_none() {
+        report.accounting_us = accounting_started.elapsed().as_micros() as u64;
+        let parent_to_drop = if self.undo_layout == UndoLayout::Hybrid || report.frame.is_none() {
             self.retained.push_back(RetainedGeneration::full(
                 trie_cache,
                 block.parent_hash,
                 block.number.saturating_sub(1),
                 retained_head.take().expect("the generation head is unused"),
             ));
-        }
+            None
+        } else {
+            Some(trie_cache)
+        };
+        let expiry_started = Instant::now();
         while self.retained.len() > self.retention_depth.as_usize() {
             self.retained.pop_front();
         }
+        report.history_expire_us = expiry_started.elapsed().as_micros() as u64;
+        let spill_started = Instant::now();
         self.spill_undo();
+        report.spill_call_us = spill_started.elapsed().as_micros() as u64;
+        // Keep the original lifetime: the displaced parent was dropped after enqueue, so the
+        // writer may already be working while its remaining allocations are reclaimed.
+        let drop_started = Instant::now();
+        drop(parent_to_drop);
+        report.parent_drop_us = drop_started.elapsed().as_micros() as u64;
         report
     }
 
@@ -571,12 +592,43 @@ impl CoordinatedPair {
         accepted_head: SealedHeader,
         retain: bool,
     ) -> CommitReport {
+        let started = Instant::now();
         let undo = self.retain_generation(displaced, block, accepted_head, retain);
         debug!(target: "partial_stateless", block = block.number,
             retained_depth = self.retained_depth(), resident_blocks = self.resident_undo_blocks(),
             "Observed cache undo retention after commit");
         let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
-        CommitReport { readiness: self.readiness.finish_block(block, &observation).label(), undo }
+        let readiness = self.readiness.finish_block(block, &observation).label();
+        // The newest handle was enqueued by this call, so it will almost always still be pending
+        // at this synchronous observation. Report it separately, then count the contiguous older
+        // history already on disk. Starting the suffix at the new handle made the old metric zero
+        // even when the writer had completed every preceding bundle.
+        let current_undo_written = self.retained.back().and_then(|held| match &held.content {
+            RetainedContent::Disk(handle) => Some(handle.is_written()),
+            _ => None,
+        });
+        let completed_prior_depth = self
+            .retained
+            .iter()
+            .rev()
+            .skip(1)
+            .take_while(|held| {
+                matches!(&held.content, RetainedContent::Disk(handle) if handle.is_written())
+            })
+            .count() as u64;
+        let retained_depth = self.retained_depth();
+        let resident_undo_blocks = self.resident_undo_blocks();
+        let disk = self.undo_store.as_ref().map(DiskUndoStore::metrics);
+        CommitReport {
+            readiness,
+            undo,
+            total_us: started.elapsed().as_micros() as u64,
+            retained_depth,
+            resident_undo_blocks,
+            current_undo_written,
+            completed_prior_depth,
+            disk,
+        }
     }
 
     /// What the retained generation costs right now, for the K = 1 memory control.
@@ -1050,6 +1102,14 @@ impl CoordinatedPair {
         ancestor_state_root: B256,
         cache_policy_id: B256,
     ) -> Option<RecoveryReport> {
+        let Some(store) = self.undo_store.as_ref() else {
+            warn!(target: "partial_stateless", cause = "missing_undo_store",
+                block = lineage.ancestor().0, requested_depth = lineage.depth(),
+                retained_depth = self.retained_depth(), dropped_generations = 0,
+                "Disk undo refused; retained handles have no backing store");
+            return None
+        };
+        let mut probe = store.recovery_probe(lineage.ancestor().0, lineage.depth());
         let reject = |cause: &'static str, block: u64, detail: String| {
             warn!(target: "partial_stateless", cause, block, %detail,
                 requested_depth = lineage.depth(), retained_depth = self.retained_depth(),
@@ -1057,15 +1117,24 @@ impl CoordinatedPair {
                 "Disk undo refused; live caches and retained history are unchanged");
             None
         };
+        let copy_started = Instant::now();
         let mut cache = self.cache.fork_for_rollback();
         let mut trie = self.trie_cache.fork_for_rollback();
+        probe.timings.candidate_copy_us = copy_started.elapsed().as_micros() as u64;
         let mut frames_applied = 0;
         for held in self.retained.iter().skip(base).rev() {
             let block = held.block_number + 1;
             let (frame, flat) = match &held.content {
                 RetainedContent::Disk(handle) => {
-                    let bundle = match handle.load() {
-                        Ok(bundle) => bundle,
+                    let bundle = match handle.load_timed() {
+                        Ok((bundle, timing)) => {
+                            probe.timings.pending_wait_us += timing.wait_us;
+                            probe.timings.read_us += timing.read_us;
+                            probe.timings.checksum_us += timing.checksum_us;
+                            probe.timings.decode_us += timing.decode_us;
+                            probe.timings.bytes_read += timing.bytes;
+                            bundle
+                        }
                         Err(error) => return reject("file_unavailable", block, error),
                     };
                     if bundle.parent_hash != held.block_hash {
@@ -1129,6 +1198,7 @@ impl CoordinatedPair {
                         ),
                     )
                 }
+                let undo_started = Instant::now();
                 if !trie.undo(frame) {
                     return reject(
                         "trie_undo_refused",
@@ -1136,6 +1206,7 @@ impl CoordinatedPair {
                         "trie representation cannot apply this frame".into(),
                     )
                 }
+                probe.timings.undo_us += undo_started.elapsed().as_micros() as u64;
                 frames_applied += 1;
             }
             if trie.undo_id() != held.undo_id || trie.state_root() != held.state_root {
@@ -1151,9 +1222,11 @@ impl CoordinatedPair {
                     ),
                 )
             }
+            let undo_started = Instant::now();
             if let Err(error) = cache.rollback_record(flat) {
                 return reject("flat_undo_refused", block, format!("{error:?}"))
             }
+            probe.timings.undo_us += undo_started.elapsed().as_micros() as u64;
         }
         let (number, hash) = lineage.ancestor();
         if cache.current_block() != number || trie.state_root() != Some(ancestor_state_root) {
@@ -1185,11 +1258,14 @@ impl CoordinatedPair {
         };
         let head = self.retained[base].accepted_head.clone();
         // Publication has no remaining file reads or other fallible operations.
+        let publish_started = Instant::now();
         self.cache.install_rollback(cache);
         self.trie_cache = trie;
         self.retained.truncate(base);
         self.accepted_head = head;
         self.readiness = readiness;
+        probe.timings.publish_us = publish_started.elapsed().as_micros() as u64;
+        probe.timings.success = true;
         Some(RecoveryReport { ready, frames_applied })
     }
 }
@@ -1251,12 +1327,26 @@ pub struct RetainedGeneration {
 /// Returned rather than logged, because the two halves have different readers: the readiness label
 /// is what a run log prints per block, and the undo report describes frame size and assembly
 /// cost. A validator with no run log ignores both.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct CommitReport {
     /// Readiness after the transition, as a label.
     pub readiness: &'static str,
     /// What this commit recorded, and what ending the block's record cost.
     pub undo: CommitUndoReport,
+    /// Complete synchronous coordination boundary, not durable-write latency.
+    pub total_us: u64,
+    pub retained_depth: u64,
+    pub resident_undo_blocks: usize,
+    /// Whether the handle enqueued by this commit had already completed at observation time.
+    /// `None` means the newest retained generation is not disk-backed.
+    pub current_undo_written: Option<bool>,
+    /// Contiguous completed disk handles immediately behind the current commit's handle.
+    ///
+    /// This measures writer progress without letting the just-enqueued handle force the value to
+    /// zero. [`Self::retained_depth`] remains the recoverable depth: recovery may wait for pending
+    /// handles and verifies every file before using it.
+    pub completed_prior_depth: u64,
+    pub disk: Option<DiskUndoMetrics>,
 }
 
 /// The undo frame one commit produced, if it produced one.
@@ -1264,7 +1354,7 @@ pub struct CommitReport {
 /// `frame` is `None` on every commit that kept its predecessor whole — recording off, a
 /// `Parallel` cache, or a record that could not describe its block — and also at depth 1 in the
 /// hybrid layout, where a frame would be immediately evicted. `us` is measured either way.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct CommitUndoReport {
     /// The frame, and the block it undoes.
     pub frame: Option<CommitUndoFrame>,
@@ -1273,6 +1363,13 @@ pub struct CommitUndoReport {
     /// Not the cost of *recording*, which is a lookup per write spread across the whole block and
     /// is not bracketed anywhere. Measuring it requires comparison with recording disabled.
     pub us: u64,
+    pub accounting_us: u64,
+    pub parent_drop_us: u64,
+    /// Retained-deque expiry wall time, including synchronous file-handle drops and unlinks.
+    pub history_expire_us: u64,
+    /// Bundle handoff call including enqueue backpressure and error cleanup.
+    /// The store's cumulative `enqueue_us` is nested within this wall interval.
+    pub spill_call_us: u64,
 }
 
 /// One frame, and which block it undoes.
@@ -1280,7 +1377,7 @@ pub struct CommitUndoReport {
 /// The block is carried rather than inferred by the reader. A hybrid frame describes the previous
 /// block whose generation is being demoted; a frames-only frame describes the block whose journal
 /// is closed by this commit. In both cases the value is the block applying the frame would undo.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct CommitUndoFrame {
     /// What the frame holds, by kind.
     pub counts: TrieCacheUndoCounts,

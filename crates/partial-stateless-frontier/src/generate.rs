@@ -25,10 +25,9 @@
 //! A **production builder's proof latency** is not measured: selecting nodes out of a decoded
 //! witness in memory is not generating a multiproof from a state database, and the two differ by
 //! orders of magnitude. An **absolute standalone validation latency** is not measured either: the
-//! per-arm timer opens at the sidecar decode, which covers every cost that varies with the cache
-//! policy but none of the delivery path a live consumer pays. Sizes, node sets, miss sets, cache
-//! footprints, and the policy-dependent part of validation cost are properties of the sidecar, and
-//! are exactly what this is for.
+//! per-arm timer opens at sidecar decode and omits coordinated undo commit, while sharing the
+//! process with generation. Sizes, node sets, miss sets and cache footprints are the primary
+//! results here. Isolated processing measurements use the saved inputs in [`crate::prepared`].
 
 use crate::{
     policy::{rotated_order, ArmKind, PolicyState},
@@ -129,16 +128,9 @@ pub struct PolicyBlockResult {
     pub structural_rounds: usize,
     /// Wall time from the serialized sidecar to a committed cache transition.
     ///
-    /// **Not** a whole standalone validation, and the name says which part it is. It opens at the
-    /// sidecar decode and closes at the cache commit, covering everything that varies with the
-    /// cache policy: decoding a witness whose size the policy decided, materializing it,
-    /// re-executing against it, computing the root, and committing. It excludes what does *not*
-    /// vary — payload decode, sender recovery, and pre-execution consensus are the same work on
-    /// the same block for every arm, and are reported once per block as
-    /// [`BlockResult::block_admission_us`].
-    ///
-    /// A whole-block standalone latency is the sum, and an *absolute* standalone latency is
-    /// neither: it is measured by a live `ps-replay` run, whose boundary opens at the frame read.
+    /// Diagnostic core boundary from sidecar decode through cache transition. It excludes
+    /// coordinated undo commit and runs beside generation and other arms. Adding
+    /// [`BlockResult::block_admission_us`] does not turn it into an operational measurement.
     pub sidecar_decode_and_commit_us: u64,
     /// The decode half of the figure above, which is the part that scales with witness size.
     pub sidecar_decode_us: u64,
@@ -385,6 +377,28 @@ where
         + ?Sized,
     ChainSpec: reth_chainspec::EthereumHardforks,
 {
+    generate_block_with_sink(rules, record, policies, cursor, block_index, measured, &mut |_, _| {
+        Ok(())
+    })
+}
+
+/// Generate and validate while optionally saving each arm's serialized input for an isolated pass.
+pub fn generate_block_with_sink<Evm, C, ChainSpec>(
+    rules: &GeneratorRules<'_, Evm, C, ChainSpec>,
+    record: &PolicyDatasetRecord,
+    policies: &mut [PolicyState],
+    cursor: &mut ChainCursor,
+    block_index: usize,
+    measured: bool,
+    sink: &mut dyn FnMut(ArmKind, &[u8]) -> eyre::Result<()>,
+) -> eyre::Result<BlockResult>
+where
+    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    C: FullConsensus<EthPrimitives>
+        + Consensus<alloy_consensus::Block<reth_ethereum_primitives::TransactionSigned>>
+        + ?Sized,
+    ChainSpec: reth_chainspec::EthereumHardforks,
+{
     let body = &record.body;
 
     // 1. Admission. The block this run works on is the one the payload produced.
@@ -461,7 +475,15 @@ where
             // produce the same bytes.
             ArmKind::Weak => {
                 state.reset_cold_at(body.block_number.saturating_sub(1));
-                validate_and_commit(rules, &block, state, weak_sidecar.clone(), None, rotation_slot)
+                validate_and_commit(
+                    rules,
+                    &block,
+                    state,
+                    weak_sidecar.clone(),
+                    None,
+                    rotation_slot,
+                    sink,
+                )
             }
             ArmKind::Policy(_) => {
                 let built = partial_stateless::build_policy_sidecar(
@@ -497,6 +519,7 @@ where
                     sidecar,
                     Some((build, build_us)),
                     rotation_slot,
+                    sink,
                 )
                 .map(|mut result| {
                     result.witness_trim = witness_trim;
@@ -626,6 +649,7 @@ fn validate_and_commit<Evm, C, ChainSpec>(
     sidecar: PartialStatelessSidecar,
     built: Option<(CacheAwareFlatBuild, u64)>,
     rotation_slot: usize,
+    sink: &mut dyn FnMut(ArmKind, &[u8]) -> eyre::Result<()>,
 ) -> eyre::Result<PolicyBlockResult>
 where
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
@@ -636,6 +660,7 @@ where
     // policy decided — the one policy-dependent cost the previous boundary left out.
     let sidecar_bytes = bincode::serialize(&sidecar)
         .map_err(|err| eyre::eyre!("sidecar failed to serialize: {err}"))?;
+    sink(state.kind, &sidecar_bytes)?;
 
     let validation_start = Instant::now();
     let decoded: PartialStatelessSidecar = bincode::deserialize(&sidecar_bytes)
@@ -687,6 +712,11 @@ where
         }
         None => (0, 0, None),
     };
+
+    // Generation has no reorg consumer. Once both sides accepted the transition, neither
+    // rollback journal has a reader. Production retention is measured in the prepared runner.
+    state.builder_cache.prune_undo_below(block.number());
+    state.validator_cache.prune_undo_below(block.number());
 
     Ok(PolicyBlockResult {
         policy: state.kind.label(),

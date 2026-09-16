@@ -77,11 +77,12 @@ impl PolicySpec {
 
     /// Blocks that must be replayed before the advertised window is genuinely populated.
     pub const fn warmup_floor(&self) -> u64 {
-        if self.account_window > self.storage_window {
+        let window = if self.account_window > self.storage_window {
             self.account_window
         } else {
             self.storage_window
-        }
+        };
+        partial_stateless::readiness::required_replay_depth(window)
     }
 
     /// The label this policy appears under in reports: `account/storage`.
@@ -209,6 +210,20 @@ mod tests {
             ArmKind::Policy(PolicySpec { account_window: 60, storage_window: 30 })
         );
         assert!("nonsense".parse::<ArmKind>().is_err());
+    }
+
+    #[test]
+    fn offline_warmup_matches_live_inclusive_readiness() {
+        for (accounts, storage) in [(60, 30), (90, 60), (120, 45), (1, 5)] {
+            let policy = PolicySpec { account_window: accounts, storage_window: storage };
+            let tracker = partial_stateless::CacheReadinessTracker::new(
+                accounts.max(storage),
+                policy.config().cache_policy_id(),
+            );
+            assert_eq!(policy.warmup_floor(), tracker.required_replay_depth());
+            assert!(policy.warmup_floor() > accounts.max(storage));
+        }
+        assert_eq!(ArmKind::Weak.warmup_floor(), 0);
     }
 
     /// Weak sorts first, which is where a reader looks for a baseline.

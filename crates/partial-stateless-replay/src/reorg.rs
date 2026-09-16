@@ -404,8 +404,8 @@ mod tests {
     };
     use partial_stateless_stream::{Checkpoint, Manifest};
     use partial_stateless_validator::{
-        admit_block, BlockAdmission, CoordinatedPair, RetainedContent, RetainedGeneration,
-        RetentionDepth, UndoLayout,
+        admit_block, BlockAdmission, CommitReport, CoordinatedPair, RetainedContent,
+        RetainedGeneration, RetentionDepth, UndoLayout,
     };
     use reth_chainspec::{EthChainSpec, MAINNET};
     use reth_primitives_traits::{Account, SealedHeader};
@@ -533,6 +533,15 @@ mod tests {
         advance_inner(state, number, tag, retain, true)
     }
 
+    fn advance_retaining_with_report(
+        state: &mut ReplayState,
+        number: u64,
+        tag: u8,
+        retain: bool,
+    ) -> (BlockRef, CommitReport) {
+        advance_inner_with_report(state, number, tag, retain, true)
+    }
+
     fn advance_inner(
         state: &mut ReplayState,
         number: u64,
@@ -540,6 +549,16 @@ mod tests {
         retain: bool,
         retention: bool,
     ) -> BlockRef {
+        advance_inner_with_report(state, number, tag, retain, retention).0
+    }
+
+    fn advance_inner_with_report(
+        state: &mut ReplayState,
+        number: u64,
+        tag: u8,
+        retain: bool,
+        retention: bool,
+    ) -> (BlockRef, CommitReport) {
         let parent = state.history.tip().expect("seeded at the checkpoint");
         let state_root =
             state.pair.trie_cache.state_root().expect("restored trie is authenticated");
@@ -571,7 +590,7 @@ mod tests {
             state_root,
             ..Default::default()
         };
-        state.pair.commit_transition(
+        let report = state.pair.commit_transition(
             Some(displaced),
             &ctx,
             SealedHeader::new(header, block.hash),
@@ -579,7 +598,7 @@ mod tests {
         );
         let cache_root = state.pair.fingerprint().cache_root;
         state.history.record(block, state_root, cache_root);
-        block
+        (block, report)
     }
 
     fn reorg_of(ancestor: BlockRef, abandoned: Vec<BlockRef>, tip: Option<BlockRef>) -> Reorg {
@@ -678,6 +697,78 @@ mod tests {
         for offset in 1..=count {
             advance_retaining(state, ANCHOR_BLOCK + offset, offset as u8, true);
         }
+    }
+
+    #[test]
+    fn disk_writer_drain_and_recovery_telemetry_cover_the_final_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics_directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        state.pair.undo_store.as_ref().unwrap().enable_metrics(metrics_directory.path()).unwrap();
+        disk_run(&mut state, 3);
+        let mut report = crate::driver::ReplayReport::default();
+        crate::driver::finish_undo(&state.pair, &mut report);
+        assert!(report.failures.is_empty());
+        let metrics = report.undo_writer.unwrap();
+        assert_eq!(
+            (metrics.submitted, metrics.completed, metrics.pending, metrics.failed),
+            (3, 3, 0, 0)
+        );
+        assert!(metrics.bytes_written > 0);
+        assert!(metrics.pending_peak <= 3);
+        let (ancestor, abandoned) = state.history.suffix(2).unwrap();
+        assert!(matches!(
+            apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+            ReorgOutcome::Applied { .. }
+        ));
+        let path =
+            std::fs::read_dir(metrics_directory.path()).unwrap().next().unwrap().unwrap().path();
+        let rows = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|row| row["kind"] == "write").count(), 3);
+        let recovery = rows.iter().find(|row| row["kind"] == "recovery").unwrap();
+        assert_eq!(recovery["timings"]["success"], true);
+        assert_eq!(recovery["timings"]["depth"], 2);
+        assert!(recovery["timings"]["bytes_read"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn commit_reports_completed_disk_history_behind_the_new_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 3);
+        state
+            .pair
+            .undo_store
+            .as_ref()
+            .unwrap()
+            .wait_for_idle(std::time::Duration::from_secs(10))
+            .unwrap();
+
+        let (_, report) = advance_retaining_with_report(&mut state, ANCHOR_BLOCK + 4, 4, true);
+        assert_eq!(report.retained_depth, 4);
+        assert_eq!(report.completed_prior_depth, 3);
+        assert!(report.current_undo_written.is_some());
+    }
+
+    #[test]
+    fn final_writer_failure_is_a_replay_failure_even_without_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 1);
+        let RetainedContent::Disk(handle) = &state.pair.retained.back().unwrap().content else {
+            panic!("disk")
+        };
+        handle.load().unwrap();
+        std::fs::remove_dir_all(handle.path().parent().unwrap()).unwrap();
+        advance_retaining(&mut state, ANCHOR_BLOCK + 2, 2, true);
+        let mut report = crate::driver::ReplayReport::default();
+        crate::driver::finish_undo(&state.pair, &mut report);
+        assert_eq!(report.undo_writer.unwrap().failed, 1);
+        assert!(!report.failures.is_empty());
     }
 
     #[test]

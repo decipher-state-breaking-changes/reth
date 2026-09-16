@@ -219,6 +219,8 @@ impl Default for ReplayOptions {
 /// What one replay found.
 #[derive(Debug, Default)]
 pub struct ReplayReport {
+    /// Final writer snapshot after draining the active session outside all block timers.
+    pub undo_writer: Option<partial_stateless::disk_undo::DiskUndoMetrics>,
     /// Commits replayed. Batch replay counts each corpus sequence once, even across replays.
     pub commits: u64,
     /// Commits whose payload was the one a consensus client sent.
@@ -435,6 +437,8 @@ pub(crate) enum CommitOutcome {
 /// for reference, never for addition.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockTiming {
+    /// Actual wall time when all validation checks returned, before coordinated undo retention.
+    pub verified_us: Option<u64>,
     /// Height.
     pub number: u64,
     /// The commit frame's sequence, which is the key an aggregator must use: a reorg legitimately
@@ -489,6 +493,8 @@ pub struct BlockTiming {
 pub struct UndoFrameTiming {
     /// Ending the block's journals and, when one came out of them, assembling the frame.
     pub assemble_us: u64,
+    /// Whole synchronous tail and cumulative writer metrics; assembly is nested within it.
+    pub commit: partial_stateless_validator::coordination::CommitReport,
     /// The frame, and the block it undoes. `null` when the commit ended a record without keeping
     /// one — a depth-1 pair, a `Parallel` cache, a record that could not describe its block —
     /// where `assemble_us` is the cost of ending the journals alone.
@@ -668,6 +674,7 @@ struct AttemptTimer {
     mutation_check_us: Option<u64>,
     admission: Option<AdmissionTimings>,
     transition_us: Option<u64>,
+    verified_us: Option<u64>,
     pair_commit_us: Option<u64>,
     undo_prune_us: Option<u64>,
     undo: Option<UndoFrameTiming>,
@@ -691,6 +698,7 @@ impl AttemptTimer {
             mutation_check_us: None,
             admission: None,
             transition_us: None,
+            verified_us: None,
             pair_commit_us: None,
             undo_prune_us: None,
             undo: None,
@@ -756,6 +764,7 @@ impl AttemptTimer {
         report.standalone_validation_us =
             report.standalone_validation_us.saturating_add(standalone_validation_us);
         report.blocks.push(BlockTiming {
+            verified_us: self.verified_us,
             number: self.number,
             sequence: self.costs.sequence,
             verdict,
@@ -2111,7 +2120,8 @@ fn finish_phase(phase: BatchPhase, report: &mut ReplayReport) {
                 checkpoint.snapshot_chunks
             ));
         }
-        BatchPhase::Live { pending_tip, announced, .. } => {
+        BatchPhase::Live { state, pending_tip, announced, .. } => {
+            finish_undo(&state.pair, report);
             if let Some(tip) = pending_tip {
                 report.winning_branch_incomplete += 1;
                 warn!(
@@ -2125,6 +2135,23 @@ fn finish_phase(phase: BatchPhase, report: &mut ReplayReport) {
             }
         }
         BatchPhase::AwaitingManifest | BatchPhase::AwaitingCheckpoint { .. } => {}
+    }
+}
+
+/// A successful last verdict must not hide an asynchronous failure after its enqueue.
+pub(crate) fn finish_undo(pair: &CoordinatedPair, report: &mut ReplayReport) {
+    let Some(store) = &pair.undo_store else { return };
+    match store.wait_for_idle(std::time::Duration::from_secs(30)) {
+        Ok(metrics) => {
+            if metrics.failed != 0 ||
+                metrics.enqueue_failures != 0 ||
+                metrics.telemetry_failures != 0
+            {
+                report.failures.push("disk undo writer failed during replay".into());
+            }
+            report.undo_writer = Some(metrics);
+        }
+        Err(error) => report.failures.push(format!("disk undo final drain: {error}")),
     }
 }
 
@@ -2601,6 +2628,8 @@ pub(crate) fn replay_commit(
         }
     };
 
+    timer.verified_us = Some(timer.started.elapsed().as_micros() as u64);
+
     // The commit above pushed one undo record. Drop every older one: without this the log grows by
     // one record per block for the life of the run -- each holding the prior value of every
     // account, storage slot and code the block touched or evicted -- which is what took a
@@ -2634,6 +2663,7 @@ pub(crate) fn replay_commit(
     timer.undo_resident_blocks = Some(state.pair.resident_undo_blocks());
     timer.undo = state.pair.trie_cache.records_undo().then(|| UndoFrameTiming {
         assemble_us: commit.undo.us,
+        commit,
         frame: commit.undo.frame.map(|frame| UndoFrameRecord {
             block: frame.block_number,
             block_hash: frame.block_hash,

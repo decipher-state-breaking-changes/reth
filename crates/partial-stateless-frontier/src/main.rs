@@ -4,7 +4,7 @@
 //! ps-policy-frontier \
 //!   --dataset /path/to/dataset \
 //!   --arm weak --arm 60/30 --arm 90/60 --arm 120/45 \
-//!   --warmup 120 --samples 1000 \
+//!   --warmup 121 --samples 1000 \
 //!   --out /path/to/frontier-out
 //! ```
 //!
@@ -57,10 +57,11 @@ pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
     "system"
 };
 
-use partial_stateless::{load_dataset, CacheTrieRepr};
+use partial_stateless::{load_dataset, CacheTrieRepr, WarmSetShrinkPolicy};
 use partial_stateless_frontier::{
-    generate::{generate_block, ChainCursor, GeneratorRules},
+    generate::{generate_block_with_sink, ChainCursor, GeneratorRules},
     policy::{ArmKind, PolicyState},
+    prepared::{parse_warm_shrink, PreparedWriter},
     report::{RunReport, RunSummary},
 };
 use partial_stateless_validator::{SidecarReexecLimits, UntrustedAdmission, ValidatorRules};
@@ -82,12 +83,18 @@ struct Options {
     witness_v3: bool,
     trie_repr: CacheTrieRepr,
     compress_sidecars: bool,
+    prepare_inputs: Option<PathBuf>,
+    warm_shrink: WarmSetShrinkPolicy,
 }
 
 fn usage() -> String {
     "usage: ps-policy-frontier --dataset <dir> --arm <weak|a/s> [--arm <weak|a/s> ...] \
      --warmup <n> --samples <n> --out <dir> [--trie-diagnostics] [--witness-v3] \
-     [--trie-repr <parallel|exact>] [--compress-sidecars]"
+     [--trie-repr <parallel|exact>] [--compress-sidecars] [--prepare-inputs <dir>] \
+     [--warm-shrink <never|blocks>]\n\
+     ps-policy-frontier --validate-inputs <prepared-arm-dir> --out <dir> \
+     [--undo-dir <dir>] [--retain-depth <1..64>] [--interval-ms <n>] [--warm-shrink <never|blocks>] \
+     [--memory-probe-every <n>]"
         .to_string()
 }
 
@@ -101,6 +108,9 @@ fn parse_args() -> eyre::Result<Options> {
     let mut witness_v3 = false;
     let mut trie_repr = CacheTrieRepr::default();
     let mut compress_sidecars = false;
+    let mut prepare_inputs = None;
+    let mut warm_shrink =
+        parse_warm_shrink(&std::env::var("PS_WARM_SHRINK").unwrap_or_else(|_| "never".into()))?;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -118,6 +128,8 @@ fn parse_args() -> eyre::Result<Options> {
             "--trie-diagnostics" => trie_diagnostics = true,
             "--witness-v3" => witness_v3 = true,
             "--compress-sidecars" => compress_sidecars = true,
+            "--prepare-inputs" => prepare_inputs = Some(PathBuf::from(value()?)),
+            "--warm-shrink" => warm_shrink = parse_warm_shrink(&value()?)?,
             "--trie-repr" => {
                 trie_repr = value()?.parse().map_err(|err| eyre::eyre!("{err}"))?;
             }
@@ -148,6 +160,9 @@ fn parse_args() -> eyre::Result<Options> {
     if samples == 0 {
         eyre::bail!("--samples must be at least 1")
     }
+    if prepare_inputs.is_some() && trie_repr != CacheTrieRepr::Exact {
+        eyre::bail!("prepared disk-undo validation requires --trie-repr exact")
+    }
 
     Ok(Options {
         dataset,
@@ -159,6 +174,8 @@ fn parse_args() -> eyre::Result<Options> {
         witness_v3,
         trie_repr,
         compress_sidecars,
+        prepare_inputs,
+        warm_shrink,
     })
 }
 
@@ -170,6 +187,10 @@ fn main() -> eyre::Result<()> {
         )
         .init();
 
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--validate-inputs") {
+        return partial_stateless_frontier::prepared::run_cli(&args, ALLOCATOR_NAME)
+    }
     let options = parse_args()?;
 
     // A warm-up shorter than the widest window leaves that policy holding part of the window its
@@ -184,7 +205,10 @@ fn main() -> eyre::Result<()> {
     }
 
     let dataset = load_dataset(&options.dataset)?;
-    let needed = options.warmup + options.samples;
+    let needed = options
+        .warmup
+        .checked_add(options.samples)
+        .ok_or_else(|| eyre::eyre!("block count overflow"))?;
     if (dataset.records.len() as u64) < needed {
         eyre::bail!(
             "dataset holds {} canonical blocks but {needed} are needed ({} warm-up + {} measured)",
@@ -256,6 +280,29 @@ fn main() -> eyre::Result<()> {
             )
         })
         .collect::<Vec<_>>();
+    for policy in &mut policies {
+        policy.builder_trie.set_warm_shrink_policy(options.warm_shrink);
+        policy.validator_trie.set_warm_shrink_policy(options.warm_shrink);
+    }
+    let mut prepared = Vec::new();
+    if let Some(root) = &options.prepare_inputs {
+        std::fs::create_dir_all(root)?;
+        for arm in &options.arms {
+            let directory = root.join(arm.label().replace('/', "-"));
+            prepared.push((
+                *arm,
+                PreparedWriter::new(
+                    &directory,
+                    *arm,
+                    dataset.manifest.chain.clone(),
+                    options.warmup,
+                    options.samples,
+                    first.body.parent_header.clone(),
+                    options.warm_shrink.interval().map(std::num::NonZeroU64::get),
+                )?,
+            ));
+        }
+    }
 
     std::fs::create_dir_all(&options.out)?;
     let mut report = RunReport::create(&options.out.join("frontier.jsonl"))?;
@@ -263,7 +310,35 @@ fn main() -> eyre::Result<()> {
 
     for (index, record) in replayed.iter().enumerate() {
         let measured = index as u64 >= options.warmup;
-        let result = generate_block(&rules, record, &mut policies, &mut cursor, index, measured)?;
+        let result = generate_block_with_sink(
+            &rules,
+            record,
+            &mut policies,
+            &mut cursor,
+            index,
+            measured,
+            &mut |arm, bytes| {
+                if let Some((_, writer)) = prepared.iter_mut().find(|(kind, _)| *kind == arm) {
+                    writer.append(
+                        record.body.block_number,
+                        record.body.block_hash,
+                        record
+                            .body
+                            .payload_json
+                            .as_deref()
+                            .ok_or_else(|| eyre::eyre!("payload missing"))?,
+                        bytes,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        if policies.iter().any(|policy| {
+            policy.builder_cache.undo_records_len() != 0 ||
+                policy.validator_cache.undo_records_len() != 0
+        }) {
+            eyre::bail!("generation retained obsolete rollback records")
+        }
         report.append(&result)?;
         if measured && result.block_number % 100 == 0 {
             info!(
@@ -276,6 +351,9 @@ fn main() -> eyre::Result<()> {
     }
 
     let stream = report.finish()?;
+    for (_, writer) in prepared {
+        writer.finish()?;
+    }
     let summary = RunSummary::accumulate(
         &options.dataset,
         dataset.manifest.producer.clone(),

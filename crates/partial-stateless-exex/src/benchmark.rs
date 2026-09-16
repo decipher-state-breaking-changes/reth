@@ -58,7 +58,7 @@ use std::{
 /// V10 changes no V9 field and moves no work between existing phases, so a V9 run and a V10 run
 /// from an ExEx are directly comparable: the new phases are null or, for
 /// `post_execution_consensus_us`, the small cost the delegated post-execution check adds.
-pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 10;
+pub const VALIDATION_BENCHMARK_SCHEMA_VERSION: u64 = 11;
 
 /// Phase instrumentation, produced by the validator core rather than by this harness.
 ///
@@ -108,6 +108,10 @@ impl WitnessSizeBreakdown {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ValidationBenchmarkRecord {
     pub schema_version: u64,
+    /// This paired probe discards its tentative trie. Production coordination is measured
+    /// separately.
+    pub timing_boundary: &'static str,
+    pub coordinated_commit_included: bool,
     pub block_number: u64,
     pub block_hash: B256,
     pub gas_used: u64,
@@ -306,6 +310,25 @@ pub fn append_builder_record(path: &Path, record: &BuilderBenchmarkRecord) -> ey
     append_json_record(path, record)
 }
 
+/// Companion stream: sidecar creation and the production coordination tail on the same block.
+pub fn append_builder_commit(
+    path: &Path,
+    block_number: u64,
+    block_hash: B256,
+    sidecar_build_us: u64,
+    through_commit_us: u64,
+    commit: partial_stateless_validator::coordination::CommitReport,
+) -> eyre::Result<()> {
+    append_json_record(
+        &path.with_extension("commit.jsonl"),
+        &serde_json::json!({
+            "schema_version": 1, "block_number": block_number, "block_hash": block_hash,
+            "sidecar_build_us": sidecar_build_us, "through_commit_us": through_commit_us,
+            "writer_completion_included": false, "commit": commit,
+        }),
+    )
+}
+
 fn append_json_record(path: &Path, record: &impl Serialize) -> eyre::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -406,7 +429,7 @@ mod tests {
     fn json_schema_contains_join_keys_phases_fingerprints_and_cache_cost() {
         let value = serde_json::to_value(ValidationBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 10);
+        assert_eq!(VALIDATION_BENCHMARK_SCHEMA_VERSION, 11);
         // Admission is nullable, and the distinction is the point: `null` means the stage was
         // already cleared before this validator saw the block, `0` means it ran and cost nothing.
         // A record that could not express the difference would make an ExEx run look like a

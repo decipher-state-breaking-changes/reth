@@ -1639,6 +1639,19 @@ impl WarmSetShrinkPolicy {
     }
 }
 
+impl std::str::FromStr for WarmSetShrinkPolicy {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("never") || raw.eq_ignore_ascii_case("off") {
+            return Ok(Self::Never)
+        }
+        let blocks = raw.parse::<u64>().map_err(|error| error.to_string())?;
+        Ok(std::num::NonZeroU64::new(blocks).map_or(Self::Never, Self::EveryBlocks))
+    }
+}
+
 impl fmt::Display for WarmSetShrinkPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

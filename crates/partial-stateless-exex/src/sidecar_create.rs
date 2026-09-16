@@ -108,6 +108,8 @@ pub(crate) type ParallelInitialProofFn<'a> =
 
 #[derive(Debug)]
 pub(crate) struct BuilderBlockReport {
+    pub(crate) builder_started: Instant,
+    pub(crate) sidecar_build_us: u64,
     pub(crate) cache_update: UpdateStats,
     pub(crate) witness: Option<WitnessResult>,
     pub(crate) sidecar_path: Option<PathBuf>,
@@ -589,6 +591,8 @@ where
         requests_valid;
     let record = ValidationBenchmarkRecord {
         schema_version: VALIDATION_BENCHMARK_SCHEMA_VERSION,
+        timing_boundary: "validation_core_discard",
+        coordinated_commit_included: false,
         block_number: block.number(),
         block_hash: block.hash(),
         gas_used: expected_gas_used,
@@ -1627,6 +1631,8 @@ where
     };
 
     Ok(BuilderBlockReport {
+        builder_started: builder_total_start,
+        sidecar_build_us: builder_total_us,
         cache_update: stats,
         witness,
         sidecar_path: saved_sidecar_path,
