@@ -742,13 +742,13 @@ mod tests {
         }
     }
 
-    fn capture_undo_warnings(run: impl FnOnce()) -> String {
+    fn capture_undo_logs(run: impl FnOnce()) -> String {
         let buffer = WarningBuffer(Default::default());
         let output = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(tracing::Level::INFO)
             .with_writer(move || output.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, run);
@@ -771,7 +771,7 @@ mod tests {
             RetainedContent::Disk(store.spill(bundle).unwrap());
         let before = state.pair.fingerprint();
         let (ancestor, abandoned) = state.history.suffix(1).unwrap();
-        let logs = capture_undo_warnings(|| {
+        let logs = capture_undo_logs(|| {
             assert!(matches!(
                 apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
                 ReorgOutcome::Unrecoverable { .. }
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(state.pair.fingerprint(), before);
         assert_eq!(state.pair.retained_depth(), 2);
         let root = state.pair.trie_cache.state_root().unwrap();
-        let logs = capture_undo_warnings(|| {
+        let logs = capture_undo_logs(|| {
             assert!(state
                 .pair
                 .restore_retained_generation(B256::ZERO, root, state.config.cache_policy_id())
@@ -1013,12 +1013,70 @@ mod tests {
     }
 
     #[test]
+    fn disk_undo_cold_initialization_skips_unrecoverable_parent_then_retains_warming_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        // The authenticated fixture supplies the trie at the end of the first cold block.
+        // Its displaced parent is empty, as on the builder's first proof reveal.
+        let initialized = state.pair.trie_cache.fork_for_rollback();
+        let head = state.pair.accepted_head.clone().unwrap();
+        state.pair.cold_reset();
+        let ctx = BlockContext {
+            number: ANCHOR_BLOCK,
+            hash: head.hash(),
+            parent_hash: head.parent_hash,
+            state_root: head.state_root,
+        };
+        assert!(matches!(
+            admit_block(&mut state.pair.readiness, &ctx),
+            BlockAdmission::Admitted(None)
+        ));
+        let mut accessed = BlockAccessedState::default();
+        accessed.accounts.insert(
+            Address::repeat_byte(0x11),
+            AccountData { nonce: 7, balance: U256::from(1_000u64), code_hash: None },
+        );
+        state.pair.cache.on_block_executed(ANCHOR_BLOCK, &accessed);
+        assert!(state.pair.cache.undo_record(ANCHOR_BLOCK).is_some());
+        let displaced = std::mem::replace(&mut state.pair.trie_cache, initialized);
+        let logs = capture_undo_logs(|| {
+            let report = state.pair.commit_transition(Some(displaced), &ctx, head, true);
+            assert_eq!(report.readiness, "warming");
+            assert!(report.undo.frame.is_none());
+        });
+        assert!(logs.contains("Initialized disk undo history; no recoverable parent"), "{logs}");
+        assert!(!logs.contains("Undo coverage lost"), "{logs}");
+        assert_eq!(state.pair.retained_depth(), 0);
+        assert_eq!(state.pair.resident_undo_blocks(), 0);
+        assert!(state.pair.cache.undo_record(ANCHOR_BLOCK).is_none());
+        disk_run(&mut state, 3);
+        assert_eq!(state.pair.retained_depth(), 3);
+        assert_eq!(state.pair.resident_undo_blocks(), 0);
+        assert!(matches!(state.pair.readiness.state(), CacheReadiness::Warming { .. }));
+        let RetainedContent::Disk(file) = &state.pair.retained.back().unwrap().content else {
+            panic!("warming commits must still be retained on disk")
+        };
+        file.load().unwrap();
+        state.pair.trie_cache.set_undo_recording(false);
+        let logs = capture_undo_logs(|| {
+            advance_retaining(&mut state, ANCHOR_BLOCK + 4, 4, true);
+        });
+        assert!(logs.contains("full_fallback"), "{logs}");
+        assert!(logs.contains("dropped_generations=4"), "{logs}");
+        assert!(!logs.contains("Initialized disk undo history"), "{logs}");
+    }
+
+    #[test]
     fn disk_undo_full_fallback_discards_unreachable_history_without_residency() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = disk_state(directory.path());
         disk_run(&mut state, 3);
         state.pair.trie_cache.set_undo_recording(false);
-        advance_retaining(&mut state, ANCHOR_BLOCK + 4, 4, true);
+        let logs = capture_undo_logs(|| {
+            advance_retaining(&mut state, ANCHOR_BLOCK + 4, 4, true);
+        });
+        assert!(logs.contains("full_fallback"), "{logs}");
+        assert!(!logs.contains("Initialized disk undo history"), "{logs}");
         assert_eq!(state.pair.retained_depth(), 0, "Full fallback is not retained in RAM");
         assert!(state.pair.cache.undo_record(ANCHOR_BLOCK + 4).is_none());
         state.pair.trie_cache.set_undo_recording(true);

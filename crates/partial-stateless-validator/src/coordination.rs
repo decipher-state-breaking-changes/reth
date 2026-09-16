@@ -436,7 +436,6 @@ impl CoordinatedPair {
         // run against on the *next* block, so it advances whether or not this run retains for
         // reorgs; the K = 1 memory control turns off retention, not admission.
         let displaced_accepted_head = self.accepted_head.replace(accepted_head);
-        let mut retained_head = Some(displaced_accepted_head);
         // Dropping `displaced` here rather than declining to produce it is deliberate: the
         // transition still copies the parent trie and still hands the copy back, so the control
         // arm pays exactly the work the production arm pays and differs only in what it keeps.
@@ -450,6 +449,26 @@ impl CoordinatedPair {
             self.retained.clear();
             return CommitUndoReport::default()
         };
+        // The first cold commit initializes the trie, but its uninitialized parent has no
+        // authenticated state to recover. Do not manufacture a Full fallback and report lost
+        // coverage when there was no history. Warming commits and authenticated checkpoints
+        // still take the normal path, including warnings if a frame cannot be produced.
+        if self.undo_store.is_some() &&
+            self.undo_layout == UndoLayout::FramesOnly &&
+            self.retained.is_empty() &&
+            displaced_accepted_head.is_none() &&
+            self.readiness.replay_depth() == 0 &&
+            trie_cache.state_root().is_none() &&
+            self.trie_cache.state_root().is_some()
+        {
+            self.trie_cache.clear_undo_record();
+            self.cache.prune_undo_below(self.cache.current_block());
+            info!(target: "partial_stateless", cause = "cold_start", block = block.number,
+                retained_depth = 0, configured_depth = self.retention_depth.get(),
+                "Initialized disk undo history; no recoverable parent");
+            return CommitUndoReport::default()
+        }
+        let mut retained_head = Some(displaced_accepted_head);
         // A frame always names the generation it restores. The hybrid closes the displaced
         // generation's older record and demotes the deque entry below it. Frames-only closes the
         // live generation's current record against `trie_cache` and retains that parent directly
