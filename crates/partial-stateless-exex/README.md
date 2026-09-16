@@ -129,9 +129,9 @@ restart real, and free.
 The cache windows default to `account_window = 60`, `storage_window = 30` blocks and are
 selected at startup with `PS_ACCOUNT_WINDOW` and `PS_STORAGE_WINDOW`. Both must be positive
 base-10 integers; invalid values fail startup. Changing a window does not require rebuilding,
-but it does select a different cache-policy ID and persisted-cache filename. Use
-[`cache_window_bench`](../partial-stateless/src/bin/README.md) to screen candidate values
-offline before committing to them.
+but it does select a different cache-policy ID and persisted-cache filename. The optional
+[`cache_window_bench`](../partial-stateless/src/bin/README.md)
+can compare candidate windows offline.
 
 Disk undo is enabled by default. Its settings survive snapshot restore, rebuild and reset.
 Incompatible legacy settings fail startup; unset them to use the current profile. Optional
@@ -222,19 +222,24 @@ History-discard warnings include `dropped_generations` and `retained_depth`. A r
 that preserves history reports zero dropped generations; retained depth alone does not prove
 that every file is readable.
 
+The first cold commit has no authenticated parent to recover. It skips retaining that parent
+and logs `Initialized disk undo history; no recoverable parent` at INFO. Subsequent warming
+commits accumulate undo normally. A later `full_fallback`, including while warming, still warns
+and discards the history that can no longer be reached.
+
 The startup retention log and per-commit debug log report the actual resident Full/Frame count.
 Replay records that count as `undo_resident_blocks` in each committed block's timing record
 (`null` for an attempt that did not commit); the manifest's `undo_resident_blocks_limit` is the
 configured limit, not a measurement. Both exclude writer buffers and disk handles.
+The benchmark report's **Newest retained generation** section describes one entry, not the
+configured K or the whole deque. A disk handle counts as present while its file payload is
+excluded from those memory figures.
 
 When deploying, confirm K, layout, recording and directory in startup logs, then check ordinary
 commits for file rotation and writer/coverage-loss warnings. No additional performance campaign
 is required to enable the feature.
 
-The initial parallel-proof gate currently requires at least two distinct storage tries and 64
-total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
-of storage workers; smaller calls and all later structural/context proof deltas stay on the serial
-provider.
+### Execution reuse and sidecar roles
 
 `PS_ENGINE_ACCESS` shares one execution between the node and the ExEx. The engine
 captures the access set at the same point of the same lifecycle the ExEx would,
@@ -371,42 +376,6 @@ an overlap-retaining Engine report, and a structured builder report. Raw records
 as `paired.jsonl`, `engine.jsonl`, `builder.jsonl`, `resources.jsonl`, and
 `reth-partial-stateless.log`.
 
-### Bounded disk-undo acceptance run on zns4
-
-`/data2/bench-runs/run_disk_undo_1000.sh` wraps
-[`run_disk_undo_smoke.py`](scripts/run_disk_undo_smoke.py). It uses the existing paired driver and
-`restore_vanilla_node.sh`, with the existing 90/60, v3, engine-access-on profile and K=32 disk undo.
-
-```sh
-/data2/bench-runs/run_disk_undo_1000.sh check
-/data2/bench-runs/run_disk_undo_1000.sh start
-/data2/bench-runs/run_disk_undo_1000.sh status <run-dir>
-/data2/bench-runs/run_disk_undo_1000.sh stop <run-dir>
-/data2/bench-runs/run_disk_undo_1000.sh rejudge <run-dir>
-```
-
-`check` is read-only. `start` detaches, builds stamped release binaries from clean main, and
-copies them into the run directory. While the ordinary node stays up, it checks depth-1 and
-depth-32 undo/reapplication on the first 200 commits of the existing spool. It then stops the
-ordinary node, preserves the old ExEx WAL in the run directory, and collects 1,000 valid paired
-samples. `--depth 64` changes the cap and the deeper injection to 64. The six-hour live deadline
-is a backstop; fewer than the requested samples fails acceptance even if the paired driver exits 0.
-
-On completion, failure or graceful stop, the worker stops its child and attempts ordinary-node
-restoration before analysis. Restore failure is explicitly a failed run. `RESULT` holds PASS/FAIL;
-`result.json` records the recovery and live checks. `undo-files.jsonl` samples file counts and
-rotation during the live run, allowing one finishing write beyond K. Residency comes from actual
-per-commit logs. Writer-wait warning counts and `paired/resources.jsonl` are diagnostics; the run
-makes no before/after performance claim. No live reorg is injected.
-
-`rejudge` checks saved artifacts without starting or stopping a node. It writes
-`REJUDGED_RESULT` and `rejudged-result.json`, preserving the original `RESULT` and recording
-both the executed build and the judging code. For older logs only, the first-block
-`full_fallback` is classified as initialization if it precedes the first commit observation,
-the parent cache was at height zero, readiness changes cold → warming at that block, and the
-next block starts retaining history. All other undo warnings still fail. New builds log this
-initialization separately because an unauthenticated initial parent is not recoverable history.
-
 ### Ordinary-builder comparison benchmark
 
 `scripts/run_live_builder_bench.py` runs `PS_SIDECAR_ROLE=builder`, requires published sidecars,
@@ -437,6 +406,11 @@ authenticated by the persistent trie cache. It requests that set once through
 `StateProofProvider::multiproof_v2`. Native V2 proof generation builds targeted storage proofs
 first and reuses their roots when encoding account leaves, avoiding a second traversal of those
 storage tries when a full storage proof is available.
+
+With `PS_PARALLEL_INITIAL_PROOF=1`, the initial parallel-proof gate requires at least two distinct
+storage tries and 64 total initial targets. Eligible calls use one account worker and a
+workload-bounded number of storage workers; smaller calls and later structural proof deltas stay
+serial. This provider option is independent of `PS_TRIE_REPR`, which must remain `exact`.
 
 The proof is revealed into one transactional sparse-trie clone. A deletion can expose a blinded
 sibling or extension child whose node kind is needed for canonical branch compression. In that
@@ -679,6 +653,7 @@ input; its run root carries `RESULT_SHA256SUMS`.
 | `<datadir>/partial_stateless_cache-a<A>-s<S>.bin` | persisted flat cache for account/storage windows `<A>/<S>`; another policy uses another filename |
 | `./sidecar/block_<N>_<hash>.bin` | witness sidecar (or `$PS_SIDECAR_DIR/block_<N>_<hash>.bin`) |
 | `./sidecar/block_<N>_<hash>.manifest.json` | per-block benchmark manifest |
+| `$PS_UNDO_DIR/undo-*/<sequence>.undo` | paired trie/flat undo bundles; default parent directory is `$PS_SIDECAR_DIR/undo`, capped at K completed files per pair after writes finish |
 | `$PS_CAPTURE_DIR/accessed_<N>.bin` | captured accessed-state data (when capture is enabled) |
 | `$PS_POLICY_DATASET_CAPTURE_DIR/manifest.json` | policy replay dataset identity, capture configuration, and the measurement disclaimer |
 | `$PS_POLICY_DATASET_CAPTURE_DIR/blocks/block_<N>_<hash>.bin` | one captured block: payload, access set, policy-neutral full witness, roots, and a record digest |
