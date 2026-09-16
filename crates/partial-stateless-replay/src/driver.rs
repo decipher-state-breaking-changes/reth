@@ -85,10 +85,8 @@ pub struct ReplayOptions {
     pub max_rewind_frames: u64,
     /// How many trie generations the pair retains, and so the deepest reorg it can undo alone.
     ///
-    /// Defaults to one, which is production's setting and today's behaviour exactly. Raising it
-    /// costs memory per generation and buys depth-2-and-deeper recovery — a trade the operator
-    /// makes, not the binary: in 10,000 recorded verdicts every reorg was depth-1, so the default
-    /// is not the deepest thing that works but the cheapest thing that suffices.
+    /// Library callers can select an in-memory control. The CLI always supplies the K=32
+    /// disk profile unless a different supported depth is explicitly requested.
     pub retain_depth: RetentionDepth,
     /// How often the pair's warm sets are returned to a size fitted to their contents.
     ///
@@ -474,6 +472,9 @@ pub struct BlockTiming {
     /// `null` unless the pair is recording. Not in `phases`: it happens inside `pair_commit_us`,
     /// so adding it beside the leaves would double count.
     pub undo: Option<UndoFrameTiming>,
+    /// Actual Full/Frame payload count after commit, excluding disk handles and writer buffers.
+    /// None when the attempt did not commit.
+    pub undo_resident_blocks: Option<usize>,
     /// The validator core's own `ValidationPhaseTimings`, verbatim, completed with the admission
     /// and sidecar-decode values the driver measured — the same completion the paired harness
     /// performs. `null` when the transition never ran. A superset of `phases`: reference only.
@@ -670,6 +671,7 @@ struct AttemptTimer {
     pair_commit_us: Option<u64>,
     undo_prune_us: Option<u64>,
     undo: Option<UndoFrameTiming>,
+    undo_resident_blocks: Option<usize>,
     oracle_compare_us: Option<u64>,
     /// The primary wall, frozen before the oracle comparison so harness work stays outside it.
     validation_wall_us: Option<u64>,
@@ -692,6 +694,7 @@ impl AttemptTimer {
             pair_commit_us: None,
             undo_prune_us: None,
             undo: None,
+            undo_resident_blocks: None,
             oracle_compare_us: None,
             validation_wall_us: None,
             core: None,
@@ -766,6 +769,7 @@ impl AttemptTimer {
             phases,
             derived,
             undo: self.undo,
+            undo_resident_blocks: self.undo_resident_blocks,
             details: self.core,
         });
     }
@@ -2627,6 +2631,7 @@ pub(crate) fn replay_commit(
     );
     // Recorded whenever the pair is recording, frame or no frame. The hybrid at depth 1 keeps no
     // frame; frames-only closes and keeps the current block's frame at every depth.
+    timer.undo_resident_blocks = Some(state.pair.resident_undo_blocks());
     timer.undo = state.pair.trie_cache.records_undo().then(|| UndoFrameTiming {
         assemble_us: commit.undo.us,
         frame: commit.undo.frame.map(|frame| UndoFrameRecord {

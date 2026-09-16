@@ -340,7 +340,7 @@ fn an_applied_forced_reorg_serializes_the_smoke_evidence() {
 }
 
 #[test]
-fn a_frames_only_forced_reorg_serializes_layout_aware_evidence() {
+fn default_disk_undo_cli_serializes_policy_and_observed_residency() {
     let dir = spool_dir("batch-forced-frames-json");
     let (fixture, commits) = common::empty_chain::chain(8);
     write_manifest(&dir);
@@ -354,31 +354,39 @@ fn a_frames_only_forced_reorg_serializes_layout_aware_evidence() {
     let json = dir.join("frames.jsonl");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ps-replay"))
         .arg(&dir)
-        .args([
-            "--no-mutations",
-            "--retain-depth",
-            "3",
-            "--undo-record",
-            "--undo-layout",
-            "frames",
-            "--forced-reorg",
-            &format!("2@{at}"),
-        ])
+        .args(["--no-mutations", "--forced-reorg", &format!("2@{at}")])
         .arg("--json")
         .arg(&json)
-        .arg("--undo-dir")
-        .arg(dir.join("undo"))
+        .env_remove("PS_RETAIN_DEPTH")
+        .env_remove("PS_UNDO_RECORD")
+        .env_remove("PS_UNDO_LAYOUT")
+        .env_remove("PS_UNDO_DIR")
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
     let rows = evidence_with_test_provenance(&json);
     assert_eq!(rows[0]["undo_layout"], "frames");
-    assert_eq!(rows[0]["undo_resident_blocks"], 0);
+    assert_eq!(rows[0]["retain_depth"], 32);
+    assert_eq!(rows[0]["undo_resident_blocks_limit"], 0);
+    assert!(
+        rows[0].get("undo_resident_blocks").is_none(),
+        "manifest is configuration, not a measurement"
+    );
+    let blocks = rows[1]["blocks"].as_array().unwrap();
+    assert!(!blocks.is_empty());
+    assert!(blocks.iter().all(|block| block["undo_resident_blocks"] == 0));
     assert_eq!(rows[0]["undo_dir"], dir.join("undo").to_str().unwrap());
     assert_eq!(rows[1]["forced_reorgs"][0]["frames_applied"], 2);
     let checked = dir.join("checked-frames.jsonl");
-    let args = vec!["--at".into(), at.to_string(), "--commits".into(), "8".into()];
+    let args = vec![
+        "--at".into(),
+        at.to_string(),
+        "--commits".into(),
+        "8".into(),
+        "--retain-depth".into(),
+        "32".into(),
+    ];
     let output = check_evidence(&checked, &rows, &args);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
@@ -668,4 +676,19 @@ fn forcing_a_restore_installs_the_recovery_checkpoint() {
     assert!(forced.resyncs[0].continuous);
     assert_eq!(forced.checkpoints_skimmed, 0);
     assert!(forced.agreed() && forced.continuous() && forced.complete());
+}
+
+#[test]
+fn disk_undo_cli_rejects_legacy_controls_in_batch_and_follow() {
+    for follow in [false, true] {
+        for (flag, value) in [("--undo-layout", "hybrid"), ("--undo-record", "off")] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ps-replay"));
+            if follow {
+                command.arg("--follow");
+            }
+            let result = command.args(["/unused-spool", flag, value]).output().unwrap();
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("no longer supported"));
+        }
+    }
 }

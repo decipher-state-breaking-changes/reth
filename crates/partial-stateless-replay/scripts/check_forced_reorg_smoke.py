@@ -37,8 +37,9 @@ def check_applied(outcome, attempts, *, at, depth, layout):
 
 def check(records, *, at, depth, commits, expected_commit, allocator,
           mode="smoke", refusal_at=None, refusal_depth=None, checkpoint_sequence=None,
-          checkpoints_skimmed=None, frames=None, layout=None):
+          checkpoints_skimmed=None, frames=None, layout=None, retain_depth=3):
     require(depth in (2, 3), "the smoke must consume frames: use depth 2 or 3")
+    require(depth <= retain_depth <= 64, "retention must cover the applied reorg and be at most 64")
     require(re.fullmatch(r"[0-9a-f]{40}", expected_commit) is not None,
             "expected_commit must be a full lowercase Git commit hash")
     require(mode in ("smoke", "recovery"), "unknown evidence mode")
@@ -52,9 +53,10 @@ def check(records, *, at, depth, commits, expected_commit, allocator,
         require(all(value is not None for value in
                     (refusal_at, refusal_depth, checkpoint_sequence, checkpoints_skimmed, frames)),
                 "recovery mode needs refusal placement, checkpoint sequence, skim count and frame inventory")
-        require(refusal_depth > 3 and refusal_at > at, "refusal must be later and deeper than retention")
+        require(refusal_depth > retain_depth and refusal_at > at,
+                "refusal must be later and deeper than retention")
         schedule.append(f"{refusal_depth}@{refusal_at}")
-    expect(manifest, benchmark="standalone_replay_v1", retain_depth=3,
+    expect(manifest, benchmark="standalone_replay_v1", retain_depth=retain_depth,
            undo_record=True, forced_reorgs=schedule, allocator=allocator)
     require(manifest["undo_record"] is True, "undo recording must be enabled")
     # Runs written before the layout axis existed used the hybrid layout. The manifest is the
@@ -152,6 +154,8 @@ def main():
     parser.add_argument("--mode", choices=("smoke", "recovery"), default="smoke")
     parser.add_argument("--at", type=int, required=True)
     parser.add_argument("--depth", type=int, default=2, choices=(2, 3))
+    parser.add_argument("--retain-depth", type=int, default=3,
+                        help="expected retention; defaults to 3 for historical smoke reports")
     parser.add_argument("--commits", type=int, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--allocator", choices=("jemalloc", "system", "snmalloc"), default="jemalloc")
@@ -167,7 +171,8 @@ def main():
               expected_commit=args.expected_commit, allocator=args.allocator, mode=args.mode,
               refusal_at=args.refusal_at, refusal_depth=args.refusal_depth,
               checkpoint_sequence=args.checkpoint_sequence, checkpoints_skimmed=args.checkpoints_skimmed,
-              frames=read_jsonl(args.frames) if args.frames else None, layout=args.layout)
+              frames=read_jsonl(args.frames) if args.frames else None, layout=args.layout,
+              retain_depth=args.retain_depth)
     except (ValueError, KeyError, TypeError, IndexError, StopIteration, OSError) as error:
         parser.exit(1, f"forced-reorg evidence failed: {error}\n")
     print(f"forced-reorg {args.mode} evidence passed: {args.commits} commits")

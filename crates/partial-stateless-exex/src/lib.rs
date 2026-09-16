@@ -127,20 +127,14 @@ fn env_flag(name: &str) -> bool {
 
 /// Reads a flag whose absence means on rather than off.
 ///
-/// Separate from [`env_flag`] because the two answer different questions. `env_flag` asks whether
-/// a run opted into something extra; this asks whether a run opted *out* of production behaviour,
-/// which a benchmark control does and nothing else should.
+/// Legacy off values remain parseable so profile validation can explain how to migrate them.
 fn env_flag_enabled_by_default(name: &str) -> bool {
     std::env::var(name)
         .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
         .unwrap_or(true)
 }
 
-/// `PS_TRIE_REPR`, refused at startup on anything but a known representation name.
-///
-/// Strict like the windows rather than defaulting like a flag: the value labels every trie the
-/// run constructs, and an A/B arm whose mistyped variable silently fell back to the default
-/// would be a measurement filed under a representation it never ran.
+/// Parse known representation names; the disk-undo profile then requires Exact.
 fn trie_repr_from_env() -> eyre::Result<CacheTrieRepr> {
     match std::env::var("PS_TRIE_REPR") {
         Err(_) => Ok(CacheTrieRepr::default()),
@@ -215,13 +209,7 @@ pub struct RunOptions {
     pub trie_cache_diagnostics: bool,
     /// Whether Ready-cache sidecars carry the receiver-aware trimmed (v3) witness.
     pub witness_v3: bool,
-    /// The sparse-trie representation every trie cache this run constructs is built on.
-    ///
-    /// Not protocol: the cross-representation oracle showed the two representations produce
-    /// identical observables (roots, anchors, witness bytes, fragments), so the choice never
-    /// reaches the wire or the policy identifier. It is a measurement label all the same — a run
-    /// is meaningless as an A/B arm unless the label names what actually ran — so it is resolved
-    /// once here, logged at startup, and preserved across cold resets.
+    /// Every trie uses Exact, as required by disk undo, including after restore or reset.
     pub trie_repr: CacheTrieRepr,
     /// Whether the builder preflights each sidecar before publishing it.
     pub run_sidecar_preflight: bool,
@@ -232,11 +220,7 @@ pub struct RunOptions {
     /// Benchmark control that recreates the old unconditional parent-cache clone, so its cost can
     /// be priced against the current conditional one.
     pub force_previous_cache_snapshot: bool,
-    /// Whether a committed block's displaced trie generation is kept for depth-1 recovery.
-    ///
-    /// On in production: K = 1 is what makes a depth-1 reorg an undo rather than a rebuild. The
-    /// only reason to turn it off is the memory control — an otherwise identical run that pays no
-    /// retention, so the difference in resident memory is attributable to retention alone.
+    /// Retention is mandatory for the production disk-undo profile.
     pub retain_generation: bool,
     /// Total undo window; production defaults to 32 blocks, all on disk.
     pub retention_depth: RetentionDepth,
@@ -364,34 +348,13 @@ impl RunOptions {
             Ok("frames") | Err(_) => UndoLayout::FramesOnly,
             Ok(other) => eyre::bail!("invalid PS_UNDO_LAYOUT={other:?}"),
         };
-        if undo_layout == UndoLayout::FramesOnly &&
-            (!undo_record || trie_repr != CacheTrieRepr::Exact)
-        {
-            eyre::bail!("frames undo requires recording on and PS_TRIE_REPR=exact")
-        }
-        let undo_dir = (undo_layout == UndoLayout::FramesOnly).then(|| {
+        let retain_generation = env_flag_enabled_by_default("PS_RETAIN_GENERATION");
+        validate_undo_profile(trie_repr, undo_layout, undo_record, retain_generation)?;
+        let undo_dir = Some(
             std::env::var_os("PS_UNDO_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| sidecar_dir.join("undo"))
-        });
-        if trie_repr != CacheTrieRepr::default() &&
-            (env_flag("PS_BOOTSTRAP_IMPORT") ||
-                env_flag("PS_CANONICAL_REBUILD") ||
-                bootstrap_self_test_blocks > 0)
-        {
-            // Snapshot restore and canonical rebuild construct their tries inside shared
-            // bootstrap code that builds the default representation; letting them run under a
-            // non-default PS_TRIE_REPR would produce a pair whose actual representation
-            // contradicts the run's label. Refused rather than converted: there is no cheap
-            // in-place conversion, and a mislabelled measurement is worse than no run.
-            return Err(eyre::eyre!(
-                "PS_TRIE_REPR={} applies to cold-started pairs only; snapshot restore, canonical \
-                 rebuild, and the bootstrap self-test build the default representation. Unset \
-                 PS_BOOTSTRAP_IMPORT / PS_CANONICAL_REBUILD / PS_BOOTSTRAP_SELF_TEST, or run on \
-                 the default representation.",
-                trie_repr.label()
-            ))
-        }
+                .unwrap_or_else(|| sidecar_dir.join("undo")),
+        );
         Ok(Self {
             config,
             sidecar_role,
@@ -415,7 +378,7 @@ impl RunOptions {
             builder_bench_output: std::env::var_os("PS_BUILDER_BENCH_OUTPUT").map(PathBuf::from),
             policy_dataset: policy_dataset_capture::PolicyDatasetCaptureConfig::from_env()?,
             force_previous_cache_snapshot: env_flag("PS_FORCE_PREVIOUS_CACHE_SNAPSHOT"),
-            retain_generation: env_flag_enabled_by_default("PS_RETAIN_GENERATION"),
+            retain_generation,
             retention_depth,
             undo_record,
             undo_layout,
@@ -459,14 +422,6 @@ impl RunOptions {
             trie_repr = self.trie_repr.label(),
             "Partial Stateless ExEx started — monitoring cache state per block"
         );
-        if self.trie_repr != CacheTrieRepr::default() {
-            info!(
-                target: "partial_stateless",
-                trie_repr = self.trie_repr.label(),
-                "Non-default cache trie representation ENABLED (PS_TRIE_REPR) — every trie cache \
-                 this run constructs uses it; observables are representation-independent"
-            );
-        }
         if let Some(dir) = &self.capture_dir {
             info!(
                 target: "partial_stateless",
@@ -523,14 +478,6 @@ impl RunOptions {
             info!(
                 target: "partial_stateless",
                 "Parallel initial V2 multiproof ENABLED (PS_PARALLEL_INITIAL_PROOF); low-width target sets remain serial"
-            );
-        }
-        if !self.retain_generation {
-            warn!(
-                target: "partial_stateless",
-                "Depth-1 retained generation DISABLED (PS_RETAIN_GENERATION=0) — benchmark memory \
-                 control only. Every reorg and revert now costs a full rebuild; do not read this \
-                 run's recovery timings as production behaviour"
             );
         }
         if self.run_sidecar_preflight {
@@ -1489,16 +1436,46 @@ fn load_initial_pair(
     Ok(pair)
 }
 
+/// Reject old experiment profiles instead of silently restoring resident whole generations.
+fn validate_undo_profile(
+    repr: CacheTrieRepr,
+    layout: UndoLayout,
+    record: bool,
+    retain: bool,
+) -> eyre::Result<()> {
+    if repr != CacheTrieRepr::Exact {
+        eyre::bail!("PS_TRIE_REPR=parallel is no longer supported by ExEx; unset it or use exact for disk undo")
+    }
+    if layout != UndoLayout::FramesOnly {
+        eyre::bail!("PS_UNDO_LAYOUT=hybrid is no longer supported by ExEx; unset it or use frames")
+    }
+    if !record {
+        eyre::bail!("PS_UNDO_RECORD=off is no longer supported by ExEx; unset it or use on")
+    }
+    if !retain {
+        eyre::bail!("PS_RETAIN_GENERATION=0 is no longer supported by ExEx; unset it or use 1")
+    }
+    Ok(())
+}
+
 fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre::Result<()> {
+    validate_undo_profile(
+        options.trie_repr,
+        options.undo_layout,
+        options.undo_record,
+        options.retain_generation,
+    )?;
+    let directory = options
+        .undo_dir
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("ExEx disk undo requires an undo directory"))?;
     pair.retention_depth = options.retention_depth;
     pair.undo_layout = options.undo_layout;
     pair.trie_cache.set_undo_recording(options.undo_record);
-    if let Some(directory) = &options.undo_dir {
-        pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
-    }
+    pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
     info!(target: "partial_stateless", depth = options.retention_depth.get(),
         recording = options.undo_record, layout = options.undo_layout.as_str(),
-        directory = ?options.undo_dir, resident_blocks = 0, "Configured cache undo retention");
+        directory = ?options.undo_dir, resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())
 }
 
@@ -3889,6 +3866,25 @@ mod tests {
                     Err(reth_provider::ProviderError::TrieWitnessError("injected".to_string()))
                 }
             }
+        }
+    }
+
+    #[test]
+    fn disk_undo_profile_rejects_legacy_memory_controls() {
+        use super::{validate_undo_profile, CacheTrieRepr, UndoLayout};
+        assert!(
+            validate_undo_profile(CacheTrieRepr::Exact, UndoLayout::FramesOnly, true, true).is_ok()
+        );
+        for (repr, layout, record, retain, setting) in [
+            (CacheTrieRepr::Parallel, UndoLayout::Hybrid, true, true, "PS_TRIE_REPR"),
+            (CacheTrieRepr::Exact, UndoLayout::Hybrid, true, true, "PS_UNDO_LAYOUT"),
+            (CacheTrieRepr::Exact, UndoLayout::FramesOnly, false, true, "PS_UNDO_RECORD"),
+            (CacheTrieRepr::Exact, UndoLayout::FramesOnly, true, false, "PS_RETAIN_GENERATION"),
+        ] {
+            assert!(validate_undo_profile(repr, layout, record, retain)
+                .unwrap_err()
+                .to_string()
+                .contains(setting));
         }
     }
 

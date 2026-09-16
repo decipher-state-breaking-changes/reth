@@ -60,7 +60,7 @@ pub const MAX_RETENTION_DEPTH: u64 = 64;
 pub struct RetentionDepth(u64);
 
 impl RetentionDepth {
-    /// The production default: today's behaviour exactly.
+    /// The minimal retention depth, also used by in-memory regression controls.
     pub const ONE: Self = Self(1);
 
     /// Validates a configured depth against `1 ..= MAX_RETENTION_DEPTH`.
@@ -340,6 +340,16 @@ impl CoordinatedPair {
         }
         self.cache.prune_undo_below(self.cache.current_block());
     }
+    /// Actual retained payloads in RAM, excluding disk handles and transient writer buffers.
+    pub fn resident_undo_blocks(&self) -> usize {
+        self.retained
+            .iter()
+            .filter(|held| {
+                matches!(held.content, RetainedContent::Full(_) | RetainedContent::Frame(_))
+            })
+            .count()
+    }
+
     pub fn fingerprint(&self) -> CoordinatedFingerprint {
         CoordinatedFingerprint {
             cache_block: self.cache.current_block(),
@@ -543,6 +553,9 @@ impl CoordinatedPair {
         retain: bool,
     ) -> CommitReport {
         let undo = self.retain_generation(displaced, block, accepted_head, retain);
+        debug!(target: "partial_stateless", block = block.number,
+            retained_depth = self.retained_depth(), resident_blocks = self.resident_undo_blocks(),
+            "Observed cache undo retention after commit");
         let observation = CacheObservation::capture(&self.cache, &self.trie_cache);
         CommitReport { readiness: self.readiness.finish_block(block, &observation).label(), undo }
     }
@@ -803,14 +816,12 @@ impl CoordinatedPair {
             let held = &self.retained[base + offset];
             let expected = lineage.generation_tag(offset).expect("offset is below the depth");
             if (held.block_number, held.block_hash) != expected {
-                debug!(
-                    target: "partial_stateless",
-                    held_block = held.block_number,
-                    held_hash = ?held.block_hash,
-                    expected_block = expected.0,
-                    expected_hash = ?expected.1,
-                    "A retained generation does not match the lineage; falling back to a rebuild"
-                );
+                warn!(target: "partial_stateless", cause = "lineage_mismatch",
+                    block = held.block_number, held_hash = ?held.block_hash,
+                    expected_block = expected.0, expected_hash = ?expected.1,
+                    requested_depth = depth, dropped_generations = self.retained.len(),
+                    retained_depth = 0, configured_depth = self.retention_depth.get(),
+                    "Undo coverage lost; retained history does not match the requested lineage");
                 // The whole deque, not the mismatching part. Every generation above the mismatch
                 // describes the branch the caller has just been told is not canonical, and the
                 // ones below cannot be reached without walking through it — so partial truncation
@@ -1020,53 +1031,122 @@ impl CoordinatedPair {
         ancestor_state_root: B256,
         cache_policy_id: B256,
     ) -> Option<RecoveryReport> {
+        let reject = |cause: &'static str, block: u64, detail: String| {
+            warn!(target: "partial_stateless", cause, block, %detail,
+                requested_depth = lineage.depth(), retained_depth = self.retained_depth(),
+                dropped_generations = 0,
+                "Disk undo refused; live caches and retained history are unchanged");
+            None
+        };
         let mut cache = self.cache.fork_for_rollback();
         let mut trie = self.trie_cache.fork_for_rollback();
         let mut frames_applied = 0;
         for held in self.retained.iter().skip(base).rev() {
+            let block = held.block_number + 1;
             let (frame, flat) = match &held.content {
                 RetainedContent::Disk(handle) => {
                     let bundle = match handle.load() {
                         Ok(bundle) => bundle,
-                        Err(error) => {
-                            warn!(target: "partial_stateless", %error, "Disk undo unavailable; recovering through fallback");
-                            return None
-                        }
+                        Err(error) => return reject("file_unavailable", block, error),
                     };
                     if bundle.parent_hash != held.block_hash {
-                        return None
+                        return reject(
+                            "parent_hash_mismatch",
+                            block,
+                            format!("expected {}, found {}", held.block_hash, bundle.parent_hash),
+                        )
                     }
                     (Some(bundle.trie), bundle.flat)
                 }
-                RetainedContent::Frame(frame) => (
-                    Some((**frame).clone()),
-                    self.cache.undo_record(held.block_number + 1)?.clone(),
-                ),
+                RetainedContent::Frame(frame) => {
+                    let Some(flat) = self.cache.undo_record(block) else {
+                        return reject(
+                            "missing_flat_record",
+                            block,
+                            "resident frame has no flat undo".into(),
+                        )
+                    };
+                    (Some((**frame).clone()), flat.clone())
+                }
                 RetainedContent::Full(parent) => {
                     trie = parent.fork_for_rollback();
-                    (None, self.cache.undo_record(held.block_number + 1)?.clone())
+                    let Some(flat) = self.cache.undo_record(block) else {
+                        return reject(
+                            "missing_flat_record",
+                            block,
+                            "resident generation has no flat undo".into(),
+                        )
+                    };
+                    (None, flat.clone())
                 }
             };
-            if flat.previous_block() != held.block_number || flat.previous_cache_root().is_none() {
-                return None
+            if flat.previous_block() != held.block_number {
+                return reject(
+                    "previous_block_mismatch",
+                    block,
+                    format!("expected {}, found {}", held.block_number, flat.previous_block()),
+                )
+            }
+            // Like can_rollback_to, only the landing record needs an authenticated cached root.
+            // Intermediate records are immediately replaced by the next undo in this candidate.
+            if held.block_number == lineage.ancestor().0 && flat.previous_cache_root().is_none() {
+                return reject(
+                    "missing_landing_cache_root",
+                    block,
+                    "landing flat undo has no cached root".into(),
+                )
             }
             if let Some(frame) = frame {
-                if frame.source() != trie.undo_id() ||
-                    frame.target() != held.undo_id ||
-                    !trie.undo(frame)
-                {
-                    return None
+                if frame.source() != trie.undo_id() || frame.target() != held.undo_id {
+                    return reject(
+                        "frame_generation_mismatch",
+                        block,
+                        format!(
+                            "expected {} -> {}, found {} -> {}",
+                            trie.undo_id(),
+                            held.undo_id,
+                            frame.source(),
+                            frame.target()
+                        ),
+                    )
+                }
+                if !trie.undo(frame) {
+                    return reject(
+                        "trie_undo_refused",
+                        block,
+                        "trie representation cannot apply this frame".into(),
+                    )
                 }
                 frames_applied += 1;
             }
             if trie.undo_id() != held.undo_id || trie.state_root() != held.state_root {
-                return None
+                return reject(
+                    "restored_trie_mismatch",
+                    block,
+                    format!(
+                        "expected generation {} root {:?}, found {} root {:?}",
+                        held.undo_id,
+                        held.state_root,
+                        trie.undo_id(),
+                        trie.state_root()
+                    ),
+                )
             }
-            cache.rollback_record(flat).ok()?;
+            if let Err(error) = cache.rollback_record(flat) {
+                return reject("flat_undo_refused", block, format!("{error:?}"))
+            }
         }
         let (number, hash) = lineage.ancestor();
         if cache.current_block() != number || trie.state_root() != Some(ancestor_state_root) {
-            return None
+            return reject(
+                "ancestor_state_mismatch",
+                number,
+                format!(
+                    "expected height {number} root {ancestor_state_root}, found {} root {:?}",
+                    cache.current_block(),
+                    trie.state_root()
+                ),
+            )
         }
         let checkpoint = TrustedCheckpoint {
             block_number: number,
@@ -1076,14 +1156,14 @@ impl CoordinatedPair {
             cache_policy_id,
         };
         let mut readiness = self.readiness.clone();
-        let ready = readiness
-            .restore_from_undone_blocks(
-                lineage.depth(),
-                &checkpoint,
-                &CacheObservation::capture(&cache, &trie),
-            )
-            .ok()?
-            .clone();
+        let ready = match readiness.restore_from_undone_blocks(
+            lineage.depth(),
+            &checkpoint,
+            &CacheObservation::capture(&cache, &trie),
+        ) {
+            Ok(ready) => ready.clone(),
+            Err(error) => return reject("readiness_refused", number, format!("{error:?}")),
+        };
         let head = self.retained[base].accepted_head.clone();
         // Publication has no remaining file reads or other fallible operations.
         self.cache.install_rollback(cache);

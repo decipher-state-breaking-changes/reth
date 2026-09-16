@@ -689,6 +689,8 @@ mod tests {
             disk_run(&mut disk, 32);
             disk_run(&mut memory, 32);
             let before = disk.pair.fingerprint();
+            assert_eq!(disk.pair.resident_undo_blocks(), 0);
+            assert_eq!(memory.pair.resident_undo_blocks(), 32);
             assert_eq!(disk.pair.retained_depth(), 32);
             assert_eq!(
                 disk.pair.retained.iter().filter(|g| g.content.frame().is_some()).count(),
@@ -724,6 +726,102 @@ mod tests {
             assert_eq!(disk.pair.fingerprint(), before);
             assert!(matches!(apply_reorg(&mut disk, &reorg), ReorgOutcome::Applied { .. }));
             assert!(disk.pair.trie_cache.structurally_eq(&memory.pair.trie_cache));
+        }
+    }
+
+    #[derive(Clone)]
+    struct WarningBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarningBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_undo_warnings(run: impl FnOnce()) -> String {
+        let buffer = WarningBuffer(Default::default());
+        let output = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || output.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn disk_undo_refusal_reports_cause_and_lineage_discard_reports_lost_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = disk_state(directory.path());
+        disk_run(&mut state, 2);
+        let RetainedContent::Disk(file) = &state.pair.retained.back().unwrap().content else {
+            panic!("disk")
+        };
+        let mut bundle = file.load().unwrap();
+        bundle.parent_hash = B256::ZERO;
+        let mut store = partial_stateless::disk_undo::DiskUndoStore::new(directory.path()).unwrap();
+        state.pair.retained.back_mut().unwrap().content =
+            RetainedContent::Disk(store.spill(bundle).unwrap());
+        let before = state.pair.fingerprint();
+        let (ancestor, abandoned) = state.history.suffix(1).unwrap();
+        let logs = capture_undo_warnings(|| {
+            assert!(matches!(
+                apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None)),
+                ReorgOutcome::Unrecoverable { .. }
+            ));
+        });
+        assert!(logs.contains("parent_hash_mismatch"), "{logs}");
+        assert!(logs.contains("dropped_generations=0"), "{logs}");
+        assert_eq!(state.pair.fingerprint(), before);
+        assert_eq!(state.pair.retained_depth(), 2);
+        let root = state.pair.trie_cache.state_root().unwrap();
+        let logs = capture_undo_warnings(|| {
+            assert!(state
+                .pair
+                .restore_retained_generation(B256::ZERO, root, state.config.cache_policy_id())
+                .is_none());
+        });
+        assert!(logs.contains("lineage_mismatch"), "{logs}");
+        assert!(logs.contains("dropped_generations=2"), "{logs}");
+        assert!(logs.contains("retained_depth=0"), "{logs}");
+        assert_eq!(state.pair.fingerprint(), before);
+    }
+
+    #[test]
+    fn disk_undo_requires_cached_root_only_at_the_landing_generation() {
+        for landing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = disk_state(directory.path());
+            disk_run(&mut state, 2);
+            let index = if landing { 0 } else { 1 };
+            let RetainedContent::Disk(file) = &state.pair.retained[index].content else {
+                panic!("disk")
+            };
+            let mut bundle = file.load().unwrap();
+            let mut flat = serde_json::to_value(&bundle.flat).unwrap();
+            flat["previous_cache_root"] = serde_json::Value::Null;
+            bundle.flat = serde_json::from_value(flat).unwrap();
+            let mut store =
+                partial_stateless::disk_undo::DiskUndoStore::new(directory.path()).unwrap();
+            state.pair.retained[index].content =
+                RetainedContent::Disk(store.spill(bundle).unwrap());
+            let before = state.pair.fingerprint();
+            let (ancestor, abandoned) = state.history.suffix(2).unwrap();
+            let outcome = apply_reorg(&mut state, &reorg_of(ancestor, abandoned, None));
+            if landing {
+                assert!(matches!(outcome, ReorgOutcome::Unrecoverable { .. }));
+                assert_eq!(state.pair.fingerprint(), before);
+            } else {
+                assert!(matches!(outcome, ReorgOutcome::Applied { .. }));
+                assert_eq!(state.pair.cache.current_block(), ANCHOR_BLOCK);
+            }
         }
     }
 

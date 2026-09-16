@@ -50,78 +50,38 @@ or either cache anchor.
 
 ## Reaching a usable cache
 
-Sparse-trie snapshots still have no general branch-aware undo representation, so
-every role that advances the caches keeps the displaced parent as one **retained
-coordinated generation**. On a depth-1 reorg it rolls the flat cache back once,
-restores that parent trie, and verifies the target hash, canonical state root,
-policy, and readiness before continuing. What happens beyond that point depends on
-the role: an ExEx-attached full node may use the **provider-backed canonical rebuild**
-([`rebuild.rs`](./src/rebuild.rs)); the standalone validator has no provider or
-database path and instead enters `NeedsSnapshot` until the producer supplies a
-recovery checkpoint bound to the required ancestor.
+Committed blocks retain paired trie and flat-cache undo files. The default is **K=32**, with
+**zero completed undo payloads retained in memory**: even depth-one recovery reads its file.
+Each trie frame restores node preimages and displaced storage tries, including branch/extension
+collapses and pruning. A reorg or revert within the available history checks lineage, generation
+identity, state roots, cache policy and readiness before publishing the recovered pair.
 
-The rebuild produces an exact coordinated pair at a canonical block hash without
-consulting the abandoned generation. It replays `max_window + 1` heights ending
-at that block to rebuild the flat cache, then authenticates the trie in one shot
-against the block's canonical state root. The same primitive serves cold start,
-deep-reorg fallback, and revert. Replaying forward from an abandoned cached
-generation would be *incorrect*, not merely slow.
+When that recovery cannot apply, the role determines the fallback. An ExEx-attached full node
+may use the **provider-backed canonical rebuild** ([`rebuild.rs`](./src/rebuild.rs)); the
+standalone validator has no provider/database path and enters `NeedsSnapshot` until a recovery
+checkpoint arrives. Missing or corrupt undo never partially changes the live caches.
 
-**The rebuild is opt-in, under `PS_CANONICAL_REBUILD=1`.** It is not free: the
-one-shot multiproof over the whole cache dominates its cost and holds a single
-read transaction open for its whole duration — measured at 120.5 s of 144.8 s
-cold — so a process that turns it on stalls once per cache epoch before it can
-publish anything. Warming instead spreads the same "not usable yet" period over a
-policy window of live blocks. The table below describes an enabled rebuild; every
-row falls through to warming when it is off.
+The rebuild replays `max_window + 1` heights ending at the canonical target to reconstruct the
+flat cache, then authenticates the trie against that block's state root. It requires those
+heights to remain readable; aggressive pruning can prevent it. **Rebuild is opt-in under
+`PS_CANONICAL_REBUILD=1`** because its whole-cache proof can stall processing. With rebuild
+disabled or unavailable, the ExEx resets and warms from live blocks.
 
-| Situation | What happens |
+| Situation | Recovery |
 | --- | --- |
-| Cold start | Rebuild at the parent of the first notified block, then publish from its first child. Roughly `window + 1` historical executions and one multiproof, against about twelve minutes of live warming. |
-| `ChainReorged` | Enter `Recovering`. Try the retained parent first for a depth-1 reorg against an already-warm pair; otherwise rebuild at the common ancestor. Apply the new blocks through the normal path so the builder still produces a sidecar for each. |
-| `ChainReverted` | Enter `Recovering` and rebuild at the new tip, addressed as the parent hash of the reverted chain's first block. |
-| Gap or wrong-branch parent | Try a rebuild at the rejected block's own parent first; only fall back to a cold reset and live warming if that fails. |
-| Rebuild disabled, unavailable, or failing | Log it and warm from live blocks. A failed recovery is logged as such rather than sharing a code path with a clean cold start, and three consecutive failures stop further attempts for the run. Being switched off is not a failure and is not logged as one: read `canonical_rebuild` in the startup summary line. |
+| Cold start | Rebuild at the first notified block's parent if enabled; otherwise warm from live blocks. |
+| `ChainReorged` | Undo the abandoned branch to the common ancestor, then apply the new blocks normally. If retained history cannot recover it, attempt rebuild. |
+| `ChainReverted` | Undo the reverted branch to its parent; attempt rebuild on refusal. |
+| Gap or wrong-branch parent | Attempt rebuild at the rejected block's parent, then reset/warm on failure. |
+| Rebuild disabled, unavailable or failing | Log the outcome and warm. Three consecutive rebuild failures stop further attempts for the run. |
 
-The retained-generation path above is unaffected by the switch. A depth-1 reorg
-against an already-warm pair still recovers in tens of milliseconds with the
-rebuild off; what the switch changes is only what happens when that path does not
-apply.
+Undo is independent of the rebuild switch and cannot promote an under-warmed cache to Ready.
+The recovered pair must still cover its policy window or be backed by an authenticated
+checkpoint. K bounds recoverable execution blocks; **K=64 is supported but is not a finality
+guarantee**. Undo files are disposable session data, not warm-restart checkpoints.
 
-The retained-generation path covers exactly one block. It adds no new trie clone
-in either role: the transition already copies the parent trie and then overwrites
-it, so both the builder and the live verifier keep a copy that exists anyway. A
-builder-side preflight discards its transactional result and displaces nothing, so
-it retains nothing. A deeper reorg falls back to the rebuild only in a full-node
-role; a standalone consumer stops applying frames and requests a recovery snapshot.
-
-Restoring a retained generation cannot promote a pair that is still warming. The
-undo gives back exactly one replayed block, so it is accepted only when the window
-stays whole without it — a pair one block past a snapshot qualifies, because the
-generation underneath is the one the checkpoint vouched for, while a pair that
-just barely filled its window by replay does not. Otherwise the pair falls through
-to the rebuild, which is the only thing that genuinely fills a window. Promoting
-instead would open the sidecar publication gate on an under-warmed cache.
-
-The rebuild requires canonical state, so it does not replace the snapshot path: a
-full node cold-starts by replay and needs no snapshot file, while a node without
-the database cannot replay at all and needs one. It also assumes the last
-`max_window + 1` heights are readable through `history_by_block_hash`, which holds
-for a full node but not under aggressive pruning.
-
-**The standalone path past depth 1 is snapshot recovery, not database rebuild.** A
-`Reorg`, `Revert`, or gap that cannot use the retained generation moves the consumer
-to `NeedsSnapshot`; it does not guess forward from stale cache state. The producer
-publishes a new checkpoint for the recovery ancestor, the consumer verifies and
-installs it, then replays the winning frames. This protocol is implemented and
-synthetically exercised for deeper reorg/revert cases; live mainnet evidence remains
-K = 1 because deeper events did not occur in the live runs.
-
-**Neither recovery path is reachable from the measured verification path.** The
-validator numbers only mean anything because the benchmark validates from
-serialized sidecar bytes against the cache, trie cache, and witness alone.
-Recovery is cache *maintenance* and runs between measured samples, never inside
-one.
+Recovery runs between block-verification samples. Historical depth-one timings do not measure
+the current disk path.
 
 ## Operator-trusted snapshot bootstrap
 
@@ -173,8 +133,9 @@ but it does select a different cache-policy ID and persisted-cache filename. Use
 [`cache_window_bench`](../partial-stateless/src/bin/README.md) to screen candidate values
 offline before committing to them.
 
-Optional diagnostic/benchmark features are off by default and enabled per run via environment
-variables, so the core sidecar generation path stays lean:
+Disk undo is enabled by default. Its settings survive snapshot restore, rebuild and reset.
+Incompatible legacy settings fail startup; unset them to use the current profile. Optional
+diagnostics and benchmark features still require explicit enablement.
 
 | Env var | Effect |
 | --- | --- |
@@ -182,7 +143,12 @@ variables, so the core sidecar generation path stays lean:
 | `PS_SIDECAR_DIR=<dir>` | write sidecars in `<dir>` (default: `./sidecar`) |
 | `PS_ACCOUNT_WINDOW=<n>` / `PS_STORAGE_WINDOW=<n>` | inclusive Last-N account and storage/code cache windows (defaults: `60` / `30`). Both are runtime protocol parameters: they select the policy ID and persisted-cache filename; non-positive, signed, whitespace-padded, or non-decimal values fail startup |
 | `PS_WITNESS_V3=1` | emit receiver-aware `MptTrimmedTransitionNodes` for a Ready cache; Cold/Warming and full-witness sidecars remain self-contained v2 (default: disabled; enabled explicitly by the frozen cohort profile) |
-| `PS_TRIE_REPR=exact\|parallel` | select the sparse-trie representation for cache account and storage tries (default: `exact`). `parallel` remains a differential control and is restricted to cold-started pairs because bootstrap restore/rebuild constructs the adopted default |
+| `PS_RETAIN_DEPTH=<K>` | undo retention cap, default `32`, range `1..=64` execution blocks |
+| `PS_UNDO_DIR=<dir>` | undo session directory parent, default `$PS_SIDECAR_DIR/undo`; failure to create/open/lock the store aborts startup |
+| `PS_TRIE_REPR=exact` | required representation and default; legacy `parallel` is rejected |
+| `PS_UNDO_LAYOUT=frames` | required layout and default; legacy `hybrid` is rejected |
+| `PS_UNDO_RECORD=on` | recording is on by default; disabling it is rejected |
+| `PS_RETAIN_GENERATION=1` | retention is on by default; disabling it is rejected |
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's accessed-state snapshot to `<dir>` (see below) |
 | `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |
@@ -219,6 +185,51 @@ variables, so the core sidecar generation path stays lean:
 | `PS_STREAM_EXPORT_MAX_WORKERS=<n>` | live export workers allowed at once, abandoned ones included — each holds an MDBX read transaction for its whole multiproof. At the cap a fresh attempt waits for a slot; invalid values are a startup error (default: 4) |
 | `PS_STREAM_REORG_CHECKPOINT=always\|never` | whether a branch change re-checkpoints the open stream at the block it recovered to (default: `always`; anything else is a startup error) |
 | `PS_BUILD_COMMIT` / `PS_BUILD_DIRTY` / `PS_CARGO_LOCK_SHA256` | **compile-time**, not runtime: exported before `cargo build`, read by `option_env!`, and baked into the binary so its run manifests can name their own build (`git rev-parse HEAD`, `0`/`1` tree dirtiness, `sha256sum Cargo.lock`). Unset builds stamp `null` plus a note; the long gate requires a non-null commit from a clean tree, and a policy replay dataset capture refuses to start without one |
+
+### Disk undo operation and standalone replay
+
+No undo flags are needed for an ordinary ExEx run. To select a larger cap or a separate disk,
+set `PS_RETAIN_DEPTH=64` and/or `PS_UNDO_DIR=/path/to/undo` before launching the node. Remove old
+`PS_TRIE_REPR=parallel`, `PS_UNDO_LAYOUT=hybrid`, `PS_UNDO_RECORD=off` and
+`PS_RETAIN_GENERATION=0` settings; they no longer select a supported ExEx mode.
+
+`ps-replay` batch and follow use K=32, recording on, frames and `<spool-dir>/undo` by default:
+
+```sh
+ps-replay <spool-dir>
+ps-replay --follow <spool-dir>
+# Optional overrides, supported in both modes:
+ps-replay <spool-dir> --retain-depth 64 --undo-dir /path/to/undo
+```
+
+Replay also accepts `PS_RETAIN_DEPTH`, `PS_UNDO_DIR`, `PS_UNDO_RECORD` and `PS_UNDO_LAYOUT`;
+CLI flags override their environment values. `--undo-record on` and `--undo-layout frames`
+are redundant; `off` and `hybrid` are rejected. A read-only spool needs a writable `--undo-dir`.
+Listing/inspecting spool frames does not create an undo store.
+
+After pending writes finish, each pair has at most K `.undo` files. Expiry, rollback and reset
+release files. A writer may additionally have one temporary/finishing file; lock files are
+metadata. Startup cleans inactive owned sessions and preserves active sessions. The writer has
+one active and one queued bundle, plus encoding buffers and an outgoing bundle while enqueue
+waits. These transient allocations and the per-block working clone are outside the zero-resident
+history policy. Recovery also needs temporary copies of the live caches plus one decoded bundle;
+no disk-path peak-RSS measurement is claimed.
+
+Enqueue warns after 100 ms and refuses after 1 s. Recovery waits at most 5 s for a pending write;
+these limits do not cancel filesystem syscalls. Write, file-integrity, lineage, generation,
+root and readiness failures log their reason and block before the existing recovery fallback.
+History-discard warnings include `dropped_generations` and `retained_depth`. A restore rejection
+that preserves history reports zero dropped generations; retained depth alone does not prove
+that every file is readable.
+
+The startup retention log and per-commit debug log report the actual resident Full/Frame count.
+Replay records that count as `undo_resident_blocks` in each committed block's timing record
+(`null` for an attempt that did not commit); the manifest's `undo_resident_blocks_limit` is the
+configured limit, not a measurement. Both exclude writer buffers and disk handles.
+
+When deploying, confirm K, layout, recording and directory in startup logs, then check ordinary
+commits for file rotation and writer/coverage-loss warnings. No additional performance campaign
+is required to enable the feature.
 
 The initial parallel-proof gate currently requires at least two distinct storage tries and 64
 total initial targets. Eligible one-shot calls use one account worker and a workload-bounded number
