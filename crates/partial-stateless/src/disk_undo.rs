@@ -7,7 +7,7 @@
 use crate::{
     network_cache::BlockCacheUndo, trie_cache_undo::StorageTrieBefore, TrieCacheUndoFrame,
 };
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::B256;
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAGIC: &[u8; 8] = b"PSUNDO01";
+const MAGIC: &[u8; 8] = b"PSUNDO02";
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const SPILL_WARN_AFTER: Duration = Duration::from_millis(100);
 const SPILL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -114,7 +114,7 @@ impl DiskUndoHandle {
         }
         let read_us = micros(started);
         let started = Instant::now();
-        if bytes[8..40] != written.checksum[..] || keccak256(&bytes[40..]) != written.checksum {
+        if bytes[8..40] != written.checksum[..] || checksum(&bytes[40..]) != written.checksum {
             return Err("undo file checksum mismatch".into())
         }
         let checksum_us = micros(started);
@@ -538,9 +538,11 @@ fn send_with_timeout<T>(
     }
 }
 
+/// Varint integers: nearly every integer in a bundle is a collection length or a small count, and
+/// fixint spends eight bytes on each.
 pub(crate) fn codec() -> impl Options {
     bincode::DefaultOptions::new()
-        .with_fixint_encoding()
+        .with_varint_encoding()
         .with_limit(MAX_BYTES)
         .reject_trailing_bytes()
 }
@@ -655,7 +657,7 @@ fn write_bundle(
     let payload = encode_bundle(bundle, capacity, &mut timing.parts)?;
     timing.serialize_us = micros(started);
     let started = Instant::now();
-    let checksum = keccak256(&payload);
+    let checksum = checksum(&payload);
     timing.checksum_us = micros(started);
     let started = Instant::now();
     let temporary = file.path.with_extension("tmp");
@@ -671,6 +673,15 @@ fn write_bundle(
     timing.write_us = micros(started);
     timing.bytes = payload.len() as u64 + 40;
     Ok(Written { bytes: payload.len() as u64 + 40, checksum })
+}
+
+/// The digest the writer keeps in memory and the loader recomputes.
+///
+/// A cryptographic hash, so a file changed on disk cannot be made to match the digest this
+/// process holds for it. BLAKE3 rather than the keccak256 used elsewhere in the crate: nothing
+/// outside this module sees the value, and over a bundle keccak costs several times as much.
+fn checksum(payload: &[u8]) -> B256 {
+    B256::from(*blake3::hash(payload).as_bytes())
 }
 
 #[cfg(test)]

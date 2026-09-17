@@ -6465,6 +6465,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "blake3",
  "eyre",
  "reth-execution-access",
  "reth-fs-util",
