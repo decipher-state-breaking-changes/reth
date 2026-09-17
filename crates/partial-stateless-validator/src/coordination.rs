@@ -34,7 +34,11 @@ use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHe
 /// making it add a dependency to spell the return type would be a boundary that means nothing.
 pub use reth_storage_errors::provider::ProviderResult;
 use serde::Serialize;
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{mpsc, OnceLock},
+    time::Instant,
+};
 use tracing::{debug, info, warn};
 
 /// The deepest reorg any pair may be configured to undo from its own retained generations.
@@ -562,17 +566,24 @@ impl CoordinatedPair {
             Some(trie_cache)
         };
         let expiry_started = Instant::now();
+        let mut expired = Vec::new();
         while self.retained.len() > self.retention_depth.as_usize() {
-            self.retained.pop_front();
+            expired.extend(self.retained.pop_front());
         }
         report.history_expire_us = expiry_started.elapsed().as_micros() as u64;
         let spill_started = Instant::now();
         self.spill_undo();
         report.spill_call_us = spill_started.elapsed().as_micros() as u64;
-        // Keep the original lifetime: the displaced parent was dropped after enqueue, so the
-        // writer may already be working while its remaining allocations are reclaimed.
+        // After enqueue, as before, so the writer may already be working while the parent is
+        // reclaimed — but reclaimed on the release thread. A frame that records rewritten storage
+        // tries as change records no longer takes the parent's old tries with it, so the parent
+        // carries every one of them, and freeing ~170 tries synchronously doubled this interval.
+        // Expired generations go with it, in one handoff: a resident frame is megabytes of change
+        // records, and a disk one is a file to unlink.
         let drop_started = Instant::now();
-        drop(parent_to_drop);
+        if parent_to_drop.is_some() || !expired.is_empty() {
+            release_off_commit_path((parent_to_drop, expired));
+        }
         report.parent_drop_us = drop_started.elapsed().as_micros() as u64;
         report
     }
@@ -1365,12 +1376,46 @@ pub struct CommitUndoReport {
     /// is not bracketed anywhere. Measuring it requires comparison with recording disabled.
     pub us: u64,
     pub accounting_us: u64,
+    /// Handing the displaced parent and the expired generations to the release thread, including
+    /// the wait while one handoff is being freed and another is already queued. Freeing them, and
+    /// unlinking expired disk files, is off the commit path.
     pub parent_drop_us: u64,
-    /// Retained-deque expiry wall time, including synchronous file-handle drops and unlinks.
+    /// Retained-deque expiry wall time: taking expired generations out of the deque. Their release
+    /// is in `parent_drop_us`.
     pub history_expire_us: u64,
     /// Bundle handoff call including enqueue backpressure and error cleanup.
     /// The store's cumulative `enqueue_us` is nested within this wall interval.
     pub spill_call_us: u64,
+}
+
+/// Frees `value` on a thread of its own, or here if that thread cannot be had.
+///
+/// A one-slot queue in front of one thread: a caller waits only while one value is being freed
+/// and another is already queued, so at most two ever outlive the call, and a release that cannot
+/// keep up slows commits down rather than growing memory. Process-wide, like the commit it serves:
+/// pairs do not overlap their commits.
+fn release_off_commit_path<T: Send + 'static>(value: T) {
+    static RELEASE: OnceLock<Option<mpsc::SyncSender<Box<dyn Send>>>> = OnceLock::new();
+    let sender = RELEASE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<Box<dyn Send>>(1);
+        std::thread::Builder::new()
+            .name("ps-generation-release".into())
+            .spawn(move || {
+                for value in receiver {
+                    drop(value);
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+    match sender {
+        Some(sender) => {
+            if let Err(mpsc::SendError(value)) = sender.send(Box::new(value)) {
+                drop(value);
+            }
+        }
+        None => drop(value),
+    }
 }
 
 /// One frame, and which block it undoes.
@@ -1688,5 +1733,39 @@ pub fn block_context(block: &RecoveredBlock<BlockTy<EthPrimitives>>) -> BlockCon
         hash: block.hash(),
         parent_hash: block.parent_hash,
         state_root: block.state_root(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn a_released_value_is_freed_off_the_calling_thread() {
+        struct Sentinel(mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+
+        let (freed, on) = mpsc::channel();
+        for _ in 0..4 {
+            release_off_commit_path(Sentinel(freed.clone()));
+        }
+        for _ in 0..4 {
+            let thread = on.recv_timeout(Duration::from_secs(10)).expect("every value is freed");
+            assert_ne!(thread, std::thread::current().id());
+        }
+
+        // Nothing is kept once freed.
+        let shared = Arc::new(());
+        release_off_commit_path(Arc::clone(&shared));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&shared) > 1 {
+            assert!(Instant::now() < deadline, "the released clone was never dropped");
+            std::thread::yield_now();
+        }
     }
 }
