@@ -1418,6 +1418,25 @@ fn release_off_commit_path<T: Send + 'static>(value: T) {
     }
 }
 
+/// Blocks until every generation handed off by earlier commits has been freed.
+///
+/// Commits free the displaced parent and expired generations on a release thread, so what a
+/// release does — a disk undo file unlinked, heap returned — can lag the commit that caused it.
+/// Call this before observing either. The thread frees in queue order, so the marker sent here is
+/// dropped after everything queued before it.
+pub fn wait_for_released_generations() {
+    struct Marker(mpsc::SyncSender<()>);
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let (freed, on_freed) = mpsc::sync_channel(1);
+    release_off_commit_path(Marker(freed));
+    let _ = on_freed.recv();
+}
+
 /// One frame, and which block it undoes.
 ///
 /// The block is carried rather than inferred by the reader. A hybrid frame describes the previous
@@ -1758,6 +1777,24 @@ mod tests {
             let thread = on.recv_timeout(Duration::from_secs(10)).expect("every value is freed");
             assert_ne!(thread, std::thread::current().id());
         }
+
+        // A wait returns only after everything released before it was dropped.
+        let slow: Vec<_> = (0..3)
+            .map(|_| {
+                struct Slow(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Slow {
+                    fn drop(&mut self) {
+                        std::thread::sleep(Duration::from_millis(20));
+                        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                release_off_commit_path(Slow(Arc::clone(&dropped)));
+                dropped
+            })
+            .collect();
+        wait_for_released_generations();
+        assert!(slow.iter().all(|dropped| dropped.load(std::sync::atomic::Ordering::SeqCst)));
 
         // Nothing is kept once freed.
         let shared = Arc::new(());

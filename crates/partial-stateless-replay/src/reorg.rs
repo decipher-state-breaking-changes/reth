@@ -404,8 +404,8 @@ mod tests {
     };
     use partial_stateless_stream::{Checkpoint, Manifest};
     use partial_stateless_validator::{
-        admit_block, BlockAdmission, CommitReport, CoordinatedPair, RetainedContent,
-        RetainedGeneration, RetentionDepth, UndoLayout,
+        admit_block, wait_for_released_generations, BlockAdmission, CommitReport, CoordinatedPair,
+        RetainedContent, RetainedGeneration, RetentionDepth, UndoLayout,
     };
     use reth_chainspec::{EthChainSpec, MAINNET};
     use reth_primitives_traits::{Account, SealedHeader};
@@ -820,12 +820,16 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct WarningBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    std::thread_local! {
+        static CAPTURED_LOGS: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl std::io::Write for WarningBuffer {
+    struct ThreadLogBuffer;
+
+    impl std::io::Write for ThreadLogBuffer {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            CAPTURED_LOGS.with(|logs| logs.borrow_mut().extend_from_slice(bytes));
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -833,18 +837,29 @@ mod tests {
         }
     }
 
+    /// What `run` logged on this thread.
+    ///
+    /// One process-wide subscriber files each event under the thread that emitted it. A scoped
+    /// subscriber per test does not work with tests running in parallel: callsite interest is
+    /// cached process-wide, and a test whose callsite was first hit elsewhere intermittently
+    /// captured nothing. The rebuild covers a callsite first hit before the subscriber existed.
     fn capture_undo_logs(run: impl FnOnce()) -> String {
-        let buffer = WarningBuffer(Default::default());
-        let output = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(move || output.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        let bytes = buffer.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| ThreadLogBuffer)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this crate installs a subscriber");
+        });
+        tracing::callsite::rebuild_interest_cache();
+        CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());
+        run();
+        String::from_utf8(CAPTURED_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut())))
+            .unwrap()
     }
 
     #[test]
@@ -1033,6 +1048,7 @@ mod tests {
         for offset in 3..=34 {
             advance_retaining(&mut state, ANCHOR_BLOCK + offset, offset as u8, true);
         }
+        wait_for_released_generations();
         assert!(!old_path.exists(), "K bounds file retention as well as the deque");
         let pending: Vec<_> = state
             .pair
@@ -1069,6 +1085,7 @@ mod tests {
                     panic!("all history is on disk")
                 };
                 latest.load().unwrap(); // Serial writer: all earlier jobs have completed too.
+                wait_for_released_generations(); // Expired handles unlink their files there.
                 let files = std::fs::read_dir(latest.path().parent().unwrap())
                     .unwrap()
                     .map(Result::unwrap)
