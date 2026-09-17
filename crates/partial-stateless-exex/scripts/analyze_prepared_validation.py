@@ -27,9 +27,11 @@ def load_pass(directory):
         raise ValueError(f"{directory}: incompatible timing boundary")
     partial = config["arm"] != "weak"
     writer = result.get("writer")
-    if partial and (not isinstance(writer, dict) or config.get("undo_layout") != "disk-frames"
+    disk = partial and config.get("undo_layout") == "disk-frames"
+    if partial and (config.get("undo_layout") not in ("disk-frames", "memory-frames")
+                    or (disk and not isinstance(writer, dict)) or (not disk and writer is not None)
                     or config.get("undo_recording") is not True or not 1 <= config["retention_depth"] <= 64):
-        raise ValueError(f"{directory}: missing disk-undo profile or final writer counters")
+        raise ValueError(f"{directory}: missing undo profile or final writer counters")
     if not partial and (writer is not None or config.get("undo_layout") != "none" or config.get("retention_depth") != 0):
         raise ValueError(f"{directory}: incompatible cacheless profile")
     writer = writer or {}
@@ -47,7 +49,9 @@ def load_pass(directory):
     keys = [(row["block_number"], row["block_hash"]) for row in measured]
     if len(set(keys)) != len(keys):
         raise ValueError(f"{directory}: repeated block")
-    if any(row["resident_flat_undo_records"] != 0 for row in rows):
+    # Memory frames keep one flat record per retained frame; nothing else may accumulate.
+    flat_limit = config["retention_depth"] if partial and not disk else 0
+    if any(row["resident_flat_undo_records"] > flat_limit for row in rows):
         raise ValueError(f"{directory}: accumulated resident flat undo")
     for row in rows:
         if not 0 <= row["verified_us"] <= row["block_step_us"]:
@@ -55,9 +59,9 @@ def load_pass(directory):
         disk = row["commit"].get("disk") or {}
         if row.get("active_warm_shrink_blocks") != config.get("warm_shrink_blocks"):
             raise ValueError(f"{directory}: active warm-shrink policy disagrees with run manifest")
-        if partial and row["commit"].get("disk") is None:
+        if disk and row["commit"].get("disk") is None:
             raise ValueError(f"{directory}: missing per-block disk counters")
-        if partial:
+        if disk:
             commit = row["commit"]
             retained = commit["retained_depth"]
             if commit.get("completed_prior_depth", 0) > max(0, retained - 1):
@@ -66,7 +70,7 @@ def load_pass(directory):
                 raise ValueError(f"{directory}: missing current undo completion state")
         if any(disk.get(key, 0) for key in ("failed", "enqueue_failures", "telemetry_failures")):
             raise ValueError(f"{directory}: writer failure during pass")
-    if partial and writer.get("submitted") != writer.get("completed", 0) + writer.get("cancelled", 0):
+    if disk and writer.get("submitted") != writer.get("completed", 0) + writer.get("cancelled", 0):
         raise ValueError(f"{directory}: inconsistent writer completion counters")
     return config, result, measured
 

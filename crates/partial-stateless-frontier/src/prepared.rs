@@ -194,6 +194,13 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         Ok(raw) => raw.parse().map_err(|err| eyre::eyre!("PS_STORAGE_UNDO: {err}"))?,
         Err(_) => Default::default(),
     };
+    // Where a Partial arm keeps its frames: session-local disk files (the production profile), or
+    // the retained deque itself, which prices keeping the same K frames resident instead.
+    let frames_in_memory = match std::env::var("PS_UNDO_STORE").as_deref() {
+        Ok("memory") => true,
+        Ok("disk") | Err(_) => false,
+        Ok(other) => eyre::bail!("PS_UNDO_STORE={other:?}; use disk or memory"),
+    };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let value = args.next().ok_or_else(|| eyre::eyre!("{arg} needs a value"))?;
@@ -254,7 +261,12 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         pair
     };
     let mut pair = make_pair(parent.number());
-    if arm != ArmKind::Weak {
+    if arm != ArmKind::Weak && frames_in_memory {
+        if undo_dir.is_some() {
+            eyre::bail!("--undo-dir conflicts with PS_UNDO_STORE=memory")
+        }
+        pair.trie_cache.set_undo_recording(true);
+    } else if arm != ArmKind::Weak {
         pair.enable_disk_undo(&undo_dir.unwrap_or_else(|| output.join("undo")))
             .map_err(eyre::Report::msg)?;
         // Each standalone pass owns its telemetry; shared global output paths are unnecessary.
@@ -290,7 +302,11 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "rayon_num_threads": std::env::var("RAYON_NUM_THREADS").ok(), "malloc_conf": std::env::var("MALLOC_CONF").ok(),
         "undo_recording": arm != ArmKind::Weak,
         "retention_depth": if arm == ArmKind::Weak { 0 } else { depth.get() },
-        "undo_layout": if arm == ArmKind::Weak { "none" } else { "disk-frames" },
+        "undo_layout": match (arm, frames_in_memory) {
+            (ArmKind::Weak, _) => "none",
+            (_, false) => "disk-frames",
+            (_, true) => "memory-frames",
+        },
         "storage_undo": (arm != ArmKind::Weak).then(|| pair.trie_cache.storage_undo().label()),
         "warm_shrink_blocks": shrink.interval().map(std::num::NonZeroU64::get), "warmup": manifest.warmup, "samples": manifest.samples,
         "interval_ms": interval_ms, "timing_boundary": "payload_decode_through_coordinated_commit",
@@ -348,7 +364,13 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
             arm != ArmKind::Weak,
         );
         let prune_at = Instant::now();
-        pair.cache.prune_undo_below(ctx.number);
+        // Disk frames carry their block's flat record with them; resident frames need theirs kept.
+        let prune_below = if frames_in_memory && arm != ArmKind::Weak {
+            ctx.number.saturating_sub(depth.get())
+        } else {
+            ctx.number
+        };
+        pair.cache.prune_undo_below(prune_below);
         let undo_prune_us = prune_at.elapsed().as_micros() as u64;
         // Cacheless cleanup belongs to its step too. No state from the previous block survives.
         if arm == ArmKind::Weak {

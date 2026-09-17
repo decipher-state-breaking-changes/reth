@@ -80,7 +80,25 @@ class PreparedTests(unittest.TestCase):
             load_pass(directory)
         self.change(directory, "run.json", "warmup", 0)
         self.change(directory, "result.json", "writer", None)
-        with self.assertRaisesRegex(ValueError, "disk-undo"):
+        with self.assertRaisesRegex(ValueError, "undo profile"):
+            load_pass(directory)
+
+    def test_memory_frames_have_no_writer_and_keep_one_flat_record_per_frame(self):
+        directory = self.make_pass("run", "90/60")
+        self.change(directory, "run.json", "undo_layout", "memory-frames")
+        with self.assertRaisesRegex(ValueError, "undo profile"):
+            load_pass(directory)
+        self.change(directory, "result.json", "writer", None)
+        path = directory / "validation.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            row["commit"] = {"retained_depth": 32}
+            row["resident_flat_undo_records"] = 32
+        path.write_text("\n".join(map(json.dumps, rows)))
+        load_pass(directory)
+        rows[2]["resident_flat_undo_records"] = 33
+        path.write_text("\n".join(map(json.dumps, rows)))
+        with self.assertRaisesRegex(ValueError, "resident flat undo"):
             load_pass(directory)
 
     def test_rejects_diagnostic_run_and_mismatched_build(self):
