@@ -201,6 +201,23 @@ impl CacheTrie {
     }
 }
 
+/// A storage trie's record starts at its first write, from the handle that shares it, rather than
+/// at a snapshot the way the account trie's does.
+impl crate::shared_trie::UndoRecording for CacheTrie {
+    type Record = UndoFrame;
+
+    fn restart_undo(&mut self) {
+        if let Self::Exact(trie) = self {
+            drop(trie.take_undo());
+            trie.begin_undo();
+        }
+    }
+
+    fn take_undo(&mut self) -> Option<UndoFrame> {
+        Self::take_undo(self)
+    }
+}
+
 impl SparseTrie for CacheTrie {
     fn set_root(
         &mut self,

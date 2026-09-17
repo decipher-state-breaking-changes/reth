@@ -297,8 +297,15 @@ impl CoordinatedPair {
                 .expect("installed above")
                 .enable_metrics(directory.as_ref())?;
         }
+        // Whole by default. A delta reads the storage trie's own record, which exists only in the
+        // frames layout this call selects: a frame taken at commit, against a parent still alive.
+        let storage_undo = match std::env::var("PS_STORAGE_UNDO") {
+            Ok(raw) => raw.parse().map_err(|err| format!("PS_STORAGE_UNDO: {err}"))?,
+            Err(_) => partial_stateless::StorageUndo::default(),
+        };
         self.undo_layout = UndoLayout::FramesOnly;
         self.trie_cache.set_undo_recording(true);
+        self.trie_cache.set_storage_undo(storage_undo);
         Ok(())
     }
 
@@ -784,6 +791,7 @@ impl CoordinatedPair {
         // leave the manifest saying one thing and the deque doing another, which is exactly what a
         // measured arm cannot afford.
         trie_cache.set_undo_recording(self.trie_cache.records_undo());
+        trie_cache.set_storage_undo(self.trie_cache.storage_undo());
         self.trie_cache = trie_cache;
         self.cache.reset();
         self.readiness.reset();

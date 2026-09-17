@@ -14,6 +14,11 @@
 //! reachable only through [`SharedSparseTrie::make_mut`], so every `&mut` path in the
 //! [`SparseTrie`] surface copies before it writes. A missed write would corrupt the parent
 //! generation, which is exactly the failure a predicted write set invites.
+//!
+//! The same chokepoint is where an undo record of a storage trie begins. A handle cloned with
+//! [`SharedSparseTrie::clone_recording`] starts its trie's record at its first write, when the trie
+//! is still exactly the parent's, so the record is what turns the rewritten trie back into the
+//! parent's without keeping the parent's copy.
 
 use alloy_primitives::{
     map::{B256Map, HashMap, HashSet},
@@ -59,6 +64,7 @@ pub fn cow_copies_taken() -> u64 {
 pub struct SharedSparseTrie<T = ParallelSparseTrie> {
     inner: Arc<T>,
     ownership: Ownership,
+    undo: UndoTracking,
 }
 
 /// How this handle came to own, or not own, its trie.
@@ -76,10 +82,40 @@ enum Ownership {
     Private,
 }
 
+/// Where a handle's undo record stands.
+///
+/// Per handle and per block: every snapshot clones its handles afresh, so a record never spans two
+/// blocks and a handle never has to tell a first write from a tenth by anything but its ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoTracking {
+    /// No record is kept.
+    Off,
+    /// The first write starts a record.
+    Armed,
+    /// A record has been kept since the first write, which found the trie at allocation `origin`.
+    ///
+    /// The origin is what ties the record to a parent: the handle can be moved to another address
+    /// or back into a reuse pool, but a record only describes the trie it started on, and a parent
+    /// still holding that allocation is the proof that its trie is the one the record reverses.
+    Recording { origin: usize },
+    /// A later write copied the trie out from under another holder, and the copy carries no
+    /// record of the writes before it.
+    Lost,
+}
+
 impl<T> SharedSparseTrie<T> {
     /// Wraps an owned trie.
     pub fn new(trie: T) -> Self {
-        Self { inner: Arc::new(trie), ownership: Ownership::Private }
+        Self { inner: Arc::new(trie), ownership: Ownership::Private, undo: UndoTracking::Off }
+    }
+
+    /// A clone whose first write starts an undo record in the trie, from the content both handles
+    /// still share.
+    ///
+    /// A plain [`Clone`] records nothing, so a handle cloned for any other purpose can never pass
+    /// for a record of the snapshot's writes.
+    pub fn clone_recording(&self) -> Self {
+        Self { undo: UndoTracking::Armed, ..self.clone() }
     }
 
     /// Whether this handle has not been written to since it was cloned from its parent.
@@ -127,24 +163,103 @@ impl<T> SharedSparseTrie<T> {
     }
 }
 
-impl<T: Clone> SharedSparseTrie<T> {
+impl<T: Clone + UndoRecording> SharedSparseTrie<T> {
     /// Mutable access, taking a private copy first if the trie is still shared.
+    ///
+    /// The first call on an armed handle starts the undo record, on both ways out of `Shared`: a
+    /// copy taken from under the parent, and a handle already unique, which copies nothing and
+    /// would otherwise write its first changes unrecorded.
     pub fn make_mut(&mut self) -> &mut T {
-        if self.ownership == Ownership::Shared {
-            self.ownership = if Arc::strong_count(&self.inner) > 1 {
-                COW_COPIES.fetch_add(1, Ordering::Relaxed);
-                Ownership::Copied
-            } else {
-                Ownership::Private
-            };
+        if self.ownership != Ownership::Shared {
+            if matches!(self.undo, UndoTracking::Recording { .. }) &&
+                Arc::strong_count(&self.inner) > 1
+            {
+                // Something cloned this handle after the first write. The copy `make_mut` is about
+                // to take starts no record of the writes already made, so what it records from
+                // here on is not the whole block.
+                self.undo = UndoTracking::Lost;
+            }
+            return Arc::make_mut(&mut self.inner)
         }
-        Arc::make_mut(&mut self.inner)
+        let origin = self.allocation_id();
+        self.ownership = if Arc::strong_count(&self.inner) > 1 {
+            COW_COPIES.fetch_add(1, Ordering::Relaxed);
+            Ownership::Copied
+        } else {
+            Ownership::Private
+        };
+        let inner = Arc::make_mut(&mut self.inner);
+        if self.undo == UndoTracking::Armed {
+            inner.restart_undo();
+            self.undo = UndoTracking::Recording { origin };
+        }
+        inner
+    }
+
+    /// Ends the record and returns it if it reverses exactly the trie at allocation `origin`.
+    ///
+    /// `None`, with the record ended either way, when this handle kept no record, lost it, started
+    /// it on a different allocation, or shares its trie with another holder and so cannot take the
+    /// record out without copying — a copy would hand back an empty record rather than the block's.
+    pub fn take_undo_from(&mut self, origin: usize) -> Option<T::Record> {
+        let recorded = match std::mem::replace(&mut self.undo, UndoTracking::Off) {
+            UndoTracking::Recording { origin } => origin,
+            UndoTracking::Off | UndoTracking::Armed | UndoTracking::Lost => {
+                self.end_trie_undo();
+                return None
+            }
+        };
+        let record = Arc::get_mut(&mut self.inner)?.take_undo();
+        (recorded == origin).then_some(record).flatten()
+    }
+
+    /// Ends any record this handle keeps, discarding it.
+    pub fn end_undo(&mut self) {
+        self.undo = UndoTracking::Off;
+        self.end_trie_undo();
+    }
+
+    /// Drops the trie's own record when this handle is the only holder. A shared trie keeps it:
+    /// ending it would need the copy that `make_mut` restarts the record after anyway.
+    fn end_trie_undo(&mut self) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            drop(inner.take_undo());
+        }
     }
 }
 
 impl<T> Clone for SharedSparseTrie<T> {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner), ownership: Ownership::Shared }
+        Self {
+            inner: Arc::clone(&self.inner),
+            ownership: Ownership::Shared,
+            undo: UndoTracking::Off,
+        }
+    }
+}
+
+/// A trie that can keep a record of its own writes and hand it back.
+///
+/// What [`SharedSparseTrie`] needs from the trie behind it to start a record at the first write.
+/// A representation with no record implements it as nothing, and its handles report no record.
+pub trait UndoRecording {
+    /// What the trie hands back.
+    type Record;
+
+    /// Discards any record in progress and starts one from the trie as it is now.
+    fn restart_undo(&mut self);
+
+    /// Ends the record and returns it, or `None` if none was kept.
+    fn take_undo(&mut self) -> Option<Self::Record>;
+}
+
+impl UndoRecording for ParallelSparseTrie {
+    type Record = std::convert::Infallible;
+
+    fn restart_undo(&mut self) {}
+
+    fn take_undo(&mut self) -> Option<Self::Record> {
+        None
     }
 }
 
@@ -174,7 +289,7 @@ impl<T: PartialEq> PartialEq for SharedSparseTrie<T> {
 
 impl<T: Eq> Eq for SharedSparseTrie<T> {}
 
-impl<T: SparseTrie + Clone + Default> SparseTrie for SharedSparseTrie<T> {
+impl<T: SparseTrie + Clone + Default + UndoRecording> SparseTrie for SharedSparseTrie<T> {
     fn set_root(
         &mut self,
         root: TrieNodeV2,

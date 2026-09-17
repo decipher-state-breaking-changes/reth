@@ -286,6 +286,7 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "undo_recording": arm != ArmKind::Weak,
         "retention_depth": if arm == ArmKind::Weak { 0 } else { depth.get() },
         "undo_layout": if arm == ArmKind::Weak { "none" } else { "disk-frames" },
+        "storage_undo": (arm != ArmKind::Weak).then(|| pair.trie_cache.storage_undo().label()),
         "warm_shrink_blocks": shrink.interval().map(std::num::NonZeroU64::get), "warmup": manifest.warmup, "samples": manifest.samples,
         "interval_ms": interval_ms, "timing_boundary": "payload_decode_through_coordinated_commit",
         "file_read_included": false, "writer_completion_included": false,

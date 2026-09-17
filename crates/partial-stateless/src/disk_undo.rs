@@ -202,6 +202,8 @@ pub struct UndoBundleParts {
     pub scalars: UndoPartSize,
     /// The account trie's preimages.
     pub account_trie: UndoPartSize,
+    /// Change records of storage tries rewritten in place.
+    pub storage_changed: UndoPartSize,
     /// Whole storage tries the older generation held revealed and the newer one still holds an
     /// entry for: rewritten in place, and the only part a record of what changed could replace.
     pub storage_kept_revealed: UndoPartSize,
@@ -546,8 +548,9 @@ pub(crate) fn codec() -> impl Options {
 /// Encodes `bundle` exactly as `codec().serialize(bundle)` would, one field at a time, charging
 /// each field's bytes and time to its [`UndoBundleParts`] part.
 ///
-/// Unlike `serialize`, it does not size the value in a separate pass first; `capacity` stands in
-/// for that pass, and an under-estimate only costs a reallocation.
+/// Each part is sized before it is encoded, exactly as `serialize` sizes the whole value, because
+/// bincode checks a size limit that way; what `serialize` used the whole size for — the buffer's
+/// capacity — comes from `capacity` instead, and an under-estimate only costs a reallocation.
 ///
 /// bincode writes a struct as its fields in declaration order with nothing between them, and a
 /// sequence as its length followed by its elements, so the concatenation is the payload the loader
@@ -586,6 +589,7 @@ pub(crate) fn encode_bundle(
     for (index, entry) in storage.iter().enumerate() {
         let part = match &entry.1 {
             StorageTrieBefore::Absent => &mut parts.storage_absent,
+            StorageTrieBefore::Changed(_) => &mut parts.storage_changed,
             StorageTrieBefore::Held(_) if index >= *storage_kept => &mut parts.storage_dropped,
             StorageTrieBefore::Held(trie) if trie.as_revealed_ref().is_some() => {
                 &mut parts.storage_kept_revealed

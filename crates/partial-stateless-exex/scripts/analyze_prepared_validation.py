@@ -87,7 +87,7 @@ def analyze(baselines, candidates):
             for field in ("build_commit", "build_dirty", "binary_keccak256", "allocator", "interval_ms", "timing_boundary", "rayon_num_threads", "malloc_conf", "warmup", "trie_repr", "asm_keccak", "keccak_cache_global"):
                 if config.get(field) != reference.get(field):
                     raise ValueError(f"passes disagree on {field}")
-            for field in ("input_manifest_digest", "retention_depth", "undo_layout", "undo_recording", "warm_shrink_blocks", "arm"):
+            for field in ("input_manifest_digest", "retention_depth", "undo_layout", "undo_recording", "storage_undo", "warm_shrink_blocks", "arm"):
                 if config.get(field) != first_config.get(field):
                     raise ValueError(f"repetitions disagree on {field}")
             if any(row["arm"] != config["arm"] for row in rows):

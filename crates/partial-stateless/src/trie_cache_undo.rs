@@ -4,9 +4,9 @@
 //! A retained generation is a whole copy of the cache — 186 MiB of it on the measured corpus —
 //! and the depth a reorg can be undone from is how many of those the process is willing to hold.
 //! This is the diff that replaces the copy: the account trie's own first-write record, the
-//! storage tries the block replaced, the keys warm membership and the retained-path indexes
-//! moved, and the three scalars, sized by what the block touched rather than by what the cache
-//! holds.
+//! storage tries the block replaced — as their own first-write records or whole — the keys warm
+//! membership and the retained-path indexes moved, and the three scalars, sized by what the block
+//! touched rather than by what the cache holds.
 //!
 //! **Direction.** A frame turns the generation it was recorded *on* back into the generation that
 //! generation was cloned *from* — newer into older, never the other way. [`TrieCacheUndoFrame`]
@@ -55,10 +55,12 @@ pub(crate) fn next_undo_id() -> u64 {
 
 /// Everything needed to turn one trie cache generation back into the one it was cloned from.
 ///
-/// Sized by the block, not by the cache. The storage tries it holds are `Arc` handles moved out
-/// of the generation it replaces rather than copies of anything, so a frame's real weight is the
-/// account-trie preimages plus whatever share of the old storage tries nothing else still points
-/// at — which is why [`Self::shared_allocations`] exists beside [`Self::allocated_bytes`].
+/// Sized by the block, not by the cache. The storage tries it holds whole are `Arc` handles moved
+/// out of the generation it replaces rather than copies of anything, so a frame's real weight is
+/// its change records plus whatever share of those old storage tries nothing else still points at
+/// — which is why [`Self::shared_allocations`] exists beside [`Self::allocated_bytes`]. With
+/// [`StorageUndo::Delta`], a trie the block rewrote in place is a change record instead, and the
+/// frame holds whole only the tries a record cannot describe.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrieCacheUndoFrame {
     /// The generation this frame applies *to*, and the one it produces.
@@ -77,14 +79,15 @@ pub struct TrieCacheUndoFrame {
     pub(crate) account: Option<UndoFrame>,
     /// Storage-trie map entries the block replaced, dropped or added.
     ///
-    /// Ordered in three runs: held tries whose address the newer generation still holds, then
-    /// held tries it dropped, then [`StorageTrieBefore::Absent`]. Undo does not depend on the
-    /// order — every entry names a different address — but [`Self::storage_kept`] does.
+    /// Ordered in three runs: entries whose address the newer generation still holds — a change
+    /// record or a held trie — then held tries it dropped, then [`StorageTrieBefore::Absent`].
+    /// Undo does not depend on the order, since every entry names a different address, but
+    /// [`Self::storage_kept`] does.
     pub(crate) storage: Vec<(B256, StorageTrieBefore)>,
     /// How many leading `storage` entries the newer generation still holds a trie for.
     ///
     /// The line between a trie the block rewrote and one retention dropped, which a byte count
-    /// needs and the undo itself does not: a rewritten trie could be described by what changed in
+    /// needs and the undo itself does not: a rewritten trie can be described by what changed in
     /// it, a dropped one only whole. Not encoded, so a frame read back from disk reports zero.
     #[serde(skip)]
     pub(crate) storage_kept: usize,
@@ -127,6 +130,12 @@ impl TrieCacheUndoFrame {
         };
         for (index, (_, before)) in self.storage.iter().enumerate() {
             match before {
+                StorageTrieBefore::Changed(record) => {
+                    let record = record.counts();
+                    counts.storage_tries_changed += 1;
+                    counts.storage_nodes += record.nodes;
+                    counts.storage_values += record.values;
+                }
                 StorageTrieBefore::Held(trie) => {
                     counts.storage_tries_held += 1;
                     if index >= self.storage_kept {
@@ -172,7 +181,8 @@ impl TrieCacheUndoFrame {
 
     /// What this block's record itself weighs: everything the block *created*.
     ///
-    /// The account-trie preimages, the membership preimages, and the frame's own containers —
+    /// The account-trie and storage-trie change records, the membership preimages, and the
+    /// frame's own containers —
     /// bounded by what the block touched, and the half of the estimate that belongs on a per-block
     /// record. Costs one pass over the recorded entries and nothing else, which is why it is
     /// computed on every commit while [`Self::storage_bytes`] is not.
@@ -181,6 +191,14 @@ impl TrieCacheUndoFrame {
         let mut bytes = std::mem::size_of::<Self>();
         bytes += self.account.as_ref().map_or(0, UndoFrame::allocated_bytes);
         bytes += self.storage.capacity() * std::mem::size_of::<(B256, StorageTrieBefore)>();
+        bytes += self
+            .storage
+            .iter()
+            .filter_map(|(_, before)| match before {
+                StorageTrieBefore::Changed(record) => Some(record.allocated_bytes()),
+                StorageTrieBefore::Held(_) | StorageTrieBefore::Absent => None,
+            })
+            .sum::<usize>();
         let delta = &self.membership.delta;
         bytes += hashbrown_table_bytes(
             delta.warm_accounts.capacity(),
@@ -260,6 +278,45 @@ impl TrieCacheUndoFrame {
     }
 }
 
+/// How a frame records a storage trie the block rewrote in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageUndo {
+    /// The older generation's whole trie, moved out of it.
+    ///
+    /// Free to record in memory, where the frame shares the allocation with nothing but the
+    /// generation being dropped. Serialized, it is the whole trie again for every block that
+    /// touches it, which is what makes a disk bundle tens of MiB.
+    #[default]
+    Whole,
+    /// The trie's own record of its writes, begun at the first one.
+    ///
+    /// Sized by what the block changed. Costs a record lookup per write to every storage trie the
+    /// block touches, the price the account trie already pays.
+    Delta,
+}
+
+impl StorageUndo {
+    /// Stable label for manifests and run summaries.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Delta => "delta",
+        }
+    }
+}
+
+impl std::str::FromStr for StorageUndo {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "whole" => Ok(Self::Whole),
+            "delta" => Ok(Self::Delta),
+            other => Err(format!("unknown storage undo {other:?}; use whole or delta")),
+        }
+    }
+}
+
 /// What a [`TrieCacheUndoFrame`] holds, by kind.
 ///
 /// Logical counts. The `account_*` fields are the sparse trie's own report flattened — a run log
@@ -309,6 +366,13 @@ pub struct TrieCacheUndoCounts {
     pub storage_tries_dropped: usize,
     /// Addresses the block added to the storage-trie map, removed again on undo.
     pub storage_tries_absent: usize,
+    /// Storage tries the block rewrote in place, recorded as their own change record rather than
+    /// held whole.
+    pub storage_tries_changed: usize,
+    /// Node preimages across those records.
+    pub storage_nodes: usize,
+    /// Leaf value preimages across those records.
+    pub storage_values: usize,
     /// Warm account keys whose membership the block moved.
     pub warm_accounts: usize,
     /// Warm storage keys whose membership the block moved.
@@ -332,6 +396,14 @@ pub(crate) enum StorageTrieBefore {
     Held(Box<CacheStorageTrie>),
     /// The map had no entry for the address; remove it.
     Absent,
+    /// The newer generation's trie for the address is this one rewritten in place; undo its
+    /// writes.
+    ///
+    /// Taken only when the trie's record began at its first write on exactly the allocation the
+    /// older generation holds, so applying it to the newer generation's trie reproduces the older
+    /// one. Everything else — a trie revealed or blinded in the block, a handle reused from
+    /// another address, a record that could not be kept — is held whole instead.
+    Changed(Box<UndoFrame>),
 }
 
 impl StorageTrieBefore {
@@ -348,7 +420,7 @@ impl StorageTrieBefore {
                 }
                 CacheStorageTrie::Blind(None) => None,
             },
-            Self::Absent => None,
+            Self::Absent | Self::Changed(_) => None,
         }
     }
 
@@ -363,7 +435,7 @@ impl StorageTrieBefore {
     fn shared(&self) -> Option<&SharedSparseTrie<CacheTrie>> {
         match self {
             Self::Held(trie) => trie.as_revealed_ref(),
-            Self::Absent => None,
+            Self::Absent | Self::Changed(_) => None,
         }
     }
 }

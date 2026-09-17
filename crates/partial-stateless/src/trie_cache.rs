@@ -13,7 +13,7 @@ use crate::{
     shared_trie::{self, SharedSparseTrie},
     trie_cache_undo::{
         next_undo_id, CacheStorageTrie, CacheUndoRecord, MembershipUndo, MembershipWhole,
-        StorageTrieBefore, TrieCacheUndoFrame,
+        StorageTrieBefore, StorageUndo, TrieCacheUndoFrame,
     },
 };
 use alloy_primitives::{
@@ -176,6 +176,10 @@ pub struct PartialTrieNodeCache {
     /// write on the hot path, and its holder has a correct fallback — keeping whole generations —
     /// which is what a cache on the `Parallel` representation gets whatever this says.
     record_undo: bool,
+    /// How a frame taken from a clone of this cache records the storage tries the block rewrote.
+    ///
+    /// Carried through a clone with [`Self::record_undo`], and read only while that is on.
+    storage_undo: StorageUndo,
     /// The record of what this block has done to this cache so far, when one is being kept.
     ///
     /// Only ever started by [`Self::clone_timed`]: a record describes the step from one generation
@@ -223,8 +227,18 @@ impl PartialTrieNodeCache {
         let start = Instant::now();
         let storage = sparse.storage_tries_mut();
         storage.reserve(self.sparse.storage_tries_ref().len());
+        // A revealed trie's handle starts its undo record at its first write, which is the one
+        // point where the trie is still exactly this generation's. A blind entry has no trie to
+        // record into, and a frame holds it whole.
+        let record_storage = self.record_undo && self.storage_undo == StorageUndo::Delta;
         for (hashed_address, trie) in self.sparse.storage_tries_ref() {
-            storage.insert(*hashed_address, trie.clone());
+            let copy = match trie {
+                CacheStorageTrie::Revealed(handle) if record_storage => {
+                    CacheStorageTrie::Revealed(Box::new(handle.clone_recording()))
+                }
+                trie => trie.clone(),
+            };
+            storage.insert(*hashed_address, copy);
         }
         timings.storage_tries_us = start.elapsed().as_micros() as u64;
         timings.storage_tries = self.sparse.storage_tries_ref().len() as u64;
@@ -254,6 +268,7 @@ impl PartialTrieNodeCache {
             warm_shrink: self.warm_shrink,
             undo_id: next_undo_id(),
             record_undo: self.record_undo,
+            storage_undo: self.storage_undo,
             undo: None,
         };
         // The working copy starts recording here and not a line later, because everything the
@@ -297,6 +312,7 @@ impl PartialTrieNodeCache {
             warm_shrink: WarmShrink::default(),
             undo_id: next_undo_id(),
             record_undo: false,
+            storage_undo: StorageUndo::default(),
             undo: None,
         }
     }
@@ -350,6 +366,19 @@ impl PartialTrieNodeCache {
         self.record_undo
     }
 
+    /// Sets how frames taken from clones of this cache record rewritten storage tries.
+    ///
+    /// Like [`Self::set_undo_recording`], it decides what the next clone does and leaves a record
+    /// already in progress alone.
+    pub const fn set_storage_undo(&mut self, storage_undo: StorageUndo) {
+        self.storage_undo = storage_undo;
+    }
+
+    /// How frames taken from clones of this cache record rewritten storage tries.
+    pub const fn storage_undo(&self) -> StorageUndo {
+        self.storage_undo
+    }
+
     /// Whether this cache is keeping a record right now.
     pub const fn is_recording_undo(&self) -> bool {
         self.undo.is_some()
@@ -387,6 +416,16 @@ impl PartialTrieNodeCache {
         if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
             drop(trie.take_undo());
         }
+        self.end_storage_undo();
+    }
+
+    /// Ends every storage trie's record, discarding them.
+    fn end_storage_undo(&mut self) {
+        for trie in self.sparse.storage_tries_mut().values_mut() {
+            if let Some(handle) = trie.as_revealed_mut() {
+                handle.end_undo();
+            }
+        }
     }
 
     /// Ends the record and returns the frame that turns this cache back into `parent`.
@@ -403,8 +442,12 @@ impl PartialTrieNodeCache {
     pub fn take_undo_frame(&mut self, parent: &mut Self) -> Option<TrieCacheUndoFrame> {
         let record = self.undo.take();
         let account = self.sparse.trie_mut().as_revealed_mut().and_then(CacheTrie::take_undo);
-        let record = record?;
+        let Some(record) = record else {
+            self.end_storage_undo();
+            return None
+        };
         if record.poisoned || record.parent != parent.undo_id {
+            self.end_storage_undo();
             return None
         }
         // The slot's reveal state, *read* rather than inferred from whether a record came back. A
@@ -415,10 +458,12 @@ impl PartialTrieNodeCache {
         // that leaves the revealed content in place while claiming to be the generation below it.
         let blind_now = self.sparse.state_trie_ref().is_none();
         if blind_now != record.account_blind {
+            self.end_storage_undo();
             return None
         }
         // Revealed at both ends, but no record: recording never began on this trie.
         if blind_now != account.is_none() {
+            self.end_storage_undo();
             return None
         }
         let (storage, storage_kept) = self.storage_undo_against(parent);
@@ -440,8 +485,15 @@ impl PartialTrieNodeCache {
     /// The representation and the account trie's reveal state, checked before [`Self::undo`]
     /// touches anything, so that call either does the whole undo or none of it.
     pub fn can_undo(&self, frame: &TrieCacheUndoFrame) -> bool {
+        let tries = self.sparse.storage_tries_ref();
         self.repr == CacheTrieRepr::Exact &&
-            (!frame.records_account_trie() || self.sparse.state_trie_ref().is_some())
+            (!frame.records_account_trie() || self.sparse.state_trie_ref().is_some()) &&
+            frame.storage.iter().all(|(hashed_address, before)| match before {
+                StorageTrieBefore::Changed(_) => {
+                    tries.get(hashed_address).is_some_and(|trie| trie.as_revealed_ref().is_some())
+                }
+                StorageTrieBefore::Held(_) | StorageTrieBefore::Absent => true,
+            })
     }
 
     /// Reverses `frame`, making this cache the generation the frame describes.
@@ -489,6 +541,15 @@ impl PartialTrieNodeCache {
                 }
                 StorageTrieBefore::Absent => {
                     storage_tries.remove(&hashed_address);
+                }
+                StorageTrieBefore::Changed(record) => {
+                    let handle = storage_tries
+                        .get_mut(&hashed_address)
+                        .and_then(CacheStorageTrie::as_revealed_mut)
+                        .expect("can_undo checked every changed trie is revealed");
+                    let applied = handle.make_mut().undo(*record);
+                    debug_assert!(applied, "can_undo checked the representation carries a record");
+                    handle.end_undo();
                 }
             }
         }
@@ -553,46 +614,64 @@ impl PartialTrieNodeCache {
 
     /// The storage-trie half of the frame that turns this cache back into `parent`.
     ///
-    /// A pointer comparison per retained trie and a move for the few that moved — 100 of ~3,630
-    /// on the measured corpus, p95 148 — rather than a hook inside `make_mut`, which would need a
-    /// per-block generation stamp on every handle to tell a first touch from a tenth. The two maps
-    /// exist side by side exactly once, at the commit that displaces `parent`, and that is the one
-    /// moment the comparison is available for free.
+    /// A pointer comparison per retained trie finds the entries that moved — 100 of ~3,630 on
+    /// the measured corpus, p95 148. The two maps exist side by side exactly once, at the commit
+    /// that displaces `parent`, and that is the one moment the comparison is available for free.
     ///
-    /// An entry with no revealed trie behind it has no `Arc` to compare, so it is recorded rather
-    /// than assumed unchanged. Recording it costs nothing here: `parent` is being dropped, so the
-    /// handle is moved out of it.
+    /// A trie rewritten in place is recorded as its own change record when its handle kept one
+    /// from its first write on exactly the allocation `parent` holds — which a handle moved to
+    /// another address or reused from the pool cannot claim, because `parent` is alive and still
+    /// holds that allocation. Everything else is moved out of `parent` whole: an entry with no
+    /// revealed trie behind it has no `Arc` to compare, so it is recorded rather than assumed
+    /// unchanged, and `parent` is being dropped, so the move costs nothing in memory. Every
+    /// storage record left in this cache is ended on the way out.
     ///
     /// Returned in the order [`TrieCacheUndoFrame::storage`] documents, with the length of its
     /// first run.
-    fn storage_undo_against(&self, parent: &mut Self) -> (Vec<(B256, StorageTrieBefore)>, usize) {
+    fn storage_undo_against(
+        &mut self,
+        parent: &mut Self,
+    ) -> (Vec<(B256, StorageTrieBefore)>, usize) {
         fn identity(trie: &CacheStorageTrie) -> Option<usize> {
             trie.as_revealed_ref().map(SharedSparseTrie::allocation_id)
         }
 
         let mut undo = Vec::new();
         let mut dropped = Vec::new();
-        let mine = self.sparse.storage_tries_ref();
+        let mine = self.sparse.storage_tries_mut();
         for (hashed_address, held) in parent.sparse.storage_tries_mut() {
-            let now = mine.get(hashed_address);
-            let unchanged = match (identity(held), now.and_then(identity)) {
+            let now = mine.get_mut(hashed_address);
+            let before = identity(held);
+            let unchanged = match (before, now.as_deref().and_then(identity)) {
                 (Some(before), Some(now)) => before == now,
                 _ => false,
             };
-            if !unchanged {
-                let entry =
-                    (*hashed_address, StorageTrieBefore::Held(Box::new(std::mem::take(held))));
-                if now.is_some() {
-                    undo.push(entry);
-                } else {
-                    dropped.push(entry);
-                }
+            if unchanged {
+                continue
             }
+            let Some(now) = now else {
+                dropped.push((
+                    *hashed_address,
+                    StorageTrieBefore::Held(Box::new(std::mem::take(held))),
+                ));
+                continue
+            };
+            let record = before
+                .zip(now.as_revealed_mut())
+                .and_then(|(before, handle)| handle.take_undo_from(before));
+            let before = match record {
+                Some(record) => StorageTrieBefore::Changed(Box::new(record)),
+                None => StorageTrieBefore::Held(Box::new(std::mem::take(held))),
+            };
+            undo.push((*hashed_address, before));
         }
         let kept = undo.len();
         undo.append(&mut dropped);
         let held_before = parent.sparse.storage_tries_ref();
-        for hashed_address in mine.keys() {
+        for (hashed_address, trie) in mine.iter_mut() {
+            if let Some(handle) = trie.as_revealed_mut() {
+                handle.end_undo();
+            }
             if !held_before.contains_key(hashed_address) {
                 undo.push((*hashed_address, StorageTrieBefore::Absent));
             }
@@ -2251,7 +2330,7 @@ mod tests {
     use crate::{
         disk_undo::{self, encode_bundle, DiskUndoBundle, UndoBundleParts},
         policy::{AccountData, LastNBlocksPolicy},
-        trie_cache_undo::TrieCacheUndoFrame,
+        trie_cache_undo::{StorageUndo, TrieCacheUndoFrame},
         NetworkStateCache,
     };
     use alloy_primitives::{map::B256Map, U256};
@@ -2912,6 +2991,7 @@ mod tests {
         };
         let mut live = PartialTrieNodeCache::new();
         live.set_undo_recording(true);
+        live.set_storage_undo(StorageUndo::Whole);
         for (address, tag) in [(changed, 1), (removed, 2)] {
             live.sparse
                 .storage_tries_mut()
@@ -2994,6 +3074,7 @@ mod tests {
 
         let mut live = revealed_cache(&harness, &keys);
         live.set_undo_recording(true);
+        live.set_storage_undo(StorageUndo::Whole);
         let tries = live.sparse.storage_tries_mut();
         tries.insert(rewritten, CacheStorageTrie::Revealed(Box::new(storage(1))));
         tries.insert(blind, CacheStorageTrie::Blind(Some(Box::new(storage(2)))));
@@ -3071,6 +3152,7 @@ mod tests {
 
         let mut live = PartialTrieNodeCache::new();
         live.set_undo_recording(true);
+        live.set_storage_undo(StorageUndo::Whole);
         {
             let tries = live.sparse.storage_tries_mut();
             tries.insert(
@@ -3484,5 +3566,264 @@ mod tests {
 
         let (grandchild, _) = child.clone_timed();
         assert_ne!(grandchild.undo_id(), child.undo_id());
+    }
+
+    /// Storage slots `0..count` with values tagged by `tag`, keyed the way a storage trie is.
+    fn slots(tag: u64, count: u64) -> BTreeMap<B256, U256> {
+        (0..count)
+            .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(tag * 1000 + i + 1)))
+            .collect()
+    }
+
+    /// A fully revealed storage trie over `entries`, as the cache's map holds one.
+    fn storage_trie(
+        entries: &BTreeMap<B256, U256>,
+    ) -> (TrieTestHarness, SharedSparseTrie<CacheTrie>) {
+        let harness = TrieTestHarness::new(entries.clone());
+        let template = revealed_cache(&harness, &entries.keys().copied().collect::<Vec<_>>());
+        let trie = SharedSparseTrie::new(template.sparse.state_trie_ref().unwrap().clone());
+        (harness, trie)
+    }
+
+    /// [`apply_leaves`] on one storage trie handle.
+    fn apply_storage_leaves(
+        harness: &TrieTestHarness,
+        trie: &mut SharedSparseTrie<CacheTrie>,
+        changes: &[(B256, U256)],
+    ) -> B256 {
+        let mut updates: B256Map<LeafUpdate> = changes
+            .iter()
+            .map(|(key, value)| {
+                let rlp =
+                    if value.is_zero() { Vec::new() } else { encode_fixed_size(value).to_vec() };
+                (*key, LeafUpdate::Changed(rlp))
+            })
+            .collect();
+        loop {
+            let mut targets = Vec::new();
+            trie.update_leaves(&mut updates, |key, min_len| {
+                targets.push(ProofV2Target::new(key).with_min_len(min_len));
+            })
+            .expect("the update applies");
+            if targets.is_empty() {
+                break
+            }
+            let (mut nodes, _) = harness.proof_v2(&mut targets);
+            trie.reveal_nodes(&mut nodes).expect("the harness answers what the update asked for");
+        }
+        trie.root()
+    }
+
+    fn storage_handle(
+        cache: &mut PartialTrieNodeCache,
+        address: B256,
+    ) -> &mut SharedSparseTrie<CacheTrie> {
+        cache.sparse.storage_tries_mut().get_mut(&address).unwrap().as_revealed_mut().unwrap()
+    }
+
+    fn storage_kind(frame: &TrieCacheUndoFrame, address: B256) -> Option<&'static str> {
+        frame.storage.iter().find(|(key, _)| *key == address).map(|(_, before)| match before {
+            StorageTrieBefore::Changed(_) => "changed",
+            StorageTrieBefore::Held(_) => "held",
+            StorageTrieBefore::Absent => "absent",
+        })
+    }
+
+    /// A recording cache holding `tries`, on the given storage undo mode.
+    fn recording_cache(
+        storage_undo: StorageUndo,
+        tries: impl IntoIterator<Item = (B256, CacheStorageTrie)>,
+    ) -> PartialTrieNodeCache {
+        let mut live = PartialTrieNodeCache::new();
+        live.set_undo_recording(true);
+        live.set_storage_undo(storage_undo);
+        live.sparse.storage_tries_mut().extend(tries);
+        live
+    }
+
+    #[test]
+    fn a_storage_trie_rewritten_in_place_is_recorded_as_its_own_changes() {
+        let [rewritten, dropped, revealed, added] = [0x11, 0x22, 0x33, 0x44].map(B256::repeat_byte);
+        let entries = slots(1, 48);
+        let keys: Vec<B256> = entries.keys().copied().collect();
+        let (harness, trie) = storage_trie(&entries);
+        let mut retained: Vec<Nibbles> =
+            keys[..44].iter().map(|key| Nibbles::unpack(*key)).collect();
+        retained.sort();
+
+        let block = |storage_undo| {
+            let mut live = recording_cache(
+                storage_undo,
+                [
+                    (rewritten, CacheStorageTrie::Revealed(Box::new(trie.clone()))),
+                    (dropped, CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(2, 8)).1))),
+                    (revealed, CacheStorageTrie::Blind(None)),
+                ],
+            );
+            let control = live.clone();
+            let (mut next, _) = live.clone_timed();
+            // Overwrites, a delete, and the prune retention runs after them — the removals a
+            // whole-trie record never had to describe.
+            let handle = storage_handle(&mut next, rewritten);
+            apply_storage_leaves(
+                &harness,
+                handle,
+                &[(keys[0], U256::from(7)), (keys[1], U256::ZERO), (keys[2], U256::from(9))],
+            );
+            assert!(SparseTrie::retain_witness_paths(handle, &retained) > 0);
+            let tries = next.sparse.storage_tries_mut();
+            tries.insert(
+                revealed,
+                CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(3, 4)).1)),
+            );
+            tries.remove(&dropped);
+            tries.insert(added, CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(4, 4)).1)));
+            let mut displaced = std::mem::replace(&mut live, next);
+            let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+            (live, control, frame)
+        };
+
+        let (_, _, whole) = block(StorageUndo::Whole);
+        let (mut live, control, frame) = block(StorageUndo::Delta);
+        assert_eq!(storage_kind(&whole, rewritten), Some("held"));
+        assert_eq!(storage_kind(&frame, rewritten), Some("changed"));
+        for frame in [&whole, &frame] {
+            assert_eq!(
+                storage_kind(frame, dropped),
+                Some("held"),
+                "only a whole trie restores a drop"
+            );
+            assert_eq!(storage_kind(frame, revealed), Some("held"), "a blind slot has no record");
+            assert_eq!(storage_kind(frame, added), Some("absent"));
+        }
+        let counts = frame.counts();
+        assert_eq!((counts.storage_tries_changed, counts.storage_tries_held), (1, 2));
+        assert!(counts.storage_nodes > 0);
+        assert_eq!(frame.storage_kept, 2, "the change record and the revealed slot are still held");
+        let entry = |frame: &TrieCacheUndoFrame| {
+            let entry = frame.storage.iter().find(|(key, _)| *key == rewritten).unwrap();
+            bincode::serialize(entry).unwrap().len()
+        };
+        assert!(
+            entry(&frame) * 2 < entry(&whole),
+            "three writes and a four-slot prune are a fraction of the 48-slot trie they were made to: \
+             {} against {} bytes",
+            entry(&frame),
+            entry(&whole)
+        );
+
+        let mut from_disk = live.fork_for_rollback();
+        assert!(from_disk.undo(bincode::deserialize(&bincode::serialize(&frame).unwrap()).unwrap()));
+        assert!(from_disk.structurally_eq(&control), "a decoded record restores the parent");
+        assert!(live.undo(frame));
+        assert!(live.structurally_eq(&control), "the in-memory record restores the parent");
+        assert_eq!(storage_handle(&mut live, rewritten).root(), harness.original_root());
+    }
+
+    #[test]
+    fn a_storage_record_is_used_only_against_the_allocation_it_started_on() {
+        let [first, second] = [0x11, 0x22].map(B256::repeat_byte);
+        let first_harness = TrieTestHarness::new(slots(1, 32));
+        let second_harness = TrieTestHarness::new(slots(2, 32));
+        let first_keys: Vec<B256> = slots(1, 32).keys().copied().collect();
+        let second_keys: Vec<B256> = slots(2, 32).keys().copied().collect();
+        // Fresh allocations per case, so no handle outside the caches shares them.
+        let tries = || {
+            [
+                (first, CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(1, 32)).1))),
+                (second, CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(2, 32)).1))),
+            ]
+        };
+        let commit = |mut live: PartialTrieNodeCache, next: PartialTrieNodeCache, control| {
+            let mut displaced = std::mem::replace(&mut live, next);
+            let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+            let kinds = [storage_kind(&frame, first), storage_kind(&frame, second)];
+            let mut from_disk = live.fork_for_rollback();
+            assert!(
+                from_disk.undo(bincode::deserialize(&bincode::serialize(&frame).unwrap()).unwrap())
+            );
+            assert!(from_disk.structurally_eq(&control));
+            assert!(live.undo(frame));
+            assert!(live.structurally_eq(&control));
+            kinds
+        };
+
+        // Nothing else holds the trie at the first write, so no copy is taken and the record
+        // starts on this handle's allocation, which the parent no longer holds.
+        let mut live = recording_cache(StorageUndo::Delta, tries());
+        let (mut next, _) = live.clone_timed();
+        let parent = storage_handle(&mut live, first);
+        *parent = SharedSparseTrie::new(parent.shared_ref().clone());
+        let control = live.clone();
+        let handle = storage_handle(&mut next, first);
+        apply_storage_leaves(&first_harness, handle, &[(first_keys[0], U256::from(5))]);
+        assert!(!handle.is_untouched() && !handle.took_copy(), "the private first write");
+        assert_eq!(commit(live, next, control), [Some("held"), None]);
+
+        // A handle that starts its record under one address and is committed under another.
+        let live = recording_cache(StorageUndo::Delta, tries());
+        let control = live.clone();
+        let (mut next, _) = live.clone_timed();
+        let mut moved = next.sparse.storage_tries_mut().remove(&first).unwrap();
+        apply_storage_leaves(
+            &first_harness,
+            moved.as_revealed_mut().unwrap(),
+            &[(first_keys[1], U256::from(6))],
+        );
+        next.sparse.storage_tries_mut().insert(second, moved);
+        assert_eq!(commit(live, next, control), [Some("held"), Some("held")]);
+
+        // A handle cloned between two writes: the copy the second write takes carries no record
+        // of the first.
+        let live = recording_cache(StorageUndo::Delta, tries());
+        let control = live.clone();
+        let (mut next, _) = live.clone_timed();
+        let handle = storage_handle(&mut next, second);
+        apply_storage_leaves(&second_harness, handle, &[(second_keys[0], U256::from(7))]);
+        let holder = handle.clone();
+        apply_storage_leaves(&second_harness, handle, &[(second_keys[1], U256::from(8))]);
+        drop(holder);
+        assert_eq!(commit(live, next, control), [None, Some("held")]);
+    }
+
+    #[test]
+    fn storage_change_records_chain_back_through_several_blocks_from_disk() {
+        let address = B256::repeat_byte(0x11);
+        let entries = slots(1, 64);
+        let keys: Vec<B256> = entries.keys().copied().collect();
+        let (harness, trie) = storage_trie(&entries);
+        let mut live = recording_cache(
+            StorageUndo::Delta,
+            [(address, CacheStorageTrie::Revealed(Box::new(trie)))],
+        );
+
+        let mut controls = Vec::new();
+        let mut frames = Vec::new();
+        for block in 0..4u64 {
+            controls.push(live.clone());
+            let (mut next, _) = live.clone_timed();
+            let base = 4 * block as usize;
+            let handle = storage_handle(&mut next, address);
+            apply_storage_leaves(
+                &harness,
+                handle,
+                &[
+                    (keys[base], U256::from(100 + block)),
+                    (keys[base + 1], U256::ZERO),
+                    (keys[base + 2], U256::from(200 + block)),
+                ],
+            );
+            let mut displaced = std::mem::replace(&mut live, next);
+            let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+            assert_eq!(storage_kind(&frame, address), Some("changed"), "block {block}");
+            frames.push(bincode::serialize(&frame).unwrap());
+        }
+
+        let mut recovering = live.fork_for_rollback();
+        for (frame, control) in frames.iter().zip(&controls).rev() {
+            assert!(recovering.undo(bincode::deserialize(frame).unwrap()));
+            assert!(recovering.structurally_eq(control));
+        }
+        assert_eq!(storage_handle(&mut recovering, address).root(), harness.original_root());
     }
 }

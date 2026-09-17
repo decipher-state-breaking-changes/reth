@@ -89,7 +89,7 @@ pub use trie_cache::{
     TrieCacheMemory, TrieCacheValidationError, TrieChangeSet, TrieCloneTimings,
     TrieMutationMetrics, TrieShapeMetrics, WarmSetShrinkPolicy, TRIE_SHAPE_PREFIX_LEVELS,
 };
-pub use trie_cache_undo::{TrieCacheUndoCounts, TrieCacheUndoFrame};
+pub use trie_cache_undo::{StorageUndo, TrieCacheUndoCounts, TrieCacheUndoFrame};
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};
 pub use witness_check::{
     compute_trustless_state_root, root_witness_targets_from_bundle,
