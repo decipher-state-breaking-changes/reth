@@ -62,7 +62,7 @@ pub const ALLOCATOR_NAME: &str = if cfg!(all(feature = "jemalloc", unix)) {
     "system"
 };
 
-use partial_stateless::WarmSetShrinkPolicy;
+use partial_stateless::{StorageUndo, WarmSetShrinkPolicy};
 use partial_stateless_replay::{
     follow, replay, FollowOptions, FollowOutcome, FollowReport, ForcedReorg, PairConfig,
     ReplayOptions, ReplayReport,
@@ -301,6 +301,9 @@ fn write_manifest(
         // generations. Absent on files written before the axis existed.
         "undo_record": pair.undo_record,
         "undo_layout": pair.undo_layout.as_str(),
+        // How frames record rewritten storage tries. Absent on files written before the axis
+        // existed, all of which recorded them whole.
+        "storage_undo": pair.storage_undo.label(),
         "undo_dir": pair.undo_dir,
         // Policy target only. Actual counts are sampled after commits in BlockTiming.
         "undo_resident_blocks_limit": pair.undo_dir.as_ref().map(|_| 0),
@@ -607,6 +610,19 @@ fn parse_undo_layout(raw: &str) -> eyre::Result<UndoLayout> {
     }
 }
 
+/// Storage undo from `PS_STORAGE_UNDO`, or whole; read before the flags like the other undo axes.
+fn storage_undo_from_env() -> eyre::Result<StorageUndo> {
+    match std::env::var("PS_STORAGE_UNDO") {
+        Ok(raw) => parse_storage_undo(&raw)
+            .map_err(|err| eyre::eyre!("PS_STORAGE_UNDO={raw:?} is not a mode: {err}")),
+        Err(_) => Ok(StorageUndo::default()),
+    }
+}
+
+fn parse_storage_undo(raw: &str) -> eyre::Result<StorageUndo> {
+    raw.trim().to_ascii_lowercase().parse().map_err(eyre::Report::msg)
+}
+
 fn check_undo_configuration(layout: UndoLayout, record: bool) -> eyre::Result<()> {
     if layout != UndoLayout::FramesOnly {
         eyre::bail!("--undo-layout hybrid / PS_UNDO_LAYOUT=hybrid is no longer supported; use frames or unset it")
@@ -691,6 +707,7 @@ fn parse_args() -> eyre::Result<Mode> {
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
         undo_layout: undo_layout_from_env()?,
+        storage_undo: storage_undo_from_env()?,
         undo_dir: std::env::var_os("PS_UNDO_DIR").map(PathBuf::from),
         forced_reorgs: forced_reorgs_from_env()?,
         ..ReplayOptions::default()
@@ -759,6 +776,12 @@ fn parse_args() -> eyre::Result<Mode> {
                     .ok_or_else(|| eyre::eyre!("--undo-layout needs 'hybrid' or 'frames'"))?;
                 options.undo_layout = parse_undo_layout(&raw)?;
             }
+            "--storage-undo" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--storage-undo needs 'whole' or 'delta'"))?;
+                options.storage_undo = parse_storage_undo(&raw)?;
+            }
             "--forced-reorg" => {
                 let raw = args
                     .next()
@@ -779,16 +802,17 @@ fn parse_args() -> eyre::Result<Mode> {
                      [--mutations-transition [N]] \
                      [--force-restore-at <sequence>] [--retain-depth N] \
                      [--warm-shrink N|never] [--undo-record [on]] \
-                     [--undo-layout frames] [--undo-dir <directory>] \
-                     [--forced-reorg D@N]... [--json <path>] \
+                     [--undo-layout frames] [--storage-undo whole|delta] \
+                     [--undo-dir <directory>] [--forced-reorg D@N]... [--json <path>] \
                      [--label <name>]\nps-replay --follow <spool-dir> [--poll-ms N] \
                      [--max-blocks N] [--idle-timeout-secs N] [--ack <path>] [--ack-fsync] \
                      [--resume] [--mutations] [--retain-depth N] [--warm-shrink N|never] \
-                     [--undo-record [on]] [--undo-layout frames] [--undo-dir <directory>] \
-                     [--json <path>] \
+                     [--undo-record [on]] [--undo-layout frames] [--storage-undo whole|delta] \
+                     [--undo-dir <directory>] [--json <path>] \
                      [--label <name>]\nps-replay --list-frames <spool-dir>\n\nPS_RETAIN_DEPTH sets --retain-depth, PS_WARM_SHRINK \
                      sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, PS_UNDO_LAYOUT sets \
-                     --undo-layout, PS_UNDO_DIR sets --undo-dir, and PS_FORCED_REORGS \
+                     --undo-layout, PS_STORAGE_UNDO sets --storage-undo, PS_UNDO_DIR sets \
+                     --undo-dir, and PS_FORCED_REORGS \
                      (D@N,D@N,...) sets --forced-reorg; the flags win.\nDefaults: K=32, recording on, frames, disk at <spool-dir>/undo. Legacy hybrid/off controls are rejected."
                 );
                 std::process::exit(0);
@@ -815,6 +839,7 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
         warm_shrink: warm_shrink_from_env()?,
         undo_record: undo_record_from_env()?,
         undo_layout: undo_layout_from_env()?,
+        storage_undo: storage_undo_from_env()?,
         undo_dir: std::env::var_os("PS_UNDO_DIR").map(PathBuf::from),
         ..FollowOptions::default()
     };
@@ -883,6 +908,12 @@ fn parse_follow_args(raw: Vec<String>) -> eyre::Result<Mode> {
                     .ok_or_else(|| eyre::eyre!("--undo-layout needs 'hybrid' or 'frames'"))?;
                 options.undo_layout = parse_undo_layout(&raw)?;
             }
+            "--storage-undo" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| eyre::eyre!("--storage-undo needs 'whole' or 'delta'"))?;
+                options.storage_undo = parse_storage_undo(&raw)?;
+            }
             other if dir.is_none() => dir = Some(PathBuf::from(other)),
             other => return Err(eyre::eyre!("unexpected argument {other}")),
         }
@@ -908,6 +939,14 @@ mod tests {
                 "{raw:?} should switch shrinking off"
             );
         }
+    }
+
+    #[test]
+    fn storage_undo_parses_both_modes_and_nothing_else() {
+        assert_eq!(parse_storage_undo(" Delta ").unwrap(), StorageUndo::Delta);
+        assert_eq!(parse_storage_undo("whole").unwrap(), StorageUndo::Whole);
+        assert!(parse_storage_undo("diff").is_err());
+        assert_eq!(ReplayOptions::default().storage_undo, StorageUndo::Whole);
     }
 
     #[test]

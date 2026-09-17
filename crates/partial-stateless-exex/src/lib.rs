@@ -226,6 +226,8 @@ pub struct RunOptions {
     pub retention_depth: RetentionDepth,
     pub undo_record: bool,
     pub undo_layout: UndoLayout,
+    /// How frames record rewritten storage tries (`PS_STORAGE_UNDO`, whole by default).
+    pub storage_undo: partial_stateless::StorageUndo,
     /// Parent directory of disposable, per-pair undo sessions.
     pub undo_dir: Option<PathBuf>,
     /// Capacity policy, shared with standalone replay and offline validation.
@@ -350,6 +352,10 @@ impl RunOptions {
             Ok("frames") | Err(_) => UndoLayout::FramesOnly,
             Ok(other) => eyre::bail!("invalid PS_UNDO_LAYOUT={other:?}"),
         };
+        let storage_undo = match std::env::var("PS_STORAGE_UNDO") {
+            Ok(raw) => raw.parse().map_err(|err: String| eyre::eyre!("PS_STORAGE_UNDO: {err}"))?,
+            Err(_) => partial_stateless::StorageUndo::default(),
+        };
         let retain_generation = env_flag_enabled_by_default("PS_RETAIN_GENERATION");
         validate_undo_profile(trie_repr, undo_layout, undo_record, retain_generation)?;
         let undo_dir = Some(
@@ -384,6 +390,7 @@ impl RunOptions {
             retention_depth,
             undo_record,
             undo_layout,
+            storage_undo,
             undo_dir,
             warm_shrink: std::env::var("PS_WARM_SHRINK")
                 .unwrap_or_else(|_| "never".into())
@@ -1478,10 +1485,12 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
     pair.retention_depth = options.retention_depth;
     pair.undo_layout = options.undo_layout;
     pair.trie_cache.set_undo_recording(options.undo_record);
+    pair.trie_cache.set_storage_undo(options.storage_undo);
     pair.trie_cache.set_warm_shrink_policy(options.warm_shrink);
     pair.enable_disk_undo(directory).map_err(eyre::Report::msg)?;
     info!(target: "partial_stateless", depth = options.retention_depth.get(),
         recording = options.undo_record, layout = options.undo_layout.as_str(),
+        storage_undo = options.storage_undo.label(),
         directory = ?options.undo_dir, warm_shrink_blocks = ?options.warm_shrink.interval(),
         resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())
@@ -1757,6 +1766,7 @@ where
         Ok(ready) => {
             *failures = 0;
             pair.trie_cache.set_undo_recording(options.undo_record);
+            pair.trie_cache.set_storage_undo(options.storage_undo);
             // The rebuild replaced the pair from canonical state; whatever was retained described
             // a generation this one does not descend from, so it goes.
             pair.forget_retained_generations();

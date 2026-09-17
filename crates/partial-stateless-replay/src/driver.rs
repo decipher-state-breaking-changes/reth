@@ -18,8 +18,8 @@ use crate::{
 use alloy_primitives::B256;
 use alloy_rlp::Decodable;
 use partial_stateless::{
-    restore_snapshot, CacheConfig, PartialStatelessSidecar, TrieCacheUndoCounts, TrustedCheckpoint,
-    WarmSetShrinkPolicy,
+    restore_snapshot, CacheConfig, PartialStatelessSidecar, StorageUndo, TrieCacheUndoCounts,
+    TrustedCheckpoint, WarmSetShrinkPolicy,
 };
 use partial_stateless_stream::{
     BlockRef, Checkpoint, CommitInput, CommitOracle, FrameLimits, Manifest, Reorg, SnapshotChunk,
@@ -107,6 +107,8 @@ pub struct ReplayOptions {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// How a frame records a storage trie the block rewrote: whole, or as its own change record.
+    pub storage_undo: StorageUndo,
     /// Directory for disk undo; all retained undo payloads are written to disk.
     pub undo_dir: Option<std::path::PathBuf>,
     /// Reorgs to force, each fired after the commit of its block lands. Ascending by block.
@@ -173,6 +175,7 @@ impl ReplayOptions {
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
             undo_layout: self.undo_layout,
+            storage_undo: self.storage_undo,
             undo_dir: self.undo_dir.clone(),
         }
     }
@@ -192,6 +195,8 @@ pub struct PairConfig {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// How frames record rewritten storage tries.
+    pub storage_undo: StorageUndo,
     /// Directory for disk undo; all retained undo payloads are written to disk.
     pub undo_dir: Option<std::path::PathBuf>,
 }
@@ -210,6 +215,7 @@ impl Default for ReplayOptions {
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
             undo_layout: UndoLayout::default(),
+            storage_undo: StorageUndo::default(),
             undo_dir: None,
             forced_reorgs: Vec::new(),
         }
@@ -2346,6 +2352,7 @@ pub(crate) fn restore(
     // Same reason, and the same place: recording is a property of the cache that every working
     // copy inherits through the clone, so it has to be set before the first block clones one.
     restored.trie_cache.set_undo_recording(pair.undo_record);
+    restored.trie_cache.set_storage_undo(pair.storage_undo);
 
     // The header is installed only because every field a consumer checks it against is in the
     // checkpoint the operator vouched for. A header that fails any of them is dropped, and the

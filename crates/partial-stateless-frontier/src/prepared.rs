@@ -190,6 +190,10 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
     let mut interval_ms = 0u64;
     let mut memory_probe_every = 0usize;
     let mut shrink_override = std::env::var("PS_WARM_SHRINK").ok();
+    let storage_undo: partial_stateless::StorageUndo = match std::env::var("PS_STORAGE_UNDO") {
+        Ok(raw) => raw.parse().map_err(|err| eyre::eyre!("PS_STORAGE_UNDO: {err}"))?,
+        Err(_) => Default::default(),
+    };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let value = args.next().ok_or_else(|| eyre::eyre!("{arg} needs a value"))?;
@@ -246,6 +250,7 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
             accepted_head: None,
         };
         pair.trie_cache.set_warm_shrink_policy(shrink);
+        pair.trie_cache.set_storage_undo(storage_undo);
         pair
     };
     let mut pair = make_pair(parent.number());

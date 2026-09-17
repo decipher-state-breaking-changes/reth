@@ -29,7 +29,7 @@ use crate::{
     tail::{SpoolTail, TailEvent, TailFault},
 };
 use alloy_primitives::{Keccak256, B256};
-use partial_stateless::WarmSetShrinkPolicy;
+use partial_stateless::{StorageUndo, WarmSetShrinkPolicy};
 use partial_stateless_stream::{
     BlockRef, Checkpoint, EndKind, FrameKind, FrameLimits, Manifest, ResetReason, SnapshotChunk,
     StreamEvent, DEFAULT_MAX_SNAPSHOT_BYTES,
@@ -89,6 +89,8 @@ pub struct FollowOptions {
     pub undo_record: bool,
     /// How recorded generations are represented in the retained deque.
     pub undo_layout: UndoLayout,
+    /// How frames record rewritten storage tries. See [`ReplayOptions::storage_undo`].
+    pub storage_undo: StorageUndo,
     /// Directory for disk undo; all retained undo payloads are written to disk.
     pub undo_dir: Option<std::path::PathBuf>,
 }
@@ -101,6 +103,7 @@ impl FollowOptions {
             warm_shrink: self.warm_shrink,
             undo_record: self.undo_record,
             undo_layout: self.undo_layout,
+            storage_undo: self.storage_undo,
             undo_dir: self.undo_dir.clone(),
         }
     }
@@ -124,6 +127,7 @@ impl Default for FollowOptions {
             warm_shrink: WarmSetShrinkPolicy::default(),
             undo_record: false,
             undo_layout: UndoLayout::default(),
+            storage_undo: StorageUndo::default(),
             undo_dir: None,
         }
     }
@@ -688,6 +692,7 @@ impl<'a> Follower<'a> {
                 warm_shrink: options.warm_shrink,
                 undo_record: options.undo_record,
                 undo_layout: options.undo_layout,
+                storage_undo: options.storage_undo,
                 undo_dir: options.undo_dir.clone(),
                 // Follow mode replays a live producer; forcing reorgs on it would be forcing
                 // them on the chain. The batch driver is where the experiment runs.
