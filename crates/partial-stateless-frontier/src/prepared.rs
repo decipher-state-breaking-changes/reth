@@ -387,10 +387,10 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         {
             eyre::bail!("undo writer failed; pass is not performance evidence")
         }
-        if arm != ArmKind::Weak &&
-            index > 0 &&
-            pair.retained_depth() != (index as u64).min(depth.get())
-        {
+        // A disk store keeps nothing for the first cold commit, whose empty parent has no state to
+        // spill. Resident frames keep that generation, so their deque fills one block sooner.
+        let expected_depth = (index as u64 + u64::from(frames_in_memory)).min(depth.get());
+        if arm != ArmKind::Weak && index > 0 && pair.retained_depth() != expected_depth {
             eyre::bail!("undo coverage was lost during prepared validation")
         }
         let memory = (memory_probe_every != 0 && index % memory_probe_every == 0).then(|| {
