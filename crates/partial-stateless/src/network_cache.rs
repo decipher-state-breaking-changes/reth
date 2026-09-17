@@ -1383,14 +1383,14 @@ impl MissResult {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockCacheUndo {
     /// The block this record can undo.
-    block_number: u64,
+    pub(crate) block_number: u64,
     /// Cache `current_block` before this block was applied (restored on rollback).
-    previous_block: u64,
+    pub(crate) previous_block: u64,
     /// Locally computed root before this block, if it had already been derived.
-    previous_cache_root: Option<B256>,
-    accounts_before: HashMap<Address, Option<CachedEntry<AccountData>>>,
-    storage_before: HashMap<(Address, B256), Option<CachedEntry<U256>>>,
-    codes_before: HashMap<B256, Option<CachedEntry<Bytes>>>,
+    pub(crate) previous_cache_root: Option<B256>,
+    pub(crate) accounts_before: HashMap<Address, Option<CachedEntry<AccountData>>>,
+    pub(crate) storage_before: HashMap<(Address, B256), Option<CachedEntry<U256>>>,
+    pub(crate) codes_before: HashMap<B256, Option<CachedEntry<Bytes>>>,
 }
 
 impl BlockCacheUndo {

@@ -4,7 +4,9 @@
 //! its file even while the write is pending: pruning the handle cannot let a late completion
 //! resurrect history.
 
-use crate::{network_cache::BlockCacheUndo, TrieCacheUndoFrame};
+use crate::{
+    network_cache::BlockCacheUndo, trie_cache_undo::StorageTrieBefore, TrieCacheUndoFrame,
+};
 use alloy_primitives::{keccak256, B256};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -184,7 +186,49 @@ pub struct UndoWriteTimings {
     pub payload_drop_us: u64,
     pub completion_us: u64,
     pub bytes: u64,
+    /// `serialize_us` and the payload bytes, by the part of the bundle they went to.
+    pub parts: UndoBundleParts,
     pub error: Option<String>,
+}
+
+/// One bundle's encoded payload divided into the parts a size decision is about.
+///
+/// The parts partition the payload: their bytes sum to `bytes` minus the 40-byte header, and
+/// their times to `serialize_us` less the timer overhead. Measured while encoding rather than by
+/// a second sizing pass, so reporting them costs the writer nothing it would not already do.
+#[derive(Debug, Default, Serialize)]
+pub struct UndoBundleParts {
+    /// Parent hash, frame identities and scalars, and the flat record's heights and root.
+    pub scalars: UndoPartSize,
+    /// The account trie's preimages.
+    pub account_trie: UndoPartSize,
+    /// Whole storage tries the older generation held revealed and the newer one still holds an
+    /// entry for: rewritten in place, and the only part a record of what changed could replace.
+    pub storage_kept_revealed: UndoPartSize,
+    /// The same, where the older generation's entry was blind.
+    pub storage_kept_blind: UndoPartSize,
+    /// Whole storage tries the newer generation no longer holds.
+    pub storage_dropped: UndoPartSize,
+    /// Addresses the block added, and the entry count.
+    pub storage_absent: UndoPartSize,
+    /// Warm membership and the retained-path indexes.
+    pub membership: UndoPartSize,
+    /// The flat value cache's preimages.
+    pub flat_accounts: UndoPartSize,
+    pub flat_storage: UndoPartSize,
+    pub flat_codes: UndoPartSize,
+}
+
+/// Encoded bytes, encode time and entry count of one [`UndoBundleParts`] part.
+///
+/// Nanoseconds rather than the microseconds every other writer field uses: a storage part is the
+/// sum of ~200 encodes, most of them shorter than a microsecond, and truncating each would lose
+/// most of the part.
+#[derive(Debug, Default, Serialize)]
+pub struct UndoPartSize {
+    pub entries: u64,
+    pub bytes: u64,
+    pub ns: u64,
 }
 
 /// Non-overlapping file-load phases; checksum validation is separate from decoding.
@@ -277,6 +321,9 @@ impl DiskUndoStore {
         std::thread::Builder::new()
             .name("ps-undo-writer".into())
             .spawn(move || {
+                // The previous payload's size, so encoding one does not regrow its buffer through
+                // every power of two on the way to tens of MiB.
+                let mut capacity = 0;
                 for job in reader {
                     // A pruned job with no remaining handle has nothing left to serve.
                     if Arc::strong_count(&job.file) == 1 {
@@ -294,7 +341,7 @@ impl DiskUndoStore {
                         queue_wait_us: micros(job.enqueued), ..Default::default()
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        write_bundle(&job.file, &job.bundle, &mut timing)
+                        write_bundle(&job.file, &job.bundle, capacity, &mut timing)
                     }))
                     .unwrap_or_else(|_| Err("undo writer panicked".into()));
                     if result.is_err() &&
@@ -317,6 +364,9 @@ impl DiskUndoStore {
                     }
                     worker_metrics.record(&timing);
                     let succeeded = result.is_ok();
+                    if let Ok(written) = &result {
+                        capacity = written.bytes as usize;
+                    }
                     if let Ok(mut state) = completion.written.lock() {
                         *state = Some(result);
                         completion.ready.notify_all();
@@ -486,21 +536,119 @@ fn send_with_timeout<T>(
     }
 }
 
-fn codec() -> impl Options {
+pub(crate) fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(MAX_BYTES)
         .reject_trailing_bytes()
 }
 
+/// Encodes `bundle` exactly as `codec().serialize(bundle)` would, one field at a time, charging
+/// each field's bytes and time to its [`UndoBundleParts`] part.
+///
+/// Unlike `serialize`, it does not size the value in a separate pass first; `capacity` stands in
+/// for that pass, and an under-estimate only costs a reallocation.
+///
+/// bincode writes a struct as its fields in declaration order with nothing between them, and a
+/// sequence as its length followed by its elements, so the concatenation is the payload the loader
+/// decodes as one [`DiskUndoBundle`]. The destructuring below names every field, so adding one to
+/// the bundle, the frame or the flat record fails to compile here until it is placed.
+pub(crate) fn encode_bundle(
+    bundle: &DiskUndoBundle,
+    capacity: usize,
+    parts: &mut UndoBundleParts,
+) -> Result<Vec<u8>, String> {
+    let DiskUndoBundle { parent_hash, trie, flat } = bundle;
+    let TrieCacheUndoFrame {
+        source,
+        target,
+        account,
+        storage,
+        storage_kept,
+        membership,
+        state_root,
+        synced_to_block,
+        warm_shrink,
+    } = trie;
+    let BlockCacheUndo {
+        block_number,
+        previous_block,
+        previous_cache_root,
+        accounts_before,
+        storage_before,
+        codes_before,
+    } = flat;
+
+    let mut payload = Vec::with_capacity(capacity);
+    encode_part(&mut payload, &mut parts.scalars, 0, &(parent_hash, source, target))?;
+    encode_part(&mut payload, &mut parts.account_trie, u64::from(account.is_some()), account)?;
+    encode_part(&mut payload, &mut parts.storage_absent, 0, &(storage.len() as u64))?;
+    for (index, entry) in storage.iter().enumerate() {
+        let part = match &entry.1 {
+            StorageTrieBefore::Absent => &mut parts.storage_absent,
+            StorageTrieBefore::Held(_) if index >= *storage_kept => &mut parts.storage_dropped,
+            StorageTrieBefore::Held(trie) if trie.as_revealed_ref().is_some() => {
+                &mut parts.storage_kept_revealed
+            }
+            StorageTrieBefore::Held(_) => &mut parts.storage_kept_blind,
+        };
+        encode_part(&mut payload, part, 1, entry)?;
+    }
+    encode_part(&mut payload, &mut parts.membership, 0, membership)?;
+    let scalars = (
+        state_root,
+        synced_to_block,
+        warm_shrink,
+        block_number,
+        previous_block,
+        previous_cache_root,
+    );
+    encode_part(&mut payload, &mut parts.scalars, 0, &scalars)?;
+    encode_part(
+        &mut payload,
+        &mut parts.flat_accounts,
+        accounts_before.len() as u64,
+        accounts_before,
+    )?;
+    encode_part(
+        &mut payload,
+        &mut parts.flat_storage,
+        storage_before.len() as u64,
+        storage_before,
+    )?;
+    encode_part(&mut payload, &mut parts.flat_codes, codes_before.len() as u64, codes_before)?;
+    Ok(payload)
+}
+
+/// Appends one value to `payload`, within what is left of the bundle's size limit.
+fn encode_part<T: Serialize + ?Sized>(
+    payload: &mut Vec<u8>,
+    part: &mut UndoPartSize,
+    entries: u64,
+    value: &T,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let before = payload.len();
+    let remaining = MAX_BYTES.saturating_sub(before as u64);
+    codec()
+        .with_limit(remaining)
+        .serialize_into(&mut *payload, value)
+        .map_err(|err| err.to_string())?;
+    part.entries += entries;
+    part.bytes += (payload.len() - before) as u64;
+    part.ns += started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    Ok(())
+}
+
 fn write_bundle(
     file: &FileState,
     bundle: &DiskUndoBundle,
+    capacity: usize,
     timing: &mut UndoWriteTimings,
 ) -> Result<Written, String> {
     use std::io::Write;
     let started = Instant::now();
-    let payload = codec().serialize(bundle).map_err(|err| err.to_string())?;
+    let payload = encode_bundle(bundle, capacity, &mut timing.parts)?;
     timing.serialize_us = micros(started);
     let started = Instant::now();
     let checksum = keccak256(&payload);

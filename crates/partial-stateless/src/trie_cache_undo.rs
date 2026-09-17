@@ -76,7 +76,18 @@ pub struct TrieCacheUndoFrame {
     /// instead of landing here.
     pub(crate) account: Option<UndoFrame>,
     /// Storage-trie map entries the block replaced, dropped or added.
+    ///
+    /// Ordered in three runs: held tries whose address the newer generation still holds, then
+    /// held tries it dropped, then [`StorageTrieBefore::Absent`]. Undo does not depend on the
+    /// order — every entry names a different address — but [`Self::storage_kept`] does.
     pub(crate) storage: Vec<(B256, StorageTrieBefore)>,
+    /// How many leading `storage` entries the newer generation still holds a trie for.
+    ///
+    /// The line between a trie the block rewrote and one retention dropped, which a byte count
+    /// needs and the undo itself does not: a rewritten trie could be described by what changed in
+    /// it, a dropped one only whole. Not encoded, so a frame read back from disk reports zero.
+    #[serde(skip)]
+    pub(crate) storage_kept: usize,
     /// Warm membership and the retained-path indexes, reversed.
     pub(crate) membership: MembershipUndo,
     /// The three scalars as they stood before the block.
@@ -114,10 +125,13 @@ impl TrieCacheUndoFrame {
             account_metadata_changed: account.metadata_changed,
             ..Default::default()
         };
-        for (_, before) in &self.storage {
+        for (index, (_, before)) in self.storage.iter().enumerate() {
             match before {
                 StorageTrieBefore::Held(trie) => {
                     counts.storage_tries_held += 1;
+                    if index >= self.storage_kept {
+                        counts.storage_tries_dropped += 1;
+                    }
                     match &**trie {
                         CacheStorageTrie::Revealed(_) => counts.storage_tries_revealed += 1,
                         CacheStorageTrie::Blind(Some(_)) => {
@@ -287,6 +301,12 @@ pub struct TrieCacheUndoCounts {
     pub storage_tries_blind_retained: usize,
     /// Of those, blind slots holding nothing: an entry to restore, and no bytes behind it.
     pub storage_tries_blind_empty: usize,
+    /// Of the held tries, the ones whose address the newer generation no longer holds.
+    ///
+    /// A second split of the same population, by why the entry is here rather than by what it
+    /// holds: retention dropped the address, so only the whole trie can put it back. The rest
+    /// were rewritten in place and are still in the newer generation.
+    pub storage_tries_dropped: usize,
     /// Addresses the block added to the storage-trie map, removed again on undo.
     pub storage_tries_absent: usize,
     /// Warm account keys whose membership the block moved.
@@ -468,6 +488,7 @@ mod tests {
             target: 1,
             account: None,
             storage: vec![(B256::ZERO, StorageTrieBefore::Held(Box::new(held)))],
+            storage_kept: 1,
             membership: MembershipUndo::default(),
             state_root: None,
             synced_to_block: None,

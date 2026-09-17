@@ -421,11 +421,13 @@ impl PartialTrieNodeCache {
         if blind_now != account.is_none() {
             return None
         }
+        let (storage, storage_kept) = self.storage_undo_against(parent);
         Some(TrieCacheUndoFrame {
             source: self.undo_id,
             target: parent.undo_id,
             account,
-            storage: self.storage_undo_against(parent),
+            storage,
+            storage_kept,
             membership: record.membership,
             state_root: record.state_root,
             synced_to_block: record.synced_to_block,
@@ -560,32 +562,42 @@ impl PartialTrieNodeCache {
     /// An entry with no revealed trie behind it has no `Arc` to compare, so it is recorded rather
     /// than assumed unchanged. Recording it costs nothing here: `parent` is being dropped, so the
     /// handle is moved out of it.
-    fn storage_undo_against(&self, parent: &mut Self) -> Vec<(B256, StorageTrieBefore)> {
+    ///
+    /// Returned in the order [`TrieCacheUndoFrame::storage`] documents, with the length of its
+    /// first run.
+    fn storage_undo_against(&self, parent: &mut Self) -> (Vec<(B256, StorageTrieBefore)>, usize) {
         fn identity(trie: &CacheStorageTrie) -> Option<usize> {
             trie.as_revealed_ref().map(SharedSparseTrie::allocation_id)
         }
 
         let mut undo = Vec::new();
+        let mut dropped = Vec::new();
         let mine = self.sparse.storage_tries_ref();
         for (hashed_address, held) in parent.sparse.storage_tries_mut() {
-            let unchanged = match (identity(held), mine.get(hashed_address).and_then(identity)) {
+            let now = mine.get(hashed_address);
+            let unchanged = match (identity(held), now.and_then(identity)) {
                 (Some(before), Some(now)) => before == now,
                 _ => false,
             };
             if !unchanged {
-                undo.push((
-                    *hashed_address,
-                    StorageTrieBefore::Held(Box::new(std::mem::take(held))),
-                ));
+                let entry =
+                    (*hashed_address, StorageTrieBefore::Held(Box::new(std::mem::take(held))));
+                if now.is_some() {
+                    undo.push(entry);
+                } else {
+                    dropped.push(entry);
+                }
             }
         }
+        let kept = undo.len();
+        undo.append(&mut dropped);
         let held_before = parent.sparse.storage_tries_ref();
         for hashed_address in mine.keys() {
             if !held_before.contains_key(hashed_address) {
                 undo.push((*hashed_address, StorageTrieBefore::Absent));
             }
         }
-        undo
+        (undo, kept)
     }
 
     pub(crate) fn restore_from_decoded_multiproof(
@@ -2237,12 +2249,14 @@ fn prefix_coverage(
 mod tests {
     use super::*;
     use crate::{
+        disk_undo::{self, encode_bundle, DiskUndoBundle, UndoBundleParts},
         policy::{AccountData, LastNBlocksPolicy},
         trie_cache_undo::TrieCacheUndoFrame,
         NetworkStateCache,
     };
     use alloy_primitives::{map::B256Map, U256};
     use alloy_rlp::encode_fixed_size;
+    use bincode::Options;
     use reth_trie::test_utils::TrieTestHarness;
     use reth_trie_common::ProofV2Target;
     use reth_trie_sparse::{ExactSparseTrie, LeafUpdate};
@@ -2957,6 +2971,89 @@ mod tests {
             assert_eq!(identity(&live, address), identity(&control, address));
         }
         assert!(!live.sparse.storage_tries_ref().contains_key(&inserted));
+    }
+
+    #[test]
+    fn disk_undo_part_encoding_is_the_whole_bundle_encoding() {
+        // Every part populated: account-trie preimages, a rewritten, a formerly blind, a dropped
+        // and an added storage trie, membership, and flat records for accounts, slots and code.
+        let entries: BTreeMap<B256, U256> = (0..64usize)
+            .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(i + 1)))
+            .collect();
+        let harness = TrieTestHarness::new(entries.clone());
+        let keys: Vec<B256> = entries.keys().copied().collect();
+        let storage = |tag: u64| {
+            let entries: BTreeMap<B256, U256> = (0..8u64)
+                .map(|i| (keccak256(B256::from(U256::from(i))), U256::from(tag * 100 + i + 1)))
+                .collect();
+            let harness = TrieTestHarness::new(entries.clone());
+            let template = revealed_cache(&harness, &entries.keys().copied().collect::<Vec<_>>());
+            SharedSparseTrie::new(template.sparse.state_trie_ref().unwrap().clone())
+        };
+        let [rewritten, blind, dropped, added] = [0x11, 0x22, 0x33, 0x44].map(B256::repeat_byte);
+
+        let mut live = revealed_cache(&harness, &keys);
+        live.set_undo_recording(true);
+        let tries = live.sparse.storage_tries_mut();
+        tries.insert(rewritten, CacheStorageTrie::Revealed(Box::new(storage(1))));
+        tries.insert(blind, CacheStorageTrie::Blind(Some(Box::new(storage(2)))));
+        tries.insert(dropped, CacheStorageTrie::Revealed(Box::new(storage(3))));
+        let control = live.clone();
+
+        let (mut next, _) = live.clone_timed();
+        apply_leaves(&harness, &mut next, &[(keys[0], U256::from(999)), (keys[1], U256::ZERO)]);
+        let tries = next.sparse.storage_tries_mut();
+        tries.get_mut(&rewritten).unwrap().as_revealed_mut().unwrap().make_mut().wipe();
+        tries.insert(blind, CacheStorageTrie::Revealed(Box::new(storage(4))));
+        tries.remove(&dropped);
+        tries.insert(added, CacheStorageTrie::Revealed(Box::new(storage(5))));
+        let mut displaced = std::mem::replace(&mut live, next);
+        let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+        let counts = frame.counts();
+        assert_eq!((counts.storage_tries_held, counts.storage_tries_dropped), (3, 1));
+        assert!(counts.account_nodes > 0);
+
+        let mut values = fast_forgetting_value_cache();
+        let mut accessed = block_touching(0..4);
+        accessed.codes.insert(B256::repeat_byte(0x55), vec![0x60; 32].into());
+        values.on_block_executed(1, &accessed);
+        let mut accessed = block_touching(2..8);
+        accessed.storage.extend(block_touching_slots(0..4).storage);
+        accessed.codes.insert(B256::repeat_byte(0x66), vec![0x61; 32].into());
+        values.on_block_executed(2, &accessed);
+        let flat = values.take_undo_record(2).expect("the value cache records every block");
+
+        let bundle = DiskUndoBundle { parent_hash: B256::repeat_byte(0x99), trie: frame, flat };
+        let mut parts = UndoBundleParts::default();
+        let encoded = encode_bundle(&bundle, 0, &mut parts).unwrap();
+        assert_eq!(encoded, disk_undo::codec().serialize(&bundle).unwrap());
+
+        let all = [
+            &parts.scalars,
+            &parts.account_trie,
+            &parts.storage_kept_revealed,
+            &parts.storage_kept_blind,
+            &parts.storage_dropped,
+            &parts.storage_absent,
+            &parts.membership,
+            &parts.flat_accounts,
+            &parts.flat_storage,
+            &parts.flat_codes,
+        ];
+        assert_eq!(all.iter().map(|part| part.bytes).sum::<u64>(), encoded.len() as u64);
+        assert!(all.iter().all(|part| part.bytes > 0), "every part was exercised: {parts:?}");
+        for part in
+            [&parts.storage_kept_revealed, &parts.storage_kept_blind, &parts.storage_dropped]
+        {
+            assert_eq!(part.entries, 1);
+            assert!(part.bytes > parts.storage_absent.bytes, "a held trie outweighs an address");
+        }
+        assert_eq!(parts.storage_absent.entries, 1);
+
+        let decoded: DiskUndoBundle = disk_undo::codec().deserialize(&encoded).unwrap();
+        let mut restored = live.fork_for_rollback();
+        assert!(restored.undo(decoded.trie));
+        assert!(restored.structurally_eq(&control), "the part-encoded bundle restores the parent");
     }
 
     #[test]
