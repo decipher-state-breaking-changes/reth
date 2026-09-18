@@ -75,9 +75,26 @@ def load_pass(directory):
     return config, result, measured
 
 
-def analyze(baselines, candidates):
+# Every pass on both sides must agree on these, unless `vary` names one of VARIABLE_ACROSS_SIDES.
+CROSS_SIDE_FIELDS = ("build_commit", "build_dirty", "binary_keccak256", "allocator", "interval_ms",
+                     "timing_boundary", "rayon_num_threads", "malloc_conf", "warmup", "trie_repr",
+                     "asm_keccak", "keccak_cache_global")
+# Repetitions of one side must agree on these; the two sides may differ.
+WITHIN_SIDE_FIELDS = ("input_manifest_digest", "retention_depth", "undo_layout", "undo_recording",
+                      "storage_undo", "warm_shrink_blocks", "undo_filesystem", "arm")
+# Process settings an A/B may change on purpose. Naming one moves it from the cross-side check to
+# the within-side one, and the output records it with both sides' values.
+VARIABLE_ACROSS_SIDES = ("malloc_conf", "rayon_num_threads")
+
+
+def analyze(baselines, candidates, vary=()):
     if not baselines or len(baselines) != len(candidates):
         raise ValueError("supply equally many baseline and candidate repetitions")
+    unknown = sorted(set(vary) - set(VARIABLE_ACROSS_SIDES))
+    if unknown:
+        raise ValueError(f"cannot vary {', '.join(unknown)}; variable fields: {', '.join(VARIABLE_ACROSS_SIDES)}")
+    cross_side = tuple(field for field in CROSS_SIDE_FIELDS if field not in vary)
+    within_side = WITHIN_SIDE_FIELDS + tuple(field for field in VARIABLE_ACROSS_SIDES if field in vary)
     sides = [[load_pass(path) for path in paths] for paths in (baselines, candidates)]
     reference_keys = [(r["block_number"], r["block_hash"]) for r in sides[0][0][2]]
     reference = sides[0][0][0]
@@ -88,10 +105,10 @@ def analyze(baselines, candidates):
             keys = [(r["block_number"], r["block_hash"]) for r in rows]
             if keys != reference_keys or result["measured_block_set_digest"] != sides[0][0][1]["measured_block_set_digest"]:
                 raise ValueError("passes do not contain exactly the same ordered block set")
-            for field in ("build_commit", "build_dirty", "binary_keccak256", "allocator", "interval_ms", "timing_boundary", "rayon_num_threads", "malloc_conf", "warmup", "trie_repr", "asm_keccak", "keccak_cache_global"):
+            for field in cross_side:
                 if config.get(field) != reference.get(field):
                     raise ValueError(f"passes disagree on {field}")
-            for field in ("input_manifest_digest", "retention_depth", "undo_layout", "undo_recording", "storage_undo", "warm_shrink_blocks", "arm"):
+            for field in within_side:
                 if config.get(field) != first_config.get(field):
                     raise ValueError(f"repetitions disagree on {field}")
             if any(row["arm"] != config["arm"] for row in rows):
@@ -116,7 +133,10 @@ def analyze(baselines, candidates):
                   for i in range(len(reference_keys))]
         network[str(bandwidth)] = {"mean_candidate_minus_baseline_ms": statistics.fmean(deltas),
                                     "candidate_faster_fraction": sum(x < 0 for x in deltas) / len(deltas)}
+    varied = {field: {"baseline": sides[0][0][0].get(field), "candidate": sides[1][0][0].get(field)}
+              for field in VARIABLE_ACROSS_SIDES if field in vary}
     return {"blocks": len(reference_keys), "repetitions": repetitions, "combined": combined,
+            "varied": varied,
             "network_model_mbit": network, "baseline": sides[0][0][0], "candidate": sides[1][0][0],
             "writer_final": [[run[1].get("writer") for run in side] for side in sides],
             "notes": ["file delivery and background writer completion excluded from block step",
@@ -129,9 +149,11 @@ def main():
     parser.add_argument("--baseline", action="append", required=True, type=Path)
     parser.add_argument("--candidate", action="append", required=True, type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--vary", action="append", default=[], choices=VARIABLE_ACROSS_SIDES,
+                        help="a process setting the two sides may differ on; each side must still agree with itself")
     args = parser.parse_args()
     try:
-        result = analyze(args.baseline, args.candidate)
+        result = analyze(args.baseline, args.candidate, args.vary)
     except (ValueError, KeyError, OSError) as error:
         raise SystemExit(str(error)) from error
     output = json.dumps(result, indent=2) + "\n"

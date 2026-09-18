@@ -48,6 +48,7 @@ snmalloc = ["dep:snmalloc-rs"]
 
 [dependencies]
 partial-stateless = { path = "../partial-stateless" }
+partial-stateless-stream = { path = "../partial-stateless-stream" }
 partial-stateless-validator = { path = "../partial-stateless-validator" }
 
 # Implementation crates only where they carry no state database. The forbidden set is the

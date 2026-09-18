@@ -1491,7 +1491,9 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
     info!(target: "partial_stateless", depth = options.retention_depth.get(),
         recording = options.undo_record, layout = options.undo_layout.as_str(),
         storage_undo = options.storage_undo.label(),
-        directory = ?options.undo_dir, warm_shrink_blocks = ?options.warm_shrink.interval(),
+        directory = ?options.undo_dir,
+        filesystem = ?options.undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
+        warm_shrink_blocks = ?options.warm_shrink.interval(),
         resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())
 }

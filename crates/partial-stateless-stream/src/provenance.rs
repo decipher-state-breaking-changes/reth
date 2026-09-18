@@ -59,7 +59,9 @@ pub struct RunProvenance {
     pub binary_keccak256: Option<String>,
     /// The process's command line, verbatim.
     pub args: Vec<String>,
-    /// Environment variables that steer these components: the `PS_*` family plus `RUST_LOG`.
+    /// Environment variables that steer these components: the `PS_*` family, `RUST_LOG`, and the
+    /// process-wide `MALLOC_CONF` and `RAYON_NUM_THREADS`, which change timings without changing
+    /// any `PS_*` setting.
     pub env: BTreeMap<String, String>,
     /// Host name.
     pub hostname: Option<String>,
@@ -120,9 +122,7 @@ impl RunProvenance {
             }
         };
 
-        let env = std::env::vars()
-            .filter(|(key, _)| key.starts_with("PS_") || key == "RUST_LOG")
-            .collect();
+        let env = std::env::vars().filter(|(key, _)| steers(key)).collect();
 
         let filesystem = target_dir.and_then(|dir| filesystem_of(dir, &mut notes));
 
@@ -154,6 +154,25 @@ impl RunProvenance {
             notes,
         }
     }
+}
+
+/// Whether an environment variable is one [`RunProvenance::env`] records.
+///
+/// Every binary here reads the unprefixed `MALLOC_CONF`: `reth-cli-util`'s jemalloc feature turns
+/// on `override_allocator_on_supported_platforms`, and the standalone binaries match it. An arm
+/// that sets it for one process can therefore reach every process started from the same
+/// environment.
+fn steers(key: &str) -> bool {
+    key.starts_with("PS_") || matches!(key, "RUST_LOG" | "MALLOC_CONF" | "RAYON_NUM_THREADS")
+}
+
+/// The mount holding `dir`, as `"<device> <fs type> <mount point>"`, or `None` when
+/// `/proc/mounts` is unreadable or names no mount above it.
+///
+/// For a directory other than the run's target, such as where undo files go: the same file
+/// written to tmpfs or to a device is a different cost, and a record has to say which.
+pub fn mount_of(dir: &Path) -> Option<String> {
+    filesystem_of(dir, &mut Vec::new())
 }
 
 /// Reads a one-line pseudo-file, noting the miss instead of failing.
@@ -265,12 +284,30 @@ mod tests {
         assert!(provenance.filesystem.is_none() || provenance.target_dir.is_some());
     }
 
-    /// The env capture is a filter, not a dump: only the `PS_*` family and `RUST_LOG` steer
-    /// these components, and a full environment dump would leak whatever else the shell holds.
+    /// The env capture is a filter, not a dump: only what steers these components is kept, and a
+    /// full environment dump would leak whatever else the shell holds.
     #[test]
     fn only_steering_environment_variables_are_captured() {
         let provenance = RunProvenance::collect("test 0.0.0", BuildStamp::default(), None);
-        assert!(provenance.env.keys().all(|key| key.starts_with("PS_") || key == "RUST_LOG"));
+        assert!(provenance.env.keys().all(|key| steers(key)));
+        for key in ["PS_UNDO_DIR", "RUST_LOG", "MALLOC_CONF", "RAYON_NUM_THREADS"] {
+            assert!(steers(key), "{key}");
+        }
+        // Prefixed jemalloc reads `_RJEM_MALLOC_CONF`, which no binary here is built to do.
+        for key in ["_RJEM_MALLOC_CONF", "HOME", "PATH", "RAYON"] {
+            assert!(!steers(key), "{key}");
+        }
+    }
+
+    /// A directory that does not exist yet still resolves to the mount it will be created on,
+    /// because undo directories are recorded before the first file is written.
+    #[test]
+    fn a_missing_directory_resolves_to_its_enclosing_mount() {
+        if std::fs::read_to_string("/proc/mounts").is_err() {
+            return
+        }
+        let mount = mount_of(Path::new("/definitely/missing/undo")).expect("/ is mounted");
+        assert_eq!(mount.split_whitespace().nth(2), Some("/"));
     }
 
     /// The dirty flag is a claim about code-freeze evidence, so it is parsed strictly: `0`/`1`

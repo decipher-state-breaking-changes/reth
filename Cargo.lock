@@ -6529,6 +6529,7 @@ dependencies = [
  "bincode",
  "eyre",
  "partial-stateless",
+ "partial-stateless-stream",
  "partial-stateless-validator",
  "reth-chainspec",
  "reth-consensus",

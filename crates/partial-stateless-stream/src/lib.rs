@@ -48,7 +48,7 @@ pub use frame::{
     FORMAT_VERSION, FRAME_HEADER_BYTES, FRAME_MAGIC,
 };
 pub use oracle::{CommitOracle, RecordedVerdict};
-pub use provenance::{BuildStamp, RunProvenance};
+pub use provenance::{mount_of, BuildStamp, RunProvenance};
 
 /// Decodes one frame into the event its kind names.
 ///

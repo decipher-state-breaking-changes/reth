@@ -261,14 +261,15 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         pair
     };
     let mut pair = make_pair(parent.number());
+    if arm != ArmKind::Weak && frames_in_memory && undo_dir.is_some() {
+        eyre::bail!("--undo-dir conflicts with PS_UNDO_STORE=memory")
+    }
+    let disk_undo_dir = (arm != ArmKind::Weak && !frames_in_memory)
+        .then(|| undo_dir.unwrap_or_else(|| output.join("undo")));
     if arm != ArmKind::Weak && frames_in_memory {
-        if undo_dir.is_some() {
-            eyre::bail!("--undo-dir conflicts with PS_UNDO_STORE=memory")
-        }
         pair.trie_cache.set_undo_recording(true);
-    } else if arm != ArmKind::Weak {
-        pair.enable_disk_undo(&undo_dir.unwrap_or_else(|| output.join("undo")))
-            .map_err(eyre::Report::msg)?;
+    } else if let Some(disk_undo_dir) = &disk_undo_dir {
+        pair.enable_disk_undo(disk_undo_dir).map_err(eyre::Report::msg)?;
         // Each standalone pass owns its telemetry; shared global output paths are unnecessary.
         if std::env::var_os("PS_UNDO_METRICS_DIR").is_none() {
             pair.undo_store
@@ -308,6 +309,8 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
             (_, true) => "memory-frames",
         },
         "storage_undo": (arm != ArmKind::Weak).then(|| pair.trie_cache.storage_undo().label()),
+        // Where undo files went; tmpfs and a device are different costs for the same bundle.
+        "undo_filesystem": disk_undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
         "warm_shrink_blocks": shrink.interval().map(std::num::NonZeroU64::get), "warmup": manifest.warmup, "samples": manifest.samples,
         "interval_ms": interval_ms, "timing_boundary": "payload_decode_through_coordinated_commit",
         "file_read_included": false, "writer_completion_included": false,

@@ -111,6 +111,31 @@ class PreparedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "build_commit"):
             analyze([a], [b])
 
+    def test_vary_lets_named_settings_differ_between_sides_only(self):
+        a1, a2 = self.make_pass("a1"), self.make_pass("a2")
+        b1, b2 = self.make_pass("b1"), self.make_pass("b2")
+        for directory in (b1, b2):
+            self.change(directory, "run.json", "malloc_conf", "dirty_decay_ms:-1")
+        with self.assertRaisesRegex(ValueError, "disagree on malloc_conf"):
+            analyze([a1, a2], [b1, b2])
+        with patch("analyze_frontier_arms.RESAMPLES", 20):
+            result = analyze([a1, a2], [b1, b2], vary=["malloc_conf"])
+        self.assertEqual(result["varied"], {"malloc_conf": {"baseline": None, "candidate": "dirty_decay_ms:-1"}})
+        # A varied setting still has to hold within each side.
+        self.change(b2, "run.json", "malloc_conf", "dirty_decay_ms:30000")
+        with self.assertRaisesRegex(ValueError, "repetitions disagree on malloc_conf"):
+            analyze([a1, a2], [b1, b2], vary=["malloc_conf"])
+        # Only process settings can be varied; the build and the boundary never can.
+        with self.assertRaisesRegex(ValueError, "cannot vary build_commit"):
+            analyze([a1], [b1], vary=["build_commit"])
+
+    def test_undo_filesystem_must_hold_within_a_side(self):
+        first, second = self.make_pass("first", "90/60"), self.make_pass("second", "90/60")
+        self.change(first, "run.json", "undo_filesystem", "tmpfs tmpfs /dev/shm")
+        self.change(second, "run.json", "undo_filesystem", "/dev/sdc1 ext4 /data2")
+        with self.assertRaisesRegex(ValueError, "repetitions disagree on undo_filesystem"):
+            analyze([first, second], [self.make_pass("weak-1"), self.make_pass("weak-2")])
+
     def test_rejects_different_order_even_with_same_claimed_digest(self):
         a, b = self.make_pass("a"), self.make_pass("b")
         path = b / "validation.jsonl"
