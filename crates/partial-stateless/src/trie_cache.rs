@@ -12,8 +12,8 @@ use crate::{
     participant::ParticipantCache,
     shared_trie::{self, SharedSparseTrie},
     trie_cache_undo::{
-        next_undo_id, CacheStorageTrie, CacheUndoRecord, MembershipUndo, MembershipWhole,
-        StorageTrieBefore, StorageUndo, TrieCacheUndoFrame,
+        next_undo_id, CacheStorageTrie, CacheUndoRecord, FrameTakeTimings, MembershipUndo,
+        MembershipWhole, StorageTrieBefore, StorageUndo, TrieCacheUndoFrame,
     },
 };
 use alloy_primitives::{
@@ -440,8 +440,19 @@ impl PartialTrieNodeCache {
     /// of those means the caller keeps `parent` whole instead, which is correct at any depth and
     /// only costs memory.
     pub fn take_undo_frame(&mut self, parent: &mut Self) -> Option<TrieCacheUndoFrame> {
+        self.take_undo_frame_timed(parent, &mut FrameTakeTimings::default())
+    }
+
+    /// [`Self::take_undo_frame`], dividing its time into `timings`.
+    pub fn take_undo_frame_timed(
+        &mut self,
+        parent: &mut Self,
+        timings: &mut FrameTakeTimings,
+    ) -> Option<TrieCacheUndoFrame> {
         let record = self.undo.take();
+        let started = Instant::now();
         let account = self.sparse.trie_mut().as_revealed_mut().and_then(CacheTrie::take_undo);
+        timings.account_us = started.elapsed().as_micros() as u64;
         let Some(record) = record else {
             self.end_storage_undo();
             return None
@@ -466,7 +477,7 @@ impl PartialTrieNodeCache {
             self.end_storage_undo();
             return None
         }
-        let (storage, storage_kept) = self.storage_undo_against(parent);
+        let (storage, storage_kept) = self.storage_undo_against(parent, timings);
         Some(TrieCacheUndoFrame {
             source: self.undo_id,
             target: parent.undo_id,
@@ -631,11 +642,13 @@ impl PartialTrieNodeCache {
     fn storage_undo_against(
         &mut self,
         parent: &mut Self,
+        timings: &mut FrameTakeTimings,
     ) -> (Vec<(B256, StorageTrieBefore)>, usize) {
         fn identity(trie: &CacheStorageTrie) -> Option<usize> {
             trie.as_revealed_ref().map(SharedSparseTrie::allocation_id)
         }
 
+        let started = Instant::now();
         let mut undo = Vec::new();
         let mut dropped = Vec::new();
         let mine = self.sparse.storage_tries_mut();
@@ -667,6 +680,8 @@ impl PartialTrieNodeCache {
         }
         let kept = undo.len();
         undo.append(&mut dropped);
+        timings.storage_records_us = started.elapsed().as_micros() as u64;
+        let started = Instant::now();
         let held_before = parent.sparse.storage_tries_ref();
         for (hashed_address, trie) in mine.iter_mut() {
             if let Some(handle) = trie.as_revealed_mut() {
@@ -676,6 +691,7 @@ impl PartialTrieNodeCache {
                 undo.push((*hashed_address, StorageTrieBefore::Absent));
             }
         }
+        timings.storage_end_us = started.elapsed().as_micros() as u64;
         (undo, kept)
     }
 
@@ -3679,7 +3695,16 @@ mod tests {
             tries.remove(&dropped);
             tries.insert(added, CacheStorageTrie::Revealed(Box::new(storage_trie(&slots(4, 4)).1)));
             let mut displaced = std::mem::replace(&mut live, next);
-            let frame = live.take_undo_frame(&mut displaced).expect("the working copy recorded");
+            let mut take = FrameTakeTimings::default();
+            let started = Instant::now();
+            let frame = live
+                .take_undo_frame_timed(&mut displaced, &mut take)
+                .expect("the working copy recorded");
+            let total = started.elapsed().as_micros() as u64;
+            assert!(
+                take.account_us + take.storage_records_us + take.storage_end_us <= total,
+                "the parts divide the take: {take:?} against {total} us"
+            );
             (live, control, frame)
         };
 

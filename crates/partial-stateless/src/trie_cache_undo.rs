@@ -318,6 +318,23 @@ impl std::str::FromStr for StorageUndo {
     }
 }
 
+/// Where taking a frame spends its time, in the order the work happens.
+///
+/// The frame take is one wall interval on the commit path; these parts divide it. Whatever they
+/// leave out of that interval is building the frame value itself. The storage parts stay zero
+/// when no frame comes out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct FrameTakeTimings {
+    /// Ending the account trie's journal and taking its record.
+    pub account_us: u64,
+    /// Comparing every storage trie `parent` holds against this cache's, taking the change record
+    /// of each one the block rewrote and moving out whole the ones it replaced or dropped.
+    pub storage_records_us: u64,
+    /// Ending the journal of every storage trie this cache holds and noting the ones `parent`
+    /// did not have.
+    pub storage_end_us: u64,
+}
+
 /// What a [`TrieCacheUndoFrame`] holds, by kind.
 ///
 /// Logical counts. The `account_*` fields are the sparse trie's own report flattened — a run log

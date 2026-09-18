@@ -25,7 +25,8 @@ use partial_stateless::{
         BlockContext, BlockedReason, CacheObservation, CacheReadinessTracker, ReadyParent,
         TrustedCheckpoint,
     },
-    PartialTrieNodeCache, TrieCacheMemory, TrieCacheUndoCounts, TrieCacheUndoFrame,
+    FrameTakeTimings, PartialTrieNodeCache, TrieCacheMemory, TrieCacheUndoCounts,
+    TrieCacheUndoFrame,
 };
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, RecoveredBlock, SealedHeader};
@@ -501,20 +502,26 @@ impl CoordinatedPair {
         // walks every storage trie it holds — a cost the control arm does not pay, which inside
         // this bracket would show up as recording being slower than it is.
         let started = Instant::now();
+        let mut take = FrameTakeTimings::default();
         let frame = match self.undo_layout {
             UndoLayout::Hybrid => match self.retained.back_mut().map(|held| &mut held.content) {
                 Some(RetainedContent::Full(parent)) if self.retention_depth.get() > 1 => {
-                    trie_cache.take_undo_frame(parent)
+                    trie_cache.take_undo_frame_timed(parent, &mut take)
                 }
                 _ => {
                     trie_cache.clear_undo_record();
                     None
                 }
             },
-            UndoLayout::FramesOnly => self.trie_cache.take_undo_frame(&mut trie_cache),
+            UndoLayout::FramesOnly => {
+                self.trie_cache.take_undo_frame_timed(&mut trie_cache, &mut take)
+            }
         };
-        let mut report =
-            CommitUndoReport { us: started.elapsed().as_micros() as u64, ..Default::default() };
+        let mut report = CommitUndoReport {
+            us: started.elapsed().as_micros() as u64,
+            take,
+            ..Default::default()
+        };
         let accounting_started = Instant::now();
         if let Some(frame) = frame {
             let (block_number, block_hash) = match self.undo_layout {
@@ -1375,6 +1382,8 @@ pub struct CommitUndoReport {
     /// Not the cost of *recording*, which is a lookup per write spread across the whole block and
     /// is not bracketed anywhere. Measuring it requires comparison with recording disabled.
     pub us: u64,
+    /// The parts of [`Self::us`]; what they leave out of it is building the frame value.
+    pub take: FrameTakeTimings,
     pub accounting_us: u64,
     /// Handing the displaced parent and the expired generations to the release thread, including
     /// the wait while one handoff is being freed and another is already queued. Freeing them, and
