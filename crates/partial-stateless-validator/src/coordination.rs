@@ -307,6 +307,15 @@ impl CoordinatedPair {
         Ok(())
     }
 
+    /// Fault injection: the next commit's bundle is refused as if the writer could not accept it,
+    /// so the commit discards the undo history behind it exactly as a writer timeout does.
+    /// `false`, doing nothing, without disk undo.
+    pub fn inject_spill_failure(&mut self) -> bool {
+        let Some(store) = self.undo_store.as_mut() else { return false };
+        store.fail_next_spill();
+        true
+    }
+
     /// Transfer the newest block's trie and flat records together; keep no resident history.
     fn spill_undo(&mut self) {
         let Some(store) = self.undo_store.as_mut() else { return };

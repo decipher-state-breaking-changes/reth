@@ -314,6 +314,8 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "storage_undo": (arm != ArmKind::Weak).then(|| pair.trie_cache.storage_undo().label()),
         // Where undo files went; tmpfs and a device are different costs for the same bundle.
         "undo_filesystem": disk_undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
+        "undo_spill_timeout_ms": partial_stateless::disk_undo::SPILL_TIMEOUT.as_millis() as u64,
+        "undo_load_timeout_ms": partial_stateless::disk_undo::LOAD_TIMEOUT.as_millis() as u64,
         "warm_shrink_blocks": shrink.interval().map(std::num::NonZeroU64::get), "warmup": manifest.warmup, "samples": manifest.samples,
         "interval_ms": interval_ms, "timing_boundary": "payload_decode_through_coordinated_commit",
         "file_read_included": false, "writer_completion_included": false,

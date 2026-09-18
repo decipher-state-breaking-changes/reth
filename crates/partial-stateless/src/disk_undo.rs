@@ -19,8 +19,11 @@ use std::{
 const MAGIC: &[u8; 8] = b"PSUNDO02";
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const SPILL_WARN_AFTER: Duration = Duration::from_millis(100);
-const SPILL_TIMEOUT: Duration = Duration::from_secs(1);
-const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a commit waits for the writer to accept a bundle before it gives up the undo history.
+/// Public so run manifests can record it: a writer-timeout observation means nothing without it.
+pub const SPILL_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a recovery waits for a pending bundle's write to complete.
+pub const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Both halves of one block's undo, always written and loaded together.
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,6 +154,8 @@ pub struct DiskUndoStore {
     writer: mpsc::SyncSender<WriteJob>,
     sequence: u64,
     metrics: Arc<WriterMetrics>,
+    /// Spills still to be refused by [`Self::fail_next_spill`].
+    injected_failures: u64,
 }
 
 /// Cumulative writer counters. Pending payloads and encoding buffers are not resident history.
@@ -161,6 +166,9 @@ pub struct DiskUndoMetrics {
     pub failed: u64,
     pub cancelled: u64,
     pub enqueue_failures: u64,
+    /// Spills refused by [`DiskUndoStore::fail_next_spill`]. Counted apart from
+    /// `enqueue_failures`, which only a real writer produces.
+    pub injected_failures: u64,
     pub pending: u64,
     pub pending_peak: u64,
     pub bytes_written: u64,
@@ -386,7 +394,7 @@ impl DiskUndoStore {
                 }
             })
             .map_err(|err| err.to_string())?;
-        Ok(Self { session_lock, directory, writer, sequence: 0, metrics })
+        Ok(Self { session_lock, directory, writer, sequence: 0, metrics, injected_failures: 0 })
     }
 
     /// Optional per-bundle JSONL outside the disposable undo session. Call before the first spill.
@@ -437,6 +445,11 @@ impl DiskUndoStore {
     /// Transfer the payload with bounded backpressure. A stalled disk cannot block commits
     /// indefinitely: after one second, the caller must discard the unreachable undo suffix.
     pub fn spill(&mut self, bundle: DiskUndoBundle) -> Result<DiskUndoHandle, String> {
+        if self.injected_failures > 0 {
+            self.injected_failures -= 1;
+            self.metrics.update(|metrics| metrics.injected_failures += 1);
+            return Err("injected spill failure".into())
+        }
         self.sequence += 1;
         let file = Arc::new(FileState {
             session_lock: Arc::clone(&self.session_lock),
@@ -468,6 +481,15 @@ impl DiskUndoStore {
         }
         result?;
         Ok(DiskUndoHandle(file))
+    }
+
+    /// Fault injection: the next [`Self::spill`] fails as a writer that cannot accept the bundle
+    /// does, without writing it or waiting [`SPILL_TIMEOUT`] for it.
+    ///
+    /// For testing what a commit does when its bundle cannot be kept. The failure is counted in
+    /// [`DiskUndoMetrics::injected_failures`], never as a writer failure.
+    pub fn fail_next_spill(&mut self) {
+        self.injected_failures += 1;
     }
 }
 

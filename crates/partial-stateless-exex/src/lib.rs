@@ -1496,6 +1496,7 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
         directory = ?options.undo_dir,
         filesystem = ?options.undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
         trie_parallel_min = ?partial_stateless::trie_parallel_min(),
+        spill_timeout_ms = partial_stateless::disk_undo::SPILL_TIMEOUT.as_millis() as u64,
         warm_shrink_blocks = ?options.warm_shrink.interval(),
         resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())
@@ -3998,6 +3999,99 @@ mod tests {
         assert_eq!(pair.fingerprint(), baseline);
         assert!(pair.trie_cache.structurally_eq(&trie));
         assert!(matches!(pair.readiness.state(), CacheReadiness::Ready(_)));
+    }
+
+    /// A bundle the writer cannot accept costs the history behind it and nothing else: the
+    /// commit still lands, later commits spill again, and a reorg reaching past the lost block is
+    /// refused with the pair unchanged while one inside the rebuilt history still recovers.
+    #[test]
+    fn a_refused_spill_discards_history_behind_it_and_only_that() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CacheConfig::default();
+        let (package, checkpoint, root) = warm_snapshot(&config);
+        let restored =
+            crate::bootstrap_io::restore_snapshot(package, &checkpoint, &config).unwrap();
+        let mut pair = LivePair::new(CoordinatedPair {
+            undo_store: None,
+            cache: restored.cache,
+            trie_cache: restored.trie_cache,
+            readiness: restored.readiness,
+            retained: Default::default(),
+            retention_depth: super::RetentionDepth::new(32).unwrap(),
+            undo_layout: super::UndoLayout::FramesOnly,
+            accepted_head: None,
+        });
+        pair.enable_disk_undo(directory.path()).unwrap();
+        let (refused_at, last) = (SNAP_BLOCK + 5, SNAP_BLOCK + 8);
+        let mut chain = vec![(SNAP_BLOCK, SNAP_HASH)];
+        let mut at_refused = None;
+        for number in SNAP_BLOCK + 1..=last {
+            let block = BlockContext {
+                number,
+                hash: numbered(number, 0xcc),
+                parent_hash: chain.last().unwrap().1,
+                state_root: root,
+            };
+            assert!(matches!(
+                admit_block(&mut pair.readiness, &block),
+                BlockAdmission::Admitted(_)
+            ));
+            apply_touching(&mut pair, number, SNAP_ADDRESS);
+            let mut next = pair.trie_cache.clone();
+            next.retain_from_value_cache(&pair.cache);
+            let displaced = std::mem::replace(&mut pair.trie_cache, next);
+            if number == refused_at {
+                assert!(pair.inject_spill_failure());
+            }
+            finish_committed_transition(&mut pair, Some(displaced), &block, sealed(&block), true);
+            pair.cache.cache_root();
+            chain.push((number, block.hash));
+            if number == refused_at {
+                assert_eq!(pair.retained_depth(), 0, "the refused block took the history with it");
+                at_refused = Some((pair.fingerprint(), pair.trie_cache.fork_for_rollback()));
+            }
+        }
+        assert_eq!(pair.retained_depth(), last - refused_at);
+        let metrics = pair
+            .undo_store
+            .as_ref()
+            .unwrap()
+            .wait_for_idle(partial_stateless::disk_undo::LOAD_TIMEOUT)
+            .unwrap();
+        assert_eq!((metrics.injected_failures, metrics.enqueue_failures), (1, 0));
+        assert_eq!(metrics.completed, metrics.submitted);
+
+        let abandon_from = |first: u64| {
+            let from = (first - SNAP_BLOCK) as usize;
+            (chain[from - 1], chain[from..].to_vec())
+        };
+        let before = pair.fingerprint();
+        let (ancestor, abandoned) = abandon_from(refused_at);
+        assert!(
+            super::recover_notified_branch(
+                &mut pair,
+                &FakeChain::Canonical(ancestor.1, root),
+                ancestor,
+                &abandoned,
+                config.cache_policy_id()
+            )
+            .is_none(),
+            "undoing the refused block needs the history it discarded"
+        );
+        assert_eq!(pair.fingerprint(), before);
+        let (ancestor, abandoned) = abandon_from(refused_at + 1);
+        let recovery = super::recover_notified_branch(
+            &mut pair,
+            &FakeChain::Canonical(ancestor.1, root),
+            ancestor,
+            &abandoned,
+            config.cache_policy_id(),
+        )
+        .unwrap();
+        assert_eq!(recovery.frames_applied, last - refused_at);
+        let (fingerprint, trie) = at_refused.unwrap();
+        assert_eq!(pair.fingerprint(), fingerprint);
+        assert!(pair.trie_cache.structurally_eq(&trie));
     }
 
     /// Advances the flat cache by a block that touches `address`, so two branches can be made to

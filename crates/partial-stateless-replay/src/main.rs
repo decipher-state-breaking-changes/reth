@@ -311,6 +311,10 @@ fn write_manifest(
         // The mount the undo files go to: the same bundle written to tmpfs and to a device are
         // different costs. `null` without disk undo or when `/proc/mounts` is unreadable.
         "undo_filesystem": pair.undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
+        // How long a commit waits for the writer before giving up the history, and how long a
+        // recovery waits for a pending write. A writer-timeout observation is read against these.
+        "undo_spill_timeout_ms": partial_stateless::disk_undo::SPILL_TIMEOUT.as_millis() as u64,
+        "undo_load_timeout_ms": partial_stateless::disk_undo::LOAD_TIMEOUT.as_millis() as u64,
         // Policy target only. Actual counts are sampled after commits in BlockTiming.
         "undo_resident_blocks_limit": pair.undo_dir.as_ref().map(|_| 0),
         // A run that forced reorgs is not a latency cohort: its re-verdicts sit in `blocks` with
