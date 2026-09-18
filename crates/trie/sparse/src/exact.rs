@@ -241,6 +241,36 @@ pub struct ExactSparseTrie {
     debug_recorder: TrieDebugRecorder,
 }
 
+/// Process-wide floors under every [`ExactSparseTrie`]'s own [`ParallelismThresholds`].
+///
+/// A trie's own thresholds are not serialized, so every trie restored from disk or from a
+/// checkpoint comes back at the default. They also take part in [`PartialEq`]. A per-trie setting
+/// would therefore reach only the tries a caller built itself, and would make them compare unequal
+/// to their restored copies. A floor reaches every trie in the process and changes no trie's
+/// content. Zero, the default, leaves each trie's own thresholds in charge.
+static MIN_REVEALED_NODES_FLOOR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static MIN_UPDATED_NODES_FLOOR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the process-wide floors under every [`ExactSparseTrie`]'s parallelism thresholds: a
+/// reveal or hash update goes parallel only when it clears both the trie's own threshold and
+/// this one.
+pub fn set_exact_parallelism_floor(floor: ParallelismThresholds) {
+    use core::sync::atomic::Ordering;
+    MIN_REVEALED_NODES_FLOOR.store(floor.min_revealed_nodes, Ordering::Relaxed);
+    MIN_UPDATED_NODES_FLOOR.store(floor.min_updated_nodes, Ordering::Relaxed);
+}
+
+/// The floors [`set_exact_parallelism_floor`] last set.
+pub fn exact_parallelism_floor() -> ParallelismThresholds {
+    use core::sync::atomic::Ordering;
+    ParallelismThresholds {
+        min_revealed_nodes: MIN_REVEALED_NODES_FLOOR.load(Ordering::Relaxed),
+        min_updated_nodes: MIN_UPDATED_NODES_FLOOR.load(Ordering::Relaxed),
+    }
+}
+
 impl Default for ExactSparseTrie {
     fn default() -> Self {
         Self {
@@ -1487,9 +1517,10 @@ impl ExactSparseTrie {
         self.updates.is_some()
     }
 
-    /// Returns true if parallelism should be enabled for revealing the given number of nodes.
-    /// Will always return false in nostd builds.
-    const fn is_reveal_parallelism_enabled(&self, num_nodes: usize) -> bool {
+    /// Returns true if parallelism should be enabled for revealing the given number of nodes:
+    /// at least this trie's threshold and the process floor. Will always return false in nostd
+    /// builds.
+    fn is_reveal_parallelism_enabled(&self, num_nodes: usize) -> bool {
         #[cfg(not(feature = "std"))]
         {
             let _ = num_nodes;
@@ -1498,13 +1529,15 @@ impl ExactSparseTrie {
 
         #[cfg(feature = "std")]
         {
-            num_nodes >= self.parallelism_thresholds.min_revealed_nodes
+            let floor = MIN_REVEALED_NODES_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
+            num_nodes >= self.parallelism_thresholds.min_revealed_nodes.max(floor)
         }
     }
 
     /// Returns true if parallelism should be enabled for updating hashes with the given number
-    /// of changed keys. Will always return false in nostd builds.
-    const fn is_update_parallelism_enabled(&self, num_changed_keys: usize) -> bool {
+    /// of changed keys: at least this trie's threshold and the process floor. Will always return
+    /// false in nostd builds.
+    fn is_update_parallelism_enabled(&self, num_changed_keys: usize) -> bool {
         #[cfg(not(feature = "std"))]
         {
             let _ = num_changed_keys;
@@ -1513,7 +1546,8 @@ impl ExactSparseTrie {
 
         #[cfg(feature = "std")]
         {
-            num_changed_keys >= self.parallelism_thresholds.min_updated_nodes
+            let floor = MIN_UPDATED_NODES_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
+            num_changed_keys >= self.parallelism_thresholds.min_updated_nodes.max(floor)
         }
     }
 

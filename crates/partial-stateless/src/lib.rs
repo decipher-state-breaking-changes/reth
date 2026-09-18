@@ -40,7 +40,10 @@ pub use bootstrap::{
     rebuild_trie_cache, verify_and_restore, verify_and_restore_with_limits, BootstrapError,
     BootstrapLimits, CacheSnapshotPackage, RebuiltTrieCache, RestoredBootstrapState,
 };
-pub use cache_trie::{CacheTrie, CacheTrieRepr};
+pub use cache_trie::{
+    apply_trie_parallel_min_from_env, trie_parallel_min, CacheTrie, CacheTrieRepr,
+    TRIE_PARALLEL_MIN_VAR,
+};
 pub use cold_admission::{
     admit_cold_sender, ColdAdmissionError, ColdAdmissionRequest, ColdSenderAdmission,
 };

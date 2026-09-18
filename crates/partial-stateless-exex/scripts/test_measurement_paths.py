@@ -125,6 +125,15 @@ class PreparedTests(unittest.TestCase):
         self.change(b2, "run.json", "malloc_conf", "dirty_decay_ms:30000")
         with self.assertRaisesRegex(ValueError, "repetitions disagree on malloc_conf"):
             analyze([a1, a2], [b1, b2], vary=["malloc_conf"])
+        # The trie parallelism floor is guarded the same way.
+        self.change(b2, "run.json", "malloc_conf", "dirty_decay_ms:-1")
+        self.change(b1, "run.json", "trie_parallel_min", [64, 64])
+        self.change(b2, "run.json", "trie_parallel_min", [64, 64])
+        with self.assertRaisesRegex(ValueError, "disagree on trie_parallel_min"):
+            analyze([a1, a2], [b1, b2], vary=["malloc_conf"])
+        with patch("analyze_frontier_arms.RESAMPLES", 20):
+            result = analyze([a1, a2], [b1, b2], vary=["malloc_conf", "trie_parallel_min"])
+        self.assertEqual(result["varied"]["trie_parallel_min"], {"baseline": None, "candidate": [64, 64]})
         # Only process settings can be varied; the build and the boundary never can.
         with self.assertRaisesRegex(ValueError, "cannot vary build_commit"):
             analyze([a1], [b1], vary=["build_commit"])

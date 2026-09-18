@@ -194,6 +194,8 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         Ok(raw) => raw.parse().map_err(|err| eyre::eyre!("PS_STORAGE_UNDO: {err}"))?,
         Err(_) => Default::default(),
     };
+    let trie_parallel_min =
+        partial_stateless::apply_trie_parallel_min_from_env().map_err(|err| eyre::eyre!(err))?;
     // Where a Partial arm keeps its frames: session-local disk files (the production profile), or
     // the retained deque itself, which prices keeping the same K frames resident instead.
     let frames_in_memory = match std::env::var("PS_UNDO_STORE").as_deref() {
@@ -301,6 +303,7 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "allocator": allocator, "trie_repr": "exact", "asm_keccak": cfg!(feature = "asm-keccak"),
         "binary_keccak256": hasher.finalize(), "keccak_cache_global": cfg!(feature = "keccak-cache-global"),
         "rayon_num_threads": std::env::var("RAYON_NUM_THREADS").ok(), "malloc_conf": std::env::var("MALLOC_CONF").ok(),
+        "trie_parallel_min": trie_parallel_min,
         "undo_recording": arm != ArmKind::Weak,
         "retention_depth": if arm == ArmKind::Weak { 0 } else { depth.get() },
         "undo_layout": match (arm, frames_in_memory) {

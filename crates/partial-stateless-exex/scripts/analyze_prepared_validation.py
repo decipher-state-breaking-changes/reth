@@ -77,14 +77,14 @@ def load_pass(directory):
 
 # Every pass on both sides must agree on these, unless `vary` names one of VARIABLE_ACROSS_SIDES.
 CROSS_SIDE_FIELDS = ("build_commit", "build_dirty", "binary_keccak256", "allocator", "interval_ms",
-                     "timing_boundary", "rayon_num_threads", "malloc_conf", "warmup", "trie_repr",
-                     "asm_keccak", "keccak_cache_global")
+                     "timing_boundary", "rayon_num_threads", "malloc_conf", "trie_parallel_min",
+                     "warmup", "trie_repr", "asm_keccak", "keccak_cache_global")
 # Repetitions of one side must agree on these; the two sides may differ.
 WITHIN_SIDE_FIELDS = ("input_manifest_digest", "retention_depth", "undo_layout", "undo_recording",
                       "storage_undo", "warm_shrink_blocks", "undo_filesystem", "arm")
 # Process settings an A/B may change on purpose. Naming one moves it from the cross-side check to
 # the within-side one, and the output records it with both sides' values.
-VARIABLE_ACROSS_SIDES = ("malloc_conf", "rayon_num_threads")
+VARIABLE_ACROSS_SIDES = ("malloc_conf", "rayon_num_threads", "trie_parallel_min")
 
 
 def analyze(baselines, candidates, vary=()):

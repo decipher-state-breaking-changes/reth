@@ -358,6 +358,8 @@ impl RunOptions {
         };
         let retain_generation = env_flag_enabled_by_default("PS_RETAIN_GENERATION");
         validate_undo_profile(trie_repr, undo_layout, undo_record, retain_generation)?;
+        // Process-wide, so the producer's Exact tries in this node take the same floor.
+        partial_stateless::apply_trie_parallel_min_from_env().map_err(eyre::Report::msg)?;
         let undo_dir = Some(
             std::env::var_os("PS_UNDO_DIR")
                 .map(PathBuf::from)
@@ -1493,6 +1495,7 @@ fn configure_pair_undo(options: &RunOptions, pair: &mut CoordinatedPair) -> eyre
         storage_undo = options.storage_undo.label(),
         directory = ?options.undo_dir,
         filesystem = ?options.undo_dir.as_deref().and_then(partial_stateless_stream::mount_of),
+        trie_parallel_min = ?partial_stateless::trie_parallel_min(),
         warm_shrink_blocks = ?options.warm_shrink.interval(),
         resident_blocks = pair.resident_undo_blocks(), "Configured cache undo retention");
     Ok(())

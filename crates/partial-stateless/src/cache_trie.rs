@@ -336,9 +336,57 @@ impl SparseTrie for CacheTrie {
     }
 }
 
+/// The variable that sets the parallelism floor of this process's `Exact` tries.
+///
+/// `<reveal>,<update>`: the fewest nodes a reveal, and the fewest changed keys a hash update, must
+/// have before either runs on the thread pool. Unset means `0,0`, under which every reveal and
+/// update may go parallel, as before the variable existed. Process-wide because the floor is: it
+/// applies to every `Exact` trie in the process, the producer's included when they share one.
+pub const TRIE_PARALLEL_MIN_VAR: &str = "PS_TRIE_PARALLEL_MIN";
+
+/// Applies [`TRIE_PARALLEL_MIN_VAR`] to this process and returns the floor now in force as
+/// `[reveal, update]`. An unparseable value is an error rather than the default, so a sweep arm
+/// cannot silently run the baseline.
+pub fn apply_trie_parallel_min_from_env() -> Result<[usize; 2], String> {
+    let floor = match std::env::var(TRIE_PARALLEL_MIN_VAR) {
+        Ok(raw) => parse_trie_parallel_min(&raw)
+            .map_err(|err| format!("{TRIE_PARALLEL_MIN_VAR}={raw:?}: {err}"))?,
+        Err(std::env::VarError::NotPresent) => [0, 0],
+        Err(err) => return Err(format!("{TRIE_PARALLEL_MIN_VAR}: {err}")),
+    };
+    reth_trie_sparse::set_exact_parallelism_floor(reth_trie_sparse::ParallelismThresholds {
+        min_revealed_nodes: floor[0],
+        min_updated_nodes: floor[1],
+    });
+    Ok(floor)
+}
+
+/// The floor now in force for this process's `Exact` tries, as `[reveal, update]`.
+pub fn trie_parallel_min() -> [usize; 2] {
+    let floor = reth_trie_sparse::exact_parallelism_floor();
+    [floor.min_revealed_nodes, floor.min_updated_nodes]
+}
+
+fn parse_trie_parallel_min(raw: &str) -> Result<[usize; 2], String> {
+    let (reveal, update) =
+        raw.split_once(',').ok_or("want `<reveal>,<update>`, two node counts")?;
+    let count = |part: &str| part.trim().parse::<usize>().map_err(|err| err.to_string());
+    Ok([count(reveal)?, count(update)?])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two counts or nothing: a sweep arm that mistypes its value must fail, not run the default.
+    #[test]
+    fn the_parallel_floor_is_two_counts() {
+        assert_eq!(parse_trie_parallel_min("0,0"), Ok([0, 0]));
+        assert_eq!(parse_trie_parallel_min(" 64, 256 "), Ok([64, 256]));
+        for raw in ["", "64", "64,", ",64", "a,b", "-1,0", "1,2,3"] {
+            assert!(parse_trie_parallel_min(raw).is_err(), "{raw:?}");
+        }
+    }
 
     #[test]
     fn the_adopted_default_is_exact_at_both_wrapper_layers() {

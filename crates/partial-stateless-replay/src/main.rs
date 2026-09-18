@@ -81,6 +81,7 @@ fn main() -> eyre::Result<()> {
         .init();
 
     let mode = parse_args()?;
+    partial_stateless::apply_trie_parallel_min_from_env().map_err(eyre::Report::msg)?;
     if let Mode::ListFrames { dir } = &mode {
         return partial_stateless_replay::spool::list_frames(
             dir,
@@ -304,6 +305,8 @@ fn write_manifest(
         // How frames record rewritten storage tries. Absent on files written before the axis
         // existed, all of which recorded them whole.
         "storage_undo": pair.storage_undo.label(),
+        // `[reveal, update]` parallelism floor of the Exact tries, from `PS_TRIE_PARALLEL_MIN`.
+        "trie_parallel_min": partial_stateless::trie_parallel_min(),
         "undo_dir": pair.undo_dir,
         // The mount the undo files go to: the same bundle written to tmpfs and to a device are
         // different costs. `null` without disk undo or when `/proc/mounts` is unreadable.
