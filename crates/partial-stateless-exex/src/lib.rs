@@ -226,7 +226,7 @@ pub struct RunOptions {
     pub retention_depth: RetentionDepth,
     pub undo_record: bool,
     pub undo_layout: UndoLayout,
-    /// How frames record rewritten storage tries (`PS_STORAGE_UNDO`, whole by default).
+    /// How frames record rewritten storage tries (`PS_STORAGE_UNDO`, delta by default).
     pub storage_undo: partial_stateless::StorageUndo,
     /// Parent directory of disposable, per-pair undo sessions.
     pub undo_dir: Option<PathBuf>,

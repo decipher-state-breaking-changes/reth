@@ -286,12 +286,13 @@ pub enum StorageUndo {
     /// Free to record in memory, where the frame shares the allocation with nothing but the
     /// generation being dropped. Serialized, it is the whole trie again for every block that
     /// touches it, which is what makes a disk bundle tens of MiB.
-    #[default]
     Whole,
     /// The trie's own record of its writes, begun at the first one.
     ///
     /// Sized by what the block changed. Costs a record lookup per write to every storage trie the
-    /// block touches, the price the account trie already pays.
+    /// block touches, the price the account trie already pays. The default, because frames are
+    /// serialized to disk, where [`Self::Whole`] is paid in bytes on every block.
+    #[default]
     Delta,
 }
 

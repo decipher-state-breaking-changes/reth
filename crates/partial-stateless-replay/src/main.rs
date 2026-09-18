@@ -610,7 +610,7 @@ fn parse_undo_layout(raw: &str) -> eyre::Result<UndoLayout> {
     }
 }
 
-/// Storage undo from `PS_STORAGE_UNDO`, or whole; read before the flags like the other undo axes.
+/// Storage undo from `PS_STORAGE_UNDO`, or delta; read before the flags like the other undo axes.
 fn storage_undo_from_env() -> eyre::Result<StorageUndo> {
     match std::env::var("PS_STORAGE_UNDO") {
         Ok(raw) => parse_storage_undo(&raw)
@@ -813,7 +813,7 @@ fn parse_args() -> eyre::Result<Mode> {
                      sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, PS_UNDO_LAYOUT sets \
                      --undo-layout, PS_STORAGE_UNDO sets --storage-undo, PS_UNDO_DIR sets \
                      --undo-dir, and PS_FORCED_REORGS \
-                     (D@N,D@N,...) sets --forced-reorg; the flags win.\nDefaults: K=32, recording on, frames, disk at <spool-dir>/undo. Legacy hybrid/off controls are rejected."
+                     (D@N,D@N,...) sets --forced-reorg; the flags win.\nDefaults: K=32, recording on, frames, delta storage undo, disk at <spool-dir>/undo. Legacy hybrid/off controls are rejected."
                 );
                 std::process::exit(0);
             }
@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(parse_storage_undo(" Delta ").unwrap(), StorageUndo::Delta);
         assert_eq!(parse_storage_undo("whole").unwrap(), StorageUndo::Whole);
         assert!(parse_storage_undo("diff").is_err());
-        assert_eq!(ReplayOptions::default().storage_undo, StorageUndo::Whole);
+        assert_eq!(ReplayOptions::default().storage_undo, StorageUndo::Delta);
     }
 
     #[test]
