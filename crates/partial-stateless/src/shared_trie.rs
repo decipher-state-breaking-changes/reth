@@ -131,6 +131,15 @@ impl<T> SharedSparseTrie<T> {
         matches!(self.ownership, Ownership::Copied)
     }
 
+    /// Whether the trie behind this handle has kept a record of every write since the handle's
+    /// first, when it was still the parent generation's trie.
+    ///
+    /// `false` for a handle that records nothing, has not been written to yet, or lost its record
+    /// to a copy taken after a write.
+    pub const fn records_since_first_write(&self) -> bool {
+        matches!(self.undo, UndoTracking::Recording { .. })
+    }
+
     /// Read-only access to the shared trie.
     pub fn shared_ref(&self) -> &T {
         &self.inner

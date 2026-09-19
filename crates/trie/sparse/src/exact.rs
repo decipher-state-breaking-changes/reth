@@ -118,6 +118,10 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, u128) {
     }
 }
 
+/// A node the narrowed retention walk has yet to visit: its path, and the retained and candidate
+/// subranges below it.
+type NearWalkEntry = (Nibbles, Range<usize>, Range<usize>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PruneAction {
     path: Nibbles,
@@ -228,6 +232,15 @@ pub struct ExactSparseTrie {
     /// The undo record in progress, when one is being kept. See [`Self::begin_undo`].
     #[cfg_attr(feature = "serde", serde(skip))]
     undo: Option<UndoInProgress>,
+    /// Whether the last witness-path retention left no node it had to keep for want of a hash.
+    ///
+    /// The precondition [`Self::retain_witness_paths_near`] needs from the trie's past: a node
+    /// kept dirty is kept with its whole subtree unexamined, and a later walk that skips the
+    /// unchanged parts of the trie would never examine it either. Bookkeeping, like the undo
+    /// record, so not serialized — a trie read back from disk starts `false` — and not part of
+    /// equality.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    retention_clean: bool,
     /// Thresholds controlling when parallelism is enabled for different operations.
     #[cfg_attr(feature = "serde", serde(skip))]
     parallelism_thresholds: ParallelismThresholds,
@@ -286,6 +299,7 @@ impl Default for ExactSparseTrie {
             branch_node_masks: JournaledMap::default(),
             update_actions_buffers: Vec::default(),
             undo: None,
+            retention_clean: false,
             parallelism_thresholds: Default::default(),
             #[cfg(feature = "metrics")]
             metrics: Default::default(),
@@ -749,6 +763,7 @@ impl SparseTrie for ExactSparseTrie {
     }
 
     fn wipe(&mut self) {
+        self.retention_clean = false;
         self.upper_subtrie.wipe();
         for idx in 0..NUM_LOWER_SUBTRIES {
             if self.undo.is_some() {
@@ -763,6 +778,7 @@ impl SparseTrie for ExactSparseTrie {
     }
 
     fn clear(&mut self) {
+        self.retention_clean = false;
         self.upper_subtrie.clear();
         self.upper_subtrie.nodes.insert(Nibbles::default(), ExactSparseNode::Empty);
         for idx in 0..NUM_LOWER_SUBTRIES {
@@ -914,6 +930,8 @@ impl SparseTrie for ExactSparseTrie {
     fn prune(&mut self, retained_leaves: &[Nibbles]) -> usize {
         #[cfg(feature = "trie-debug")]
         self.debug_recorder.reset();
+        // Leaf pruning keeps a different shape from witness retention, so it is no base for one.
+        self.retention_clean = false;
 
         let mut retained_leaves = retained_leaves.to_vec();
         retained_leaves.sort_unstable();
@@ -1149,11 +1167,124 @@ impl ExactSparseTrie {
         retained_paths: &[Nibbles],
         options: RetentionOptions,
     ) -> RetainOutcome {
+        let metrics = RetainWitnessPathsMetrics { full_range_calls: 1, ..Default::default() };
+        self.retain_witness_paths_walking(retained_paths, None, options, metrics)
+    }
+
+    /// Retains exactly what [`Self::retain_witness_paths_with_options`] would, walking only the
+    /// parts of the trie that `candidates` reach.
+    ///
+    /// The full walk descends into every revealed node that has a retained path below it. This one
+    /// descends into such a node only when a candidate lies at or below it too, and otherwise does
+    /// everything the full walk does: a visited branch still examines each revealed child, and a
+    /// child with no retained path below it is still blinded where it stands.
+    ///
+    /// Sound — the same actions, so the same trie — when the last retention of this trie was clean
+    /// ([`Self::is_retention_clean`]) and was over the retained set `candidates` was derived
+    /// against, and `candidates` holds the path of every node and leaf value written since and
+    /// every path that entered or left that retained set. A subtree none of those reach is then
+    /// byte-identical to what that retention left, under the same retained paths, and a
+    /// retention of its own output blinds nothing more.
+    /// [`Self::retain_witness_paths_since_undo_began`] assembles such a set from the
+    /// undo record. Candidates are accepted in any order and with repeats.
+    pub fn retain_witness_paths_near(
+        &mut self,
+        retained_paths: &[Nibbles],
+        mut candidates: Vec<Nibbles>,
+        options: RetentionOptions,
+    ) -> RetainOutcome {
+        debug_assert!(self.retention_clean, "a narrowed walk needs a clean last retention");
+        let mut metrics = RetainWitnessPathsMetrics { delta_calls: 1, ..Default::default() };
+        let (_, sort_ns) = timed(|| {
+            candidates.sort_unstable();
+            candidates.dedup();
+        });
+        metrics.candidate_paths = candidates.len() as u64;
+        metrics.candidate_us = (sort_ns / 1_000) as u64;
+        self.retain_witness_paths_walking(retained_paths, Some(&candidates), options, metrics)
+    }
+
+    /// [`Self::retain_witness_paths_near`] with the candidates the undo record names: the path of
+    /// every node and leaf value written since the record began, plus `moved_paths`, the paths that
+    /// entered or left the retained set since the last retention.
+    ///
+    /// The caller vouches that nothing wrote to the trie between its last retention and the moment
+    /// the record began — the record holds everything after. What the trie can check itself, it
+    /// does: `None`, having changed nothing, when its last retention was not clean or the record
+    /// cannot name every path written (see [`Self::undo_written_paths`]). The caller then
+    /// runs the full walk.
+    pub fn retain_witness_paths_since_undo_began(
+        &mut self,
+        retained_paths: &[Nibbles],
+        moved_paths: &[Nibbles],
+        options: RetentionOptions,
+    ) -> Option<RetainOutcome> {
+        if !self.retention_clean {
+            return None
+        }
+        let (candidates, collect_ns) = timed(|| {
+            let mut candidates = Vec::new();
+            self.undo_written_paths(&mut candidates).then(|| {
+                candidates.extend_from_slice(moved_paths);
+                candidates
+            })
+        });
+        let mut outcome = self.retain_witness_paths_near(retained_paths, candidates?, options);
+        outcome.metrics.candidate_us =
+            outcome.metrics.candidate_us.saturating_add((collect_ns / 1_000) as u64);
+        Some(outcome)
+    }
+
+    /// Whether the last witness-path retention of this trie left no node kept for want of a hash.
+    ///
+    /// `false` on a trie that has never been retained, or whose content was since replaced by a
+    /// clear, a wipe, a leaf prune or an undo.
+    pub const fn is_retention_clean(&self) -> bool {
+        self.retention_clean
+    }
+
+    /// Appends every path the undo record says may have changed since it began, read without
+    /// ending the record: each node written, and the full path of each leaf value written. A
+    /// superset of what changed, in no particular order and with repeats.
+    ///
+    /// Leaf values are included because an overwrite of an existing leaf writes its value and not
+    /// its node. After the root is computed the node is rewritten too, but a walk that ran before
+    /// the root would otherwise miss the one leaf whose cached hash is out of date.
+    ///
+    /// `false`, with `out` possibly extended, when the record cannot name every such path: none is
+    /// being kept, or a subtrie holds entries it is not recording.
+    pub fn undo_written_paths(&self, out: &mut Vec<Nibbles>) -> bool {
+        if self.undo.is_none() {
+            return false
+        }
+        let subtries = core::iter::once(self.upper_subtrie.as_ref())
+            .chain(self.lower_subtries.iter().filter_map(LowerExactSubtrie::allocated_ref));
+        for subtrie in subtries {
+            match (subtrie.nodes.written_keys(), subtrie.inner.values.written_keys()) {
+                (Some(nodes), Some(values)) => {
+                    out.extend(nodes);
+                    out.extend(values);
+                }
+                _ if subtrie.nodes.is_empty() && subtrie.inner.values.is_empty() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The retention both entry points share. `candidates`, sorted and distinct, selects the
+    /// narrowed walk; `metrics` arrives with the call counters and candidate cost already set.
+    fn retain_witness_paths_walking(
+        &mut self,
+        retained_paths: &[Nibbles],
+        candidates: Option<&[Nibbles]>,
+        options: RetentionOptions,
+        mut metrics: RetainWitnessPathsMetrics,
+    ) -> RetainOutcome {
         #[cfg(feature = "trie-debug")]
         self.debug_recorder.reset();
 
-        let mut metrics =
-            RetainWitnessPathsMetrics { calls: 1, full_range_calls: 1, ..Default::default() };
+        metrics.calls = 1;
 
         #[cfg(feature = "std")]
         let input_start = StdInstant::now();
@@ -1177,7 +1308,12 @@ impl ExactSparseTrie {
 
         #[cfg(feature = "std")]
         let traversal_start = StdInstant::now();
-        let mut actions = self.collect_witness_prune_actions(&retained_paths, &mut metrics);
+        let mut actions = match candidates {
+            None => self.collect_witness_prune_actions(&retained_paths, &mut metrics),
+            Some(candidates) => {
+                self.collect_witness_prune_actions_near(&retained_paths, candidates, &mut metrics)
+            }
+        };
         #[cfg(feature = "std")]
         {
             metrics.traversal_us = traversal_start.elapsed().as_micros() as u64;
@@ -1225,6 +1361,7 @@ impl ExactSparseTrie {
         metrics.finalization_maps_us = finalization.maps_us;
         metrics.finalization_subtries_us = finalization.subtries_us;
 
+        self.retention_clean = metrics.unprunable_dirty == 0;
         RetainOutcome { pruned, metrics }
     }
 
@@ -1333,6 +1470,123 @@ impl ExactSparseTrie {
                         );
                         if !child_range.is_empty() {
                             stack.push((child, child_range));
+                            continue;
+                        }
+
+                        let Some(child_node) = self
+                            .subtrie_for_path(&child)
+                            .and_then(|subtrie| subtrie.nodes.get(&child))
+                        else {
+                            panic!("expected node at path {child:?}");
+                        };
+                        self.collect_blind_action(child, child_node, &mut actions, metrics);
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// [`Self::collect_witness_prune_actions`], descending only toward `candidates`.
+    ///
+    /// Each stack entry carries the candidate subrange below its node beside the retained one. A
+    /// child with retained paths below it is pushed only when its candidate subrange is not empty
+    /// either; everything else is the full walk's, including the blinding of a child with no
+    /// retained path below it, which needs no descent. Subranges are found by
+    /// [`seek_prefix_range`], because a node visited here is one of few, and scanning the whole
+    /// retained range of a node near the root would cost the comparisons the full walk spends.
+    fn collect_witness_prune_actions_near(
+        &self,
+        retained_paths: &[Nibbles],
+        candidates: &[Nibbles],
+        metrics: &mut RetainWitnessPathsMetrics,
+    ) -> Vec<PruneAction> {
+        let mut actions = Vec::new();
+        let mut stack: SmallVec<[NearWalkEntry; 32]> = SmallVec::new();
+        if !candidates.is_empty() {
+            stack.push((Nibbles::default(), 0..retained_paths.len(), 0..candidates.len()));
+        }
+
+        while let Some((path, retained_range, candidate_range)) = stack.pop() {
+            let Some(node) =
+                self.subtrie_for_path(&path).and_then(|subtrie| subtrie.nodes.get(&path))
+            else {
+                continue;
+            };
+            metrics.nodes_visited = metrics.nodes_visited.saturating_add(1);
+
+            match node {
+                ExactSparseNode::Empty | ExactSparseNode::Leaf { .. } => {}
+                ExactSparseNode::Extension { key, .. } => {
+                    let mut child = path;
+                    child.extend(key);
+
+                    if !retained_range.is_empty() {
+                        let mut candidate_idx = candidate_range.start;
+                        let child_candidates = seek_prefix_range(
+                            candidates,
+                            &mut candidate_idx,
+                            candidate_range.end,
+                            &child,
+                            &mut metrics.retained_path_comparisons,
+                        );
+                        if child_candidates.is_empty() {
+                            metrics.subtrees_skipped = metrics.subtrees_skipped.saturating_add(1);
+                            continue;
+                        }
+                        let mut retained_idx = retained_range.start;
+                        let child_range = seek_prefix_range(
+                            retained_paths,
+                            &mut retained_idx,
+                            retained_range.end,
+                            &child,
+                            &mut metrics.retained_path_comparisons,
+                        );
+                        stack.push((child, child_range, child_candidates));
+                        continue;
+                    }
+
+                    if path.is_empty() {
+                        continue;
+                    }
+                    self.collect_blind_action(path, node, &mut actions, metrics);
+                }
+                ExactSparseNode::Branch { state_mask, blinded_mask, .. } => {
+                    let state_mask = *state_mask;
+                    let blinded_mask = *blinded_mask;
+                    let mut retained_idx = retained_range.start;
+                    let mut candidate_idx = candidate_range.start;
+
+                    for nibble in state_mask.iter() {
+                        if blinded_mask.is_bit_set(nibble) {
+                            continue;
+                        }
+                        metrics.edges_visited = metrics.edges_visited.saturating_add(1);
+
+                        let mut child = path;
+                        child.push_unchecked(nibble);
+                        let child_range = seek_prefix_range(
+                            retained_paths,
+                            &mut retained_idx,
+                            retained_range.end,
+                            &child,
+                            &mut metrics.retained_path_comparisons,
+                        );
+                        if !child_range.is_empty() {
+                            let child_candidates = seek_prefix_range(
+                                candidates,
+                                &mut candidate_idx,
+                                candidate_range.end,
+                                &child,
+                                &mut metrics.retained_path_comparisons,
+                            );
+                            if child_candidates.is_empty() {
+                                metrics.subtrees_skipped =
+                                    metrics.subtrees_skipped.saturating_add(1);
+                            } else {
+                                stack.push((child, child_range, child_candidates));
+                            }
                             continue;
                         }
 
@@ -2811,6 +3065,7 @@ impl ExactSparseTrie {
             update_actions_buffers,
             parallelism_thresholds,
             undo,
+            retention_clean: self.retention_clean,
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
             #[cfg(feature = "trie-debug")]
@@ -4269,6 +4524,39 @@ fn next_retained_prefix_range(
     begin..*cursor
 }
 
+/// [`next_retained_prefix_range`] for a walk that visits few nodes: a long remaining range is
+/// binary searched rather than scanned.
+///
+/// The full walk visits every node, so its scans add up to about one pass over the sorted paths
+/// per level and cannot do better. A narrowed walk visits a handful of nodes per level, and a
+/// linear scan would still pay the whole range of each — at the root, every retained path.
+fn seek_prefix_range(
+    paths: &[Nibbles],
+    cursor: &mut usize,
+    end: usize,
+    prefix: &Nibbles,
+    comparisons: &mut u64,
+) -> Range<usize> {
+    const SCAN_AT_MOST: usize = 32;
+    if end - *cursor <= SCAN_AT_MOST {
+        return next_retained_prefix_range(paths, cursor, end, prefix, comparisons);
+    }
+    let mut compared = 0u64;
+    let begin = *cursor +
+        paths[*cursor..end].partition_point(|path| {
+            compared += 1;
+            path < prefix
+        });
+    let stop = begin +
+        paths[begin..end].partition_point(|path| {
+            compared += 1;
+            path.starts_with(prefix)
+        });
+    *comparisons = comparisons.saturating_add(compared);
+    *cursor = stop;
+    begin..stop
+}
+
 fn prune_action_parent(action: &PruneAction) -> Nibbles {
     action.path.slice(0..action.path.len().saturating_sub(1))
 }
@@ -4682,6 +4970,7 @@ impl Clone for ExactSparseTrie {
             update_actions_buffers: self.update_actions_buffers.clone(),
             parallelism_thresholds: self.parallelism_thresholds,
             undo: self.undo.as_ref().map(|_| UndoInProgress::new(&self.prefix_set, &self.updates)),
+            retention_clean: self.retention_clean,
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
             #[cfg(feature = "trie-debug")]
@@ -4692,8 +4981,8 @@ impl Clone for ExactSparseTrie {
 
 impl PartialEq for ExactSparseTrie {
     /// Content equality. Whether either side keeps an undo record, and what it has recorded, is
-    /// bookkeeping about the past and not part of what the trie represents; the update-action
-    /// buffers are scratch.
+    /// bookkeeping about the past and not part of what the trie represents, and so is how its last
+    /// retention went; the update-action buffers are scratch.
     fn eq(&self, other: &Self) -> bool {
         self.upper_subtrie == other.upper_subtrie &&
             self.lower_subtries == other.lower_subtries &&
@@ -4765,6 +5054,8 @@ impl ExactSparseTrie {
     /// [`Self::begin_undo`] again to record from the restored content.
     pub fn undo(&mut self, frame: UndoFrame) {
         self.undo = None;
+        // The frame restores content, not how the retention before it went.
+        self.retention_clean = false;
         self.branch_node_masks.take_journal();
         self.branch_node_masks.restore(frame.masks);
         self.upper_subtrie.take_undo();

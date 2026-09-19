@@ -82,6 +82,7 @@ fn main() -> eyre::Result<()> {
 
     let mode = parse_args()?;
     partial_stateless::apply_trie_parallel_min_from_env().map_err(eyre::Report::msg)?;
+    partial_stateless::apply_delta_retention_from_env().map_err(eyre::Report::msg)?;
     if let Mode::ListFrames { dir } = &mode {
         return partial_stateless_replay::spool::list_frames(
             dir,
@@ -307,6 +308,9 @@ fn write_manifest(
         "storage_undo": pair.storage_undo.label(),
         // `[reveal, update]` parallelism floor of the Exact tries, from `PS_TRIE_PARALLEL_MIN`.
         "trie_parallel_min": partial_stateless::trie_parallel_min(),
+        // How retention walks the tries, from `PS_DELTA_RETENTION`; absent on files written
+        // before the axis existed, all of which walked in full.
+        "delta_retention": partial_stateless::default_delta_retention().label(),
         "undo_dir": pair.undo_dir,
         // The mount the undo files go to: the same bundle written to tmpfs and to a device are
         // different costs. `null` without disk undo or when `/proc/mounts` is unreadable.
@@ -823,7 +827,8 @@ fn parse_args() -> eyre::Result<Mode> {
                      sets --warm-shrink, PS_UNDO_RECORD sets --undo-record, PS_UNDO_LAYOUT sets \
                      --undo-layout, PS_STORAGE_UNDO sets --storage-undo, PS_UNDO_DIR sets \
                      --undo-dir, and PS_FORCED_REORGS \
-                     (D@N,D@N,...) sets --forced-reorg; the flags win.\nDefaults: K=32, recording on, frames, delta storage undo, disk at <spool-dir>/undo. Legacy hybrid/off controls are rejected."
+                     (D@N,D@N,...) sets --forced-reorg; the flags win. PS_DELTA_RETENTION \
+                     (off|on|oracle) selects the retention walk.\nDefaults: K=32, recording on, frames, delta storage undo, disk at <spool-dir>/undo, full retention walk. Legacy hybrid/off controls are rejected."
                 );
                 std::process::exit(0);
             }

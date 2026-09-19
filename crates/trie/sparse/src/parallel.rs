@@ -99,9 +99,21 @@ pub struct RetainWitnessPathsMetrics {
     pub calls: u64,
     /// Calls executed with the complete sorted range walk.
     ///
-    /// This is explicit so a future delta strategy can be compared without changing the metrics
-    /// shape or inferring the strategy from unrelated counters.
+    /// Explicit so the delta strategy can be compared without inferring the strategy from
+    /// unrelated counters.
     pub full_range_calls: u64,
+    /// Calls that walked only toward a candidate set rather than the whole revealed trie.
+    ///
+    /// Every call is exactly one of this and `full_range_calls`.
+    pub delta_calls: u64,
+    /// Distinct candidate paths the delta calls walked toward.
+    pub candidate_paths: u64,
+    /// Microseconds the delta calls spent collecting and sorting their candidates, outside
+    /// `traversal_us`.
+    pub candidate_us: u64,
+    /// Revealed children with retained paths below them that a delta call left unvisited, because
+    /// no candidate lay below them either.
+    pub subtrees_skipped: u64,
     /// Calls that consumed a verified sorted slice without cloning it.
     pub presorted_inputs: u64,
     /// Calls that requested sorted input but fell back because it was unordered.
@@ -201,6 +213,10 @@ impl RetainWitnessPathsMetrics {
     pub const fn accumulate(&mut self, other: &Self) {
         self.calls = self.calls.saturating_add(other.calls);
         self.full_range_calls = self.full_range_calls.saturating_add(other.full_range_calls);
+        self.delta_calls = self.delta_calls.saturating_add(other.delta_calls);
+        self.candidate_paths = self.candidate_paths.saturating_add(other.candidate_paths);
+        self.candidate_us = self.candidate_us.saturating_add(other.candidate_us);
+        self.subtrees_skipped = self.subtrees_skipped.saturating_add(other.subtrees_skipped);
         self.presorted_inputs = self.presorted_inputs.saturating_add(other.presorted_inputs);
         self.sorted_input_fallbacks =
             self.sorted_input_fallbacks.saturating_add(other.sorted_input_fallbacks);
@@ -667,9 +683,10 @@ impl SparseTrie for ParallelSparseTrie {
         let reachable_subtries = self.reachable_subtries();
 
         // The lower half of the mask update, now that admission is decidable.
-        for ProofTrieNodeV2 { path, masks, node } in lower_nodes.iter().filter(|n| {
-            reachable_subtries.admits(path_subtrie_index_unchecked(&n.path), &n.path)
-        }) {
+        for ProofTrieNodeV2 { path, masks, node } in lower_nodes
+            .iter()
+            .filter(|n| reachable_subtries.admits(path_subtrie_index_unchecked(&n.path), &n.path))
+        {
             if let Some(branch_masks) = masks {
                 let path = if let TrieNodeV2::Branch(branch) = node &&
                     !branch.key.is_empty()

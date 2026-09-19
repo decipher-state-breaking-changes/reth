@@ -106,6 +106,20 @@ impl<K, V> JournaledMap<K, V> {
             self.journal = Some(MapJournal::default());
         }
     }
+
+    /// Every key whose content may have changed since recording began, read without ending the
+    /// record. `None` when the map is not recording.
+    ///
+    /// A superset, in no particular order and possibly with repeats: a `get_mut` that changed
+    /// nothing is a write here. After a bulk clear the record stops naming keys one by one, so
+    /// the keys the clear removed and every key the map holds now are named instead — a key
+    /// absent from all three held nothing when recording began and holds nothing now.
+    pub fn written_keys(&self) -> Option<impl Iterator<Item = &K>> {
+        let journal = self.journal.as_ref()?;
+        let since_clear =
+            journal.whole.iter().flat_map(|whole| whole.keys().chain(self.map.keys()));
+        Some(journal.preimages.keys().chain(since_clear))
+    }
 }
 
 impl<K: Copy + Eq + Hash, V: Clone + PartialEq> JournaledMap<K, V> {

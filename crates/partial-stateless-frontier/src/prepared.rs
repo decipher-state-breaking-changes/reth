@@ -196,6 +196,9 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
     };
     let trie_parallel_min =
         partial_stateless::apply_trie_parallel_min_from_env().map_err(|err| eyre::eyre!(err))?;
+    // Before any cache is built: a cache takes the process default when it is constructed.
+    let delta_retention =
+        partial_stateless::apply_delta_retention_from_env().map_err(|err| eyre::eyre!(err))?;
     // Where a Partial arm keeps its frames: session-local disk files (the production profile), or
     // the retained deque itself, which prices keeping the same K frames resident instead.
     let frames_in_memory = match std::env::var("PS_UNDO_STORE").as_deref() {
@@ -304,6 +307,7 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "binary_keccak256": hasher.finalize(), "keccak_cache_global": cfg!(feature = "keccak-cache-global"),
         "rayon_num_threads": std::env::var("RAYON_NUM_THREADS").ok(), "malloc_conf": std::env::var("MALLOC_CONF").ok(),
         "trie_parallel_min": trie_parallel_min,
+        "delta_retention": delta_retention.label(),
         "undo_recording": arm != ArmKind::Weak,
         "retention_depth": if arm == ArmKind::Weak { 0 } else { depth.get() },
         "undo_layout": match (arm, frames_in_memory) {
@@ -320,7 +324,9 @@ pub fn run_cli(args: &[String], allocator: &str) -> eyre::Result<()> {
         "interval_ms": interval_ms, "timing_boundary": "payload_decode_through_coordinated_commit",
         "file_read_included": false, "writer_completion_included": false,
         "memory_probe_every": memory_probe_every,
-        "timing_eligible": memory_probe_every == 0 && std::env::var_os("PS_TRIE_SHAPE_DIAGNOSTICS").is_none(),
+        // The oracle repeats every narrowed walk in full inside the block.
+        "timing_eligible": memory_probe_every == 0 && std::env::var_os("PS_TRIE_SHAPE_DIAGNOSTICS").is_none()
+            && delta_retention != partial_stateless::DeltaRetention::Oracle,
     });
     serde_json::to_writer_pretty(
         OpenOptions::new().create_new(true).write(true).open(output.join("run.json"))?,

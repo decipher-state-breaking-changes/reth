@@ -30,7 +30,10 @@ use serde::Serialize;
 use std::{
     fmt,
     num::NonZeroU64,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, OnceLock,
+    },
     time::Instant,
 };
 
@@ -185,6 +188,174 @@ pub struct PartialTrieNodeCache {
     /// Only ever started by [`Self::clone_timed`]: a record describes the step from one generation
     /// to the next, and a cache that was not cloned from anything has no such step to describe.
     undo: Option<CacheUndoRecord>,
+    /// How retention walks the tries. Taken from the process default when the cache is built and
+    /// carried through a clone, like the undo settings.
+    delta_retention: DeltaRetention,
+    /// What the next retention pass may assume about how the tries came to be as they are.
+    retention_base: RetentionBase,
+}
+
+/// What a retention pass may assume about the tries' history, which is what decides whether a
+/// walk narrowed to the block's changes is sound.
+///
+/// A narrowed walk skips every subtree that neither the undo record nor the retained-path delta
+/// reaches, on the grounds that the last retention left it exactly as a retention would. That
+/// holds only if every write since that retention is in a record, so the cache tracks it here:
+/// `sparse_mut` is the one door writes come through outside retention and undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RetentionBase {
+    /// Nothing can be assumed: a fresh or rolled-back cache, a displaced parent, or one written to
+    /// with no record in progress.
+    #[default]
+    Unproven,
+    /// Every trie is what the last retention pass left it, and nothing has written to it since.
+    Retained,
+    /// Every trie was what the last retention pass left it, and every write since went into the
+    /// undo record still in progress.
+    Journaled,
+}
+
+impl RetentionBase {
+    /// The base after a write, given whether a record is in progress to hold it.
+    const fn after_write(self, recording: bool) -> Self {
+        match self {
+            Self::Retained | Self::Journaled if recording => Self::Journaled,
+            _ => Self::Unproven,
+        }
+    }
+
+    /// The base after the record in progress ends: the writes it held are no longer named.
+    const fn after_record_ends(self) -> Self {
+        match self {
+            Self::Journaled => Self::Unproven,
+            base => base,
+        }
+    }
+
+    /// What a clone starts from: its own record begins empty, so only a parent nothing has
+    /// written to since its retention hands anything on.
+    const fn for_clone(self) -> Self {
+        match self {
+            Self::Retained => Self::Retained,
+            _ => Self::Unproven,
+        }
+    }
+}
+
+/// The variable that sets how this process's trie caches walk their tries during retention.
+///
+/// - `off`, the default: every prune walks every revealed node of its trie.
+/// - `on`: a prune the cache can vouch for walks only toward what the block changed — the nodes and
+///   leaf values its undo record names and the paths that entered or left the retained set — and
+///   every other prune falls back to the full walk.
+/// - `oracle`: as `on`, and every narrowed prune is also run in full on a copy taken just before
+///   it; the process panics unless the two tries come out equal. A correctness pass: the copies are
+///   excluded from the phase timers but not from the block.
+///
+/// Process-wide so every binary sets it the same way, and read when a cache is built; a clone
+/// inherits its parent's.
+pub const DELTA_RETENTION_VAR: &str = "PS_DELTA_RETENTION";
+
+/// How retention walks a trie. See [`DELTA_RETENTION_VAR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaRetention {
+    /// Every prune walks the whole revealed trie.
+    #[default]
+    Off,
+    /// A prune the cache can vouch for walks only toward what the block changed.
+    On,
+    /// As `On`, with every narrowed prune checked against a full walk of a copy.
+    Oracle,
+}
+
+impl DeltaRetention {
+    /// Stable label for manifests and run summaries.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Oracle => "oracle",
+        }
+    }
+
+    const fn narrows(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    const fn from_index(index: u8) -> Self {
+        match index {
+            1 => Self::On,
+            2 => Self::Oracle,
+            _ => Self::Off,
+        }
+    }
+
+    const fn index(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Oracle => 2,
+        }
+    }
+}
+
+impl std::str::FromStr for DeltaRetention {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            "oracle" => Ok(Self::Oracle),
+            other => Err(format!("unknown delta retention {other:?}; use off, on or oracle")),
+        }
+    }
+}
+
+/// The process default, or [`DEFAULT_DELTA_RETENTION_UNSET`] until something sets or reads it.
+static DEFAULT_DELTA_RETENTION: AtomicU8 = AtomicU8::new(DEFAULT_DELTA_RETENTION_UNSET);
+const DEFAULT_DELTA_RETENTION_UNSET: u8 = u8::MAX;
+
+/// Sets the mode every trie cache built from now on in this process starts with.
+pub fn set_default_delta_retention(mode: DeltaRetention) {
+    DEFAULT_DELTA_RETENTION.store(mode.index(), Ordering::Relaxed);
+}
+
+/// The mode a trie cache built now starts with.
+///
+/// A process that never applied [`DELTA_RETENTION_VAR`] — a test binary, a tool — reads it here on
+/// first use, so a whole test suite can be run under the oracle by setting the variable. The
+/// binaries apply it at startup instead, where a bad value is an error rather than this panic.
+pub fn default_delta_retention() -> DeltaRetention {
+    let index = DEFAULT_DELTA_RETENTION.load(Ordering::Relaxed);
+    if index != DEFAULT_DELTA_RETENTION_UNSET {
+        return DeltaRetention::from_index(index)
+    }
+    let mode = match std::env::var(DELTA_RETENTION_VAR) {
+        Ok(raw) => raw.parse().unwrap_or_else(|err| panic!("{DELTA_RETENTION_VAR}={raw:?}: {err}")),
+        Err(_) => DeltaRetention::Off,
+    };
+    // A concurrent first reader computes the same value from the same variable.
+    let _ = DEFAULT_DELTA_RETENTION.compare_exchange(
+        DEFAULT_DELTA_RETENTION_UNSET,
+        mode.index(),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    DeltaRetention::from_index(DEFAULT_DELTA_RETENTION.load(Ordering::Relaxed))
+}
+
+/// Applies [`DELTA_RETENTION_VAR`] to this process and returns the mode now in force. Unset means
+/// `off`; an unparseable value is an error rather than the default, so an A/B arm cannot silently
+/// run the baseline.
+pub fn apply_delta_retention_from_env() -> Result<DeltaRetention, String> {
+    let mode = match std::env::var(DELTA_RETENTION_VAR) {
+        Ok(raw) => raw.parse().map_err(|err| format!("{DELTA_RETENTION_VAR}={raw:?}: {err}"))?,
+        Err(std::env::VarError::NotPresent) => DeltaRetention::Off,
+        Err(err) => return Err(format!("{DELTA_RETENTION_VAR}: {err}")),
+    };
+    set_default_delta_retention(mode);
+    Ok(mode)
 }
 
 impl Clone for PartialTrieNodeCache {
@@ -270,6 +441,8 @@ impl PartialTrieNodeCache {
             record_undo: self.record_undo,
             storage_undo: self.storage_undo,
             undo: None,
+            delta_retention: self.delta_retention,
+            retention_base: self.retention_base.for_clone(),
         };
         // The working copy starts recording here and not a line later, because everything the
         // block does to it — the transition, the retention pass, the prune — has to be inside the
@@ -314,6 +487,8 @@ impl PartialTrieNodeCache {
             record_undo: false,
             storage_undo: StorageUndo::default(),
             undo: None,
+            delta_retention: default_delta_retention(),
+            retention_base: RetentionBase::Unproven,
         }
     }
 
@@ -379,6 +554,16 @@ impl PartialTrieNodeCache {
         self.storage_undo
     }
 
+    /// Sets how retention walks this cache's tries, and every clone's after it.
+    pub const fn set_delta_retention(&mut self, mode: DeltaRetention) {
+        self.delta_retention = mode;
+    }
+
+    /// How retention walks this cache's tries.
+    pub const fn delta_retention(&self) -> DeltaRetention {
+        self.delta_retention
+    }
+
     /// Whether this cache is keeping a record right now.
     pub const fn is_recording_undo(&self) -> bool {
         self.undo.is_some()
@@ -413,6 +598,7 @@ impl PartialTrieNodeCache {
     /// ask for a frame from should not go on holding them.
     pub fn clear_undo_record(&mut self) {
         self.undo = None;
+        self.retention_base = self.retention_base.after_record_ends();
         if let Some(trie) = self.sparse.trie_mut().as_revealed_mut() {
             drop(trie.take_undo());
         }
@@ -450,6 +636,9 @@ impl PartialTrieNodeCache {
         timings: &mut FrameTakeTimings,
     ) -> Option<TrieCacheUndoFrame> {
         let record = self.undo.take();
+        self.retention_base = self.retention_base.after_record_ends();
+        // Its storage tries are about to be moved into the frame.
+        parent.retention_base = RetentionBase::Unproven;
         let started = Instant::now();
         let account = self.sparse.trie_mut().as_revealed_mut().and_then(CacheTrie::take_undo);
         timings.account_us = started.elapsed().as_micros() as u64;
@@ -533,6 +722,8 @@ impl PartialTrieNodeCache {
         );
         // The record in progress described the content this call is about to replace.
         self.clear_undo_record();
+        // A frame restores content, not the history a narrowed walk leans on.
+        self.retention_base = RetentionBase::Unproven;
 
         if let Some(account) = frame.account {
             let applied = self
@@ -727,7 +918,9 @@ impl PartialTrieNodeCache {
         self.state_root
     }
 
+    /// Write access to the tries for everything but retention and undo.
     pub(crate) fn sparse_mut(&mut self) -> &mut CacheSparseStateTrie {
+        self.retention_base = self.retention_base.after_write(self.undo.is_some());
         &mut self.sparse
     }
 
@@ -758,14 +951,22 @@ impl PartialTrieNodeCache {
             (Some(synced), Some(delta)) if delta.block_number == synced + 1 => Some(delta),
             _ => None,
         };
+        // A narrowed walk also needs the tries' history vouched for; see `RetentionBase`.
+        let narrow =
+            self.delta_retention.narrows() && self.retention_base != RetentionBase::Unproven;
         let mut timings = match delta {
-            Some(delta) => self.retain_incrementally(&delta),
+            Some(delta) => {
+                let mut timings = self.retain_incrementally(&delta, narrow);
+                timings.delta_unproven = self.delta_retention.narrows() && !narrow;
+                timings
+            }
             None => {
                 let mut timings = self.retain_fully(value_cache);
                 timings.full_rebuild = true;
                 timings
             }
         };
+        self.retention_base = RetentionBase::Retained;
         self.synced_to_block = Some(value_cache.current_block());
         (timings.warm_shrink_us, timings.warm_shrink) = self.maintain_warm_capacity();
         timings
@@ -811,6 +1012,7 @@ impl PartialTrieNodeCache {
     /// the cache in the same state, and `tests/delta_retention.rs` is where that is enforced.
     pub fn retain_reference(&mut self, value_cache: &NetworkStateCache) -> RetentionTimings {
         let timings = self.retain_fully(value_cache);
+        self.retention_base = RetentionBase::Retained;
         self.synced_to_block = Some(value_cache.current_block());
         timings
     }
@@ -902,10 +1104,12 @@ impl PartialTrieNodeCache {
             .collect();
         timings.storage_paths_us += start.elapsed().as_micros() as u64;
 
-        (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
+        (timings.account_trie_us, timings.account_trie) =
+            self.prune_account_trie(None, &mut timings.narrowing);
         // Nothing is known to be unmoved after a full rebuild, so every trie is pruned. This is
         // the cost the incremental path exists to avoid, not a case it has to reproduce.
-        timings.record_storage_prune(self.prune_storage_tries(&B256Map::default(), true));
+        let storage = self.prune_storage_tries(&B256Map::default(), true, false);
+        timings.record_storage_prune(storage);
         timings
     }
 
@@ -913,7 +1117,10 @@ impl PartialTrieNodeCache {
     ///
     /// Every step here is the delta-shaped equivalent of a line in [`Self::retain_fully`], and the
     /// two must produce byte-identical sets — that equality is a differential test, not a comment.
-    fn retain_incrementally(&mut self, delta: &MembershipDelta) -> RetentionTimings {
+    ///
+    /// With `narrow`, the cache vouches for its tries' history and each prune may walk only toward
+    /// what moved; see [`DeltaRetention`].
+    fn retain_incrementally(&mut self, delta: &MembershipDelta, narrow: bool) -> RetentionTimings {
         let mut timings = RetentionTimings::default();
 
         let start = Instant::now();
@@ -996,12 +1203,22 @@ impl PartialTrieNodeCache {
             }
         }
         self.record_account_paths(paths_added.iter().chain(&paths_removed));
+        // The paths that entered or left, for a narrowed walk: the splice consumes `paths_added`.
+        let moved_accounts: Vec<Nibbles> = if narrow {
+            paths_added.iter().chain(&paths_removed).copied().collect()
+        } else {
+            Vec::new()
+        };
         splice_sorted(&mut self.retained_account_paths, &mut paths_added, &paths_removed);
         timings.account_paths = self.retained_account_paths.len() as u64;
         timings.account_paths_us = start.elapsed().as_micros() as u64;
 
-        (timings.account_trie_us, timings.account_trie) = self.prune_account_trie();
-        timings.record_storage_prune(self.prune_storage_tries(&moved, false));
+        (timings.account_trie_us, timings.account_trie) = self.prune_account_trie(
+            narrow.then_some(moved_accounts.as_slice()),
+            &mut timings.narrowing,
+        );
+        let storage = self.prune_storage_tries(&moved, false, narrow);
+        timings.record_storage_prune(storage);
         timings
     }
 
@@ -1071,21 +1288,34 @@ impl PartialTrieNodeCache {
     }
 
     /// Prunes the account trie to the retained paths, returning what it cost.
-    fn prune_account_trie(&mut self) -> (u64, RetainWitnessPathsMetrics) {
+    ///
+    /// `moved`, the account paths that entered or left the retained set, is given when the cache
+    /// vouches for the trie's history; the walk is then narrowed if the trie vouches too.
+    fn prune_account_trie(
+        &mut self,
+        moved: Option<&[Nibbles]>,
+        narrowing: &mut NarrowingCounts,
+    ) -> (u64, RetainWitnessPathsMetrics) {
         let start = Instant::now();
+        let oracle_before = narrowing.oracle_us;
+        let oracle = self.delta_retention == DeltaRetention::Oracle;
         let metrics = self
             .sparse
             .trie_mut()
             .as_revealed_mut()
             .map(|trie| {
-                trie.retain_witness_paths_with_options(
+                retain_trie(
+                    trie,
                     &self.retained_account_paths,
-                    shape_diagnostics().retention_options(),
+                    moved,
+                    oracle,
+                    narrowing,
+                    format_args!("the account trie"),
                 )
-                .metrics
             })
             .unwrap_or_default();
-        (start.elapsed().as_micros() as u64, metrics)
+        let oracle_us = narrowing.oracle_us - oracle_before;
+        ((start.elapsed().as_micros() as u64).saturating_sub(oracle_us), metrics)
     }
 
     /// Prunes every storage trie the block could have moved, and drops the ones no longer retained.
@@ -1094,14 +1324,20 @@ impl PartialTrieNodeCache {
     /// transition also never wrote to is already pruned to exactly these paths, and pruning it
     /// again would reproduce the shape it has — which under copy-on-write costs a full copy of a
     /// trie the block never touched, the copy the snapshot exists to avoid.
+    ///
+    /// With `narrow`, the cache vouches for its tries' history, and a trie whose handle can vouch
+    /// for its own — untouched since the clone, or recording alone since its first write — walks
+    /// only toward what moved.
     fn prune_storage_tries(
         &mut self,
         moved: &B256Map<StorageSlotDelta>,
         prune_everything: bool,
+        narrow: bool,
     ) -> StoragePruneOutcome {
         let start = Instant::now();
         let copies_before = shared_trie::cow_copies_taken();
         let retained = std::mem::take(&mut self.retained_storage_paths);
+        let oracle = self.delta_retention == DeltaRetention::Oracle;
         let mut outcome = StoragePruneOutcome::default();
         // Tries whose address left the retained set are moved out here and freed together below,
         // so the cost of releasing a whole storage trie is measured rather than folded into the
@@ -1120,6 +1356,15 @@ impl PartialTrieNodeCache {
             if untouched && unchanged {
                 outcome.skipped += 1;
             } else if let Some(trie) = trie.as_revealed_mut() {
+                // Read before `make_mut`, which is where an untouched handle begins its record
+                // and where a shared one would lose it. A handle written through a copy it shares
+                // with anything else cannot say its trie recorded every write.
+                let vouched = narrow &&
+                    (untouched || (trie.records_since_first_write() && trie.is_sole_owner()));
+                if narrow && !vouched {
+                    outcome.narrowing.ineligible += 1;
+                }
+
                 // `make_mut` is timed apart from the walk it precedes. A trie still shared with
                 // the retained generation is copied whole here, before the walk reads a single
                 // node — transactional-snapshot cost that lands inside retention's timer rather
@@ -1128,11 +1373,21 @@ impl PartialTrieNodeCache {
                 trie.make_mut();
                 outcome.cow_us += copy.elapsed().as_micros() as u64;
 
-                let walk = trie.make_mut().retain_witness_paths_with_options(
+                let slots_moved: Option<Vec<Nibbles>> = vouched.then(|| {
+                    moved
+                        .get(hashed_address)
+                        .map(|delta| delta.added.iter().chain(&delta.removed).copied().collect())
+                        .unwrap_or_default()
+                });
+                let walk = retain_trie(
+                    trie.make_mut(),
                     slots,
-                    shape_diagnostics().retention_options(),
+                    slots_moved.as_deref(),
+                    oracle,
+                    &mut outcome.narrowing,
+                    format_args!("storage trie {hashed_address}"),
                 );
-                outcome.metrics.accumulate(&walk.metrics);
+                outcome.metrics.accumulate(&walk);
                 outcome.pruned += 1;
             }
             true
@@ -1145,7 +1400,8 @@ impl PartialTrieNodeCache {
         outcome.drop_us = release.elapsed().as_micros() as u64;
 
         outcome.cow_copies = shared_trie::cow_copies_taken().saturating_sub(copies_before);
-        outcome.total_us = start.elapsed().as_micros() as u64;
+        outcome.total_us =
+            (start.elapsed().as_micros() as u64).saturating_sub(outcome.narrowing.oracle_us);
         outcome
     }
 
@@ -1666,6 +1922,60 @@ impl StorageSlotDelta {
     }
 }
 
+/// Prunes one trie to `retained_paths`, narrowing the walk to `moved` and the trie's own record
+/// when `moved` is given — the caller vouching for the trie's history — and the trie vouches too.
+///
+/// In the oracle mode a narrowed walk is repeated in full on a copy taken first, and a difference
+/// panics: the two must leave the same trie, blind the same roots, and agree on whether anything
+/// was left dirty. Anything else would mean a skipped subtree was not what the last retention left.
+fn retain_trie(
+    trie: &mut CacheTrie,
+    retained_paths: &[Nibbles],
+    moved: Option<&[Nibbles]>,
+    oracle: bool,
+    narrowing: &mut NarrowingCounts,
+    which: fmt::Arguments<'_>,
+) -> RetainWitnessPathsMetrics {
+    let options = shape_diagnostics().retention_options();
+    let Some(moved) = moved else {
+        return trie.retain_witness_paths_with_options(retained_paths, options).metrics
+    };
+    let oracle_start = Instant::now();
+    let reference = oracle.then(|| trie.clone());
+    let mut oracle_us = oracle_start.elapsed().as_micros() as u64;
+
+    let metrics = match trie.retain_witness_paths_since_undo_began(retained_paths, moved, options) {
+        Some(narrowed) => {
+            if let Some(mut reference) = reference {
+                let oracle_start = Instant::now();
+                let full = reference.retain_witness_paths_with_options(retained_paths, options);
+                assert!(
+                    *trie == reference &&
+                        narrowed.pruned == full.pruned &&
+                        (narrowed.metrics.unprunable_dirty == 0) ==
+                            (full.metrics.unprunable_dirty == 0),
+                    "narrowed retention of {which} differs from the full walk: pruned {} vs {}, \
+                     dirty {} vs {}, tries equal {}",
+                    narrowed.pruned,
+                    full.pruned,
+                    narrowed.metrics.unprunable_dirty,
+                    full.metrics.unprunable_dirty,
+                    *trie == reference,
+                );
+                oracle_us += oracle_start.elapsed().as_micros() as u64;
+                narrowing.oracle_checks += 1;
+            }
+            narrowed.metrics
+        }
+        None => {
+            narrowing.refused += 1;
+            trie.retain_witness_paths_with_options(retained_paths, options).metrics
+        }
+    };
+    narrowing.oracle_us += oracle_us;
+    metrics
+}
+
 /// Removes `removed` from the sorted `target`, then merges `added` into it, keeping it sorted and
 /// deduplicated.
 ///
@@ -1838,6 +2148,40 @@ pub struct RetentionTimings {
     /// configured to shrink but never reaching an interval boundary reads as a misconfiguration
     /// rather than as a null result.
     pub warm_shrink: bool,
+    /// True when narrowed walks were enabled and the retained sets were patched, but the cache
+    /// could not vouch for its tries' history — the first block after a start, a restore or a
+    /// rollback, or one written to outside an undo record — so every walk ran in full.
+    ///
+    /// Which walk each prune took is in the two walk metrics' `delta_calls` and
+    /// `full_range_calls`; this and [`Self::narrowing`] say why a walk was not narrowed.
+    pub delta_unproven: bool,
+    /// Why vouched-for prunes still walked in full, and what the oracle checks cost.
+    pub narrowing: NarrowingCounts,
+}
+
+/// Why narrowed retention walked a trie in full anyway, and what checking it cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NarrowingCounts {
+    /// Tries the cache vouched for that refused on their own account: their last retention left
+    /// a node dirty, or their undo record could not name every write.
+    pub refused: u64,
+    /// Storage tries the cache could not vouch for individually: written through a handle that
+    /// kept no record from its first write, or that shared its trie when written.
+    pub ineligible: u64,
+    /// Narrowed walks the oracle checked against a full walk of a copy.
+    pub oracle_checks: u64,
+    /// What those checks cost, copies included. Excluded from `account_trie_us` and
+    /// `storage_tries_us`, not from the caller's timer around the whole retention.
+    pub oracle_us: u64,
+}
+
+impl NarrowingCounts {
+    const fn accumulate(&mut self, other: &Self) {
+        self.refused = self.refused.saturating_add(other.refused);
+        self.ineligible = self.ineligible.saturating_add(other.ineligible);
+        self.oracle_checks = self.oracle_checks.saturating_add(other.oracle_checks);
+        self.oracle_us = self.oracle_us.saturating_add(other.oracle_us);
+    }
 }
 
 /// One storage-prune pass, split into the parts that scale differently.
@@ -1855,6 +2199,7 @@ struct StoragePruneOutcome {
     skipped: u64,
     dropped: u64,
     metrics: RetainWitnessPathsMetrics,
+    narrowing: NarrowingCounts,
 }
 
 impl RetentionTimings {
@@ -1868,6 +2213,7 @@ impl RetentionTimings {
         self.storage_trie_cow_copies = outcome.cow_copies;
         self.storage_trie_drop_us = outcome.drop_us;
         self.storage_tries_dropped = outcome.dropped;
+        self.narrowing.accumulate(&outcome.narrowing);
     }
 
     /// Storage-prune time the measured walk phases and the copies do not account for.
@@ -3850,5 +4196,508 @@ mod tests {
             assert!(recovering.structurally_eq(control));
         }
         assert_eq!(storage_handle(&mut recovering, address).root(), harness.original_root());
+    }
+
+    /// Narrowed retention held to the full walk at the level of the whole cache: real account and
+    /// storage tries, a value cache whose windows move the retained sets every block, undo
+    /// recording on, and every way a cache's history can stop being vouched for.
+    mod narrowed_retention {
+        use super::*;
+
+        const ACCOUNTS: usize = 600;
+        const CONTRACTS: usize = 6;
+        const SLOTS: usize = 150;
+
+        /// splitmix64, so the block sequence is reproducible without a dependency.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            }
+
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        fn slot(index: usize) -> B256 {
+            B256::from(U256::from(index + 1))
+        }
+
+        /// The state both chains are validated against, and the value cache they share.
+        struct World {
+            accounts: BTreeMap<B256, U256>,
+            account_harness: TrieTestHarness,
+            storage: Vec<BTreeMap<B256, U256>>,
+            storage_harness: Vec<TrieTestHarness>,
+            values: NetworkStateCache,
+            next_account: usize,
+            next_slot: usize,
+        }
+
+        impl World {
+            fn new() -> Self {
+                let accounts: BTreeMap<B256, U256> =
+                    (0..ACCOUNTS).map(|i| (keccak256(account_at(i)), U256::from(i + 1))).collect();
+                let storage: Vec<BTreeMap<B256, U256>> = (0..CONTRACTS)
+                    .map(|c| {
+                        (0..SLOTS)
+                            .map(|j| (keccak256(slot(j)), U256::from(c * 1_000 + j + 1)))
+                            .collect()
+                    })
+                    .collect();
+                Self {
+                    account_harness: TrieTestHarness::new(accounts.clone()),
+                    storage_harness: storage.iter().cloned().map(TrieTestHarness::new).collect(),
+                    accounts,
+                    storage,
+                    values: NetworkStateCache::new(
+                        Box::new(LastNBlocksPolicy::new(6)),
+                        Box::new(LastNBlocksPolicy::new(3)),
+                    ),
+                    next_account: ACCOUNTS,
+                    next_slot: SLOTS,
+                }
+            }
+
+            /// A cache with every account and slot revealed, as a cold start leaves it before
+            /// its first retention.
+            fn cache(&self, mode: DeltaRetention) -> PartialTrieNodeCache {
+                let mut cache = revealed_cache(
+                    &self.account_harness,
+                    &self.accounts.keys().copied().collect::<Vec<_>>(),
+                );
+                for (contract, harness) in self.storage_harness.iter().enumerate() {
+                    let slots: Vec<B256> = self.storage[contract].keys().copied().collect();
+                    cache
+                        .sparse_mut()
+                        .storage_tries_mut()
+                        .insert(keccak256(account_at(contract)), storage_trie(harness, &slots));
+                }
+                cache.set_undo_recording(true);
+                cache.set_delta_retention(mode);
+                cache
+            }
+
+            fn block(&mut self, rng: &mut Rng, number: u64) -> Block {
+                let mut accessed = BlockAccessedState::default();
+                let mut account_reveals = Vec::new();
+                let mut account_changes = BTreeMap::new();
+                let touch = |accessed: &mut BlockAccessedState, address: Address| {
+                    accessed.accounts.insert(
+                        address,
+                        AccountData { nonce: number, balance: U256::from(number), code_hash: None },
+                    );
+                    keccak256(address)
+                };
+                for _ in 0..40 {
+                    account_reveals.push(touch(&mut accessed, account_at(rng.below(ACCOUNTS))));
+                }
+                for _ in 0..12 {
+                    let key = touch(&mut accessed, account_at(rng.below(ACCOUNTS)));
+                    account_reveals.push(key);
+                    account_changes
+                        .insert(key, U256::from(number * 10_000 + rng.below(9_999) as u64 + 1));
+                }
+                for _ in 0..3 {
+                    let key = keccak256(account_at(CONTRACTS + rng.below(ACCOUNTS - CONTRACTS)));
+                    if self.accounts.contains_key(&key) {
+                        account_changes.insert(key, U256::ZERO);
+                    }
+                }
+                for _ in 0..3 {
+                    let key = touch(&mut accessed, account_at(self.next_account));
+                    account_changes.insert(key, U256::from(self.next_account + 1));
+                    self.next_account += 1;
+                }
+                // Looked up and absent: retained for its exclusion proof.
+                for _ in 0..2 {
+                    account_reveals
+                        .push(touch(&mut accessed, account_at(100_000 + rng.below(100_000))));
+                }
+
+                let mut storage = Vec::new();
+                let mut contracts: Vec<usize> = (0..3).map(|_| rng.below(CONTRACTS)).collect();
+                contracts.sort_unstable();
+                contracts.dedup();
+                for contract in contracts {
+                    let owner = account_at(contract);
+                    let mut reveals = Vec::new();
+                    let mut changes = BTreeMap::new();
+                    for _ in 0..10 {
+                        let slot = slot(rng.below(SLOTS));
+                        accessed.storage.insert((owner, slot), U256::from(number));
+                        reveals.push(keccak256(slot));
+                    }
+                    for _ in 0..4 {
+                        let slot = slot(rng.below(SLOTS));
+                        accessed.storage.insert((owner, slot), U256::from(number));
+                        changes.insert(
+                            keccak256(slot),
+                            U256::from(number * 100 + rng.below(99) as u64 + 1),
+                        );
+                    }
+                    let deleted = keccak256(slot(rng.below(SLOTS)));
+                    if self.storage[contract].contains_key(&deleted) {
+                        changes.insert(deleted, U256::ZERO);
+                    }
+                    let inserted = slot(self.next_slot);
+                    self.next_slot += 1;
+                    accessed.storage.insert((owner, inserted), U256::from(number));
+                    changes.insert(keccak256(inserted), U256::from(self.next_slot));
+                    storage.push((contract, reveals, changes.into_iter().collect()));
+                }
+                Block {
+                    accessed,
+                    account_reveals,
+                    account_changes: account_changes.into_iter().collect(),
+                    storage,
+                }
+            }
+
+            /// Applies a block's writes to the world once every chain has validated it.
+            fn advance(&mut self, block: &Block) {
+                let changes: BTreeMap<B256, U256> = block.account_changes.iter().copied().collect();
+                apply_to_map(&mut self.accounts, &changes);
+                self.account_harness.apply_changeset(changes);
+                for (contract, _, changes) in &block.storage {
+                    let changes: BTreeMap<B256, U256> = changes.iter().copied().collect();
+                    apply_to_map(&mut self.storage[*contract], &changes);
+                    self.storage_harness[*contract].apply_changeset(changes);
+                }
+            }
+        }
+
+        struct Block {
+            accessed: BlockAccessedState,
+            account_reveals: Vec<B256>,
+            account_changes: Vec<(B256, U256)>,
+            storage: Vec<StorageWork>,
+        }
+
+        /// One contract's part of a block: its index, the slots revealed, the slots written.
+        type StorageWork = (usize, Vec<B256>, Vec<(B256, U256)>);
+
+        fn apply_to_map(map: &mut BTreeMap<B256, U256>, changes: &BTreeMap<B256, U256>) {
+            for (key, value) in changes {
+                if value.is_zero() {
+                    map.remove(key);
+                } else {
+                    map.insert(*key, *value);
+                }
+            }
+        }
+
+        fn storage_trie(harness: &TrieTestHarness, revealed: &[B256]) -> CacheStorageTrie {
+            let root = harness.root_node();
+            let mut trie = ExactSparseTrie::default();
+            trie.set_root(root.node, root.masks, false).expect("the harness root reveals");
+            reveal_into(harness, &mut trie, revealed);
+            trie.root();
+            CacheStorageTrie::Revealed(Box::new(SharedSparseTrie::new(CacheTrie::Exact(trie))))
+        }
+
+        fn reveal_into<T: SparseTrie>(harness: &TrieTestHarness, trie: &mut T, keys: &[B256]) {
+            if keys.is_empty() {
+                return
+            }
+            let mut targets: Vec<_> = keys.iter().map(|key| ProofV2Target::new(*key)).collect();
+            let (mut nodes, _) = harness.proof_v2(&mut targets);
+            trie.reveal_nodes(&mut nodes).expect("the harness proof reveals");
+        }
+
+        fn update_into<T: SparseTrie>(
+            harness: &TrieTestHarness,
+            trie: &mut T,
+            changes: &[(B256, U256)],
+        ) {
+            let mut updates: B256Map<LeafUpdate> = changes
+                .iter()
+                .map(|(key, value)| {
+                    let rlp = if value.is_zero() {
+                        Vec::new()
+                    } else {
+                        encode_fixed_size(value).to_vec()
+                    };
+                    (*key, LeafUpdate::Changed(rlp))
+                })
+                .collect();
+            loop {
+                let mut targets = Vec::new();
+                trie.update_leaves(&mut updates, |key, min_len| {
+                    targets.push(ProofV2Target::new(key).with_min_len(min_len));
+                })
+                .expect("the update applies");
+                if targets.is_empty() {
+                    break
+                }
+                let (mut nodes, _) = harness.proof_v2(&mut targets);
+                trie.reveal_nodes(&mut nodes).expect("the harness answers the update");
+            }
+        }
+
+        /// The block's trie work on a working copy: the witness reveals, the writes, the roots.
+        fn apply_block(world: &World, cache: &mut PartialTrieNodeCache, block: &Block) {
+            for (contract, reveals, changes) in &block.storage {
+                let harness = &world.storage_harness[*contract];
+                let tries = cache.sparse_mut().storage_tries_mut();
+                let hashed = keccak256(account_at(*contract));
+                if tries.get(&hashed).and_then(CacheStorageTrie::as_revealed_ref).is_none() {
+                    // Evicted with its address: revealed afresh, as the witness would.
+                    tries.insert(hashed, storage_trie(harness, reveals));
+                }
+                let handle = tries
+                    .get_mut(&hashed)
+                    .and_then(CacheStorageTrie::as_revealed_mut)
+                    .expect("inserted above");
+                reveal_into(harness, handle, reveals);
+                update_into(harness, handle, changes);
+                handle.root();
+            }
+            let trie = cache
+                .sparse_mut()
+                .trie_mut()
+                .as_revealed_mut()
+                .expect("the fixture's account trie is revealed");
+            reveal_into(&world.account_harness, trie, &block.account_reveals);
+            update_into(&world.account_harness, trie, &block.account_changes);
+            let root = trie.root();
+            cache.set_state_root(root);
+        }
+
+        /// One chain: the live cache and the frame its last commit produced.
+        struct Chain {
+            live: PartialTrieNodeCache,
+            frame: Option<TrieCacheUndoFrame>,
+            displaced: Option<PartialTrieNodeCache>,
+        }
+
+        impl Chain {
+            fn new(world: &World, mode: DeltaRetention) -> Self {
+                Self { live: world.cache(mode), frame: None, displaced: None }
+            }
+
+            /// Validates `block` on a working copy and commits it, returning the retention report.
+            fn commit(&mut self, world: &World, block: &Block) -> RetentionTimings {
+                let (mut working, _) = self.live.clone_timed();
+                apply_block(world, &mut working, block);
+                let timings = working.retain_from_value_cache(&world.values);
+                let mut displaced = std::mem::replace(&mut self.live, working);
+                self.frame = self.live.take_undo_frame(&mut displaced);
+                self.displaced = Some(displaced);
+                timings
+            }
+        }
+
+        fn assert_same(narrow: &Chain, reference: &Chain, at: &str) {
+            assert_eq!(narrow.live.state_root(), reference.live.state_root(), "{at}");
+            assert_eq!(narrow.live.cache_root(), reference.live.cache_root(), "{at}");
+            assert_eq!(
+                narrow.live.retention_fingerprint(),
+                reference.live.retention_fingerprint(),
+                "{at}"
+            );
+            assert!(narrow.live.structurally_eq(&reference.live), "{at}: the tries diverged");
+        }
+
+        /// Runs one block through both chains and the world, returning the narrowed chain's report.
+        fn step(
+            world: &mut World,
+            rng: &mut Rng,
+            narrow: &mut Chain,
+            reference: &mut Chain,
+            number: u64,
+        ) -> RetentionTimings {
+            step_both(world, rng, narrow, reference, number).0
+        }
+
+        /// [`step`], returning the reference chain's report as well.
+        fn step_both(
+            world: &mut World,
+            rng: &mut Rng,
+            narrow: &mut Chain,
+            reference: &mut Chain,
+            number: u64,
+        ) -> (RetentionTimings, RetentionTimings) {
+            let block = world.block(rng, number);
+            world.values.on_block_executed(number, &block.accessed);
+            let timings = narrow.commit(world, &block);
+            let reference_timings = reference.commit(world, &block);
+            assert_eq!(reference_timings.account_trie.delta_calls, 0);
+            assert_eq!(reference_timings.storage_tries.delta_calls, 0);
+            world.advance(&block);
+            assert_same(narrow, reference, &format!("block {number}"));
+            (timings, reference_timings)
+        }
+
+        /// Two chains warmed past the first, full retention and the windows' first evictions.
+        fn warmed(seed: u64) -> (World, Rng, Chain, Chain) {
+            let mut world = World::new();
+            let mut rng = Rng(seed);
+            let mut narrow = Chain::new(&world, DeltaRetention::Oracle);
+            let mut reference = Chain::new(&world, DeltaRetention::Off);
+            let first = world.block(&mut rng, 1);
+            world.values.on_block_executed(1, &first.accessed);
+            for chain in [&mut narrow, &mut reference] {
+                apply_block(&world, &mut chain.live, &first);
+                chain.live.retain_from_value_cache(&world.values);
+            }
+            world.advance(&first);
+            assert_same(&narrow, &reference, "the first block");
+            for number in 2..=8 {
+                step(&mut world, &mut rng, &mut narrow, &mut reference, number);
+            }
+            (world, rng, narrow, reference)
+        }
+
+        #[test]
+        fn narrowed_retention_equals_the_full_walk_on_every_block() {
+            for seed in [1, 2, 3] {
+                let (mut world, mut rng, mut narrow, mut reference) = warmed(seed);
+                let mut account = RetainWitnessPathsMetrics::default();
+                let mut storage = RetainWitnessPathsMetrics::default();
+                let mut full_account = RetainWitnessPathsMetrics::default();
+                let mut checks = 0;
+                for number in 9..=30 {
+                    let (timings, full) =
+                        step_both(&mut world, &mut rng, &mut narrow, &mut reference, number);
+                    assert!(!timings.full_rebuild && !timings.delta_unproven, "block {number}");
+                    account.accumulate(&timings.account_trie);
+                    storage.accumulate(&timings.storage_tries);
+                    full_account.accumulate(&full.account_trie);
+                    checks += timings.narrowing.oracle_checks;
+                }
+                assert_eq!(account.delta_calls, 22, "every account walk is narrowed: {account:?}");
+                assert!(storage.delta_calls > 0, "{storage:?}");
+                assert_eq!(
+                    checks,
+                    account.delta_calls + storage.delta_calls,
+                    "the oracle saw each"
+                );
+                assert!(
+                    account.nodes_visited < full_account.nodes_visited,
+                    "narrowed {} against full {} account-trie visits",
+                    account.nodes_visited,
+                    full_account.nodes_visited
+                );
+                eprintln!(
+                    "seed {seed}: account visits narrowed {} / full {}, {} candidates, {} storage \
+                     walks narrowed and {} full",
+                    account.nodes_visited,
+                    full_account.nodes_visited,
+                    account.candidate_paths,
+                    storage.delta_calls,
+                    storage.full_range_calls
+                );
+            }
+        }
+
+        #[test]
+        fn a_rollback_walks_in_full_once_and_then_narrows_again() {
+            let (mut world, mut rng, mut narrow, mut reference) = warmed(7);
+            let accounts = world.accounts.clone();
+            let storage = world.storage.clone();
+            let (next_account, next_slot) = (world.next_account, world.next_slot);
+            step(&mut world, &mut rng, &mut narrow, &mut reference, 9);
+
+            // Block 9 is abandoned: the value cache, the world and both chains go back.
+            world.values.rollback_block(9).expect("the newest block rolls back");
+            world.accounts = accounts;
+            world.storage = storage;
+            world.account_harness = TrieTestHarness::new(world.accounts.clone());
+            world.storage_harness =
+                world.storage.iter().cloned().map(TrieTestHarness::new).collect();
+            (world.next_account, world.next_slot) = (next_account, next_slot);
+            // The narrowed chain through a frame read back from disk, the reference through the
+            // generation it displaced.
+            let frame = narrow.frame.take().expect("the commit recorded");
+            let frame: TrieCacheUndoFrame =
+                bincode::deserialize(&bincode::serialize(&frame).unwrap()).unwrap();
+            let mut recovered = narrow.live.fork_for_rollback();
+            assert!(recovered.undo(frame));
+            narrow.live = recovered;
+            reference.live = reference.displaced.take().expect("the commit displaced a generation");
+            assert_same(&narrow, &reference, "after the rollback");
+
+            let timings = step(&mut world, &mut rng, &mut narrow, &mut reference, 9);
+            assert!(timings.delta_unproven, "a rolled-back cache cannot vouch for its history");
+            assert_eq!(timings.account_trie.delta_calls, 0);
+            assert_eq!(timings.storage_tries.delta_calls, 0);
+            let timings = step(&mut world, &mut rng, &mut narrow, &mut reference, 10);
+            assert!(!timings.delta_unproven);
+            assert_eq!(timings.account_trie.delta_calls, 1, "the next block narrows again");
+        }
+
+        #[test]
+        fn an_aborted_block_leaves_the_parent_able_to_narrow() {
+            let (mut world, mut rng, mut narrow, mut reference) = warmed(11);
+            // A block validated on a working copy and refused: the copy is dropped, the value
+            // cache rolled back, and the world never advances.
+            let refused = world.block(&mut rng, 9);
+            world.values.on_block_executed(9, &refused.accessed);
+            let (mut working, _) = narrow.live.clone_timed();
+            apply_block(&world, &mut working, &refused);
+            working.retain_from_value_cache(&world.values);
+            drop(working);
+            world.values.rollback_block(9).expect("the newest block rolls back");
+
+            let timings = step(&mut world, &mut rng, &mut narrow, &mut reference, 9);
+            assert!(!timings.delta_unproven);
+            assert_eq!(timings.account_trie.delta_calls, 1);
+        }
+
+        #[test]
+        fn a_write_outside_any_record_makes_the_next_block_walk_in_full() {
+            let (mut world, mut rng, mut narrow, mut reference) = warmed(13);
+            // The same stray reveal into both live caches, with no block recording it.
+            let stray: Vec<B256> = (0..20).map(|i| keccak256(account_at(i * 7))).collect();
+            for chain in [&mut narrow, &mut reference] {
+                let trie = chain.live.sparse_mut().trie_mut().as_revealed_mut().unwrap();
+                reveal_into(&world.account_harness, trie, &stray);
+            }
+            let timings = step(&mut world, &mut rng, &mut narrow, &mut reference, 9);
+            assert!(
+                timings.delta_unproven,
+                "a write no record holds is a history nobody vouches for"
+            );
+            let timings = step(&mut world, &mut rng, &mut narrow, &mut reference, 10);
+            assert!(!timings.delta_unproven);
+        }
+
+        #[test]
+        fn a_storage_trie_written_while_shared_walks_in_full() {
+            let (mut world, mut rng, mut narrow, mut reference) = warmed(17);
+            let block = world.block(&mut rng, 9);
+            world.values.on_block_executed(9, &block.accessed);
+            let (mut working, _) = narrow.live.clone_timed();
+            apply_block(&world, &mut working, &block);
+            // Something takes a snapshot of the working copy mid-block and holds it: every storage
+            // trie the block wrote is now shared, and a second write copies it without its record.
+            let snapshot = working.clone();
+            let (contract, _, _) = &block.storage[0];
+            let handle = working
+                .sparse_mut()
+                .storage_tries_mut()
+                .get_mut(&keccak256(account_at(*contract)))
+                .and_then(CacheStorageTrie::as_revealed_mut)
+                .unwrap();
+            handle.make_mut();
+            assert!(!handle.records_since_first_write(), "the copy lost the record");
+            let timings = working.retain_from_value_cache(&world.values);
+            assert!(timings.narrowing.ineligible > 0, "{:?}", timings.narrowing);
+            drop(snapshot);
+
+            let reference_timings = reference.commit(&world, &block);
+            assert_eq!(reference_timings.storage_tries.delta_calls, 0);
+            let mut displaced = std::mem::replace(&mut narrow.live, working);
+            narrow.frame = narrow.live.take_undo_frame(&mut displaced);
+            world.advance(&block);
+            assert_same(&narrow, &reference, "after a shared write");
+        }
     }
 }

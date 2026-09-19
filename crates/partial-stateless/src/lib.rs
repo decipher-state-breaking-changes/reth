@@ -88,9 +88,11 @@ pub use transition_build::{
     TrimmedWitnessBuild, V2TargetSet,
 };
 pub use trie_cache::{
-    PartialTrieNodeCache, PrefixCoverage, RetentionTimings, StorageTrieMutation, TrieBranchCensus,
-    TrieCacheMemory, TrieCacheValidationError, TrieChangeSet, TrieCloneTimings,
-    TrieMutationMetrics, TrieShapeMetrics, WarmSetShrinkPolicy, TRIE_SHAPE_PREFIX_LEVELS,
+    apply_delta_retention_from_env, default_delta_retention, set_default_delta_retention,
+    DeltaRetention, NarrowingCounts, PartialTrieNodeCache, PrefixCoverage, RetentionTimings,
+    StorageTrieMutation, TrieBranchCensus, TrieCacheMemory, TrieCacheValidationError,
+    TrieChangeSet, TrieCloneTimings, TrieMutationMetrics, TrieShapeMetrics, WarmSetShrinkPolicy,
+    DELTA_RETENTION_VAR, TRIE_SHAPE_PREFIX_LEVELS,
 };
 pub use trie_cache_undo::{FrameTakeTimings, StorageUndo, TrieCacheUndoCounts, TrieCacheUndoFrame};
 pub use witness::{measure_multiproof_size, miss_to_proof_targets, WitnessResult};

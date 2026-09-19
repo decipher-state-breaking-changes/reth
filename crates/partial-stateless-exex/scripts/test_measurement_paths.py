@@ -134,6 +134,15 @@ class PreparedTests(unittest.TestCase):
         with patch("analyze_frontier_arms.RESAMPLES", 20):
             result = analyze([a1, a2], [b1, b2], vary=["malloc_conf", "trie_parallel_min"])
         self.assertEqual(result["varied"]["trie_parallel_min"], {"baseline": None, "candidate": [64, 64]})
+        # And so is the retention walk: a full-versus-narrowed A/B names it.
+        for directory in (b1, b2):
+            self.change(directory, "run.json", "delta_retention", "on")
+        with self.assertRaisesRegex(ValueError, "disagree on delta_retention"):
+            analyze([a1, a2], [b1, b2], vary=["malloc_conf", "trie_parallel_min"])
+        with patch("analyze_frontier_arms.RESAMPLES", 20):
+            result = analyze([a1, a2], [b1, b2],
+                             vary=["malloc_conf", "trie_parallel_min", "delta_retention"])
+        self.assertEqual(result["varied"]["delta_retention"], {"baseline": None, "candidate": "on"})
         # Only process settings can be varied; the build and the boundary never can.
         with self.assertRaisesRegex(ValueError, "cannot vary build_commit"):
             analyze([a1], [b1], vary=["build_commit"])

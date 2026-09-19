@@ -130,6 +130,25 @@ impl CacheTrie {
         delegate!(self => trie.retain_witness_paths_with_options(retained_paths, options))
     }
 
+    /// Retains exactly what [`Self::retain_witness_paths_with_options`] would, walking only toward
+    /// what the undo record says changed and `moved_paths`. `None`, having changed nothing, when
+    /// the trie cannot vouch for that; `Parallel` never can, having no record.
+    ///
+    /// See [`ExactSparseTrie::retain_witness_paths_since_undo_began`] for what the caller vouches.
+    pub fn retain_witness_paths_since_undo_began(
+        &mut self,
+        retained_paths: &[Nibbles],
+        moved_paths: &[Nibbles],
+        options: RetentionOptions,
+    ) -> Option<RetainOutcome> {
+        match self {
+            Self::Parallel(_) => None,
+            Self::Exact(trie) => {
+                trie.retain_witness_paths_since_undo_began(retained_paths, moved_paths, options)
+            }
+        }
+    }
+
     /// Clones the trie while timing and accounting the copy.
     pub fn clone_measured(&self, options: CloneMeasureOptions) -> (Self, CloneBreakdown) {
         match self {

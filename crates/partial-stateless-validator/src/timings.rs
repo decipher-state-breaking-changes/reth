@@ -19,6 +19,14 @@ use serde::Serialize;
 pub struct RetentionWalkMetrics {
     pub calls: u64,
     pub full_range_calls: u64,
+    /// Calls that walked only toward what the block changed; every call is this or the above.
+    pub delta_calls: u64,
+    /// Distinct candidate paths those calls walked toward.
+    pub candidate_paths: u64,
+    /// Collecting and sorting the candidates, outside `traversal_us`.
+    pub candidate_us: u64,
+    /// Children with retained paths below them the narrowed walks left unvisited.
+    pub subtrees_skipped: u64,
     pub presorted_inputs: u64,
     pub sorted_input_fallbacks: u64,
     pub input_us: u64,
@@ -71,6 +79,10 @@ impl From<&RetainWitnessPathsMetrics> for RetentionWalkMetrics {
         Self {
             calls: metrics.calls,
             full_range_calls: metrics.full_range_calls,
+            delta_calls: metrics.delta_calls,
+            candidate_paths: metrics.candidate_paths,
+            candidate_us: metrics.candidate_us,
+            subtrees_skipped: metrics.subtrees_skipped,
             presorted_inputs: metrics.presorted_inputs,
             sorted_input_fallbacks: metrics.sorted_input_fallbacks,
             input_us: metrics.input_us,
@@ -496,6 +508,20 @@ pub struct ValidationPhaseTimings {
     /// because an arm configured to shrink whose sum is zero never reached an interval boundary,
     /// which is a misconfigured arm rather than a change that did nothing.
     pub retention_warm_shrinks: u64,
+    /// 1 when narrowed retention was on but the cache could not vouch for its tries' history, so
+    /// every walk of the block ran in full: the first patched block after a start, a restore or a
+    /// rollback.
+    pub retention_delta_unproven: u64,
+    /// Walks the cache vouched for that the trie itself refused — a dirty residual from its last
+    /// retention, or a record that could not name every write — and so ran in full.
+    pub retention_delta_refused: u64,
+    /// Storage tries whose handle could not vouch for its trie's history, walked in full.
+    pub retention_delta_ineligible: u64,
+    /// Narrowed walks the oracle mode checked against a full walk of a copy, and what the checks
+    /// cost. The cost is outside the retention subphases above but inside `trie_retention_us`, so
+    /// an oracle pass is a correctness pass and never a timing one.
+    pub retention_oracle_checks: u64,
+    pub retention_oracle_us: u64,
     pub next_cache_anchor_us: u64,
     /// The anchor's internal split; included in `next_cache_anchor_us`, never summed into a total.
     pub next_cache_anchor_detail: CacheRootMetrics,
