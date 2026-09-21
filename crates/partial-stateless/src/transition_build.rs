@@ -33,7 +33,8 @@ use crate::{
 use alloy_primitives::{keccak256, map::B256Map, Bytes, B256};
 use alloy_rlp::{Encodable, EMPTY_STRING_CODE};
 use reth_trie_common::{
-    DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofV2Target, EMPTY_ROOT_HASH,
+    DecodedMultiProofV2, HashedPostState, MultiProofTargetsV2, ProofTrieNodeV2, ProofV2Target,
+    EMPTY_ROOT_HASH,
 };
 use std::{collections::BTreeMap, time::Instant};
 use tracing::warn;
@@ -54,6 +55,60 @@ pub struct ParallelProof {
     /// Storage-trie workers the source used.
     pub storage_workers: usize,
     /// Account-trie workers the source used.
+    pub account_workers: usize,
+}
+
+/// Which initial-proof path runs first when one block measures both.
+///
+/// Benchmark-only. The production flag picks one path for a whole process, which leaves a serial
+/// arm and a wide arm standing on different blocks; under this mode one process proves the same
+/// targets against the same parent state twice, so the two are paired by construction. The order
+/// alternates per block because the second call runs on whatever the first left in the page cache
+/// and the provider's own caches, and a fixed order would hand that to one arm on every block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialProofOrder {
+    /// The serial provider call runs first.
+    SerialFirst,
+    /// The wide (parallel) call runs first.
+    ParallelFirst,
+}
+
+impl InitialProofOrder {
+    /// The order this block runs its two calls in.
+    pub const fn for_block(block_number: u64) -> Self {
+        if block_number.is_multiple_of(2) {
+            Self::SerialFirst
+        } else {
+            Self::ParallelFirst
+        }
+    }
+
+    /// Which arm ran first, as a record reports it.
+    pub const fn first_label(self) -> &'static str {
+        match self {
+            Self::SerialFirst => "serial",
+            Self::ParallelFirst => "parallel",
+        }
+    }
+}
+
+/// What both initial-proof paths cost on one block, and whether they proved the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct InitialProofAbTiming {
+    /// The serial provider call.
+    pub serial_us: u64,
+    /// The wide call, its workers included.
+    pub parallel_us: u64,
+    /// Which of the two ran first on this block.
+    pub first: &'static str,
+    /// Whether both calls proved the same nodes, node order aside.
+    ///
+    /// This is what makes the pair readable as an A/B at all: two paths that disagree are not two
+    /// timings of one thing, and a run that reports a disagreement is reporting a defect.
+    pub agreed: bool,
+    /// Storage-trie workers the wide call used.
+    pub storage_workers: usize,
+    /// Account-trie workers the wide call used.
     pub account_workers: usize,
 }
 
@@ -96,6 +151,13 @@ pub struct TransitionBuildContext<'a> {
     /// Requires the parent trie cache to be revealed and anchored — a cold or warming cache has
     /// no frontier to trim against, and callers degrade to the self-contained v2 wire instead.
     pub trim_witness: bool,
+    /// Benchmark-only: prove this block's initial targets both ways and report both.
+    ///
+    /// `None` in every ordinary run, and the only answer a source without a wide path can be
+    /// measured under. On, the block pays a second initial multiproof, so nothing end-to-end in
+    /// that run — builder total, process CPU — describes a production builder; the paired provider
+    /// times do.
+    pub initial_proof_ab: Option<InitialProofOrder>,
 }
 
 impl std::fmt::Debug for TransitionBuildContext<'_> {
@@ -109,12 +171,18 @@ impl std::fmt::Debug for TransitionBuildContext<'_> {
 impl<'a> TransitionBuildContext<'a> {
     /// A context that measures nothing about the host process.
     pub const fn uninstrumented(proofs: &'a dyn TransitionProofSource) -> Self {
-        Self { proofs, rss_sampler: None, trim_witness: false }
+        Self { proofs, rss_sampler: None, trim_witness: false, initial_proof_ab: None }
     }
 
     /// The same context, additionally producing the trimmed (v3) witness.
     pub const fn with_trimmed_witness(mut self) -> Self {
         self.trim_witness = true;
+        self
+    }
+
+    /// The same context, measuring both initial-proof paths on every eligible block.
+    pub const fn with_initial_proof_ab(mut self, order: InitialProofOrder) -> Self {
+        self.initial_proof_ab = Some(order);
         self
     }
 
@@ -334,13 +402,19 @@ pub struct CacheAwareBaseProof {
     pub cache_covered_mutation_targets: usize,
     /// Wall time the proof source spent.
     pub provider_us: u64,
-    /// Which path answered: `empty`, `parallel`, `serial`, `serial-low-width`, or
-    /// `serial-after-parallel-error`.
+    /// Which path answered: `empty`, `parallel`, `serial`, `serial-low-width`,
+    /// `serial-after-parallel-error`, `ab` or `ab-after-parallel-error`.
     pub proof_source: &'static str,
     /// Storage workers the wide path used, zero otherwise.
     pub parallel_storage_workers: usize,
     /// Account workers the wide path used, zero otherwise.
     pub parallel_account_workers: usize,
+    /// Both paths' cost on this block, when the benchmark-only A/B measured them.
+    ///
+    /// `Some` only on a block whose targets the production gate would have sent down the wide
+    /// path: below that width both arms make the same serial call, and timing it twice would
+    /// compare a path against itself.
+    pub initial_proof_ab: Option<InitialProofAbTiming>,
 }
 
 /// The parent-state targets a block needs proved before its transition can start.
@@ -417,6 +491,32 @@ pub fn generate_cache_aware_base_proof(
     }
 
     let parallel_initial_proof = ctx.proofs.parallel_initial_proof();
+    // Benchmark-only, and before the production paths because it stands in for both of them: the
+    // same targets proved twice against the same parent state, so a serial and a wide timing come
+    // from one block instead of two runs.
+    let ab_order = ctx.initial_proof_ab.filter(|_| {
+        !targets.is_empty() &&
+            parallel_initial_proof.is_some() &&
+            targets.should_use_parallel_initial_proof()
+    });
+    if let Some(order) = ab_order {
+        let parallel = parallel_initial_proof.expect("the filter above required a wide path");
+        let (proof, serial_us, timing) = measure_initial_proof_ab(ctx, parallel, &targets, order)?;
+        return Ok(CacheAwareBaseProof {
+            targets,
+            proof,
+            cache_covered_mutation_targets,
+            // The serial call alone, so this field stays the one thing it has always been: what
+            // the path that produced the kept proof cost. The wide arm's time is in `timing`.
+            provider_us: serial_us,
+            proof_source: if timing.is_some() { "ab" } else { "ab-after-parallel-error" },
+            // The kept proof is the serial one, so it used no workers. The wide call's workers are
+            // reported beside its own timing.
+            parallel_storage_workers: 0,
+            parallel_account_workers: 0,
+            initial_proof_ab: timing,
+        })
+    }
     let provider_start = Instant::now();
     let (proof, proof_source, parallel_storage_workers, parallel_account_workers) = if targets
         .is_empty()
@@ -466,7 +566,98 @@ pub fn generate_cache_aware_base_proof(
         proof_source,
         parallel_storage_workers,
         parallel_account_workers,
+        initial_proof_ab: None,
     })
+}
+
+/// Proves `targets` both ways and returns the serial proof, its own time, and the pair.
+///
+/// The serial proof is the one kept, so an A/B run publishes exactly what a production serial run
+/// would: the wide path is the candidate under measurement, not the one shipping the sidecar.
+/// A wide call that fails yields `None` for the pair rather than an error — the production path
+/// falls back to serial for the same failure, and one unmeasurable block must not fail a block.
+fn measure_initial_proof_ab(
+    ctx: &TransitionBuildContext<'_>,
+    parallel: &dyn Fn(MultiProofTargetsV2) -> eyre::Result<ParallelProof>,
+    targets: &V2TargetSet,
+    order: InitialProofOrder,
+) -> eyre::Result<(DecodedMultiProofV2, u64, Option<InitialProofAbTiming>)> {
+    let serial = || -> eyre::Result<(DecodedMultiProofV2, u64)> {
+        let started = Instant::now();
+        let proof = ctx
+            .proofs
+            .multiproof_v2(targets.to_provider_targets())
+            .map_err(|err| eyre::eyre!("failed to generate initial V2 multiproof: {err}"))?;
+        Ok((proof, started.elapsed().as_micros() as u64))
+    };
+    let wide = || {
+        let started = Instant::now();
+        let proof = parallel(targets.to_provider_targets());
+        (proof, started.elapsed().as_micros() as u64)
+    };
+
+    let ((serial_proof, serial_us), (parallel_proof, parallel_us)) = match order {
+        InitialProofOrder::SerialFirst => (serial()?, wide()),
+        InitialProofOrder::ParallelFirst => {
+            let parallel_proof = wide();
+            (serial()?, parallel_proof)
+        }
+    };
+    let parallel_proof = match parallel_proof {
+        Ok(parallel_proof) => parallel_proof,
+        Err(err) => {
+            warn!(
+                target: "partial_stateless",
+                error = %err,
+                initial_targets = targets.len(),
+                distinct_storage_tries = targets.distinct_storage_tries(),
+                "Parallel initial V2 multiproof failed under the A/B; the block keeps the serial proof and reports no pair"
+            );
+            return Ok((serial_proof, serial_us, None))
+        }
+    };
+    let agreed = proofs_agree(&serial_proof, &parallel_proof.proof);
+    if !agreed {
+        warn!(
+            target: "partial_stateless",
+            initial_targets = targets.len(),
+            distinct_storage_tries = targets.distinct_storage_tries(),
+            "The wide initial V2 multiproof proved different nodes than the serial one"
+        );
+    }
+    Ok((
+        serial_proof,
+        serial_us,
+        Some(InitialProofAbTiming {
+            serial_us,
+            parallel_us,
+            first: order.first_label(),
+            agreed,
+            storage_workers: parallel_proof.storage_workers,
+            account_workers: parallel_proof.account_workers,
+        }),
+    ))
+}
+
+/// Whether two proofs of one target set carry the same nodes, node order aside.
+///
+/// The wide path assembles storage tries on workers, so its vectors can arrive in an order the
+/// serial walk would not have produced. Order is not part of what a proof says — the sparse trie
+/// reveals by path — so the comparison sorts by path before it compares.
+fn proofs_agree(left: &DecodedMultiProofV2, right: &DecodedMultiProofV2) -> bool {
+    fn by_path(nodes: &[ProofTrieNodeV2]) -> Vec<&ProofTrieNodeV2> {
+        let mut sorted: Vec<&ProofTrieNodeV2> = nodes.iter().collect();
+        sorted.sort_by_key(|node| node.path);
+        sorted
+    }
+    by_path(&left.account_proofs) == by_path(&right.account_proofs) &&
+        left.storage_proofs.len() == right.storage_proofs.len() &&
+        left.storage_proofs.iter().all(|(hashed_address, nodes)| {
+            right
+                .storage_proofs
+                .get(hashed_address)
+                .is_some_and(|other| by_path(nodes) == by_path(other))
+        })
 }
 
 /// Runs one block's cache-aware transition to a checked post-state root.
@@ -1169,6 +1360,161 @@ mod tests {
         });
         assert_eq!(wide.distinct_storage_tries(), 1);
         assert!(!wide.should_use_parallel_initial_proof());
+    }
+
+    /// A target set the production gate would send down the wide path.
+    fn wide_targets() -> V2TargetSet {
+        let mut targets = V2TargetSet::default();
+        for index in 0..62u8 {
+            let mut key = [0u8; 32];
+            key[31] = index;
+            targets.insert(TrieProofTargetV2::Account { key: B256::from(key), min_len: 0 });
+        }
+        for tag in [0xaa, 0xbb] {
+            targets.insert(TrieProofTargetV2::Storage {
+                hashed_address: B256::repeat_byte(tag),
+                key: B256::repeat_byte(0x01),
+                min_len: 0,
+            });
+        }
+        assert!(targets.should_use_parallel_initial_proof());
+        targets
+    }
+
+    fn proof_node(tag: u8) -> ProofTrieNodeV2 {
+        let mut node = ProofTrieNodeV2::empty();
+        node.path = reth_trie_common::Nibbles::from_nibbles([tag & 0x0f]);
+        node
+    }
+
+    fn proof_of(tags: [u8; 3]) -> DecodedMultiProofV2 {
+        DecodedMultiProofV2 {
+            account_proofs: tags.iter().map(|&tag| proof_node(tag)).collect(),
+            storage_proofs: Default::default(),
+        }
+    }
+
+    /// A source that logs the order it was called in and answers the wide path however a test says.
+    struct LoggingSource {
+        serial: DecodedMultiProofV2,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        wide: Box<dyn Fn(MultiProofTargetsV2) -> eyre::Result<ParallelProof>>,
+    }
+
+    impl LoggingSource {
+        fn new(
+            serial: DecodedMultiProofV2,
+            wide: impl Fn(MultiProofTargetsV2) -> eyre::Result<DecodedMultiProofV2> + 'static,
+        ) -> Self {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let logged = std::rc::Rc::clone(&calls);
+            Self {
+                serial,
+                calls,
+                wide: Box::new(move |targets| {
+                    logged.borrow_mut().push("parallel");
+                    wide(targets).map(|proof| ParallelProof {
+                        proof,
+                        storage_workers: 3,
+                        account_workers: 1,
+                    })
+                }),
+            }
+        }
+    }
+
+    impl TransitionProofSource for LoggingSource {
+        fn multiproof_v2(
+            &self,
+            _targets: MultiProofTargetsV2,
+        ) -> eyre::Result<DecodedMultiProofV2> {
+            self.calls.borrow_mut().push("serial");
+            Ok(self.serial.clone())
+        }
+
+        fn parallel_initial_proof(
+            &self,
+        ) -> Option<&dyn Fn(MultiProofTargetsV2) -> eyre::Result<ParallelProof>> {
+            Some(self.wide.as_ref())
+        }
+    }
+
+    #[test]
+    fn the_initial_proof_ab_runs_both_paths_in_the_order_the_block_selects() {
+        for (block, expected) in [(100u64, ["serial", "parallel"]), (101, ["parallel", "serial"])] {
+            let proof = proof_of([1, 2, 3]);
+            let source = LoggingSource::new(proof.clone(), move |_| Ok(proof_of([3, 2, 1])));
+            let ctx = TransitionBuildContext::uninstrumented(&source);
+            let order = InitialProofOrder::for_block(block);
+            let (kept, serial_us, timing) = measure_initial_proof_ab(
+                &ctx,
+                source.parallel_initial_proof().unwrap(),
+                &wide_targets(),
+                order,
+            )
+            .expect("both paths answered");
+
+            assert_eq!(*source.calls.borrow(), expected, "block {block} ran them out of order");
+            let timing = timing.expect("a pair");
+            assert_eq!(timing.first, expected[0]);
+            assert_eq!(timing.serial_us, serial_us);
+            // The kept proof is the serial one, so an A/B run publishes what a serial run would.
+            assert_eq!(kept, proof);
+            // Node order is not part of what a proof says: the wide answer is the same nodes.
+            assert!(timing.agreed);
+            assert_eq!((timing.storage_workers, timing.account_workers), (3, 1));
+        }
+    }
+
+    #[test]
+    fn the_initial_proof_ab_reports_two_paths_that_proved_different_nodes() {
+        let source = LoggingSource::new(proof_of([1, 2, 3]), |_| Ok(proof_of([1, 2, 4])));
+        let ctx = TransitionBuildContext::uninstrumented(&source);
+        let (_, _, timing) = measure_initial_proof_ab(
+            &ctx,
+            source.parallel_initial_proof().unwrap(),
+            &wide_targets(),
+            InitialProofOrder::SerialFirst,
+        )
+        .expect("both paths answered");
+        assert!(!timing.expect("a pair").agreed);
+    }
+
+    #[test]
+    fn a_failed_wide_call_leaves_the_block_with_its_serial_proof_and_no_pair() {
+        let proof = proof_of([1, 2, 3]);
+        let source =
+            LoggingSource::new(proof.clone(), |_| Err(eyre::eyre!("no workers available")));
+        let ctx = TransitionBuildContext::uninstrumented(&source);
+        for order in [InitialProofOrder::SerialFirst, InitialProofOrder::ParallelFirst] {
+            let (kept, _, timing) = measure_initial_proof_ab(
+                &ctx,
+                source.parallel_initial_proof().unwrap(),
+                &wide_targets(),
+                order,
+            )
+            .expect("the serial path still answered");
+            assert_eq!(kept, proof);
+            assert!(timing.is_none());
+        }
+    }
+
+    #[test]
+    fn proof_agreement_ignores_node_order_and_sees_a_different_node() {
+        assert!(proofs_agree(&proof_of([1, 2, 3]), &proof_of([3, 1, 2])));
+        assert!(!proofs_agree(&proof_of([1, 2, 3]), &proof_of([1, 2, 4])));
+
+        let mut with_storage = proof_of([1, 2, 3]);
+        with_storage
+            .storage_proofs
+            .insert(B256::repeat_byte(0xaa), vec![proof_node(1), proof_node(2)]);
+        let mut reordered = proof_of([1, 2, 3]);
+        reordered
+            .storage_proofs
+            .insert(B256::repeat_byte(0xaa), vec![proof_node(2), proof_node(1)]);
+        assert!(proofs_agree(&with_storage, &reordered));
+        // One trie fewer is a different proof, whatever the nodes in the tries they share.
+        assert!(!proofs_agree(&with_storage, &proof_of([1, 2, 3])));
     }
 
     #[test]

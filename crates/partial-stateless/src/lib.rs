@@ -83,9 +83,9 @@ pub use transition_build::{
     assemble_sidecar, build_cache_aware_flat_transition, build_full_witness_sidecar,
     build_policy_sidecar, decode_transition_witness, full_witness_sidecar_from_nodes,
     generate_cache_aware_base_proof, initial_cache_aware_targets, measure_transition_witness_size,
-    BlockTransitionRef, CacheAwareBaseProof, CacheAwareFlatBuild, FullWitnessBuild, ParallelProof,
-    PolicySidecarBuild, SidecarAssembly, TransitionBuildContext, TransitionProofSource,
-    TrimmedWitnessBuild, V2TargetSet,
+    BlockTransitionRef, CacheAwareBaseProof, CacheAwareFlatBuild, FullWitnessBuild,
+    InitialProofAbTiming, InitialProofOrder, ParallelProof, PolicySidecarBuild, SidecarAssembly,
+    TransitionBuildContext, TransitionProofSource, TrimmedWitnessBuild, V2TargetSet,
 };
 pub use trie_cache::{
     apply_delta_retention_from_env, default_delta_retention, set_default_delta_retention,

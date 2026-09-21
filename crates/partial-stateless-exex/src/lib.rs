@@ -234,6 +234,14 @@ pub struct RunOptions {
     pub warm_shrink: partial_stateless::WarmSetShrinkPolicy,
     /// Whether eligible initial V2 multiproofs use reth's proof workers.
     pub parallel_initial_proof: bool,
+    /// Benchmark-only: prove every eligible block's initial targets both ways, and report both.
+    ///
+    /// The production flag above picks one path for the whole process, so a serial arm and a wide
+    /// arm stand on different blocks. This one pairs them on the same block, the same parent state
+    /// and the same targets, alternating which call runs first. It implies the wide path, costs a
+    /// second initial multiproof per eligible block, and makes the run's end-to-end columns
+    /// unusable as a production builder's.
+    pub initial_proof_ab: bool,
     /// Whether the paired in-memory validation benchmark is running.
     pub validation_bench: bool,
     /// Bounds on sidecar witness decoding.
@@ -401,6 +409,7 @@ impl RunOptions {
                 .parse()
                 .map_err(eyre::Report::msg)?,
             parallel_initial_proof: env_flag("PS_PARALLEL_INITIAL_PROOF"),
+            initial_proof_ab: env_flag("PS_INITIAL_PROOF_AB"),
             validation_bench,
             reexec_limits: SidecarReexecLimits::default(),
             canonical_rebuild: env_flag("PS_CANONICAL_REBUILD"),
@@ -497,6 +506,12 @@ impl RunOptions {
                 "Parallel initial V2 multiproof ENABLED (PS_PARALLEL_INITIAL_PROOF); low-width target sets remain serial"
             );
         }
+        if self.initial_proof_ab {
+            info!(
+                target: "partial_stateless",
+                "Initial V2 multiproof A/B ENABLED (PS_INITIAL_PROOF_AB): every eligible block proves its targets serially AND wide, alternating which runs first. The block keeps the serial proof; builder totals and process CPU in this run carry both calls and are not a production builder's"
+            );
+        }
         if self.run_sidecar_preflight {
             info!(
                 target: "partial_stateless",
@@ -575,6 +590,7 @@ impl RunOptions {
             retained_generation,
             reexec_limits: &self.reexec_limits,
             parallel_initial_proof,
+            initial_proof_ab: self.initial_proof_ab,
             ready_parent,
             retain_sidecar,
         }
@@ -2057,8 +2073,9 @@ where
         &mut pair.coordinated.trie_cache,
         &options.config,
         options.builder_options(
-            options
-                .parallel_initial_proof
+            // The A/B needs the wide path whether or not production asked for it: it is the arm
+            // under measurement, and a source without it would leave every block unpaired.
+            (options.parallel_initial_proof || options.initial_proof_ab)
                 .then_some(&parallel_initial_proof as &ParallelInitialProofFn<'_>),
             ready_parent.as_ref(),
             // The recorder needs the sidecar as a value, and the builder otherwise hands back

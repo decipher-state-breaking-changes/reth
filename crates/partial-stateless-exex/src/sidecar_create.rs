@@ -34,8 +34,8 @@ use partial_stateless::{
         accessed_to_state_targets, build_sidecar_targets, cache_hit_targets,
         measure_multiproof_size, state_targets_to_proof_targets, WitnessResult,
     },
-    CacheAnchor, CacheAwareFlatBuild, CacheFootprintStats, FullWitnessBuild, ParallelProof,
-    PartialExecutionWitnessState, PartialStatelessSidecar, PartialTrieNodeCache,
+    CacheAnchor, CacheAwareFlatBuild, CacheFootprintStats, FullWitnessBuild, InitialProofOrder,
+    ParallelProof, PartialExecutionWitnessState, PartialStatelessSidecar, PartialTrieNodeCache,
     RootWitnessCompletenessSummary, SidecarAssembly, SidecarBenchmarkManifest, StateTargetStats,
     TransitionBuildContext, TransitionProofSource, TrieChangeSet, TrieProofTargetV2, V2TargetSet,
     WitnessReductionStats,
@@ -81,6 +81,13 @@ pub(crate) struct BuilderOptions<'a> {
     pub(crate) retained_generation: RetainedGenerationBytes,
     pub(crate) reexec_limits: &'a SidecarReexecLimits,
     pub(crate) parallel_initial_proof: Option<&'a ParallelInitialProofFn<'a>>,
+    /// Benchmark-only: prove this block's initial targets both serially and wide, and report both.
+    ///
+    /// Off in every ordinary run. On, the block pays a second initial multiproof, so this run's
+    /// builder total and process CPU describe no production builder — only the paired provider
+    /// times do. It needs the wide path, so the launcher supplies `parallel_initial_proof`
+    /// whether or not the production flag asked for it.
+    pub(crate) initial_proof_ab: bool,
     /// The parent the caches are authenticated against, when they are Ready.
     ///
     /// Publication requires it. A Warming cache produces an arithmetically correct sidecar while
@@ -324,6 +331,7 @@ impl<'a> RethStateProviderSource<'a> {
             proofs: self,
             rss_sampler: Some(process_rss_bytes),
             trim_witness: false,
+            initial_proof_ab: None,
         }
     }
 }
@@ -980,6 +988,7 @@ where
     let saved_sidecar_path;
     let builder_initial_proof_source;
     let builder_initial_provider_us;
+    let builder_initial_proof_ab;
     let builder_initial_targets;
     let builder_distinct_storage_tries;
     let builder_parallel_storage_workers;
@@ -1010,6 +1019,14 @@ where
         proof_source.context().with_trimmed_witness()
     } else {
         proof_source.context()
+    };
+    // The height decides which of the two calls goes first, so the order alternates over the run
+    // without this side keeping any state of its own — and a re-verdict of one height, after a
+    // reorg, measures it the same way it did the first time.
+    let build_ctx = if options.initial_proof_ab {
+        build_ctx.with_initial_proof_ab(InitialProofOrder::for_block(block_number))
+    } else {
+        build_ctx
     };
     let witness = {
         let base =
@@ -1047,9 +1064,11 @@ where
         .map_err(|err| rollback_sidecar_transition(cache, block_number, err))?;
         let initial_provider_us = base.provider_us;
         let initial_proof_source = base.proof_source;
+        let initial_proof_ab = base.initial_proof_ab;
         let transition_witness_build_us = start.elapsed().as_micros() as u64;
         builder_initial_proof_source = initial_proof_source;
         builder_initial_provider_us = initial_provider_us;
+        builder_initial_proof_ab = initial_proof_ab;
         builder_initial_targets = initial_targets;
         builder_distinct_storage_tries = base.targets.distinct_storage_tries();
         builder_parallel_storage_workers = base.parallel_storage_workers;
@@ -1539,6 +1558,7 @@ where
             cache_parent_synced,
             initial_proof_source: builder_initial_proof_source,
             initial_provider_us: builder_initial_provider_us,
+            initial_proof_ab: builder_initial_proof_ab,
             initial_targets: builder_initial_targets,
             distinct_storage_tries: builder_distinct_storage_tries,
             parallel_storage_workers: builder_parallel_storage_workers,

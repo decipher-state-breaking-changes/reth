@@ -1,5 +1,7 @@
 use alloy_primitives::B256;
-use partial_stateless::{PartialExecutionWitness, PartialStatelessSidecar, TrieMutationMetrics};
+use partial_stateless::{
+    InitialProofAbTiming, PartialExecutionWitness, PartialStatelessSidecar, TrieMutationMetrics,
+};
 use serde::Serialize;
 use std::{
     fs::{self, OpenOptions},
@@ -176,7 +178,7 @@ pub struct ValidationBenchmarkRecord {
 /// still current while `PS_TRIE_REPR=exact` was used for the O2.2 live arm, so an analyzer must
 /// recover the label from that run's external manifest or startup log, never infer it from the
 /// schema number.
-pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 5;
+pub const BUILDER_BENCHMARK_SCHEMA_VERSION: u64 = 6;
 
 /// Per-block builder telemetry used to isolate cache snapshot and initial proof costs.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -221,6 +223,13 @@ pub struct BuilderBenchmarkRecord {
     pub distinct_storage_tries: usize,
     pub parallel_storage_workers: usize,
     pub parallel_account_workers: usize,
+    /// Both initial-proof paths' cost on this block, under the benchmark-only A/B.
+    ///
+    /// `null` in every ordinary run, and on an A/B run's blocks whose targets were too narrow for
+    /// the wide path or whose wide call failed. When it is present, `initial_provider_us` is the
+    /// serial call alone and `builder_total_us` carries both, so an A/B run's end-to-end columns
+    /// are not a production builder's. Since schema 6.
+    pub initial_proof_ab: Option<InitialProofAbTiming>,
     pub initial_proof_nodes: usize,
     pub initial_proof_bytes: usize,
     pub witness_commitment: Option<B256>,
@@ -575,7 +584,7 @@ mod tests {
         // find `artifact_available` absent and report 0% delivery rather than "not recorded".
         let value = serde_json::to_value(BuilderBenchmarkRecord::default()).unwrap();
 
-        assert_eq!(BUILDER_BENCHMARK_SCHEMA_VERSION, 5);
+        assert_eq!(BUILDER_BENCHMARK_SCHEMA_VERSION, 6);
         for field in ["artifact_available", "artifact_reused", "shadow_sampled", "fallback_reason"]
         {
             assert!(value.get(field).is_some(), "schema 4 must carry {field}");
