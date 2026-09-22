@@ -244,10 +244,11 @@ impl RetentionBase {
 
 /// The variable that sets how this process's trie caches walk their tries during retention.
 ///
-/// - `off`, the default: every prune walks every revealed node of its trie.
-/// - `on`: a prune the cache can vouch for walks only toward what the block changed — the nodes and
-///   leaf values its undo record names and the paths that entered or left the retained set — and
-///   every other prune falls back to the full walk.
+/// - `on`, the default: a prune the cache can vouch for walks only toward what the block changed —
+///   the nodes and leaf values its undo record names and the paths that entered or left the
+///   retained set — and every other prune falls back to the full walk.
+/// - `off`: every prune walks every revealed node of its trie. The default until the 12 s ABBA on
+///   the real device adopted `on` (2026-09-22); kept as the A/B baseline and for diagnosis.
 /// - `oracle`: as `on`, and every narrowed prune is also run in full on a copy taken just before
 ///   it; the process panics unless the two tries come out equal. A correctness pass: the copies are
 ///   excluded from the phase timers but not from the block.
@@ -260,9 +261,9 @@ pub const DELTA_RETENTION_VAR: &str = "PS_DELTA_RETENTION";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeltaRetention {
     /// Every prune walks the whole revealed trie.
-    #[default]
     Off,
     /// A prune the cache can vouch for walks only toward what the block changed.
+    #[default]
     On,
     /// As `On`, with every narrowed prune checked against a full walk of a copy.
     Oracle,
@@ -333,7 +334,7 @@ pub fn default_delta_retention() -> DeltaRetention {
     }
     let mode = match std::env::var(DELTA_RETENTION_VAR) {
         Ok(raw) => raw.parse().unwrap_or_else(|err| panic!("{DELTA_RETENTION_VAR}={raw:?}: {err}")),
-        Err(_) => DeltaRetention::Off,
+        Err(_) => DeltaRetention::default(),
     };
     // A concurrent first reader computes the same value from the same variable.
     let _ = DEFAULT_DELTA_RETENTION.compare_exchange(
@@ -346,12 +347,12 @@ pub fn default_delta_retention() -> DeltaRetention {
 }
 
 /// Applies [`DELTA_RETENTION_VAR`] to this process and returns the mode now in force. Unset means
-/// `off`; an unparseable value is an error rather than the default, so an A/B arm cannot silently
-/// run the baseline.
+/// the default (`on`); an unparseable value is an error rather than the default, so an A/B arm
+/// cannot silently run the other arm.
 pub fn apply_delta_retention_from_env() -> Result<DeltaRetention, String> {
     let mode = match std::env::var(DELTA_RETENTION_VAR) {
         Ok(raw) => raw.parse().map_err(|err| format!("{DELTA_RETENTION_VAR}={raw:?}: {err}"))?,
-        Err(std::env::VarError::NotPresent) => DeltaRetention::Off,
+        Err(std::env::VarError::NotPresent) => DeltaRetention::default(),
         Err(err) => return Err(format!("{DELTA_RETENTION_VAR}: {err}")),
     };
     set_default_delta_retention(mode);

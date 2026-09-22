@@ -153,6 +153,7 @@ diagnostics and benchmark features still require explicit enablement.
 | `PS_UNDO_LAYOUT=frames` | required layout and default; legacy `hybrid` is rejected |
 | `PS_UNDO_RECORD=on` | recording is on by default; disabling it is rejected |
 | `PS_RETAIN_GENERATION=1` | retention is on by default; disabling it is rejected |
+| `PS_DELTA_RETENTION=on\|off\|oracle` | how retention walks the cached tries (default: `on`): `on` walks only toward what the block changed wherever the cache can vouch for its undo record, and falls back to the full walk everywhere else; `off` walks every revealed node, the pre-2026-09-22 default and the A/B baseline; `oracle` also runs every narrowed walk in full on a copy and panics on any difference (a correctness pass, never timed). Every binary reads it at startup and records it in its run manifest; an unparseable value fails startup |
 | `PS_SIDECAR_VERIFIER_WAIT_MS=<ms>` | in `verifier` mode, wait up to this long for the block sidecar file to appear (default: `2000`) |
 | `PS_CAPTURE_DIR=<dir>` | dump each block's accessed-state snapshot to `<dir>` (see below) |
 | `PS_POLICY_DATASET_CAPTURE_DIR=<abs dir>` | capture the policy replay dataset into `<abs dir>`: raw payload, access set, and a policy-neutral full witness per block, so every cache policy can be generated offline later. Absolute paths only; refused alongside any measuring variable; requires `PS_ENGINE_ACCESS=on` and `PS_ENGINE_PAYLOAD=on` (see below) |

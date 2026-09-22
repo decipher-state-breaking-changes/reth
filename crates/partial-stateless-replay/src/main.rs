@@ -828,7 +828,7 @@ fn parse_args() -> eyre::Result<Mode> {
                      --undo-layout, PS_STORAGE_UNDO sets --storage-undo, PS_UNDO_DIR sets \
                      --undo-dir, and PS_FORCED_REORGS \
                      (D@N,D@N,...) sets --forced-reorg; the flags win. PS_DELTA_RETENTION \
-                     (off|on|oracle) selects the retention walk.\nDefaults: K=32, recording on, frames, delta storage undo, disk at <spool-dir>/undo, full retention walk. Legacy hybrid/off controls are rejected."
+                     (off|on|oracle) selects the retention walk.\nDefaults: K=32, recording on, frames, delta storage undo, disk at <spool-dir>/undo, narrowed retention walk. Legacy hybrid/off controls are rejected."
                 );
                 std::process::exit(0);
             }
